@@ -133,6 +133,21 @@ class ProjectStore:
         source = self.root / project_id / "source"
         return sum(1 for path in source.iterdir() if path.is_file() and path.suffix.lower() == ".pdf")
 
+    def path_for(self, project_id: str) -> Path:
+        """Return a registered project path without accepting arbitrary paths."""
+        self.get(project_id)
+        return self.root / project_id
+
+    def update_status(self, project_id: str, status: str) -> Project:
+        if status not in PROJECT_STATUSES:
+            raise ProjectError(f"未知的專案狀態：{status}")
+        project = self.get(project_id)
+        value = asdict(project)
+        value["status"] = status
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_metadata(self.root / project_id / "project.json", value)
+        return Project.from_dict(value)
+
     def table_rows(self) -> list[list[str | int]]:
         return [
             [
