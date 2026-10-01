@@ -8,6 +8,7 @@ from pathlib import Path
 import gradio as gr
 
 from .documents import DocumentInfo, DocumentService
+from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
 
 
@@ -18,6 +19,7 @@ DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "�
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     store = ProjectStore(project_root or os.environ.get("PROJECTS_ROOT", "projects"))
     documents = DocumentService(store)
+    indexing = IndexingService(store)
 
     def refresh_projects() -> list[list[str | int]]:
         return store.table_rows()
@@ -51,6 +53,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f"無文字 {report.empty_pages} 頁、錯誤 {report.error_pages} 頁"
         )
         return message, document_rows(project_id)
+
+    def build_index(project_id: str | None):
+        if not project_id:
+            return "❌ 請先選擇專案", ""
+        try:
+            result = indexing.build(project_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", ""
+        icon = "✅" if result.status == "INDEXED" else "❌"
+        summary = f"{icon} {result.status}｜耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}"
+        log_path = store.path_for(project_id) / "graphrag" / result.log_file
+        log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        return summary, log
 
     def create_project(
         project_id: str,
@@ -110,6 +125,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             with gr.Row():
                 upload_button = gr.Button("上傳")
                 preprocess_button = gr.Button("開始前處理", variant="primary")
+                index_button = gr.Button("建立 Graph", variant="primary")
                 document_refresh_button = gr.Button("重新整理")
             document_result = gr.Markdown()
             document_table = gr.Dataframe(
@@ -118,6 +134,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 datatype=["str", "number", "number", "str", "number", "number", "str"],
                 label="Documents",
             )
+            indexing_log = gr.Textbox(label="建圖日誌", lines=12, interactive=False)
 
         refresh_button.click(refresh_projects, outputs=project_table)
         create_button.click(
@@ -145,6 +162,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=document_project,
             outputs=[document_result, document_table],
         )
+        index_button.click(build_index, inputs=document_project, outputs=[document_result, indexing_log])
         document_refresh_button.click(document_rows, inputs=document_project, outputs=document_table)
     return demo
 

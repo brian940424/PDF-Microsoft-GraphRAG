@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Automotive repair manual GraphRAG management interface"
 requires-python = ">=3.11"
 dependencies = [
+    "graphrag>=3,<4",
     "gradio>=5,<7",
     "pypdf>=5,<7",
 ]
