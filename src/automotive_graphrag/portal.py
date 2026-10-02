@@ -10,6 +10,7 @@ import gradio as gr
 
 from .cases import CaseService
 from .connections import ConnectionSettings
+from .downloads import stage_downloads
 from .projects import Project, ProjectError, ProjectStore
 from .querying import QueryResult, QueryService
 
@@ -125,6 +126,7 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "❌ 請先選擇車型／專案", None, None
         try:
             json_path, csv_path = cases.export(project_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出案例紀錄", str(json_path), str(csv_path)

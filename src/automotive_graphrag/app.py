@@ -12,6 +12,7 @@ import gradio as gr
 from .automatic_evaluation import AutomaticEvaluationService
 from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
 from .documents import DocumentInfo, DocumentService
+from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
@@ -244,6 +245,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "❌ 請先選擇專案與題目集", None, None
         try:
             json_path, csv_path = question_sets.export(project_id, question_set_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出 JSON 與 CSV", str(json_path), str(csv_path)
@@ -323,6 +325,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "❌ 請先選擇專案與題目集", None, None
         try:
             json_path, csv_path = reviews.export(project_id, question_set_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出人工評測 JSON 與 CSV", str(json_path), str(csv_path)
@@ -443,6 +446,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "❌ 請先選擇專案與題目集", None, None
         try:
             json_path, csv_path = retrieval_evaluation.export(project_id, question_set_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出 Retrieval 評估 JSON 與 CSV", str(json_path), str(csv_path)
@@ -501,6 +505,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "❌ 請先選擇專案與題目集", None, None
         try:
             json_path, csv_path = automatic_evaluation.export(project_id, question_set_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出自動評測 JSON 與 CSV", str(json_path), str(csv_path)
@@ -615,6 +620,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "❌ 尚未建立取樣批次", None, None
         try:
             json_path, csv_path = source_sampling.export(project_id, sample_batch_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出原文取樣 JSON 與 CSV", str(json_path), str(csv_path)
@@ -717,6 +723,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "❌ 尚未建立題目生成批次", None
         try:
             path = question_generation.export_question_set(project_id, generation_batch_id)
+            (path,) = stage_downloads((path,))
         except ProjectError as exc:
             return f"❌ {exc}", None
         return "✅ 已匯出所有已核准題目的 question_set JSON", str(path)
