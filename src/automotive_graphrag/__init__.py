@@ -9,6 +9,11 @@ from .projects import Project, ProjectError, ProjectStore
 from .querying import QueryExecution, QueryResult, QueryService
 from .question_sets import BatchQuestion, BatchSummary, GoldEvidence, QuestionSet, QuestionSetService
 from .reviews import ReviewProgress, ReviewRecord, ReviewService
+from .retrieval_evaluation import (
+    RetrievalEvaluationItem,
+    RetrievalEvaluationResult,
+    RetrievalEvaluationService,
+)
 from .source_metadata import SourceMetadata, SourceMetadataService
 
 __all__ = [
@@ -36,6 +41,9 @@ __all__ = [
     "ReviewProgress",
     "ReviewRecord",
     "ReviewService",
+    "RetrievalEvaluationItem",
+    "RetrievalEvaluationResult",
+    "RetrievalEvaluationService",
     "SourceMetadata",
     "SourceMetadataService",
 ]

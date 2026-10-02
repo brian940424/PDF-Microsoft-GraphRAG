@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Protocol
 
+from .evidence import Evidence
 from .projects import ProjectError, ProjectStore
 from .querying import QueryResult, QueryService
 
@@ -41,6 +42,7 @@ class BatchQuestion:
     duration_seconds: float | None = None
     completed_at: str | None = None
     gold_evidence: tuple[GoldEvidence, ...] = ()
+    retrieved_evidence: tuple[Evidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +167,7 @@ class QuestionSetService:
                     duration_seconds=result.duration_seconds,
                     completed_at=result.completed_at,
                     gold_evidence=item.gold_evidence,
+                    retrieved_evidence=result.evidence,
                 )
             except Exception as exc:
                 questions[index] = BatchQuestion(
@@ -209,12 +212,14 @@ class QuestionSetService:
                 "duration_seconds",
                 "completed_at",
                 "gold_evidence",
+                "retrieved_evidence",
             ],
         )
         writer.writeheader()
         for item in question_set.questions:
             row = asdict(item)
             row["gold_evidence"] = json.dumps(row["gold_evidence"], ensure_ascii=False)
+            row["retrieved_evidence"] = json.dumps(row["retrieved_evidence"], ensure_ascii=False)
             writer.writerow(row)
         self._atomic_text(csv_path, buffer.getvalue())
         return json_path, csv_path
@@ -234,6 +239,7 @@ class QuestionSetService:
                 found = True
                 value = asdict(item)
                 value["gold_evidence"] = gold_evidence
+                value["retrieved_evidence"] = item.retrieved_evidence
                 questions.append(BatchQuestion(**value))
             else:
                 questions.append(item)
@@ -345,6 +351,9 @@ class QuestionSetService:
                     chunk_ids=tuple(gold.get("chunk_ids", [])),
                 )
                 for gold in item.get("gold_evidence", [])
+            )
+            item["retrieved_evidence"] = tuple(
+                Evidence(**evidence) for evidence in item.get("retrieved_evidence", [])
             )
             questions.append(BatchQuestion(**item))
         return QuestionSet(**value, questions=tuple(questions))

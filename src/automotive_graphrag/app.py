@@ -17,6 +17,7 @@ from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_sets import QuestionSet, QuestionSetService
 from .reviews import ReviewService
+from .retrieval_evaluation import RetrievalEvaluationService
 
 
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "更新時間"]
@@ -24,6 +25,7 @@ DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "�
 BATCH_COLUMNS = ["題號", "問題", "狀態", "耗時 (秒)", "錯誤"]
 EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
+RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "Retrieved", "First Relevant Rank", "Pass@K"]
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -35,6 +37,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     question_sets = QuestionSetService(store, querying)
     reviews = ReviewService(store, question_sets)
     ground_truth = GroundTruthService(store, question_sets)
+    retrieval_evaluation = RetrievalEvaluationService(store, question_sets)
 
     def connection_status() -> str:
         return (
@@ -349,6 +352,64 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         item = next(item for item in updated.questions if item.question_id == question_id)
         normalized = json.dumps([asdict(gold) for gold in item.gold_evidence], ensure_ascii=False, indent=2)
         return f"✅ 已儲存 {len(item.gold_evidence)} 組 Gold Evidence", normalized
+
+    def run_retrieval_evaluation(
+        project_id: str | None,
+        question_set_id: str | None,
+        top_k: float,
+        rerun_queries: bool,
+        method: str,
+    ):
+        if not project_id or not question_set_id:
+            return "❌ 請先選擇專案與題目集", "", [], gr.Dropdown(choices=[]), []
+        try:
+            result = retrieval_evaluation.evaluate(
+                project_id,
+                question_set_id,
+                top_k=int(top_k),
+                rerun_queries=rerun_queries,
+                method=method,
+            )
+        except ProjectError as exc:
+            return f"❌ {exc}", "", [], gr.Dropdown(choices=[]), []
+        summary = (
+            f"Recall@1 `{result.recall_at_1:.3f}`｜Recall@3 `{result.recall_at_3:.3f}`｜"
+            f"Recall@5 `{result.recall_at_5:.3f}`｜MRR `{result.mrr:.3f}`｜"
+            f"Avg First Rank `{result.average_first_relevant_rank if result.average_first_relevant_rank is not None else 'N/A'}`｜"
+            f"Source Accuracy `{result.evidence_source_accuracy:.3f}`｜"
+            f"Avg Latency `{result.average_latency_seconds if result.average_latency_seconds is not None else 'N/A'}` 秒"
+        )
+        item_values = [asdict(item) for item in result.items]
+        rows = [
+            [
+                item.question_id,
+                sum(len(gold.chunk_ids) or len(gold.pages) for gold in item.gold_evidence),
+                len(item.retrieved_evidence),
+                item.first_relevant_rank,
+                item.passed_at_k,
+            ]
+            for item in result.items
+        ]
+        selector = gr.Dropdown(
+            choices=[(item.question_id, item.question_id) for item in result.items],
+            value=result.items[0].question_id if result.items else None,
+        )
+        return "✅ Retrieval 評估完成", summary, rows, selector, item_values
+
+    def retrieval_item_detail(question_id: str | None, items: list[dict[str, object]]):
+        for item in items or []:
+            if item.get("question_id") == question_id:
+                return item
+        return {}
+
+    def export_retrieval_evaluation(project_id: str | None, question_set_id: str | None):
+        if not project_id or not question_set_id:
+            return "❌ 請先選擇專案與題目集", None, None
+        try:
+            json_path, csv_path = retrieval_evaluation.export(project_id, question_set_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", None, None
+        return "✅ 已匯出 Retrieval 評估 JSON 與 CSV", str(json_path), str(csv_path)
 
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
@@ -692,6 +753,40 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             save_gold_evidence_button = gr.Button("驗證並儲存 Gold Evidence", variant="primary")
             gold_evidence_result = gr.Markdown()
 
+        with gr.Tab("Retrieval 評估"):
+            with gr.Row():
+                retrieval_project = gr.Dropdown(choices=project_choices(), label="專案")
+                retrieval_project_refresh = gr.Button("重新整理專案")
+                retrieval_question_set = gr.Dropdown(label="題目集")
+            with gr.Row():
+                retrieval_top_k = gr.Number(label="Top-K", value=5, minimum=1, precision=0)
+                retrieval_method = gr.Dropdown(
+                    choices=[("Local", "local")],
+                    value="local",
+                    label="查詢方法",
+                )
+                retrieval_rerun = gr.Checkbox(
+                    label="重新執行查詢（會產生 API Token 費用）",
+                    value=False,
+                )
+            with gr.Row():
+                run_retrieval_button = gr.Button("執行評估", variant="primary")
+                export_retrieval_button = gr.Button("匯出結果")
+            retrieval_result = gr.Markdown()
+            retrieval_summary = gr.Markdown()
+            retrieval_table = gr.Dataframe(
+                headers=RETRIEVAL_COLUMNS,
+                interactive=False,
+                datatype=["str", "number", "number", "number", "bool"],
+                label="逐題 Retrieval 結果",
+            )
+            retrieval_items_state = gr.State([])
+            retrieval_item_selector = gr.Dropdown(label="查看逐題 Evidence 詳情")
+            retrieval_item_json = gr.JSON(label="Gold／Retrieved Evidence")
+            with gr.Row():
+                retrieval_json_export = gr.File(label="Retrieval JSON")
+                retrieval_csv_export = gr.File(label="Retrieval CSV")
+
         refresh_button.click(
             refresh_project_views,
             inputs=selected_project,
@@ -949,6 +1044,46 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             save_ground_truth,
             inputs=[gold_project, gold_question_set, gold_question, gold_evidence_editor],
             outputs=[gold_evidence_result, gold_evidence_editor],
+        )
+        retrieval_project_refresh.click(
+            lambda: gr.Dropdown(choices=project_choices()),
+            outputs=retrieval_project,
+        )
+        retrieval_project.change(
+            lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
+            inputs=retrieval_project,
+            outputs=retrieval_question_set,
+        )
+        run_retrieval_button.click(
+            run_retrieval_evaluation,
+            inputs=[
+                retrieval_project,
+                retrieval_question_set,
+                retrieval_top_k,
+                retrieval_rerun,
+                retrieval_method,
+            ],
+            outputs=[
+                retrieval_result,
+                retrieval_summary,
+                retrieval_table,
+                retrieval_item_selector,
+                retrieval_items_state,
+            ],
+        ).then(
+            retrieval_item_detail,
+            inputs=[retrieval_item_selector, retrieval_items_state],
+            outputs=retrieval_item_json,
+        )
+        retrieval_item_selector.input(
+            retrieval_item_detail,
+            inputs=[retrieval_item_selector, retrieval_items_state],
+            outputs=retrieval_item_json,
+        )
+        export_retrieval_button.click(
+            export_retrieval_evaluation,
+            inputs=[retrieval_project, retrieval_question_set],
+            outputs=[retrieval_result, retrieval_json_export, retrieval_csv_export],
         )
         test_connection_button.click(
             test_connection,
