@@ -83,14 +83,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return []
         return [document_row(document) for document in documents.list_documents(project_id)]
 
+    def document_view(project_id: str | None):
+        rows = document_rows(project_id)
+        choices = [row[0] for row in rows]
+        return rows, gr.Dropdown(choices=choices, value=None)
+
     def import_documents(project_id: str | None, files: list[str] | None):
         if not project_id:
-            return "❌ 請先選擇專案", []
+            return "❌ 請先選擇專案", [], gr.Dropdown(choices=[])
         try:
             imported = documents.import_pdfs(project_id, files or [])
         except ProjectError as exc:
-            return f"❌ {exc}", document_rows(project_id)
-        return f"✅ 已匯入 {len(files or [])} 份 PDF", [document_row(item) for item in imported]
+            rows, selector = document_view(project_id)
+            return f"❌ {exc}", rows, selector
+        rows = [document_row(item) for item in imported]
+        return f"✅ 已匯入 {len(files or [])} 份 PDF", rows, gr.Dropdown(choices=[row[0] for row in rows])
 
     def preprocess_documents(
         project_id: str | None,
@@ -98,16 +105,33 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         footer_ignore_percent: float,
     ):
         if not project_id:
-            return "❌ 請先選擇專案", []
+            return "❌ 請先選擇專案", [], gr.Dropdown(choices=[])
         try:
             report = documents.preprocess(project_id, header_ignore_percent, footer_ignore_percent)
         except (ProjectError, OSError) as exc:
-            return f"❌ {exc}", document_rows(project_id)
+            rows, selector = document_view(project_id)
+            return f"❌ {exc}", rows, selector
         message = (
             f"✅ 前處理完成：成功 {report.successful_pages} 頁、"
             f"無文字 {report.empty_pages} 頁、錯誤 {report.error_pages} 頁"
         )
-        return message, document_rows(project_id)
+        rows, selector = document_view(project_id)
+        return message, rows, selector
+
+    def remove_document(project_id: str | None, filename: str | None, confirmed: bool):
+        if not project_id or not filename:
+            rows, selector = document_view(project_id)
+            return "❌ 請先選擇專案與 PDF", rows, selector, False
+        if not confirmed:
+            rows, selector = document_view(project_id)
+            return "❌ 請勾選移除確認", rows, selector, False
+        try:
+            documents.remove_pdf(project_id, filename)
+        except ProjectError as exc:
+            rows, selector = document_view(project_id)
+            return f"❌ {exc}", rows, selector, False
+        rows, selector = document_view(project_id)
+        return f"✅ 已移除 {filename}；請重新執行前處理與建圖", rows, selector, False
 
     def build_index(project_id: str | None):
         if not project_id:
@@ -235,6 +259,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 datatype=["str", "number", "number", "str", "number", "number", "str"],
                 label="Documents",
             )
+            with gr.Row():
+                removable_pdf = gr.Dropdown(label="選擇要移除的 PDF")
+                remove_pdf_confirmation = gr.Checkbox(label="我確認要移除選取的 PDF")
+                remove_pdf_button = gr.Button("移除 PDF", variant="stop")
             indexing_log = gr.Textbox(label="建圖日誌", lines=12, interactive=False)
 
         refresh_button.click(
@@ -271,19 +299,32 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 delete_confirmation,
             ],
         )
-        document_project.change(document_rows, inputs=document_project, outputs=document_table)
+        document_project.change(
+            document_view,
+            inputs=document_project,
+            outputs=[document_table, removable_pdf],
+        )
         upload_button.click(
             import_documents,
             inputs=[document_project, uploaded_files],
-            outputs=[document_result, document_table],
+            outputs=[document_result, document_table, removable_pdf],
         )
         preprocess_button.click(
             preprocess_documents,
             inputs=[document_project, header_ignore_percent, footer_ignore_percent],
-            outputs=[document_result, document_table],
+            outputs=[document_result, document_table, removable_pdf],
         )
         index_button.click(build_index, inputs=document_project, outputs=[document_result, indexing_log])
-        document_refresh_button.click(document_rows, inputs=document_project, outputs=document_table)
+        document_refresh_button.click(
+            document_view,
+            inputs=document_project,
+            outputs=[document_table, removable_pdf],
+        )
+        remove_pdf_button.click(
+            remove_document,
+            inputs=[document_project, removable_pdf, remove_pdf_confirmation],
+            outputs=[document_result, document_table, removable_pdf, remove_pdf_confirmation],
+        )
         test_connection_button.click(
             test_connection,
             inputs=[api_base_url, api_key],

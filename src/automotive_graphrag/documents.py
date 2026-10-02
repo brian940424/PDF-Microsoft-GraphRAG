@@ -108,6 +108,26 @@ class DocumentService:
             )
         return documents
 
+    def remove_pdf(self, project_id: str, filename: str) -> None:
+        project_path = self.projects.path_for(project_id)
+        if not filename or Path(filename).name != filename or Path(filename).suffix.lower() != ".pdf":
+            raise ProjectError("PDF 檔名格式不正確")
+        if (project_path / "graphrag" / ".indexing.lock").exists():
+            raise ProjectError("建圖工作執行中，無法移除 PDF")
+        source = project_path / "source" / filename
+        if not source.is_file():
+            raise ProjectError(f"找不到 PDF：{filename}")
+
+        source.unlink()
+        for stale_output in (
+            project_path / "processed" / "input.jsonl",
+            project_path / "processed" / "report.json",
+            project_path / "graphrag" / "input" / "input.jsonl",
+        ):
+            stale_output.unlink(missing_ok=True)
+        next_status = "UPLOADED" if self.projects.document_count(project_id) else "EMPTY"
+        self.projects.update_status(project_id, next_status)
+
     def preprocess(
         self,
         project_id: str,

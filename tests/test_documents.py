@@ -162,6 +162,33 @@ class DocumentServiceTests(unittest.TestCase):
 
         self.assertEqual(self.store.get("L33-SM3E").status, "UPLOADED")
 
+    def test_remove_pdf_deletes_selected_file_and_invalidates_processed_input(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf"), self.upload("PG.pdf")])
+        self.service.preprocess("L33-SM3E")
+        project_path = self.store.path_for("L33-SM3E")
+        graph_input = project_path / "graphrag" / "input" / "input.jsonl"
+        graph_input.parent.mkdir()
+        graph_input.write_text("stale")
+
+        self.service.remove_pdf("L33-SM3E", "WW.pdf")
+
+        self.assertEqual([item.filename for item in self.service.list_documents("L33-SM3E")], ["PG.pdf"])
+        self.assertEqual(self.store.get("L33-SM3E").status, "UPLOADED")
+        self.assertFalse((project_path / "processed" / "input.jsonl").exists())
+        self.assertFalse((project_path / "processed" / "report.json").exists())
+        self.assertFalse(graph_input.exists())
+
+    def test_remove_last_pdf_returns_project_to_empty(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
+
+        self.service.remove_pdf("L33-SM3E", "WW.pdf")
+
+        self.assertEqual(self.store.get("L33-SM3E").status, "EMPTY")
+
+    def test_remove_pdf_rejects_path_traversal(self) -> None:
+        with self.assertRaisesRegex(ProjectError, "檔名格式"):
+            self.service.remove_pdf("L33-SM3E", "../WW.pdf")
+
 
 if __name__ == "__main__":
     unittest.main()
