@@ -19,7 +19,8 @@ dependencies = [
 test = ["pytest>=8,<10"]
 
 [project.scripts]
-automotive-graphrag = "automotive_graphrag.app:main"
+automotive-graphrag = "automotive_graphrag.portal:main"
+automotive-graphrag-admin = "automotive_graphrag.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -10,7 +10,6 @@ from pathlib import Path
 import gradio as gr
 
 from .automatic_evaluation import AutomaticEvaluationService
-from .cases import CaseService
 from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
 from .documents import DocumentInfo, DocumentService
 from .ground_truth import GroundTruthService
@@ -56,7 +55,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     source_sampling = SourceSamplingService(store)
     question_generation = QuestionGenerationService(store, source_sampling, connections)
     automatic_evaluation = AutomaticEvaluationService(store, question_sets, connections)
-    cases = CaseService(store, querying)
 
     def connection_status() -> str:
         return (
@@ -97,7 +95,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 f"{project.display_name}｜{project.vehicle_name}｜{project.manual_version}",
                 project.project_id,
             )
-            for project in store.queryable_projects()
+            for project in store.list()
+            if project.status == "INDEXED"
         ]
 
     def refresh_query_projects(project_id: str | None):
@@ -151,100 +150,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     f"Text Unit：`{item['text_unit_id']}`\n\n{item['text']}"
                 )
         return ""
-
-    def unified_project_view(project_id: str | None):
-        if not project_id:
-            return (
-                "### 尚未選擇車型／專案",
-                "",
-                "",
-                [],
-                gr.Dropdown(choices=[]),
-                "",
-                [],
-                "",
-                gr.Button(interactive=False),
-            )
-        try:
-            project = store.get(project_id)
-        except ProjectError as exc:
-            return (
-                "### 專案無法使用",
-                f"❌ {exc}",
-                "",
-                [],
-                gr.Dropdown(choices=[]),
-                "",
-                [],
-                "",
-                gr.Button(interactive=False),
-            )
-        available = project.status == "INDEXED" and project.enabled
-        status = "" if available else "❌ 此專案目前未啟用或索引不可用，請聯絡管理者"
-        return (
-            f"### {project.display_name}\n車型：`{project.vehicle_name}`｜手冊版本：`{project.manual_version}`",
-            status,
-            "",
-            [],
-            gr.Dropdown(choices=[]),
-            "",
-            [],
-            "",
-            gr.Button(interactive=available),
-        )
-
-    def ask_unified_question(project_id: str | None, question: str):
-        empty = ("", [], gr.Dropdown(choices=[]), "", [], "")
-        if not project_id:
-            return ("❌ 請先選擇車型／專案", *empty)
-        try:
-            project = store.get(project_id)
-            if project.status != "INDEXED" or not project.enabled:
-                raise ProjectError("此專案目前未啟用或索引不可用，請聯絡管理者")
-            result = querying.ask(project_id, question, "local")
-        except ProjectError as exc:
-            return (f"❌ {exc}", *empty)
-        if result.status != "COMPLETED":
-            return (f"❌ 查詢失敗：{result.error}", *empty)
-        values = [asdict(item) for item in result.evidence]
-        rows = [
-            [item.rank, item.evidence_id, item.document_id, item.page, item.chunk_id, item.score]
-            for item in result.evidence
-        ]
-        selected = result.evidence[0].evidence_id if result.evidence else None
-        selector = gr.Dropdown(
-            choices=[item.evidence_id for item in result.evidence],
-            value=selected,
-        )
-        detail = evidence_markdown(selected, values) if selected else ""
-        warning = "" if result.evidence else "\n\n> ⚠️ 此回答沒有可回連的來源證據，請人工確認。"
-        return (
-            f"✅ 回答完成｜耗時 {result.duration_seconds:.3f} 秒",
-            f"{result.answer}{warning}",
-            rows,
-            selector,
-            detail,
-            values,
-            result.query_id,
-        )
-
-    def save_unified_case(project_id: str | None, query_id: str, note: str):
-        if not project_id or not query_id:
-            return "❌ 請先完成一筆問答"
-        try:
-            record = cases.save_query(project_id, query_id, note)
-        except ProjectError as exc:
-            return f"❌ {exc}"
-        return f"✅ 已加入案例紀錄 {record.case_id}"
-
-    def export_unified_cases(project_id: str | None):
-        if not project_id:
-            return "❌ 請先選擇車型／專案", None, None
-        try:
-            json_path, csv_path = cases.export(project_id)
-        except ProjectError as exc:
-            return f"❌ {exc}", None, None
-        return "✅ 已匯出案例紀錄", str(json_path), str(csv_path)
 
     def question_set_choices(project_id: str | None) -> list[tuple[str, str]]:
         if not project_id:
@@ -957,46 +862,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             asdict(project),
         )
 
-    with gr.Blocks(title="汽車維修 GraphRAG 平台") as demo:
-        gr.Markdown("# 汽車維修 GraphRAG 平台")
-        with gr.Tab("維修問答"):
-            gr.Markdown("## 汽車維修手冊問答助手")
-            with gr.Row():
-                unified_project = gr.Dropdown(
-                    choices=query_project_choices(),
-                    label="車型／專案",
-                )
-                unified_project_refresh = gr.Button("重新整理可用專案")
-            unified_project_header = gr.Markdown("### 尚未選擇車型／專案")
-            with gr.Row():
-                with gr.Column():
-                    unified_question = gr.Textbox(label="維修問題", lines=6)
-                    with gr.Row():
-                        unified_ask_button = gr.Button("送出問題", variant="primary", interactive=False)
-                        unified_clear_button = gr.Button("清除")
-                    unified_status = gr.Markdown()
-                with gr.Column():
-                    unified_answer = gr.Markdown(label="系統回答")
-            unified_evidence_state = gr.State([])
-            unified_query_id_state = gr.State("")
-            unified_evidence_table = gr.Dataframe(
-                headers=EVIDENCE_COLUMNS,
-                interactive=False,
-                datatype=["number", "str", "str", "number", "str", "number"],
-                label="回答採用的 Evidence",
-            )
-            unified_evidence_selector = gr.Dropdown(label="查看證據全文")
-            unified_evidence_detail = gr.Markdown()
-            gr.Markdown("### 案例紀錄")
-            unified_case_note = gr.Textbox(label="案例備註", lines=2)
-            with gr.Row():
-                unified_save_case_button = gr.Button("將本次問答加入案例")
-                unified_export_cases_button = gr.Button("匯出此專案案例")
-            unified_case_result = gr.Markdown()
-            with gr.Row():
-                unified_cases_json = gr.File(label="案例 JSON")
-                unified_cases_csv = gr.File(label="案例 CSV")
-
+    with gr.Blocks(title="汽車維修 GraphRAG 管理後台") as demo:
+        gr.Markdown("# 汽車維修 GraphRAG 管理後台")
         with gr.Tab("專案設定"):
             selected_project = gr.Dropdown(choices=project_choices(), label="選擇專案紀錄")
             selected_project_details = gr.JSON(label="專案資料")
@@ -1373,68 +1240,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generated_evidence = gr.JSON(label="引用來源與 Gold Evidence")
             generated_question_export = gr.File(label="Question Set JSON")
 
-        unified_project_refresh.click(
-            refresh_query_projects,
-            inputs=unified_project,
-            outputs=unified_project,
-        )
-        unified_project.change(
-            unified_project_view,
-            inputs=unified_project,
-            outputs=[
-                unified_project_header,
-                unified_status,
-                unified_answer,
-                unified_evidence_table,
-                unified_evidence_selector,
-                unified_evidence_detail,
-                unified_evidence_state,
-                unified_query_id_state,
-                unified_ask_button,
-            ],
-        )
-        unified_ask_button.click(
-            ask_unified_question,
-            inputs=[unified_project, unified_question],
-            outputs=[
-                unified_status,
-                unified_answer,
-                unified_evidence_table,
-                unified_evidence_selector,
-                unified_evidence_detail,
-                unified_evidence_state,
-                unified_query_id_state,
-            ],
-        )
-        unified_evidence_selector.input(
-            evidence_markdown,
-            inputs=[unified_evidence_selector, unified_evidence_state],
-            outputs=unified_evidence_detail,
-        )
-        unified_clear_button.click(
-            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", [], "", ""),
-            outputs=[
-                unified_question,
-                unified_status,
-                unified_answer,
-                unified_evidence_table,
-                unified_evidence_selector,
-                unified_evidence_detail,
-                unified_evidence_state,
-                unified_query_id_state,
-                unified_case_note,
-            ],
-        )
-        unified_save_case_button.click(
-            save_unified_case,
-            inputs=[unified_project, unified_query_id_state, unified_case_note],
-            outputs=unified_case_result,
-        )
-        unified_export_cases_button.click(
-            export_unified_cases,
-            inputs=unified_project,
-            outputs=[unified_case_result, unified_cases_json, unified_cases_csv],
-        )
         refresh_button.click(
             refresh_project_views,
             inputs=selected_project,
