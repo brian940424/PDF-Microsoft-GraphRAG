@@ -105,18 +105,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return gr.Dropdown(choices=choices, value=project_id if project_id in available_ids else None)
 
     def ask_question(project_id: str | None, question: str, method: str):
+        yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, []
         if not project_id:
-            return "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
+            yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
+            return
         try:
             query_result = querying.ask(project_id, question, method)
         except ProjectError as exc:
-            return "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
+            yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
+            return
         summary = (
             f"狀態：{query_result.status}｜方法：{query_result.method}｜"
             f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
         )
         if query_result.status == "FAILED":
-            return "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, []
+            yield "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, []
+            return
         evidence_values = [asdict(item) for item in query_result.evidence]
         evidence_rows = [
             [item.rank, item.evidence_id, item.document_id, item.page, item.chunk_id, item.score]
@@ -138,7 +142,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             choices=[item.evidence_id for item in query_result.evidence],
             value=selected,
         )
-        return answer, f"✅ {summary}", evidence_rows, selector, detail, query_result.context, evidence_values
+        yield (
+            answer,
+            f"✅ {summary}",
+            evidence_rows,
+            selector,
+            detail,
+            querying.context_summary(query_result.context),
+            evidence_values,
+        )
 
     def evidence_markdown(evidence_id: str | None, evidence_values: list[dict[str, object]]) -> str:
         for item in evidence_values or []:
@@ -752,9 +764,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None), False
 
     def document_rows(project_id: str | None) -> list[list[str | int | None]]:
-        if not project_id:
-            return []
-        return [document_row(document) for document in documents.list_documents(project_id)]
+        return [document_row(document) for document in documents.list_documents_if_available(project_id)]
 
     def document_view(project_id: str | None):
         rows = document_rows(project_id)

@@ -77,14 +77,18 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def ask(project_id: str | None, question: str):
         empty = ("", [], gr.Dropdown(choices=[]), "", [], "")
+        yield ("⏳ 正在查詢維修手冊，完成後將顯示回答與 Evidence…", *empty)
         if not project_id:
-            return ("❌ 請先選擇車型／專案", *empty)
+            yield ("❌ 請先選擇車型／專案", *empty)
+            return
         try:
             result = portal.ask(project_id, question)
         except ProjectError as exc:
-            return (f"❌ {exc}", *empty)
+            yield (f"❌ {exc}", *empty)
+            return
         if result.status != "COMPLETED":
-            return (f"❌ 查詢失敗：{result.error}", *empty)
+            yield (f"❌ 查詢失敗：{result.error}", *empty)
+            return
         values = [asdict(item) for item in result.evidence]
         rows = [
             [item.rank, item.evidence_id, item.document_id, item.page, item.chunk_id, item.score]
@@ -97,7 +101,7 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         detail = evidence_detail(selected, values) if selected else ""
         warning = "" if result.evidence else "\n\n> ⚠️ 此回答沒有可回連的來源證據，請人工確認。"
-        return (
+        yield (
             f"✅ 回答完成｜耗時 {result.duration_seconds:.3f} 秒",
             f"{result.answer}{warning}",
             rows,

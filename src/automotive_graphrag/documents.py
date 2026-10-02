@@ -108,6 +108,15 @@ class DocumentService:
             )
         return documents
 
+    def list_documents_if_available(self, project_id: str | None) -> list[DocumentInfo]:
+        """Return an empty list when a UI selection refers to a deleted project."""
+        if not project_id:
+            return []
+        try:
+            return self.list_documents(project_id)
+        except ProjectError:
+            return []
+
     def remove_pdf(self, project_id: str, filename: str) -> None:
         project_path = self.projects.path_for(project_id)
         if not filename or Path(filename).name != filename or Path(filename).suffix.lower() != ".pdf":

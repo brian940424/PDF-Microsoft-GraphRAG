@@ -194,6 +194,11 @@ class DocumentServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "檔名格式"):
             self.service.remove_pdf("L33-SM3E", "../WW.pdf")
 
+    def test_ui_safe_list_ignores_a_stale_deleted_project_selection(self) -> None:
+        self.store.delete("L33-SM3E")
+
+        self.assertEqual(self.service.list_documents_if_available("L33-SM3E"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

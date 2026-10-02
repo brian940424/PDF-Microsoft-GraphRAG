@@ -1,4 +1,5 @@
 import subprocess
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -118,6 +119,15 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.evidence[0].evidence_id, "E1")
         self.assertEqual(result.context["sources"][0]["id"], "7")
         self.assertEqual(service.history("L33-SM3E")[0], result)
+
+    def test_context_summary_is_bounded_for_large_query_context(self) -> None:
+        context = {"sources": [{"text": "x" * 10_000} for _ in range(100)], "metadata": {"a": 1}}
+
+        summary = QueryService.context_summary(context)
+
+        self.assertEqual(summary["sections"]["sources"]["items"], 100)
+        self.assertNotIn("x" * 100, json.dumps(summary))
+        self.assertLess(len(json.dumps(summary)), 1000)
 
     def test_query_rejects_project_without_completed_index(self) -> None:
         self.store.update_status("L33-SM3E", "READY")

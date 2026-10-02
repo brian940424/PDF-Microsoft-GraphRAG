@@ -137,6 +137,21 @@ class QueryService:
             raise ProjectError("問答紀錄格式錯誤") from exc
 
     @staticmethod
+    def context_summary(context: dict[str, Any]) -> dict[str, Any]:
+        """Return a bounded UI-safe summary instead of the potentially huge raw context."""
+        sections: dict[str, dict[str, Any]] = {}
+        for key, value in context.items():
+            sections[str(key)] = {
+                "type": type(value).__name__,
+                "items": len(value) if isinstance(value, (list, dict, tuple)) else None,
+            }
+        return {
+            "available": bool(context),
+            "sections": sections,
+            "message": "完整 Query Context 保留於後端查詢紀錄；前端僅顯示摘要以避免大型回應。",
+        }
+
+    @staticmethod
     def _result_from_dict(value: dict[str, Any]) -> QueryResult:
         value["evidence"] = tuple(Evidence(**item) for item in value.get("evidence", []))
         value.setdefault("context", {})
