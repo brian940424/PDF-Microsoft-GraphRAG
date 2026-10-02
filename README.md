@@ -121,9 +121,25 @@ Windows PowerShell（單行）：
 $env:DOCKER_BUILDKIT="1"; docker build --progress=plain -t automotive-graphrag:local .
 ```
 
-Dockerfile 會先安裝 `requirements.docker.txt` 中已驗證且固定版本的 GraphRAG 依賴，再複製應用程式碼。如此可避免 pip 在 GraphRAG 與 Pandas 版本間大量回溯；後續只修改 `src/` 或 README 時，也會直接沿用依賴層與 pip 下載快取。
+Dockerfile 會先從 PyPI 鏡像安裝 `uv`，再以 `uv pip install --system` 並行下載及安裝 `requirements.docker.txt` 中已驗證的固定版本，最後才複製應用程式碼。如此可避免 pip 在 GraphRAG 與 Pandas 版本間大量回溯；後續只修改原始碼或 README 時，也會直接沿用依賴 layer 與 `/root/.cache/uv` BuildKit 快取。
 
-第一次建置仍需下載 GraphRAG、PyArrow 等大型套件，實際時間取決於網路與 CPU；第二次之後應明顯加快。請勿在一般重建時使用 `--no-cache`。若只想重新下載基礎映像，可使用：
+預設使用清華 PyPI 鏡像。若所在網路使用國網中心較快，可在建置時覆寫：
+
+Linux／macOS：
+
+```bash
+DOCKER_BUILDKIT=1 docker build --build-arg PYPI_INDEX_URL=https://free.nchc.org.tw/pypi/simple/ --progress=plain -t automotive-graphrag:local .
+```
+
+Windows PowerShell（單行）：
+
+```powershell
+$env:DOCKER_BUILDKIT="1"; docker build --build-arg PYPI_INDEX_URL=https://free.nchc.org.tw/pypi/simple/ --progress=plain -t automotive-graphrag:local .
+```
+
+也可將 `PYPI_INDEX_URL` 改回 `https://pypi.org/simple`。請只使用信任且支援 HTTPS 的鏡像站。
+
+第一次建置仍需下載 GraphRAG、PyArrow 等大型套件，實際時間取決於鏡像站、網路與 CPU；第二次之後應明顯加快。請勿在一般重建時使用 `--no-cache` 或 `--no-cache-filter`。若只想重新下載基礎映像，可使用：
 
 ```bash
 DOCKER_BUILDKIT=1 docker build --pull --progress=plain -t automotive-graphrag:local .
