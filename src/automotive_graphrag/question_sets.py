@@ -36,6 +36,7 @@ class GoldEvidence:
 class BatchQuestion:
     question_id: str
     question: str
+    reference_answer: str = ""
     status: str = "PENDING"
     answer: str = ""
     error: str | None = None
@@ -137,7 +138,12 @@ class QuestionSetService:
         questions = list(question_set.questions)
         if not resume:
             questions = [
-                BatchQuestion(item.question_id, item.question, gold_evidence=item.gold_evidence)
+                BatchQuestion(
+                    item.question_id,
+                    item.question,
+                    reference_answer=item.reference_answer,
+                    gold_evidence=item.gold_evidence,
+                )
                 if item.question_id in targets
                 else item
                 for item in questions
@@ -151,6 +157,7 @@ class QuestionSetService:
             questions[index] = BatchQuestion(
                 item.question_id,
                 item.question,
+                reference_answer=item.reference_answer,
                 status="RUNNING",
                 gold_evidence=item.gold_evidence,
             )
@@ -161,6 +168,7 @@ class QuestionSetService:
                 questions[index] = BatchQuestion(
                     question_id=item.question_id,
                     question=item.question,
+                    reference_answer=item.reference_answer,
                     status=result.status,
                     answer=result.answer,
                     error=result.error,
@@ -173,6 +181,7 @@ class QuestionSetService:
                 questions[index] = BatchQuestion(
                     question_id=item.question_id,
                     question=item.question,
+                    reference_answer=item.reference_answer,
                     status="FAILED",
                     error=str(exc),
                     completed_at=datetime.now(timezone.utc).isoformat(),
@@ -206,6 +215,7 @@ class QuestionSetService:
             fieldnames=[
                 "question_id",
                 "question",
+                "reference_answer",
                 "status",
                 "answer",
                 "error",
@@ -274,6 +284,7 @@ class QuestionSetService:
                 continue
             question_id = raw.get("question_id")
             question = raw.get("question")
+            reference_answer = raw.get("reference_answer", "")
             try:
                 gold_evidence = QuestionSetService.parse_gold_evidence(raw.get("gold_evidence", []), location)
             except ProjectError as exc:
@@ -287,9 +298,22 @@ class QuestionSetService:
                 seen.add(question_id.strip())
             if not isinstance(question, str) or not question.strip():
                 errors.append(f"{location}.question：必須是非空白字串")
-            if isinstance(question_id, str) and question_id.strip() and isinstance(question, str) and question.strip():
+            if not isinstance(reference_answer, str):
+                errors.append(f"{location}.reference_answer：必須是字串")
+            if (
+                isinstance(question_id, str)
+                and question_id.strip()
+                and isinstance(question, str)
+                and question.strip()
+                and isinstance(reference_answer, str)
+            ):
                 questions.append(
-                    BatchQuestion(question_id.strip(), question.strip(), gold_evidence=gold_evidence)
+                    BatchQuestion(
+                        question_id.strip(),
+                        question.strip(),
+                        reference_answer=reference_answer.strip(),
+                        gold_evidence=gold_evidence,
+                    )
                 )
         if errors:
             raise ProjectError("題目集格式錯誤：\n- " + "\n- ".join(errors))

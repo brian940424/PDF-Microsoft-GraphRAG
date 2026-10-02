@@ -62,7 +62,7 @@ class QuestionSetServiceTests(unittest.TestCase):
             "name": "雨刷測試集",
             "description": "批次測試",
             "questions": [
-                {"question_id": "Q001", "question": "問題一"},
+                {"question_id": "Q001", "question": "問題一", "reference_answer": "參考答案一"},
                 {"question_id": "Q002", "question": "問題二"},
                 {"question_id": "Q003", "question": "問題三"},
             ],
@@ -73,6 +73,7 @@ class QuestionSetServiceTests(unittest.TestCase):
 
         self.assertEqual(question_set.name, "雨刷測試集")
         self.assertEqual([item.status for item in question_set.questions], ["PENDING"] * 3)
+        self.assertEqual(question_set.questions[0].reference_answer, "參考答案一")
         self.assertEqual(self.service.get("L33-SM3E", question_set.question_set_id), question_set)
 
     def test_import_reports_duplicate_id_with_array_position(self) -> None:
@@ -146,6 +147,7 @@ class QuestionSetServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result.questions[0].gold_evidence[0].pages, (25,))
+        self.assertEqual(result.questions[0].reference_answer, "參考答案一")
         self.assertEqual(
             result.questions[0].gold_evidence[0].chunk_ids,
             ("L33-SM3E-WW-p0025-b01",),
