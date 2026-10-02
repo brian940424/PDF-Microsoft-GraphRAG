@@ -102,7 +102,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def refresh_query_projects(project_id: str | None):
         choices = query_project_choices()
         available_ids = {value for _, value in choices}
-        return gr.Dropdown(choices=choices, value=project_id if project_id in available_ids else None)
+        return gr.Dropdown(
+            choices=choices,
+            value=project_id if project_id in available_ids else None,
+            allow_custom_value=True,
+        )
 
     def ask_question(project_id: str | None, question: str, method: str):
         yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, []
@@ -747,9 +751,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         choices = project_choices()
         return (
             store.table_rows(),
-            gr.Dropdown(choices=choices, value=selected),
+            gr.Dropdown(choices=choices, value=selected, allow_custom_value=True),
             project_details(selected),
-            gr.Dropdown(choices=choices, value=selected),
+            gr.Dropdown(choices=choices, value=selected, allow_custom_value=True),
         )
 
     def delete_project(project_id: str | None, confirmed: bool):
@@ -845,7 +849,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 description=description,
             )
         except ProjectError as exc:
-            selector = gr.Dropdown(choices=project_choices())
+            selector = gr.Dropdown(choices=project_choices(), allow_custom_value=True)
             return (
                 f"❌ {exc}",
                 store.table_rows(),
@@ -858,7 +862,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 selector,
                 {},
             )
-        selector = gr.Dropdown(choices=project_choices(), value=project.project_id)
+        selector = gr.Dropdown(
+            choices=project_choices(),
+            value=project.project_id,
+            allow_custom_value=True,
+        )
         return (
             f"✅ 已建立專案 {project.project_id}",
             store.table_rows(),
@@ -875,7 +883,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     with gr.Blocks(title="汽車維修 GraphRAG 管理後台") as demo:
         gr.Markdown("# 汽車維修 GraphRAG 管理後台")
         with gr.Tab("專案設定"):
-            selected_project = gr.Dropdown(choices=project_choices(), label="選擇專案紀錄")
+            selected_project = gr.Dropdown(
+                choices=project_choices(),
+                label="選擇專案紀錄",
+                allow_custom_value=True,
+            )
             selected_project_details = gr.JSON(label="專案資料")
             project_table = gr.Dataframe(
                 headers=PROJECT_COLUMNS,
@@ -930,7 +942,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             connection_result = gr.Markdown()
 
         with gr.Tab("文件與建圖"):
-            document_project = gr.Dropdown(choices=project_choices(), label="專案")
+            document_project = gr.Dropdown(
+                choices=project_choices(),
+                label="專案",
+                allow_custom_value=True,
+            )
             uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
             with gr.Row():
                 header_ignore_percent = gr.Number(
@@ -965,7 +981,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("問答測試"):
             with gr.Row():
-                query_project = gr.Dropdown(choices=query_project_choices(), label="已建圖專案")
+                query_project = gr.Dropdown(
+                    choices=query_project_choices(),
+                    label="已建圖專案",
+                    allow_custom_value=True,
+                )
                 query_project_refresh = gr.Button("重新整理專案")
             with gr.Row():
                 with gr.Column():
@@ -994,7 +1014,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
             gr.Markdown("## 題目集批次問答")
             with gr.Row():
-                batch_project = gr.Dropdown(choices=project_choices(), label="專案")
+                batch_project = gr.Dropdown(
+                    choices=project_choices(),
+                    label="專案",
+                    allow_custom_value=True,
+                )
                 batch_project_refresh = gr.Button("重新整理專案")
                 question_set_selector = gr.Dropdown(label="題目集")
             question_set_file = gr.File(file_types=[".json"], type="filepath", label="匯入 question_set.json")
@@ -1026,7 +1050,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("人工檢查"):
             with gr.Row():
-                review_project = gr.Dropdown(choices=project_choices(), label="專案")
+                review_project = gr.Dropdown(
+                    choices=project_choices(),
+                    label="專案",
+                    allow_custom_value=True,
+                )
                 review_project_refresh = gr.Button("重新整理專案")
                 review_question_set = gr.Dropdown(label="題目集")
             review_progress = gr.Markdown("尚未選擇題目集")
@@ -1057,7 +1085,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("Gold Evidence"):
             with gr.Row():
-                gold_project = gr.Dropdown(choices=project_choices(), label="專案")
+                gold_project = gr.Dropdown(
+                    choices=project_choices(),
+                    label="專案",
+                    allow_custom_value=True,
+                )
                 gold_project_refresh = gr.Button("重新整理專案")
                 gold_question_set = gr.Dropdown(label="題目集")
                 gold_question = gr.Dropdown(label="題目")
@@ -1078,7 +1110,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("Retrieval 評估"):
             with gr.Row():
-                retrieval_project = gr.Dropdown(choices=project_choices(), label="專案")
+                retrieval_project = gr.Dropdown(
+                    choices=project_choices(),
+                    label="專案",
+                    allow_custom_value=True,
+                )
                 retrieval_project_refresh = gr.Button("重新整理專案")
                 retrieval_question_set = gr.Dropdown(label="題目集")
             with gr.Row():
@@ -1116,7 +1152,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 "每批 Judge 僅呼叫 API 一次，預設使用 `gpt-4o-mini`；低分、Retrieval 失敗或低信心結果會標記待人工審查。"
             )
             with gr.Row():
-                automatic_project = gr.Dropdown(choices=project_choices(), label="專案")
+                automatic_project = gr.Dropdown(
+                    choices=project_choices(),
+                    label="專案",
+                    allow_custom_value=True,
+                )
                 automatic_project_refresh = gr.Button("重新整理專案")
                 automatic_question_set = gr.Dropdown(label="題目集")
             with gr.Row():
@@ -1156,7 +1196,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         with gr.Tab("題目生成"):
             gr.Markdown("## 原文取樣器")
             with gr.Row():
-                sampling_project = gr.Dropdown(choices=project_choices(), label="專案")
+                sampling_project = gr.Dropdown(
+                    choices=project_choices(),
+                    label="專案",
+                    allow_custom_value=True,
+                )
                 sampling_project_refresh = gr.Button("重新整理專案")
                 sampling_sections = gr.Dropdown(multiselect=True, label="章節（空白代表全部）")
             with gr.Row():
@@ -1356,7 +1400,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ],
         )
         batch_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices()),
+            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
             outputs=batch_project,
         )
         batch_project.change(
@@ -1408,7 +1452,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[batch_result, batch_json_export, batch_csv_export],
         )
         review_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices()),
+            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
             outputs=review_project,
         )
         review_project.change(
@@ -1488,7 +1532,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[review_result, review_json_export, review_csv_export],
         )
         gold_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices()),
+            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
             outputs=gold_project,
         )
         gold_project.change(
@@ -1518,7 +1562,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[gold_evidence_result, gold_evidence_editor],
         )
         retrieval_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices()),
+            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
             outputs=retrieval_project,
         )
         retrieval_project.change(
@@ -1558,7 +1602,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[retrieval_result, retrieval_json_export, retrieval_csv_export],
         )
         automatic_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices()),
+            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
             outputs=automatic_project,
         )
         automatic_project.change(
@@ -1599,7 +1643,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[automatic_result, automatic_json_export, automatic_csv_export],
         )
         sampling_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices()),
+            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
             outputs=sampling_project,
         )
         sampling_project.change(

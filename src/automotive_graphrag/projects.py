@@ -69,7 +69,8 @@ class ProjectStore:
     """Create and discover isolated GraphRAG project workspaces."""
 
     def __init__(self, root: str | Path = "projects") -> None:
-        self.root = Path(root)
+        # Keep every callback and worker bound to one stable path even if a launcher changes cwd.
+        self.root = Path(root).expanduser().resolve()
 
     def create(
         self,
@@ -120,7 +121,13 @@ class ProjectStore:
         for path in self.root.iterdir():
             metadata = path / "project.json"
             if path.is_dir() and metadata.is_file():
-                projects.append(self.get(path.name))
+                try:
+                    projects.append(self.get(path.name))
+                except ProjectError:
+                    # Another admin process may delete a project between discovery and read.
+                    if not metadata.exists():
+                        continue
+                    raise
         return sorted(projects, key=lambda project: project.project_id.casefold())
 
     def queryable_projects(self) -> list[Project]:

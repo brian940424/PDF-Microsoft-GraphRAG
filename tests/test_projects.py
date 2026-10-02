@@ -33,6 +33,10 @@ class ProjectStoreTests(unittest.TestCase):
         metadata = json.loads((project_path / "project.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["description"], "測試專案")
 
+    def test_project_root_is_resolved_to_a_stable_absolute_path(self) -> None:
+        self.assertTrue(self.store.root.is_absolute())
+        self.assertEqual(self.store.root, self.store.root.resolve())
+
     def test_create_project_rejects_invalid_project_ids(self) -> None:
         for project_id in ("", "with space", "../escape", "中文", "a/b"):
             with self.subTest(project_id=project_id), self.assertRaises(ProjectError):

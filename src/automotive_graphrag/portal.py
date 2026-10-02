@@ -133,7 +133,11 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
         gr.Markdown("# 汽車維修手冊問答助手")
         gr.Markdown("選擇車型與手冊版本後輸入維修問題；回答下方會列出採用的原始手冊證據。")
         with gr.Row():
-            project_selector = gr.Dropdown(choices=portal.choices(), label="車型／專案")
+            project_selector = gr.Dropdown(
+                choices=portal.choices(),
+                label="車型／專案",
+                allow_custom_value=True,
+            )
             refresh_button = gr.Button("重新整理可用專案")
         project_header = gr.Markdown("### 尚未選擇車型／專案")
         with gr.Row():
@@ -171,6 +175,7 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
             lambda current: gr.Dropdown(
                 choices=portal.choices(),
                 value=current if current in {value for _, value in portal.choices()} else None,
+                allow_custom_value=True,
             ),
             inputs=project_selector,
             outputs=project_selector,

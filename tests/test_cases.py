@@ -129,6 +129,24 @@ class CaseServiceTests(unittest.TestCase):
         self.assertNotIn("API Base URL", portal_labels)
         self.assertIn("API Base URL", admin_labels)
         self.assertNotIn("車型／專案", admin_labels)
+        portal_project_dropdowns = [
+            component.get_config()
+            for component in portal_app.blocks.values()
+            if hasattr(component, "get_config")
+            and component.get_config().get("label") == "車型／專案"
+        ]
+        admin_project_dropdowns = [
+            component.get_config()
+            for component in admin_app.blocks.values()
+            if hasattr(component, "get_config")
+            and component.get_config().get("label")
+            in {"專案", "選擇專案紀錄", "已建圖專案"}
+        ]
+        self.assertTrue(portal_project_dropdowns)
+        self.assertTrue(admin_project_dropdowns)
+        self.assertTrue(
+            all(config.get("allow_custom_value") for config in portal_project_dropdowns + admin_project_dropdowns)
+        )
 
 
 if __name__ == "__main__":
