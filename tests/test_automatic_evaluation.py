@@ -1,0 +1,198 @@
+import csv
+import json
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+
+from automotive_graphrag.app import create_app
+from automotive_graphrag.automatic_evaluation import AutomaticEvaluationService, PROMPT_VERSION
+from automotive_graphrag.connections import ConnectionSettings
+from automotive_graphrag.evidence import Evidence
+from automotive_graphrag.projects import ProjectError, ProjectStore
+from automotive_graphrag.querying import QueryResult
+from automotive_graphrag.question_sets import QuestionSetService
+from automotive_graphrag.reviews import ReviewService
+
+
+def evidence(chunk_id: str, page: int) -> Evidence:
+    return Evidence(
+        evidence_id=f"E-{chunk_id}",
+        rank=1,
+        context_id="1",
+        text_unit_id=f"tu-{chunk_id}",
+        chunk_id=chunk_id,
+        section_id="WW",
+        section_name="Wiper",
+        document_id="WW.pdf",
+        page=page,
+        block_id="b01",
+        text=f"支援內容 {chunk_id}" * 20,
+    )
+
+
+class AnswerRunner:
+    def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
+        number = 1 if question == "問題一" else 2
+        now = datetime.now(timezone.utc).isoformat()
+        return QueryResult(
+            query_id=f"query-{number}",
+            project_id=project_id,
+            question=question,
+            method=method,
+            status="COMPLETED",
+            answer=f"系統答案{number}",
+            error=None,
+            started_at=now,
+            completed_at=now,
+            duration_seconds=0.1,
+            evidence=(evidence(f"gold-{number}", 20 + number),),
+        )
+
+
+class FakeJudge:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, str, str, str]] = []
+
+    def __call__(self, base_url: str, api_key: str, model: str, prompt: str) -> object:
+        self.calls.append((base_url, api_key, model, prompt))
+        return self.responses[len(self.calls) - 1]
+
+
+class AutomaticEvaluationServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.store = ProjectStore(self.root / "projects")
+        self.store.create(
+            project_id="L33-SM3E",
+            display_name="L33 / SM3E",
+            vehicle_name="L33",
+            manual_version="SM3E",
+        )
+        self.store.update_status("L33-SM3E", "INDEXED")
+        source = self.root / "questions.json"
+        source.write_text(
+            json.dumps(
+                {
+                    "name": "自動評測集",
+                    "questions": [
+                        {
+                            "question_id": "Q001",
+                            "question": "問題一",
+                            "reference_answer": "參考答案一",
+                            "gold_evidence": [
+                                {"document_id": "WW.pdf", "pages": [21], "chunk_ids": ["gold-1"]}
+                            ],
+                        },
+                        {
+                            "question_id": "Q002",
+                            "question": "問題二",
+                            "reference_answer": "參考答案二",
+                            "gold_evidence": [
+                                {"document_id": "WW.pdf", "pages": [22], "chunk_ids": ["gold-2"]}
+                            ],
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self.question_sets = QuestionSetService(self.store, AnswerRunner())
+        imported = self.question_sets.import_file("L33-SM3E", source)
+        self.question_set_id = imported.question_set_id
+        self.question_sets.run("L33-SM3E", self.question_set_id)
+        self.connections = ConnectionSettings(self.store.root)
+        self.connections.save("https://api.openai.com/v1", "test-key")
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    @staticmethod
+    def judged(q1_score: int = 3) -> dict[str, object]:
+        return {
+            "items": [
+                {
+                    "question_id": "Q001",
+                    "answer_score": q1_score,
+                    "evidence_support_score": 5,
+                    "reason": "第一題評語",
+                    "confidence": "high",
+                },
+                {
+                    "question_id": "Q002",
+                    "answer_score": 5,
+                    "evidence_support_score": 5,
+                    "reason": "第二題評語",
+                    "confidence": "high",
+                },
+            ]
+        }
+
+    def test_evaluate_uses_one_cheap_call_and_persists_three_layer_scores(self) -> None:
+        judge = FakeJudge([self.judged()])
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+
+        result = service.evaluate("L33-SM3E", self.question_set_id)
+
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(judge.calls[0][2], "gpt-4o-mini")
+        self.assertTrue(all(item.retrieval_pass for item in result.items))
+        self.assertTrue(result.items[0].needs_human_review)
+        self.assertFalse(result.items[1].needs_human_review)
+        self.assertEqual(result.prompt_version, PROMPT_VERSION)
+        self.assertIn("參考答案一", result.judge_prompt)
+        self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
+
+        ReviewService(self.store, self.question_sets).save(
+            "L33-SM3E", self.question_set_id, "Q001", "partially_correct", "人工抽查"
+        )
+        json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["model"], "gpt-4o-mini")
+        self.assertEqual(payload["human_reviews"][0]["human_label"], "partially_correct")
+        with csv_path.open(encoding="utf-8", newline="") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["reviewer_note"], "人工抽查")
+
+    def test_only_previous_failures_rejudges_subset_and_merges_result(self) -> None:
+        second_response = {"items": [self.judged(5)["items"][0]]}
+        judge = FakeJudge([self.judged(), second_response])
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+        service.evaluate("L33-SM3E", self.question_set_id)
+
+        result = service.evaluate("L33-SM3E", self.question_set_id, only_previous_failures=True)
+
+        self.assertEqual(len(judge.calls), 2)
+        self.assertIn("Q001", judge.calls[1][3])
+        self.assertNotIn("Q002", judge.calls[1][3])
+        self.assertEqual(result.question_count, 2)
+        self.assertEqual(result.human_review_count, 0)
+
+    def test_rejects_invalid_or_invented_judge_result(self) -> None:
+        response = self.judged()
+        response["items"][0]["question_id"] = "INVENTED"  # type: ignore[index]
+        judge = FakeJudge([response])
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+
+        with self.assertRaisesRegex(ProjectError, "未知或重複"):
+            service.evaluate("L33-SM3E", self.question_set_id)
+
+    def test_app_builds_with_automatic_evaluation_controls(self) -> None:
+        app = create_app(self.root / "ui-projects")
+
+        labels = {
+            component.get_config().get("label")
+            for component in app.blocks.values()
+            if hasattr(component, "get_config")
+        }
+        self.assertIn("逐題自動評測結果", labels)
+        self.assertIn("只重跑前次待人工審查題目", labels)
+        self.assertIn("自動評測 JSON", labels)
+
+
+if __name__ == "__main__":
+    unittest.main()

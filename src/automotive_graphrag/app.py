@@ -9,6 +9,7 @@ from pathlib import Path
 
 import gradio as gr
 
+from .automatic_evaluation import AutomaticEvaluationService
 from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
 from .documents import DocumentInfo, DocumentService
 from .ground_truth import GroundTruthService
@@ -30,6 +31,15 @@ SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "Retrieved", "First Relevant Rank", "Pass@K"]
 SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk ID"]
 GENERATED_QUESTION_COLUMNS = ["Question ID", "Question", "Difficulty", "Status", "Sources"]
+AUTOMATIC_EVALUATION_COLUMNS = [
+    "Question ID",
+    "Retrieval Pass",
+    "Answer Score",
+    "Evidence Support",
+    "Confidence",
+    "Human Review",
+    "Judge Reason",
+]
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -44,6 +54,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     retrieval_evaluation = RetrievalEvaluationService(store, question_sets)
     source_sampling = SourceSamplingService(store)
     question_generation = QuestionGenerationService(store, source_sampling, connections)
+    automatic_evaluation = AutomaticEvaluationService(store, question_sets, connections)
 
     def connection_status() -> str:
         return (
@@ -416,6 +427,64 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出 Retrieval 評估 JSON 與 CSV", str(json_path), str(csv_path)
+
+    def run_automatic_evaluation(
+        project_id: str | None,
+        question_set_id: str | None,
+        top_k: float,
+        rerun_answers: bool,
+        only_failures: bool,
+        evidence_limit: float,
+    ):
+        if not project_id or not question_set_id:
+            return "❌ 請先選擇專案與題目集", "", [], gr.Dropdown(choices=[]), []
+        try:
+            result = automatic_evaluation.evaluate(
+                project_id,
+                question_set_id,
+                top_k=int(top_k),
+                rerun_answers=rerun_answers,
+                only_previous_failures=only_failures,
+                maximum_evidence_characters=int(evidence_limit),
+            )
+        except ProjectError as exc:
+            return f"❌ {exc}", "", [], gr.Dropdown(choices=[]), []
+        rows = [
+            [
+                item.question_id,
+                item.retrieval_pass,
+                item.answer_score,
+                item.evidence_support_score,
+                item.judge_confidence,
+                item.needs_human_review,
+                item.judge_reason,
+            ]
+            for item in result.items
+        ]
+        values = [asdict(item) for item in result.items]
+        first_id = result.items[0].question_id if result.items else None
+        selector = gr.Dropdown(
+            choices=[(item.question_id, item.question_id) for item in result.items],
+            value=first_id,
+        )
+        summary = (
+            f"模型 `{result.model}`｜Prompt `{result.prompt_version}`｜題數 {result.question_count}｜"
+            f"平均答案分數 `{result.average_answer_score:.2f}`｜平均證據支持分數 "
+            f"`{result.average_evidence_support_score:.2f}`｜待人工審查 {result.human_review_count}"
+        )
+        return "✅ 自動評測完成（LLM Judge 結果仍需人工抽查）", summary, rows, selector, values
+
+    def automatic_evaluation_detail(question_id: str | None, items: list[dict[str, object]]):
+        return next((item for item in items or [] if item.get("question_id") == question_id), {})
+
+    def export_automatic_evaluation(project_id: str | None, question_set_id: str | None):
+        if not project_id or not question_set_id:
+            return "❌ 請先選擇專案與題目集", None, None
+        try:
+            json_path, csv_path = automatic_evaluation.export(project_id, question_set_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", None, None
+        return "✅ 已匯出自動評測 JSON 與 CSV", str(json_path), str(csv_path)
 
     def sampling_section_choices(project_id: str | None):
         if not project_id:
@@ -1009,6 +1078,49 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 retrieval_json_export = gr.File(label="Retrieval JSON")
                 retrieval_csv_export = gr.File(label="Retrieval CSV")
 
+        with gr.Tab("自動評測"):
+            gr.Markdown(
+                "## 回答與證據自動評測\n"
+                "每批 Judge 僅呼叫 API 一次，預設使用 `gpt-4o-mini`；低分、Retrieval 失敗或低信心結果會標記待人工審查。"
+            )
+            with gr.Row():
+                automatic_project = gr.Dropdown(choices=project_choices(), label="專案")
+                automatic_project_refresh = gr.Button("重新整理專案")
+                automatic_question_set = gr.Dropdown(label="題目集")
+            with gr.Row():
+                automatic_top_k = gr.Number(label="Top-K", value=5, minimum=1, precision=0)
+                automatic_evidence_limit = gr.Number(
+                    label="每筆 Evidence 字數上限",
+                    value=1200,
+                    minimum=200,
+                    precision=0,
+                )
+                automatic_rerun_answers = gr.Checkbox(
+                    label="先重新執行系統回答（增加 API 成本）",
+                    value=False,
+                )
+                automatic_only_failures = gr.Checkbox(
+                    label="只重跑前次待人工審查題目",
+                    value=False,
+                )
+            with gr.Row():
+                run_automatic_button = gr.Button("執行回答與評測", variant="primary")
+                export_automatic_button = gr.Button("匯出評測報告")
+            automatic_result = gr.Markdown()
+            automatic_summary = gr.Markdown()
+            automatic_table = gr.Dataframe(
+                headers=AUTOMATIC_EVALUATION_COLUMNS,
+                interactive=False,
+                datatype=["str", "bool", "number", "number", "str", "bool", "str"],
+                label="逐題自動評測結果",
+            )
+            automatic_items_state = gr.State([])
+            automatic_item_selector = gr.Dropdown(label="查看逐題 Judge 詳情")
+            automatic_item_json = gr.JSON(label="自動評測詳情")
+            with gr.Row():
+                automatic_json_export = gr.File(label="自動評測 JSON")
+                automatic_csv_export = gr.File(label="自動評測 CSV")
+
         with gr.Tab("題目生成"):
             gr.Markdown("## 原文取樣器")
             with gr.Row():
@@ -1403,6 +1515,47 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             export_retrieval_evaluation,
             inputs=[retrieval_project, retrieval_question_set],
             outputs=[retrieval_result, retrieval_json_export, retrieval_csv_export],
+        )
+        automatic_project_refresh.click(
+            lambda: gr.Dropdown(choices=project_choices()),
+            outputs=automatic_project,
+        )
+        automatic_project.change(
+            lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
+            inputs=automatic_project,
+            outputs=automatic_question_set,
+        )
+        run_automatic_button.click(
+            run_automatic_evaluation,
+            inputs=[
+                automatic_project,
+                automatic_question_set,
+                automatic_top_k,
+                automatic_rerun_answers,
+                automatic_only_failures,
+                automatic_evidence_limit,
+            ],
+            outputs=[
+                automatic_result,
+                automatic_summary,
+                automatic_table,
+                automatic_item_selector,
+                automatic_items_state,
+            ],
+        ).then(
+            automatic_evaluation_detail,
+            inputs=[automatic_item_selector, automatic_items_state],
+            outputs=automatic_item_json,
+        )
+        automatic_item_selector.input(
+            automatic_evaluation_detail,
+            inputs=[automatic_item_selector, automatic_items_state],
+            outputs=automatic_item_json,
+        )
+        export_automatic_button.click(
+            export_automatic_evaluation,
+            inputs=[automatic_project, automatic_question_set],
+            outputs=[automatic_result, automatic_json_export, automatic_csv_export],
         )
         sampling_project_refresh.click(
             lambda: gr.Dropdown(choices=project_choices()),

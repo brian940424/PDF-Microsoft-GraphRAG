@@ -1,5 +1,10 @@
 """Automotive repair manual GraphRAG platform."""
 
+from .automatic_evaluation import (
+    AutomaticEvaluationItem,
+    AutomaticEvaluationResult,
+    AutomaticEvaluationService,
+)
 from .connections import ConnectionSettings, ConnectionTestResult
 from .documents import DocumentInfo, DocumentService, ProcessingReport
 from .evidence import Evidence, EvidenceService
@@ -19,6 +24,9 @@ from .source_metadata import SourceMetadata, SourceMetadataService
 from .source_sampling import SourceSample, SourceSampleBatch, SourceSamplingService
 
 __all__ = [
+    "AutomaticEvaluationItem",
+    "AutomaticEvaluationResult",
+    "AutomaticEvaluationService",
     "DocumentInfo",
     "DocumentService",
     "Evidence",
