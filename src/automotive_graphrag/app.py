@@ -61,11 +61,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", document_rows(project_id)
         return f"✅ 已匯入 {len(files or [])} 份 PDF", [document_row(item) for item in imported]
 
-    def preprocess_documents(project_id: str | None):
+    def preprocess_documents(
+        project_id: str | None,
+        header_ignore_percent: float,
+        footer_ignore_percent: float,
+    ):
         if not project_id:
             return "❌ 請先選擇專案", []
         try:
-            report = documents.preprocess(project_id)
+            report = documents.preprocess(project_id, header_ignore_percent, footer_ignore_percent)
         except (ProjectError, OSError) as exc:
             return f"❌ {exc}", document_rows(project_id)
         message = (
@@ -143,6 +147,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             document_project = gr.Dropdown(choices=project_choices(), label="專案")
             uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
             with gr.Row():
+                header_ignore_percent = gr.Number(
+                    label="忽略頁首高度 (%)",
+                    value=0,
+                    minimum=0,
+                    maximum=99,
+                )
+                footer_ignore_percent = gr.Number(
+                    label="忽略頁尾高度 (%)",
+                    value=0,
+                    minimum=0,
+                    maximum=99,
+                )
+            with gr.Row():
                 upload_button = gr.Button("上傳")
                 preprocess_button = gr.Button("開始前處理", variant="primary")
                 index_button = gr.Button("建立 Graph", variant="primary")
@@ -189,7 +206,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         preprocess_button.click(
             preprocess_documents,
-            inputs=document_project,
+            inputs=[document_project, header_ignore_percent, footer_ignore_percent],
             outputs=[document_result, document_table],
         )
         index_button.click(build_index, inputs=document_project, outputs=[document_result, indexing_log])

@@ -17,7 +17,7 @@ from .projects import ProjectError, ProjectStore
 
 
 class PdfPage(Protocol):
-    def extract_text(self) -> str | None: ...
+    def extract_text(self, **kwargs: Any) -> str | None: ...
 
 
 class PdfDocument(Protocol):
@@ -44,6 +44,8 @@ class ProcessingReport:
     empty_pages: int
     error_pages: int
     documents_with_errors: int
+    header_ignore_percent: float
+    footer_ignore_percent: float
     output: str
     completed_at: str
 
@@ -106,7 +108,16 @@ class DocumentService:
             )
         return documents
 
-    def preprocess(self, project_id: str) -> ProcessingReport:
+    def preprocess(
+        self,
+        project_id: str,
+        header_ignore_percent: float = 0,
+        footer_ignore_percent: float = 0,
+    ) -> ProcessingReport:
+        header_ignore_percent, footer_ignore_percent = self._validate_ignored_margins(
+            header_ignore_percent,
+            footer_ignore_percent,
+        )
         project_path = self.projects.path_for(project_id)
         sources = sorted((project_path / "source").glob("*.pdf"), key=lambda item: item.name.casefold())
         if not sources:
@@ -120,12 +131,21 @@ class DocumentService:
 
         try:
             for source in sources:
-                document_report = self._process_document(project_id, source, records, totals)
+                document_report = self._process_document(
+                    project_id,
+                    source,
+                    records,
+                    totals,
+                    header_ignore_percent,
+                    footer_ignore_percent,
+                )
                 document_reports.append(document_report)
             report = ProcessingReport(
                 project_id=project_id,
                 documents=len(sources),
                 documents_with_errors=sum(1 for item in document_reports if item["error"] or item["error_pages"]),
+                header_ignore_percent=header_ignore_percent,
+                footer_ignore_percent=footer_ignore_percent,
                 output="input.jsonl",
                 completed_at=datetime.now(timezone.utc).isoformat(),
                 **totals,
@@ -147,6 +167,8 @@ class DocumentService:
         source: Path,
         records: list[dict[str, Any]],
         totals: dict[str, int],
+        header_ignore_percent: float,
+        footer_ignore_percent: float,
     ) -> dict[str, Any]:
         report: dict[str, Any] = {
             "filename": source.name,
@@ -168,7 +190,7 @@ class DocumentService:
         document_stem = self._safe_identifier(source.stem)
         for page_number, page in enumerate(pages, start=1):
             try:
-                text = (page.extract_text() or "").strip()
+                text = self._extract_page_text(page, header_ignore_percent, footer_ignore_percent).strip()
             except Exception as exc:
                 report["error_pages"] += 1
                 totals["error_pages"] += 1
@@ -193,6 +215,48 @@ class DocumentService:
         elif report["empty_pages"]:
             report["status"] = "PROCESSED_WITH_WARNINGS"
         return report
+
+    @staticmethod
+    def _validate_ignored_margins(header_percent: float, footer_percent: float) -> tuple[float, float]:
+        try:
+            header = float(header_percent)
+            footer = float(footer_percent)
+        except (TypeError, ValueError) as exc:
+            raise ProjectError("頁首與頁尾忽略比例必須是數字") from exc
+        if not 0 <= header < 100 or not 0 <= footer < 100:
+            raise ProjectError("頁首與頁尾忽略比例必須介於 0%（含）與 100%（不含）")
+        if header + footer >= 100:
+            raise ProjectError("頁首與頁尾忽略比例合計必須小於 100%")
+        return header, footer
+
+    @staticmethod
+    def _extract_page_text(page: PdfPage, header_percent: float, footer_percent: float) -> str:
+        if header_percent == 0 and footer_percent == 0:
+            return page.extract_text() or ""
+
+        try:
+            page_height = float(page.mediabox.height)  # type: ignore[attr-defined]
+            page_bottom = float(page.mediabox.bottom)  # type: ignore[attr-defined]
+            page_top = float(page.mediabox.top)  # type: ignore[attr-defined]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("無法取得 PDF 頁面高度以套用頁首頁尾忽略比例") from exc
+        footer_limit = page_bottom + page_height * footer_percent / 100
+        header_limit = page_top - page_height * header_percent / 100
+        fragments: list[str] = []
+
+        def collect_text(
+            text: str,
+            _current_transformation_matrix: list[float],
+            text_matrix: list[float],
+            _font_dictionary: dict[str, Any] | None,
+            _font_size: float,
+        ) -> None:
+            y_position = float(text_matrix[5])
+            if footer_limit <= y_position <= header_limit:
+                fragments.append(text)
+
+        page.extract_text(visitor_text=collect_text)
+        return "".join(fragments)
 
     def _document_reports(self, project_id: str) -> dict[str, dict[str, Any]]:
         report_path = self.projects.path_for(project_id) / "processed" / "report.json"

@@ -23,6 +23,26 @@ class FakeDocument:
         self.pages = pages
 
 
+class FakeMediaBox:
+    height = 100
+    bottom = 0
+    top = 100
+
+
+class PositionedFakePage:
+    mediabox = FakeMediaBox()
+
+    def __init__(self, fragments: list[tuple[str, float]]) -> None:
+        self.fragments = fragments
+
+    def extract_text(self, visitor_text=None) -> str:
+        if visitor_text is None:
+            return "".join(text for text, _ in self.fragments)
+        for text, y_position in self.fragments:
+            visitor_text(text, [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, y_position], None, 12)
+        return ""
+
+
 class DocumentServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -109,6 +129,38 @@ class DocumentServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "沒有可處理"):
             self.service.preprocess("L33-SM3E")
         self.assertEqual(self.store.get("L33-SM3E").status, "EMPTY")
+
+    def test_preprocess_ignores_configured_header_and_footer_percentages(self) -> None:
+        self.pages_by_filename["WW.pdf"] = FakeDocument(
+            [
+                PositionedFakePage(
+                    [
+                        ("重複頁首\n", 95),
+                        ("維修內文\n", 50),
+                        ("第 1 頁", 5),
+                    ]
+                )
+            ]
+        )
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
+
+        report = self.service.preprocess("L33-SM3E", header_ignore_percent=10, footer_ignore_percent=10)
+
+        processed = self.store.path_for("L33-SM3E") / "processed"
+        record = json.loads((processed / "input.jsonl").read_text().strip())
+        self.assertEqual(record["text"], "維修內文")
+        self.assertEqual((report.header_ignore_percent, report.footer_ignore_percent), (10, 10))
+        summary = json.loads((processed / "report.json").read_text())["summary"]
+        self.assertEqual(summary["header_ignore_percent"], 10)
+        self.assertEqual(summary["footer_ignore_percent"], 10)
+
+    def test_preprocess_rejects_margins_that_remove_the_whole_page(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
+
+        with self.assertRaisesRegex(ProjectError, "合計必須小於 100"):
+            self.service.preprocess("L33-SM3E", header_ignore_percent=50, footer_ignore_percent=50)
+
+        self.assertEqual(self.store.get("L33-SM3E").status, "UPLOADED")
 
 
 if __name__ == "__main__":
