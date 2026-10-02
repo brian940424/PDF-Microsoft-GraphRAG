@@ -109,8 +109,16 @@ API 連線設定保存在 `PROJECTS_ROOT/.connection.json`，由該根目錄下�
 
 建立映像：
 
+Linux／macOS：
+
 ```bash
 DOCKER_BUILDKIT=1 docker build --progress=plain -t automotive-graphrag:local .
+```
+
+Windows PowerShell（單行）：
+
+```powershell
+$env:DOCKER_BUILDKIT="1"; docker build --progress=plain -t automotive-graphrag:local .
 ```
 
 Dockerfile 會先安裝 `requirements.docker.txt` 中已驗證且固定版本的 GraphRAG 依賴，再複製應用程式碼。如此可避免 pip 在 GraphRAG 與 Pandas 版本間大量回溯；後續只修改 `src/` 或 README 時，也會直接沿用依賴層與 pip 下載快取。
@@ -121,11 +129,23 @@ Dockerfile 會先安裝 `requirements.docker.txt` 中已驗證且固定版本的
 DOCKER_BUILDKIT=1 docker build --pull --progress=plain -t automotive-graphrag:local .
 ```
 
+Windows PowerShell（單行）：
+
+```powershell
+$env:DOCKER_BUILDKIT="1"; docker build --pull --progress=plain -t automotive-graphrag:local .
+```
+
 若建置看似停滯，`--progress=plain` 會顯示目前正在下載或安裝的套件，方便判斷是網路速度還是套件解析問題。
 
 建立持久化 Volume：
 
 ```bash
+docker volume create automotive-graphrag-data
+```
+
+Windows PowerShell 使用相同的單行指令：
+
+```powershell
 docker volume create automotive-graphrag-data
 ```
 
@@ -144,6 +164,8 @@ GRAPHRAG_EMBEDDING_MODEL=text-embedding-3-small
 
 先啟動管理後台：
 
+Linux／macOS：
+
 ```bash
 docker run --rm \
   --name automotive-graphrag-admin \
@@ -154,9 +176,17 @@ docker run --rm \
   automotive-graphrag-admin
 ```
 
+Windows PowerShell（單行）：
+
+```powershell
+docker run --rm --name automotive-graphrag-admin --env-file .env -p 7861:7860 -v automotive-graphrag-data:/app/projects automotive-graphrag:local automotive-graphrag-admin
+```
+
 瀏覽 `http://localhost:7861` 完成專案、PDF 與建圖設定。
 
 再啟動一般使用者入口：
+
+Linux／macOS：
 
 ```bash
 docker run --rm \
@@ -165,6 +195,12 @@ docker run --rm \
   -p 7860:7860 \
   -v automotive-graphrag-data:/app/projects \
   automotive-graphrag:local
+```
+
+Windows PowerShell（單行）：
+
+```powershell
+docker run --rm --name automotive-graphrag-portal --env-file .env -p 7860:7860 -v automotive-graphrag-data:/app/projects automotive-graphrag:local
 ```
 
 瀏覽 `http://localhost:7860` 使用維修問答。
@@ -221,6 +257,8 @@ docker run --rm \
 
 建立虛擬環境並安裝：
 
+Linux／macOS：
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -228,7 +266,15 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[test]"
 ```
 
+Windows PowerShell（單行）：
+
+```powershell
+py -3.12 -m venv .venv; .\.venv\Scripts\python.exe -m pip install --upgrade pip; .\.venv\Scripts\python.exe -m pip install -e ".[test]"
+```
+
 設定專案資料位置及 API：
+
+Linux／macOS：
 
 ```bash
 export PROJECTS_ROOT="$PWD/projects"
@@ -238,10 +284,22 @@ export GRAPHRAG_CHAT_MODEL="gpt-4o-mini"
 export GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"
 ```
 
+Windows PowerShell（單行）：
+
+```powershell
+$env:PROJECTS_ROOT=(Join-Path $PWD "projects"); $env:GRAPHRAG_API_KEY="your-api-key"; $env:GRAPHRAG_API_BASE="https://api.openai.com/v1"; $env:GRAPHRAG_CHAT_MODEL="gpt-4o-mini"; $env:GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"
+```
+
 啟動一般入口：
 
 ```bash
 automotive-graphrag
+```
+
+Windows PowerShell（單行）：
+
+```powershell
+$env:GRADIO_SERVER_PORT="7860"; .\.venv\Scripts\automotive-graphrag.exe
 ```
 
 啟動管理後台：
@@ -250,12 +308,24 @@ automotive-graphrag
 automotive-graphrag-admin
 ```
 
+Windows PowerShell（請在另一個視窗執行，單行）：
+
+```powershell
+$env:GRADIO_SERVER_PORT="7861"; .\.venv\Scripts\automotive-graphrag-admin.exe
+```
+
 Gradio 預設只監聽本機。若需讓同一網路中的其他主機連線：
 
 ```bash
 export GRADIO_SERVER_NAME=0.0.0.0
 export GRADIO_SERVER_PORT=7860
 automotive-graphrag
+```
+
+Windows PowerShell（單行）：
+
+```powershell
+$env:GRADIO_SERVER_NAME="0.0.0.0"; $env:GRADIO_SERVER_PORT="7860"; .\.venv\Scripts\automotive-graphrag.exe
 ```
 
 管理後台與一般入口同時執行時，請使用不同連接埠，但必須指向同一個絕對 `PROJECTS_ROOT`。
