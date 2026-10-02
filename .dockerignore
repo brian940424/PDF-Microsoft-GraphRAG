@@ -2,6 +2,9 @@
 .gitignore
 .venv
 .pytest_cache
+build
+dist
+*.egg-info
 __pycache__
 *.py[cod]
 *.log

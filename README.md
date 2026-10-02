@@ -110,8 +110,18 @@ API 連線設定保存在 `PROJECTS_ROOT/.connection.json`，由該根目錄下�
 建立映像：
 
 ```bash
-docker build -t automotive-graphrag:local .
+DOCKER_BUILDKIT=1 docker build --progress=plain -t automotive-graphrag:local .
 ```
+
+Dockerfile 會先安裝 `requirements.docker.txt` 中已驗證且固定版本的 GraphRAG 依賴，再複製應用程式碼。如此可避免 pip 在 GraphRAG 與 Pandas 版本間大量回溯；後續只修改 `src/` 或 README 時，也會直接沿用依賴層與 pip 下載快取。
+
+第一次建置仍需下載 GraphRAG、PyArrow 等大型套件，實際時間取決於網路與 CPU；第二次之後應明顯加快。請勿在一般重建時使用 `--no-cache`。若只想重新下載基礎映像，可使用：
+
+```bash
+DOCKER_BUILDKIT=1 docker build --pull --progress=plain -t automotive-graphrag:local .
+```
+
+若建置看似停滯，`--progress=plain` 會顯示目前正在下載或安裝的套件，方便判斷是網路速度還是套件解析問題。
 
 建立持久化 Volume：
 

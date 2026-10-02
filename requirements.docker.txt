@@ -1,0 +1,6 @@
+# Versions verified by the test suite. Exact pins avoid expensive resolver backtracking.
+graphrag==3.2.0
+gradio==6.29.0
+pandas==3.0.6
+pyarrow==25.0.1
+pypdf==6.19.0
