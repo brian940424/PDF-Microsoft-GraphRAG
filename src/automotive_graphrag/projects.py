@@ -45,6 +45,7 @@ class Project:
     vehicle_name: str
     manual_version: str
     description: str
+    enabled: bool
     status: str
     created_at: str
     updated_at: str
@@ -52,9 +53,13 @@ class Project:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "Project":
         try:
-            project = cls(**{field: value[field] for field in cls.__dataclass_fields__})
+            normalized = dict(value)
+            normalized.setdefault("enabled", True)
+            project = cls(**{field: normalized[field] for field in cls.__dataclass_fields__})
         except (KeyError, TypeError) as exc:
             raise ProjectError("project.json 缺少必要欄位或格式錯誤") from exc
+        if not isinstance(project.enabled, bool):
+            raise ProjectError("專案 enabled 欄位格式錯誤")
         if project.status not in PROJECT_STATUSES:
             raise ProjectError(f"未知的專案狀態：{project.status}")
         return project
@@ -97,6 +102,7 @@ class ProjectStore:
             now = datetime.now(timezone.utc).isoformat()
             project = Project(
                 **values,
+                enabled=True,
                 status="EMPTY",
                 created_at=now,
                 updated_at=now,
@@ -149,6 +155,16 @@ class ProjectStore:
         self._write_metadata(self.root / project_id / "project.json", value)
         return Project.from_dict(value)
 
+    def set_enabled(self, project_id: str, enabled: bool) -> Project:
+        if not isinstance(enabled, bool):
+            raise ProjectError("專案啟用狀態格式錯誤")
+        project = self.get(project_id)
+        value = asdict(project)
+        value["enabled"] = enabled
+        value["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_metadata(self.root / project_id / "project.json", value)
+        return Project.from_dict(value)
+
     def delete(self, project_id: str) -> None:
         project_path = self.path_for(project_id)
         if project_path.is_symlink():
@@ -164,6 +180,7 @@ class ProjectStore:
                 project.display_name,
                 self.document_count(project.project_id),
                 project.status,
+                project.enabled,
                 project.updated_at,
             ]
             for project in self.list()

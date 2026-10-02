@@ -28,6 +28,7 @@ class ProjectStoreTests(unittest.TestCase):
 
         project_path = self.store.root / project.project_id
         self.assertEqual(project.status, "EMPTY")
+        self.assertTrue(project.enabled)
         self.assertTrue(all((project_path / name).is_dir() for name in PROJECT_DIRECTORIES))
         metadata = json.loads((project_path / "project.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["description"], "測試專案")
@@ -55,9 +56,21 @@ class ProjectStoreTests(unittest.TestCase):
         rows = self.store.table_rows()
 
         self.assertEqual([row[0] for row in rows], ["L33-SM3E", "T30-SM5E"])
-        self.assertEqual(rows[0][2:4], [1, "EMPTY"])
-        self.assertEqual(rows[0][4], first.updated_at)
-        self.assertEqual(rows[1][4], second.updated_at)
+        self.assertEqual(rows[0][2:5], [1, "EMPTY", True])
+        self.assertEqual(rows[0][5], first.updated_at)
+        self.assertEqual(rows[1][5], second.updated_at)
+
+    def test_enable_state_can_be_changed_and_legacy_metadata_defaults_to_enabled(self) -> None:
+        project = self.create_project()
+
+        disabled = self.store.set_enabled(project.project_id, False)
+
+        self.assertFalse(disabled.enabled)
+        metadata_path = self.store.root / project.project_id / "project.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.pop("enabled")
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        self.assertTrue(self.store.get(project.project_id).enabled)
 
     def test_required_display_fields_are_validated(self) -> None:
         with self.assertRaisesRegex(ProjectError, "顯示名稱為必填"):

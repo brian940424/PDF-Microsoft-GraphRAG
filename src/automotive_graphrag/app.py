@@ -23,7 +23,7 @@ from .retrieval_evaluation import RetrievalEvaluationService
 from .source_sampling import SourceSample, SourceSamplingService
 
 
-PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "更新時間"]
+PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 BATCH_COLUMNS = ["題號", "問題", "狀態", "耗時 (秒)", "錯誤"]
 EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
@@ -91,9 +91,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def query_project_choices() -> list[tuple[str, str]]:
         return [
-            (project.display_name, project.project_id)
+            (
+                f"{project.display_name}｜{project.vehicle_name}｜{project.manual_version}",
+                project.project_id,
+            )
             for project in store.list()
-            if project.status == "INDEXED"
+            if project.status == "INDEXED" and project.enabled
         ]
 
     def refresh_query_projects(project_id: str | None):
@@ -705,6 +708,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
             return {}
+
+    def project_enabled_value(project_id: str | None) -> bool:
+        try:
+            return store.get(project_id).enabled if project_id else True
+        except ProjectError:
+            return True
+
+    def update_project_enabled(project_id: str | None, enabled: bool):
+        if not project_id:
+            return "❌ 請先選擇專案", store.table_rows(), {}
+        try:
+            project = store.set_enabled(project_id, enabled)
+        except ProjectError as exc:
+            return f"❌ {exc}", store.table_rows(), project_details(project_id)
+        state = "啟用" if project.enabled else "停用"
+        return f"✅ 已{state}專案 {project.project_id}", store.table_rows(), asdict(project)
         try:
             return asdict(store.get(project_id))
         except ProjectError:
@@ -852,11 +871,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 headers=PROJECT_COLUMNS,
                 value=refresh_projects,
                 interactive=False,
-                datatype=["str", "str", "number", "str", "str"],
+                datatype=["str", "str", "number", "str", "bool", "str"],
                 label="Projects",
             )
             with gr.Row():
                 refresh_button = gr.Button("重新整理")
+                project_enabled = gr.Checkbox(label="啟用一般使用者查詢", value=True)
+                update_project_enabled_button = gr.Button("更新啟用狀態")
+            project_activation_result = gr.Markdown()
             gr.Markdown("## 建立新專案")
             project_id = gr.Textbox(label="Project ID", placeholder="L33-SM3E")
             display_name = gr.Textbox(label="顯示名稱", placeholder="L33 / SM3E")
@@ -1223,7 +1245,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=selected_project,
             outputs=[project_table, selected_project, selected_project_details, document_project],
         )
-        selected_project.change(project_details, inputs=selected_project, outputs=selected_project_details)
+        selected_project.change(
+            lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
+            inputs=selected_project,
+            outputs=[selected_project_details, project_enabled],
+        )
+        update_project_enabled_button.click(
+            update_project_enabled,
+            inputs=[selected_project, project_enabled],
+            outputs=[project_activation_result, project_table, selected_project_details],
+        )
         create_button.click(
             create_project,
             inputs=[project_id, display_name, vehicle_name, manual_version, description],
