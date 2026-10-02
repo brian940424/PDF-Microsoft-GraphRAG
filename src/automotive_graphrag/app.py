@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 from pathlib import Path
 
 import gradio as gr
@@ -46,6 +47,36 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def project_choices() -> list[tuple[str, str]]:
         return [(project.display_name, project.project_id) for project in store.list()]
+
+    def project_details(project_id: str | None) -> dict[str, str]:
+        if not project_id:
+            return {}
+        try:
+            return asdict(store.get(project_id))
+        except ProjectError:
+            return {}
+
+    def refresh_project_views(project_id: str | None):
+        available_ids = {project.project_id for project in store.list()}
+        selected = project_id if project_id in available_ids else None
+        choices = project_choices()
+        return (
+            store.table_rows(),
+            gr.Dropdown(choices=choices, value=selected),
+            project_details(selected),
+            gr.Dropdown(choices=choices, value=selected),
+        )
+
+    def delete_project(project_id: str | None, confirmed: bool):
+        if not project_id:
+            return "❌ 請先選擇專案", *refresh_project_views(None), False
+        if not confirmed:
+            return "❌ 請勾選刪除確認", *refresh_project_views(project_id), False
+        try:
+            store.delete(project_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", *refresh_project_views(project_id), False
+        return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None), False
 
     def document_rows(project_id: str | None) -> list[list[str | int | None]]:
         if not project_id:
@@ -117,13 +148,28 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 manual_version,
                 description,
                 selector,
+                selector,
+                {},
             )
         selector = gr.Dropdown(choices=project_choices(), value=project.project_id)
-        return f"✅ 已建立專案 {project.project_id}", store.table_rows(), "", "", "", "", "", selector
+        return (
+            f"✅ 已建立專案 {project.project_id}",
+            store.table_rows(),
+            "",
+            "",
+            "",
+            "",
+            "",
+            selector,
+            selector,
+            asdict(project),
+        )
 
     with gr.Blocks(title="汽車維修 GraphRAG 平台") as demo:
         gr.Markdown("# 汽車維修 GraphRAG 平台")
-        with gr.Tab("專案列表"):
+        with gr.Tab("專案設定"):
+            selected_project = gr.Dropdown(choices=project_choices(), label="選擇專案紀錄")
+            selected_project_details = gr.JSON(label="專案資料")
             project_table = gr.Dataframe(
                 headers=PROJECT_COLUMNS,
                 value=refresh_projects,
@@ -142,6 +188,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             description = gr.Textbox(label="說明", lines=3)
             create_button = gr.Button("建立專案", variant="primary")
             result = gr.Markdown()
+            gr.Markdown("## 刪除專案")
+            delete_confirmation = gr.Checkbox(label="我確認要永久刪除選取的專案及其所有資料")
+            delete_button = gr.Button("刪除選取專案", variant="stop")
 
         with gr.Tab("文件與建圖"):
             document_project = gr.Dropdown(choices=project_choices(), label="專案")
@@ -183,7 +232,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 save_connection_button = gr.Button("儲存 API Key", variant="primary")
             connection_result = gr.Markdown()
 
-        refresh_button.click(refresh_projects, outputs=project_table)
+        refresh_button.click(
+            refresh_project_views,
+            inputs=selected_project,
+            outputs=[project_table, selected_project, selected_project_details, document_project],
+        )
+        selected_project.change(project_details, inputs=selected_project, outputs=selected_project_details)
         create_button.click(
             create_project,
             inputs=[project_id, display_name, vehicle_name, manual_version, description],
@@ -195,7 +249,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 vehicle_name,
                 manual_version,
                 description,
+                selected_project,
                 document_project,
+                selected_project_details,
+            ],
+        )
+        delete_button.click(
+            delete_project,
+            inputs=[selected_project, delete_confirmation],
+            outputs=[
+                result,
+                project_table,
+                selected_project,
+                selected_project_details,
+                document_project,
+                delete_confirmation,
             ],
         )
         document_project.change(document_rows, inputs=document_project, outputs=document_table)

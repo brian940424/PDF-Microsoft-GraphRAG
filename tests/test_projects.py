@@ -63,6 +63,27 @@ class ProjectStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "顯示名稱為必填"):
             self.create_project(display_name="  ")
 
+    def test_delete_removes_only_the_selected_project(self) -> None:
+        selected = self.create_project()
+        remaining = self.create_project(project_id="T30-SM5E", display_name="T30 / SM5E")
+        selected_path = self.store.path_for(selected.project_id)
+        (selected_path / "source" / "manual.pdf").write_bytes(b"pdf")
+
+        self.store.delete(selected.project_id)
+
+        self.assertFalse(selected_path.exists())
+        self.assertEqual([project.project_id for project in self.store.list()], [remaining.project_id])
+
+    def test_delete_rejects_project_with_active_index_job(self) -> None:
+        project = self.create_project()
+        project_path = self.store.path_for(project.project_id)
+        (project_path / "graphrag" / ".indexing.lock").write_text("busy")
+
+        with self.assertRaisesRegex(ProjectError, "執行中"):
+            self.store.delete(project.project_id)
+
+        self.assertTrue(project_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

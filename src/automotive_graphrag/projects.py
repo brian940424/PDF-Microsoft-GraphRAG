@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -147,6 +148,14 @@ class ProjectStore:
         value["updated_at"] = datetime.now(timezone.utc).isoformat()
         self._write_metadata(self.root / project_id / "project.json", value)
         return Project.from_dict(value)
+
+    def delete(self, project_id: str) -> None:
+        project_path = self.path_for(project_id)
+        if project_path.is_symlink():
+            raise ProjectError("拒絕刪除符號連結專案")
+        if (project_path / "graphrag" / ".indexing.lock").exists():
+            raise ProjectError("建圖工作執行中，無法刪除專案")
+        shutil.rmtree(project_path)
 
     def table_rows(self) -> list[list[str | int]]:
         return [
