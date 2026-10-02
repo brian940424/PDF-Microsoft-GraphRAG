@@ -9,19 +9,31 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
+import pandas as pd
 import yaml
 
 from .connections import ConnectionSettings
+from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
-CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class QueryExecution:
+    returncode: int
+    stdout: str
+    stderr: str
+    context: dict[str, Any] = field(default_factory=dict)
+
+
+CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str] | QueryExecution]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +48,8 @@ class QueryResult:
     started_at: str
     completed_at: str
     duration_seconds: float
+    evidence: tuple[Evidence, ...] = ()
+    context: dict[str, Any] = field(default_factory=dict)
 
 
 class QueryService:
@@ -44,10 +58,12 @@ class QueryService:
         projects: ProjectStore,
         runner: CommandRunner | None = None,
         connection_settings: ConnectionSettings | None = None,
+        evidence_service: EvidenceService | None = None,
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
+        self.evidence_service = evidence_service or EvidenceService(projects)
 
     def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
         project = self.projects.get(project_id)
@@ -88,6 +104,8 @@ class QueryService:
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
+        context = result.context if isinstance(result, QueryExecution) else {}
+        evidence = tuple(self.evidence_service.from_context(project_id, context)) if context else ()
         if result.returncode == 0 and not answer:
             error = "GraphRAG 未回傳回答"
         query_result = QueryResult(
@@ -101,6 +119,8 @@ class QueryService:
             started_at=started.isoformat(),
             completed_at=completed.isoformat(),
             duration_seconds=round(time.monotonic() - started_clock, 3),
+            evidence=evidence,
+            context=context,
         )
         self._append_record(self.projects.path_for(project_id) / "runs" / "queries.jsonl", query_result)
         return query_result
@@ -112,18 +132,59 @@ class QueryService:
         except FileNotFoundError:
             return []
         try:
-            return [QueryResult(**json.loads(line)) for line in lines if line.strip()]
+            return [self._result_from_dict(json.loads(line)) for line in lines if line.strip()]
         except (json.JSONDecodeError, TypeError) as exc:
             raise ProjectError("問答紀錄格式錯誤") from exc
 
     @staticmethod
-    def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(command, text=True, capture_output=True, check=False)
+    def _result_from_dict(value: dict[str, Any]) -> QueryResult:
+        value["evidence"] = tuple(Evidence(**item) for item in value.get("evidence", []))
+        value.setdefault("context", {})
+        return QueryResult(**value)
 
     @staticmethod
-    def _last_error(result: subprocess.CompletedProcess[str]) -> str:
+    def _run(command: list[str]) -> subprocess.CompletedProcess[str] | QueryExecution:
+        method = command[command.index("--method") + 1]
+        if method != "local":
+            return subprocess.run(command, text=True, capture_output=True, check=False)
+        root = Path(command[command.index("--root") + 1])
+        question = command[-1]
+        try:
+            from graphrag.cli.query import run_local_search
+
+            response, context = run_local_search(
+                data_dir=None,
+                root_dir=root,
+                community_level=2,
+                response_type="Multiple Paragraphs",
+                streaming=False,
+                query=question,
+                verbose=False,
+            )
+            return QueryExecution(0, str(response), "", QueryService._serialize_context(context))
+        except Exception as exc:
+            return QueryExecution(1, "", str(exc))
+
+    @staticmethod
+    def _last_error(result: subprocess.CompletedProcess[str] | QueryExecution) -> str:
         lines = ((result.stderr or "") + "\n" + (result.stdout or "")).strip().splitlines()
         return lines[-1] if lines else f"GraphRAG 查詢失敗（exit {result.returncode}）"
+
+    @staticmethod
+    def _serialize_context(context: Any) -> dict[str, Any]:
+        if not isinstance(context, dict):
+            return {"raw": str(context)}
+        serialized: dict[str, Any] = {}
+        for key, value in context.items():
+            if isinstance(value, pd.DataFrame):
+                serialized[str(key)] = json.loads(value.to_json(orient="records", force_ascii=False))
+            else:
+                try:
+                    json.dumps(value)
+                    serialized[str(key)] = value
+                except TypeError:
+                    serialized[str(key)] = str(value)
+        return serialized
 
     @staticmethod
     def _configure_connection(

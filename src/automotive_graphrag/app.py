@@ -20,6 +20,7 @@ from .reviews import ReviewService
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 BATCH_COLUMNS = ["題號", "問題", "狀態", "耗時 (秒)", "錯誤"]
+EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -78,18 +79,50 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def ask_question(project_id: str | None, question: str, method: str):
         if not project_id:
-            return "", "❌ 請先選擇已完成建圖的專案"
+            return "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
         try:
             query_result = querying.ask(project_id, question, method)
         except ProjectError as exc:
-            return "", f"❌ {exc}"
+            return "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
         summary = (
             f"狀態：{query_result.status}｜方法：{query_result.method}｜"
             f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
         )
         if query_result.status == "FAILED":
-            return "", f"❌ {summary}｜{query_result.error}"
-        return query_result.answer, f"✅ {summary}"
+            return "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, []
+        evidence_values = [asdict(item) for item in query_result.evidence]
+        evidence_rows = [
+            [item.rank, item.evidence_id, item.document_id, item.page, item.chunk_id, item.score]
+            for item in query_result.evidence
+        ]
+        if query_result.evidence:
+            references = "\n".join(
+                f"- [{item.evidence_id}] {item.document_id}，第 {item.page} 頁，Chunk `{item.chunk_id}`"
+                for item in query_result.evidence
+            )
+            answer = f"{query_result.answer}\n\n---\n### Evidence\n{references}"
+            selected = query_result.evidence[0].evidence_id
+            detail = evidence_markdown(selected, evidence_values)
+        else:
+            answer = f"{query_result.answer}\n\n> ⚠️ 未驗證：Query Context 中沒有可回連的來源證據。"
+            selected = None
+            detail = ""
+        selector = gr.Dropdown(
+            choices=[item.evidence_id for item in query_result.evidence],
+            value=selected,
+        )
+        return answer, f"✅ {summary}", evidence_rows, selector, detail, query_result.context, evidence_values
+
+    def evidence_markdown(evidence_id: str | None, evidence_values: list[dict[str, object]]) -> str:
+        for item in evidence_values or []:
+            if item.get("evidence_id") == evidence_id:
+                return (
+                    f"### [{item['evidence_id']}] {item['document_id']} — 第 {item['page']} 頁\n\n"
+                    f"章節：{item['section_name']} (`{item['section_id']}`)  \n"
+                    f"Chunk：`{item['chunk_id']}`  \n"
+                    f"Text Unit：`{item['text_unit_id']}`\n\n{item['text']}"
+                )
+        return ""
 
     def question_set_choices(project_id: str | None) -> list[tuple[str, str]]:
         if not project_id:
@@ -498,6 +531,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 with gr.Column():
                     query_answer = gr.Markdown(label="系統回答")
                     query_summary = gr.Markdown(label="查詢資訊")
+            gr.Markdown("### Evidence 詳情")
+            query_evidence_state = gr.State([])
+            query_evidence_table = gr.Dataframe(
+                headers=EVIDENCE_COLUMNS,
+                interactive=False,
+                datatype=["number", "str", "str", "number", "str", "number"],
+                label="Top Evidence",
+            )
+            query_evidence_selector = gr.Dropdown(label="選取證據全文")
+            query_evidence_detail = gr.Markdown()
+            query_context = gr.JSON(label="原始 GraphRAG Query Context")
             gr.Markdown("## 題目集批次問答")
             with gr.Row():
                 batch_project = gr.Dropdown(choices=project_choices(), label="專案")
@@ -629,11 +673,33 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ask_button.click(
             ask_question,
             inputs=[query_project, question, query_method],
-            outputs=[query_answer, query_summary],
+            outputs=[
+                query_answer,
+                query_summary,
+                query_evidence_table,
+                query_evidence_selector,
+                query_evidence_detail,
+                query_context,
+                query_evidence_state,
+            ],
+        )
+        query_evidence_selector.input(
+            evidence_markdown,
+            inputs=[query_evidence_selector, query_evidence_state],
+            outputs=query_evidence_detail,
         )
         clear_question_button.click(
-            lambda: ("", "", ""),
-            outputs=[question, query_answer, query_summary],
+            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, []),
+            outputs=[
+                question,
+                query_answer,
+                query_summary,
+                query_evidence_table,
+                query_evidence_selector,
+                query_evidence_detail,
+                query_context,
+                query_evidence_state,
+            ],
         )
         batch_project_refresh.click(
             lambda: gr.Dropdown(choices=project_choices()),

@@ -7,7 +7,8 @@ import yaml
 
 from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
-from automotive_graphrag.querying import QueryService
+from automotive_graphrag.evidence import Evidence
+from automotive_graphrag.querying import QueryExecution, QueryService
 
 
 class FakeQueryRunner:
@@ -20,6 +21,30 @@ class FakeQueryRunner:
         if self.return_code:
             return subprocess.CompletedProcess(command, self.return_code, "", "query failed\n")
         return subprocess.CompletedProcess(command, 0, "先檢查保險絲，再檢查馬達。\n", "")
+
+
+class ContextQueryRunner:
+    def __call__(self, command: list[str]) -> QueryExecution:
+        return QueryExecution(0, "有來源的回答", "", {"sources": [{"id": "7", "text": "來源"}]})
+
+
+class FakeEvidenceService:
+    def from_context(self, project_id: str, context: dict[str, object]) -> list[Evidence]:
+        return [
+            Evidence(
+                evidence_id="E1",
+                rank=1,
+                context_id="7",
+                text_unit_id="full-tu-1",
+                chunk_id="L33-SM3E-WW-p0025-b01",
+                section_id="WW",
+                section_name="Wiper & Washer",
+                document_id="WW.pdf",
+                page=25,
+                block_id="b01",
+                text="來源",
+            )
+        ]
 
 
 class QueryServiceTests(unittest.TestCase):
@@ -78,6 +103,20 @@ class QueryServiceTests(unittest.TestCase):
 
         self.assertEqual(result.status, "FAILED")
         self.assertEqual(result.error, "query failed")
+        self.assertEqual(service.history("L33-SM3E")[0], result)
+
+    def test_query_saves_context_and_resolved_evidence(self) -> None:
+        service = QueryService(
+            self.store,
+            ContextQueryRunner(),
+            self.connections,
+            evidence_service=FakeEvidenceService(),
+        )
+
+        result = service.ask("L33-SM3E", "測試來源")
+
+        self.assertEqual(result.evidence[0].evidence_id, "E1")
+        self.assertEqual(result.context["sources"][0]["id"], "7")
         self.assertEqual(service.history("L33-SM3E")[0], result)
 
     def test_query_rejects_project_without_completed_index(self) -> None:
