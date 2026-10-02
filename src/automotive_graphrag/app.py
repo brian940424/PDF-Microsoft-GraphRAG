@@ -12,6 +12,7 @@ from .connections import ConnectionSettings
 from .documents import DocumentInfo, DocumentService
 from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
+from .querying import QueryService
 
 
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "更新時間"]
@@ -23,6 +24,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     connections = ConnectionSettings(store.root)
     documents = DocumentService(store)
     indexing = IndexingService(store, connection_settings=connections)
+    querying = QueryService(store, connection_settings=connections)
 
     def connection_status() -> str:
         return f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key()}"
@@ -47,6 +49,33 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def project_choices() -> list[tuple[str, str]]:
         return [(project.display_name, project.project_id) for project in store.list()]
+
+    def query_project_choices() -> list[tuple[str, str]]:
+        return [
+            (project.display_name, project.project_id)
+            for project in store.list()
+            if project.status == "INDEXED"
+        ]
+
+    def refresh_query_projects(project_id: str | None):
+        choices = query_project_choices()
+        available_ids = {value for _, value in choices}
+        return gr.Dropdown(choices=choices, value=project_id if project_id in available_ids else None)
+
+    def ask_question(project_id: str | None, question: str, method: str):
+        if not project_id:
+            return "", "❌ 請先選擇已完成建圖的專案"
+        try:
+            query_result = querying.ask(project_id, question, method)
+        except ProjectError as exc:
+            return "", f"❌ {exc}"
+        summary = (
+            f"狀態：{query_result.status}｜方法：{query_result.method}｜"
+            f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
+        )
+        if query_result.status == "FAILED":
+            return "", f"❌ {summary}｜{query_result.error}"
+        return query_result.answer, f"✅ {summary}"
 
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
@@ -265,6 +294,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 remove_pdf_button = gr.Button("移除 PDF", variant="stop")
             indexing_log = gr.Textbox(label="建圖日誌", lines=12, interactive=False)
 
+        with gr.Tab("問答測試"):
+            with gr.Row():
+                query_project = gr.Dropdown(choices=query_project_choices(), label="已建圖專案")
+                query_project_refresh = gr.Button("重新整理專案")
+            with gr.Row():
+                with gr.Column():
+                    question = gr.Textbox(label="問題", lines=5)
+                    query_method = gr.Dropdown(
+                        choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+                        value="local",
+                        label="查詢方法",
+                    )
+                    with gr.Row():
+                        ask_button = gr.Button("送出問題", variant="primary")
+                        clear_question_button = gr.Button("清除")
+                with gr.Column():
+                    query_answer = gr.Markdown(label="系統回答")
+                    query_summary = gr.Markdown(label="查詢資訊")
+
         refresh_button.click(
             refresh_project_views,
             inputs=selected_project,
@@ -324,6 +372,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             remove_document,
             inputs=[document_project, removable_pdf, remove_pdf_confirmation],
             outputs=[document_result, document_table, removable_pdf, remove_pdf_confirmation],
+        )
+        query_project_refresh.click(
+            refresh_query_projects,
+            inputs=query_project,
+            outputs=query_project,
+        )
+        ask_button.click(
+            ask_question,
+            inputs=[query_project, question, query_method],
+            outputs=[query_answer, query_summary],
+        )
+        clear_question_button.click(
+            lambda: ("", "", ""),
+            outputs=[question, query_answer, query_summary],
         )
         test_connection_button.click(
             test_connection,

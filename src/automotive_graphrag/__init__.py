@@ -4,6 +4,7 @@ from .connections import ConnectionSettings, ConnectionTestResult
 from .documents import DocumentInfo, DocumentService, ProcessingReport
 from .indexing import IndexingResult, IndexingService
 from .projects import Project, ProjectError, ProjectStore
+from .querying import QueryResult, QueryService
 
 __all__ = [
     "DocumentInfo",
@@ -16,4 +17,6 @@ __all__ = [
     "Project",
     "ProjectError",
     "ProjectStore",
+    "QueryResult",
+    "QueryService",
 ]
