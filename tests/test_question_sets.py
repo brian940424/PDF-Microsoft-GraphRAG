@@ -128,6 +128,29 @@ class QuestionSetServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "尚未完成建圖"):
             self.service.run("L33-SM3E", imported.question_set_id)
 
+    def test_batch_rerun_preserves_imported_gold_evidence(self) -> None:
+        value = self.valid_value()
+        value["questions"][0]["gold_evidence"] = [  # type: ignore[index]
+            {
+                "document_id": "WW.pdf",
+                "pages": [25],
+                "chunk_ids": ["L33-SM3E-WW-p0025-b01"],
+            }
+        ]
+        imported = self.service.import_file("L33-SM3E", self.write_question_set(value))
+
+        result = self.service.run(
+            "L33-SM3E",
+            imported.question_set_id,
+            selected_question_ids=["Q001"],
+        )
+
+        self.assertEqual(result.questions[0].gold_evidence[0].pages, (25,))
+        self.assertEqual(
+            result.questions[0].gold_evidence[0].chunk_ids,
+            ("L33-SM3E-WW-p0025-b01",),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

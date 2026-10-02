@@ -3,10 +3,11 @@
 from .connections import ConnectionSettings, ConnectionTestResult
 from .documents import DocumentInfo, DocumentService, ProcessingReport
 from .evidence import Evidence, EvidenceService
+from .ground_truth import GroundTruthService
 from .indexing import IndexingResult, IndexingService
 from .projects import Project, ProjectError, ProjectStore
 from .querying import QueryExecution, QueryResult, QueryService
-from .question_sets import BatchQuestion, BatchSummary, QuestionSet, QuestionSetService
+from .question_sets import BatchQuestion, BatchSummary, GoldEvidence, QuestionSet, QuestionSetService
 from .reviews import ReviewProgress, ReviewRecord, ReviewService
 from .source_metadata import SourceMetadata, SourceMetadataService
 
@@ -15,6 +16,7 @@ __all__ = [
     "DocumentService",
     "Evidence",
     "EvidenceService",
+    "GroundTruthService",
     "ConnectionSettings",
     "ConnectionTestResult",
     "IndexingResult",
@@ -28,6 +30,7 @@ __all__ = [
     "QueryService",
     "BatchQuestion",
     "BatchSummary",
+    "GoldEvidence",
     "QuestionSet",
     "QuestionSetService",
     "ReviewProgress",

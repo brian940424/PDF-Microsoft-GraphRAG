@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -10,6 +11,7 @@ import gradio as gr
 
 from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
 from .documents import DocumentInfo, DocumentService
+from .ground_truth import GroundTruthService
 from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
@@ -21,6 +23,7 @@ PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "�
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 BATCH_COLUMNS = ["題號", "問題", "狀態", "耗時 (秒)", "錯誤"]
 EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
+SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -31,6 +34,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     querying = QueryService(store, connection_settings=connections)
     question_sets = QuestionSetService(store, querying)
     reviews = ReviewService(store, question_sets)
+    ground_truth = GroundTruthService(store, question_sets)
 
     def connection_status() -> str:
         return (
@@ -283,6 +287,68 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出人工評測 JSON 與 CSV", str(json_path), str(csv_path)
+
+    def source_rows(project_id: str | None) -> list[list[str | int]]:
+        if not project_id:
+            return []
+        try:
+            sources = ground_truth.available_sources(project_id)
+        except ProjectError:
+            return []
+        seen: set[str] = set()
+        rows: list[list[str | int]] = []
+        for source in sources:
+            if source.chunk_id in seen:
+                continue
+            seen.add(source.chunk_id)
+            rows.append(
+                [source.document_id, source.page, source.chunk_id, source.section_name, source.text]
+            )
+        return rows
+
+    def ground_truth_set_view(project_id: str | None, question_set_id: str | None):
+        if not project_id or not question_set_id:
+            return gr.Dropdown(choices=[]), "", "[]", source_rows(project_id), ""
+        try:
+            question_set = question_sets.get(project_id, question_set_id)
+        except ProjectError as exc:
+            return gr.Dropdown(choices=[]), "", "[]", source_rows(project_id), f"❌ {exc}"
+        choices = [(item.question_id, item.question_id) for item in question_set.questions]
+        return gr.Dropdown(choices=choices), "", "[]", source_rows(project_id), ""
+
+    def ground_truth_question_view(
+        project_id: str | None,
+        question_set_id: str | None,
+        question_id: str | None,
+    ):
+        if not project_id or not question_set_id or not question_id:
+            return "", "[]"
+        question_set = question_sets.get(project_id, question_set_id)
+        item = next((item for item in question_set.questions if item.question_id == question_id), None)
+        if item is None:
+            return "", "[]"
+        evidence_json = json.dumps([asdict(value) for value in item.gold_evidence], ensure_ascii=False, indent=2)
+        return f"### {item.question_id}\n\n{item.question}", evidence_json
+
+    def save_ground_truth(
+        project_id: str | None,
+        question_set_id: str | None,
+        question_id: str | None,
+        evidence_json: str,
+    ):
+        if not project_id or not question_set_id or not question_id:
+            return "❌ 請先選擇專案、題目集與題目", evidence_json
+        try:
+            value = json.loads(evidence_json)
+        except json.JSONDecodeError as exc:
+            return f"❌ JSON 格式錯誤：第 {exc.lineno} 行第 {exc.colno} 欄，{exc.msg}", evidence_json
+        try:
+            updated = ground_truth.save(project_id, question_set_id, question_id, value)
+        except ProjectError as exc:
+            return f"❌ {exc}", evidence_json
+        item = next(item for item in updated.questions if item.question_id == question_id)
+        normalized = json.dumps([asdict(gold) for gold in item.gold_evidence], ensure_ascii=False, indent=2)
+        return f"✅ 已儲存 {len(item.gold_evidence)} 組 Gold Evidence", normalized
 
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
@@ -605,6 +671,27 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 review_json_export = gr.File(label="人工評測 JSON")
                 review_csv_export = gr.File(label="人工評測 CSV")
 
+        with gr.Tab("Gold Evidence"):
+            with gr.Row():
+                gold_project = gr.Dropdown(choices=project_choices(), label="專案")
+                gold_project_refresh = gr.Button("重新整理專案")
+                gold_question_set = gr.Dropdown(label="題目集")
+                gold_question = gr.Dropdown(label="題目")
+            gold_question_text = gr.Markdown()
+            gr.Markdown(
+                "請參考可用來源填寫 JSON；每筆需包含 `document_id`、`pages`、`chunk_ids`，可用 `[]` 清除標記。"
+            )
+            with gr.Row():
+                available_source_table = gr.Dataframe(
+                    headers=SOURCE_COLUMNS,
+                    interactive=False,
+                    datatype=["str", "number", "str", "str", "str"],
+                    label="索引中的可用來源",
+                )
+                gold_evidence_editor = gr.Code(language="json", value="[]", label="Gold Evidence JSON", lines=16)
+            save_gold_evidence_button = gr.Button("驗證並儲存 Gold Evidence", variant="primary")
+            gold_evidence_result = gr.Markdown()
+
         refresh_button.click(
             refresh_project_views,
             inputs=selected_project,
@@ -832,6 +919,36 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             export_reviews,
             inputs=[review_project, review_question_set],
             outputs=[review_result, review_json_export, review_csv_export],
+        )
+        gold_project_refresh.click(
+            lambda: gr.Dropdown(choices=project_choices()),
+            outputs=gold_project,
+        )
+        gold_project.change(
+            lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
+            inputs=gold_project,
+            outputs=gold_question_set,
+        )
+        gold_question_set.input(
+            ground_truth_set_view,
+            inputs=[gold_project, gold_question_set],
+            outputs=[
+                gold_question,
+                gold_question_text,
+                gold_evidence_editor,
+                available_source_table,
+                gold_evidence_result,
+            ],
+        )
+        gold_question.input(
+            ground_truth_question_view,
+            inputs=[gold_project, gold_question_set, gold_question],
+            outputs=[gold_question_text, gold_evidence_editor],
+        )
+        save_gold_evidence_button.click(
+            save_ground_truth,
+            inputs=[gold_project, gold_question_set, gold_question, gold_evidence_editor],
+            outputs=[gold_evidence_result, gold_evidence_editor],
         )
         test_connection_button.click(
             test_connection,

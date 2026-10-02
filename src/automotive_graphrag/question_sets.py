@@ -25,6 +25,13 @@ class QuestionRunner(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class GoldEvidence:
+    document_id: str
+    pages: tuple[int, ...]
+    chunk_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class BatchQuestion:
     question_id: str
     question: str
@@ -33,6 +40,7 @@ class BatchQuestion:
     error: str | None = None
     duration_seconds: float | None = None
     completed_at: str | None = None
+    gold_evidence: tuple[GoldEvidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +135,9 @@ class QuestionSetService:
         questions = list(question_set.questions)
         if not resume:
             questions = [
-                BatchQuestion(item.question_id, item.question) if item.question_id in targets else item
+                BatchQuestion(item.question_id, item.question, gold_evidence=item.gold_evidence)
+                if item.question_id in targets
+                else item
                 for item in questions
             ]
         current = self._replace(question_set, questions, method)
@@ -136,7 +146,12 @@ class QuestionSetService:
         for index, item in enumerate(questions):
             if item.question_id not in targets:
                 continue
-            questions[index] = BatchQuestion(item.question_id, item.question, status="RUNNING")
+            questions[index] = BatchQuestion(
+                item.question_id,
+                item.question,
+                status="RUNNING",
+                gold_evidence=item.gold_evidence,
+            )
             current = self._replace(current, questions, method)
             self._write(current)
             try:
@@ -149,6 +164,7 @@ class QuestionSetService:
                     error=result.error,
                     duration_seconds=result.duration_seconds,
                     completed_at=result.completed_at,
+                    gold_evidence=item.gold_evidence,
                 )
             except Exception as exc:
                 questions[index] = BatchQuestion(
@@ -157,6 +173,7 @@ class QuestionSetService:
                     status="FAILED",
                     error=str(exc),
                     completed_at=datetime.now(timezone.utc).isoformat(),
+                    gold_evidence=item.gold_evidence,
                 )
             current = self._replace(current, questions, method)
             self._write(current)
@@ -191,12 +208,40 @@ class QuestionSetService:
                 "error",
                 "duration_seconds",
                 "completed_at",
+                "gold_evidence",
             ],
         )
         writer.writeheader()
-        writer.writerows(asdict(item) for item in question_set.questions)
+        for item in question_set.questions:
+            row = asdict(item)
+            row["gold_evidence"] = json.dumps(row["gold_evidence"], ensure_ascii=False)
+            writer.writerow(row)
         self._atomic_text(csv_path, buffer.getvalue())
         return json_path, csv_path
+
+    def update_gold_evidence(
+        self,
+        project_id: str,
+        question_set_id: str,
+        question_id: str,
+        gold_evidence: tuple[GoldEvidence, ...],
+    ) -> QuestionSet:
+        question_set = self.get(project_id, question_set_id)
+        found = False
+        questions: list[BatchQuestion] = []
+        for item in question_set.questions:
+            if item.question_id == question_id:
+                found = True
+                value = asdict(item)
+                value["gold_evidence"] = gold_evidence
+                questions.append(BatchQuestion(**value))
+            else:
+                questions.append(item)
+        if not found:
+            raise ProjectError(f"題目集找不到題號：{question_id}")
+        updated = self._replace(question_set, questions, question_set.method)
+        self._write(updated)
+        return updated
 
     @staticmethod
     def _validate(value: object) -> tuple[str, str, list[BatchQuestion]]:
@@ -223,6 +268,11 @@ class QuestionSetService:
                 continue
             question_id = raw.get("question_id")
             question = raw.get("question")
+            try:
+                gold_evidence = QuestionSetService.parse_gold_evidence(raw.get("gold_evidence", []), location)
+            except ProjectError as exc:
+                errors.extend(str(exc).splitlines())
+                gold_evidence = ()
             if not isinstance(question_id, str) or not question_id.strip():
                 errors.append(f"{location}.question_id：必須是非空白字串")
             elif question_id.strip() in seen:
@@ -232,10 +282,52 @@ class QuestionSetService:
             if not isinstance(question, str) or not question.strip():
                 errors.append(f"{location}.question：必須是非空白字串")
             if isinstance(question_id, str) and question_id.strip() and isinstance(question, str) and question.strip():
-                questions.append(BatchQuestion(question_id.strip(), question.strip()))
+                questions.append(
+                    BatchQuestion(question_id.strip(), question.strip(), gold_evidence=gold_evidence)
+                )
         if errors:
             raise ProjectError("題目集格式錯誤：\n- " + "\n- ".join(errors))
         return name.strip(), description.strip(), questions
+
+    @staticmethod
+    def parse_gold_evidence(value: object, location: str = "gold_evidence") -> tuple[GoldEvidence, ...]:
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise ProjectError(f"{location}.gold_evidence：必須是陣列")
+        result: list[GoldEvidence] = []
+        errors: list[str] = []
+        for index, raw in enumerate(value):
+            item_location = f"{location}.gold_evidence[{index}]"
+            if not isinstance(raw, dict):
+                errors.append(f"{item_location}：必須是 object")
+                continue
+            document_id = raw.get("document_id")
+            pages = raw.get("pages", [])
+            chunk_ids = raw.get("chunk_ids", [])
+            if not isinstance(document_id, str) or not document_id.strip():
+                errors.append(f"{item_location}.document_id：必須是非空白字串")
+            if not isinstance(pages, list) or any(not isinstance(page, int) or page < 1 for page in pages):
+                errors.append(f"{item_location}.pages：必須是正整數陣列")
+                pages = []
+            if not isinstance(chunk_ids, list) or any(
+                not isinstance(chunk_id, str) or not chunk_id.strip() for chunk_id in chunk_ids
+            ):
+                errors.append(f"{item_location}.chunk_ids：必須是非空白字串陣列")
+                chunk_ids = []
+            if not pages and not chunk_ids:
+                errors.append(f"{item_location}：pages 與 chunk_ids 至少需要一項")
+            if isinstance(document_id, str) and document_id.strip() and (pages or chunk_ids):
+                result.append(
+                    GoldEvidence(
+                        document_id=document_id.strip(),
+                        pages=tuple(dict.fromkeys(pages)),
+                        chunk_ids=tuple(dict.fromkeys(chunk_id.strip() for chunk_id in chunk_ids)),
+                    )
+                )
+        if errors:
+            raise ProjectError("\n".join(errors))
+        return tuple(result)
 
     def _write(self, question_set: QuestionSet) -> None:
         path = self.projects.path_for(question_set.project_id) / "question_sets" / f"{question_set.question_set_id}.json"
@@ -244,8 +336,18 @@ class QuestionSetService:
     @staticmethod
     def _read(path: Path) -> QuestionSet:
         value = json.loads(path.read_text(encoding="utf-8"))
-        questions = tuple(BatchQuestion(**item) for item in value.pop("questions"))
-        return QuestionSet(**value, questions=questions)
+        questions = []
+        for item in value.pop("questions"):
+            item["gold_evidence"] = tuple(
+                GoldEvidence(
+                    document_id=gold["document_id"],
+                    pages=tuple(gold.get("pages", [])),
+                    chunk_ids=tuple(gold.get("chunk_ids", [])),
+                )
+                for gold in item.get("gold_evidence", [])
+            )
+            questions.append(BatchQuestion(**item))
+        return QuestionSet(**value, questions=tuple(questions))
 
     @staticmethod
     def _to_dict(question_set: QuestionSet) -> dict[str, object]:
