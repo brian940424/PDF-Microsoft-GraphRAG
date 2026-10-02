@@ -15,6 +15,7 @@ from .retrieval_evaluation import (
     RetrievalEvaluationService,
 )
 from .source_metadata import SourceMetadata, SourceMetadataService
+from .source_sampling import SourceSample, SourceSampleBatch, SourceSamplingService
 
 __all__ = [
     "DocumentInfo",
@@ -46,4 +47,7 @@ __all__ = [
     "RetrievalEvaluationService",
     "SourceMetadata",
     "SourceMetadataService",
+    "SourceSample",
+    "SourceSampleBatch",
+    "SourceSamplingService",
 ]

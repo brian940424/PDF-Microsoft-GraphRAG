@@ -18,6 +18,7 @@ from .querying import QueryService
 from .question_sets import QuestionSet, QuestionSetService
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
+from .source_sampling import SourceSample, SourceSamplingService
 
 
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "更新時間"]
@@ -26,6 +27,7 @@ BATCH_COLUMNS = ["題號", "問題", "狀態", "耗時 (秒)", "錯誤"]
 EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "Retrieved", "First Relevant Rank", "Pass@K"]
+SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk ID"]
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -38,6 +40,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     reviews = ReviewService(store, question_sets)
     ground_truth = GroundTruthService(store, question_sets)
     retrieval_evaluation = RetrievalEvaluationService(store, question_sets)
+    source_sampling = SourceSamplingService(store)
 
     def connection_status() -> str:
         return (
@@ -410,6 +413,120 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出 Retrieval 評估 JSON 與 CSV", str(json_path), str(csv_path)
+
+    def sampling_section_choices(project_id: str | None):
+        if not project_id:
+            return gr.Dropdown(choices=[], value=[])
+        try:
+            sections = source_sampling.available_sections(project_id)
+        except ProjectError:
+            sections = []
+        return gr.Dropdown(
+            choices=[(f"{section_id} — {name}", section_id) for section_id, name in sections],
+            value=[],
+        )
+
+    @staticmethod
+    def sample_rows(samples: list[SourceSample]) -> list[list[str | int]]:
+        return [
+            [
+                item.document_id,
+                item.page,
+                item.section_name,
+                item.content_type,
+                item.character_count,
+                item.chunk_id,
+            ]
+            for item in samples
+        ]
+
+    def source_sample_detail(sample_id: str | None, values: list[dict[str, object]]) -> str:
+        for item in values or []:
+            if item.get("sample_id") == sample_id:
+                return (
+                    f"### {item['document_id']} — 第 {item['page']} 頁\n\n"
+                    f"類型：{item['content_type']}  \nChunk：`{item['chunk_id']}`\n\n{item['text']}"
+                )
+        return ""
+
+    def scan_source_samples(
+        project_id: str | None,
+        section_ids: list[str] | None,
+        page_from: float | None,
+        page_to: float | None,
+        content_type: str,
+        minimum_characters: float,
+    ):
+        if not project_id:
+            return "❌ 請先選擇專案", [], gr.Dropdown(choices=[]), "", []
+        try:
+            samples = source_sampling.scan(
+                project_id,
+                section_ids,
+                int(page_from) if page_from is not None else None,
+                int(page_to) if page_to is not None else None,
+                content_type,
+                int(minimum_characters),
+            )
+        except ProjectError as exc:
+            return f"❌ {exc}", [], gr.Dropdown(choices=[]), "", []
+        values = [asdict(item) for item in samples]
+        selector = gr.Dropdown(
+            choices=[(f"{item.document_id} p.{item.page} — {item.content_type}", item.sample_id) for item in samples],
+            value=samples[0].sample_id if samples else None,
+        )
+        detail = source_sample_detail(samples[0].sample_id, values) if samples else ""
+        return f"✅ 找到 {len(samples)} 筆候選原文", sample_rows(samples), selector, detail, values
+
+    def create_source_sample_batch(
+        project_id: str | None,
+        section_ids: list[str] | None,
+        page_from: float | None,
+        page_to: float | None,
+        content_type: str,
+        minimum_characters: float,
+        count: float,
+        seed: float,
+    ):
+        if not project_id:
+            return "❌ 請先選擇專案", [], gr.Dropdown(choices=[]), "", [], ""
+        try:
+            batch = source_sampling.sample(
+                project_id,
+                int(count),
+                section_ids,
+                int(page_from) if page_from is not None else None,
+                int(page_to) if page_to is not None else None,
+                content_type,
+                int(minimum_characters),
+                int(seed),
+            )
+        except ProjectError as exc:
+            return f"❌ {exc}", [], gr.Dropdown(choices=[]), "", [], ""
+        samples = list(batch.samples)
+        values = [asdict(item) for item in samples]
+        selector = gr.Dropdown(
+            choices=[(f"{item.document_id} p.{item.page} — {item.content_type}", item.sample_id) for item in samples],
+            value=samples[0].sample_id if samples else None,
+        )
+        detail = source_sample_detail(samples[0].sample_id, values) if samples else ""
+        return (
+            f"✅ 已建立取樣批次 {batch.sample_batch_id}，共 {len(samples)} 筆",
+            sample_rows(samples),
+            selector,
+            detail,
+            values,
+            batch.sample_batch_id,
+        )
+
+    def export_source_samples(project_id: str | None, sample_batch_id: str):
+        if not project_id or not sample_batch_id:
+            return "❌ 尚未建立取樣批次", None, None
+        try:
+            json_path, csv_path = source_sampling.export(project_id, sample_batch_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", None, None
+        return "✅ 已匯出原文取樣 JSON 與 CSV", str(json_path), str(csv_path)
 
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
@@ -787,6 +904,53 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 retrieval_json_export = gr.File(label="Retrieval JSON")
                 retrieval_csv_export = gr.File(label="Retrieval CSV")
 
+        with gr.Tab("題目生成"):
+            gr.Markdown("## 原文取樣器")
+            with gr.Row():
+                sampling_project = gr.Dropdown(choices=project_choices(), label="專案")
+                sampling_project_refresh = gr.Button("重新整理專案")
+                sampling_sections = gr.Dropdown(multiselect=True, label="章節（空白代表全部）")
+            with gr.Row():
+                sampling_page_from = gr.Number(label="起始頁碼", minimum=1, precision=0)
+                sampling_page_to = gr.Number(label="結束頁碼", minimum=1, precision=0)
+                sampling_content_type = gr.Dropdown(
+                    choices=[
+                        ("全部", "all"),
+                        ("診斷", "diagnostic"),
+                        ("程序", "procedure"),
+                        ("規格", "specification"),
+                        ("一般", "general"),
+                    ],
+                    value="all",
+                    label="內容類型",
+                )
+                sampling_minimum_characters = gr.Number(
+                    label="最小字數",
+                    value=200,
+                    minimum=1,
+                    precision=0,
+                )
+            with gr.Row():
+                sampling_count = gr.Number(label="取樣數量", value=10, minimum=1, precision=0)
+                sampling_seed = gr.Number(label="Random Seed", value=42, precision=0)
+                scan_sources_button = gr.Button("掃描可用原文")
+                sample_sources_button = gr.Button("建立取樣批次", variant="primary")
+                export_samples_button = gr.Button("匯出取樣")
+            sampling_result = gr.Markdown()
+            sampling_table = gr.Dataframe(
+                headers=SAMPLE_COLUMNS,
+                interactive=False,
+                datatype=["str", "number", "str", "str", "number", "str"],
+                label="候選／取樣原文",
+            )
+            sampling_values_state = gr.State([])
+            sampling_batch_state = gr.State("")
+            sampling_preview_selector = gr.Dropdown(label="預覽原文")
+            sampling_preview = gr.Markdown()
+            with gr.Row():
+                sampling_json_export = gr.File(label="取樣 JSON")
+                sampling_csv_export = gr.File(label="取樣 CSV")
+
         refresh_button.click(
             refresh_project_views,
             inputs=selected_project,
@@ -1084,6 +1248,64 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             export_retrieval_evaluation,
             inputs=[retrieval_project, retrieval_question_set],
             outputs=[retrieval_result, retrieval_json_export, retrieval_csv_export],
+        )
+        sampling_project_refresh.click(
+            lambda: gr.Dropdown(choices=project_choices()),
+            outputs=sampling_project,
+        )
+        sampling_project.change(
+            sampling_section_choices,
+            inputs=sampling_project,
+            outputs=sampling_sections,
+        )
+        scan_sources_button.click(
+            scan_source_samples,
+            inputs=[
+                sampling_project,
+                sampling_sections,
+                sampling_page_from,
+                sampling_page_to,
+                sampling_content_type,
+                sampling_minimum_characters,
+            ],
+            outputs=[
+                sampling_result,
+                sampling_table,
+                sampling_preview_selector,
+                sampling_preview,
+                sampling_values_state,
+            ],
+        )
+        sample_sources_button.click(
+            create_source_sample_batch,
+            inputs=[
+                sampling_project,
+                sampling_sections,
+                sampling_page_from,
+                sampling_page_to,
+                sampling_content_type,
+                sampling_minimum_characters,
+                sampling_count,
+                sampling_seed,
+            ],
+            outputs=[
+                sampling_result,
+                sampling_table,
+                sampling_preview_selector,
+                sampling_preview,
+                sampling_values_state,
+                sampling_batch_state,
+            ],
+        )
+        sampling_preview_selector.input(
+            source_sample_detail,
+            inputs=[sampling_preview_selector, sampling_values_state],
+            outputs=sampling_preview,
+        )
+        export_samples_button.click(
+            export_source_samples,
+            inputs=[sampling_project, sampling_batch_state],
+            outputs=[sampling_result, sampling_json_export, sampling_csv_export],
         )
         test_connection_button.click(
             test_connection,
