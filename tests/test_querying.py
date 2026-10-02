@@ -48,6 +48,11 @@ class FakeEvidenceService:
         ]
 
 
+class FailingEvidenceService:
+    def from_context(self, project_id: str, context: dict[str, object]) -> list[Evidence]:
+        raise ProjectError(f"找不到專案：{project_id}")
+
+
 class QueryServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -128,6 +133,22 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(summary["sections"]["sources"]["items"], 100)
         self.assertNotIn("x" * 100, json.dumps(summary))
         self.assertLess(len(json.dumps(summary)), 1000)
+
+    def test_answer_survives_evidence_resolution_project_error(self) -> None:
+        service = QueryService(
+            self.store,
+            ContextQueryRunner(),
+            self.connections,
+            evidence_service=FailingEvidenceService(),
+        )
+
+        result = service.ask("L33-SM3E", "測試來源錯誤")
+
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertEqual(result.answer, "有來源的回答")
+        self.assertEqual(result.evidence, ())
+        self.assertIn("找不到專案", result.context["_evidence_warning"])
+        self.assertEqual(service.history("L33-SM3E")[0], result)
 
     def test_query_rejects_project_without_completed_index(self) -> None:
         self.store.update_status("L33-SM3E", "READY")

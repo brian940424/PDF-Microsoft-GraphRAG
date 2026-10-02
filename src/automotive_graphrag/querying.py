@@ -67,6 +67,7 @@ class QueryService:
 
     def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
         project = self.projects.get(project_id)
+        project_path = self.projects.path_for(project_id)
         prompt = question.strip()
         normalized_method = method.strip().lower()
         if project.status != "INDEXED":
@@ -76,7 +77,7 @@ class QueryService:
         if normalized_method not in QUERY_METHODS:
             raise ProjectError(f"不支援的查詢方法：{method}")
 
-        graph_root = self.projects.path_for(project_id) / "graphrag"
+        graph_root = project_path / "graphrag"
         if not (graph_root / "output").is_dir():
             raise ProjectError("找不到此專案的 GraphRAG 索引輸出")
         self.connection_settings.apply_to_environment()
@@ -105,7 +106,13 @@ class QueryService:
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
         context = result.context if isinstance(result, QueryExecution) else {}
-        evidence = tuple(self.evidence_service.from_context(project_id, context)) if context else ()
+        evidence: tuple[Evidence, ...] = ()
+        if context:
+            try:
+                evidence = tuple(self.evidence_service.from_context(project_id, context))
+            except (ProjectError, OSError, ValueError) as exc:
+                context = dict(context)
+                context["_evidence_warning"] = str(exc)
         if result.returncode == 0 and not answer:
             error = "GraphRAG 未回傳回答"
         query_result = QueryResult(
@@ -122,7 +129,11 @@ class QueryService:
             evidence=evidence,
             context=context,
         )
-        self._append_record(self.projects.path_for(project_id) / "runs" / "queries.jsonl", query_result)
+        try:
+            self._append_record(project_path / "runs" / "queries.jsonl", query_result)
+        except FileNotFoundError:
+            # A separate admin process may remove the project while a long query is running.
+            pass
         return query_result
 
     def history(self, project_id: str) -> list[QueryResult]:
