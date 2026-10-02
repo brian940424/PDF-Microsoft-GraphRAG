@@ -13,10 +13,12 @@ from .documents import DocumentInfo, DocumentService
 from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
+from .question_sets import QuestionSet, QuestionSetService
 
 
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
+BATCH_COLUMNS = ["題號", "問題", "狀態", "耗時 (秒)", "錯誤"]
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -25,6 +27,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     documents = DocumentService(store)
     indexing = IndexingService(store, connection_settings=connections)
     querying = QueryService(store, connection_settings=connections)
+    question_sets = QuestionSetService(store, querying)
 
     def connection_status() -> str:
         return f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key()}"
@@ -76,6 +79,87 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if query_result.status == "FAILED":
             return "", f"❌ {summary}｜{query_result.error}"
         return query_result.answer, f"✅ {summary}"
+
+    def question_set_choices(project_id: str | None) -> list[tuple[str, str]]:
+        if not project_id:
+            return []
+        try:
+            return [(item.name, item.question_set_id) for item in question_sets.list(project_id)]
+        except ProjectError:
+            return []
+
+    def batch_rows(question_set: QuestionSet | None) -> list[list[str | float | None]]:
+        if question_set is None:
+            return []
+        return [
+            [item.question_id, item.question, item.status, item.duration_seconds, item.error]
+            for item in question_set.questions
+        ]
+
+    def batch_summary(question_set: QuestionSet) -> str:
+        summary = question_sets.summary(question_set)
+        return (
+            f"題目集：{question_set.name}｜總計 {summary.total}｜完成 {summary.completed}｜"
+            f"失敗 {summary.failed}｜待執行 {summary.pending}｜執行中 {summary.running}"
+        )
+
+    def question_set_view(project_id: str | None, question_set_id: str | None):
+        choices = question_set_choices(project_id)
+        if not project_id or not question_set_id:
+            return gr.Dropdown(choices=choices), [], gr.Dropdown(choices=[]), ""
+        try:
+            question_set = question_sets.get(project_id, question_set_id)
+        except ProjectError:
+            return gr.Dropdown(choices=choices), [], gr.Dropdown(choices=[]), ""
+        question_choices = [(item.question_id, item.question_id) for item in question_set.questions]
+        return (
+            gr.Dropdown(choices=choices, value=question_set_id),
+            batch_rows(question_set),
+            gr.Dropdown(choices=question_choices, value=[]),
+            batch_summary(question_set),
+        )
+
+    def import_question_set(project_id: str | None, source: str | None):
+        if not project_id or not source:
+            return "❌ 請選擇專案與題目集 JSON", {"errors": ["缺少專案或檔案"]}, *question_set_view(project_id, None)
+        try:
+            imported = question_sets.import_file(project_id, source)
+        except ProjectError as exc:
+            return f"❌ {exc}", {"errors": str(exc).splitlines()}, *question_set_view(project_id, None)
+        view = question_set_view(project_id, imported.question_set_id)
+        return f"✅ 已匯入 {len(imported.questions)} 題", {}, *view
+
+    def run_batch(
+        project_id: str | None,
+        question_set_id: str | None,
+        method: str,
+        selected_question_ids: list[str] | None,
+        mode: str,
+    ):
+        if not project_id or not question_set_id:
+            return "❌ 請先選擇專案與題目集", [], ""
+        if mode == "selected" and not selected_question_ids:
+            return "❌ 請至少選擇一題", batch_rows(question_sets.get(project_id, question_set_id)), ""
+        try:
+            result = question_sets.run(
+                project_id,
+                question_set_id,
+                method,
+                selected_question_ids=selected_question_ids if mode == "selected" else None,
+                resume=mode == "resume",
+            )
+        except ProjectError as exc:
+            return f"❌ {exc}", [], ""
+        return f"✅ 批次執行完成｜{batch_summary(result)}", batch_rows(result), batch_summary(result)
+
+    def export_batch(project_id: str | None, question_set_id: str | None):
+        if not project_id or not question_set_id:
+            return "❌ 請先選擇專案與題目集", None, None
+        try:
+            json_path, csv_path = question_sets.export(project_id, question_set_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", None, None
+        return "✅ 已匯出 JSON 與 CSV", str(json_path), str(csv_path)
 
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
@@ -312,6 +396,37 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 with gr.Column():
                     query_answer = gr.Markdown(label="系統回答")
                     query_summary = gr.Markdown(label="查詢資訊")
+            gr.Markdown("## 題目集批次問答")
+            with gr.Row():
+                batch_project = gr.Dropdown(choices=project_choices(), label="專案")
+                batch_project_refresh = gr.Button("重新整理專案")
+                question_set_selector = gr.Dropdown(label="題目集")
+            question_set_file = gr.File(file_types=[".json"], type="filepath", label="匯入 question_set.json")
+            with gr.Row():
+                import_question_set_button = gr.Button("匯入並驗證")
+                batch_method = gr.Dropdown(
+                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+                    value="local",
+                    label="查詢方法",
+                )
+            question_set_validation = gr.JSON(label="驗證錯誤")
+            selected_batch_questions = gr.Dropdown(multiselect=True, label="選擇題目（選題執行用）")
+            with gr.Row():
+                run_all_button = gr.Button("執行全部", variant="primary")
+                run_selected_button = gr.Button("執行選取題目")
+                resume_batch_button = gr.Button("繼續未完成")
+                export_batch_button = gr.Button("匯出結果")
+            batch_result = gr.Markdown()
+            batch_status = gr.Markdown()
+            batch_table = gr.Dataframe(
+                headers=BATCH_COLUMNS,
+                interactive=False,
+                datatype=["str", "str", "str", "number", "str"],
+                label="批次題目狀態",
+            )
+            with gr.Row():
+                batch_json_export = gr.File(label="JSON 匯出")
+                batch_csv_export = gr.File(label="CSV 匯出")
 
         refresh_button.click(
             refresh_project_views,
@@ -386,6 +501,58 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         clear_question_button.click(
             lambda: ("", "", ""),
             outputs=[question, query_answer, query_summary],
+        )
+        batch_project_refresh.click(
+            lambda: gr.Dropdown(choices=project_choices()),
+            outputs=batch_project,
+        )
+        batch_project.change(
+            lambda project_id: question_set_view(project_id, None),
+            inputs=batch_project,
+            outputs=[question_set_selector, batch_table, selected_batch_questions, batch_status],
+        )
+        question_set_selector.input(
+            question_set_view,
+            inputs=[batch_project, question_set_selector],
+            outputs=[question_set_selector, batch_table, selected_batch_questions, batch_status],
+        )
+        import_question_set_button.click(
+            import_question_set,
+            inputs=[batch_project, question_set_file],
+            outputs=[
+                batch_result,
+                question_set_validation,
+                question_set_selector,
+                batch_table,
+                selected_batch_questions,
+                batch_status,
+            ],
+        )
+        run_all_button.click(
+            lambda project_id, question_set_id, method, selected: run_batch(
+                project_id, question_set_id, method, selected, "all"
+            ),
+            inputs=[batch_project, question_set_selector, batch_method, selected_batch_questions],
+            outputs=[batch_result, batch_table, batch_status],
+        )
+        run_selected_button.click(
+            lambda project_id, question_set_id, method, selected: run_batch(
+                project_id, question_set_id, method, selected, "selected"
+            ),
+            inputs=[batch_project, question_set_selector, batch_method, selected_batch_questions],
+            outputs=[batch_result, batch_table, batch_status],
+        )
+        resume_batch_button.click(
+            lambda project_id, question_set_id, method, selected: run_batch(
+                project_id, question_set_id, method, selected, "resume"
+            ),
+            inputs=[batch_project, question_set_selector, batch_method, selected_batch_questions],
+            outputs=[batch_result, batch_table, batch_status],
+        )
+        export_batch_button.click(
+            export_batch,
+            inputs=[batch_project, question_set_selector],
+            outputs=[batch_result, batch_json_export, batch_csv_export],
         )
         test_connection_button.click(
             test_connection,

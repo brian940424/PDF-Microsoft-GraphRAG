@@ -5,6 +5,7 @@ from .documents import DocumentInfo, DocumentService, ProcessingReport
 from .indexing import IndexingResult, IndexingService
 from .projects import Project, ProjectError, ProjectStore
 from .querying import QueryResult, QueryService
+from .question_sets import BatchQuestion, BatchSummary, QuestionSet, QuestionSetService
 
 __all__ = [
     "DocumentInfo",
@@ -19,4 +20,8 @@ __all__ = [
     "ProjectStore",
     "QueryResult",
     "QueryService",
+    "BatchQuestion",
+    "BatchSummary",
+    "QuestionSet",
+    "QuestionSetService",
 ]
