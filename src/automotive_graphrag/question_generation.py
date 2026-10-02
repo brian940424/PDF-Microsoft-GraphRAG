@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import urllib.error
 import urllib.request
@@ -223,6 +224,8 @@ class QuestionGenerationService:
         ]
         return (
             "你是汽車維修手冊題目設計器。只能使用提供的原文，不可加入外部知識。\n"
+            "問題與參考答案必須使用繁體中文；零件名稱、縮寫、DTC、單位與原廠術語可保留英文。"
+            "不得因翻譯加入原文沒有的資訊。\n"
             f"生成 {count} 題，難度固定為 {difficulty}。問題不可直接暴露答案；參考答案必須可由引用原文完整支持。\n"
             "只輸出 JSON object，格式為 "
             '{"questions":[{"question":"...","reference_answer":"...","source_sample_ids":["..."]}]}。\n'
@@ -259,6 +262,8 @@ class QuestionGenerationService:
                 raise ProjectError(f"生成題目第 {index} 筆缺少問題")
             if not isinstance(answer, str) or not answer.strip():
                 raise ProjectError(f"生成題目第 {index} 筆缺少參考答案")
+            if not self._contains_chinese(question) or not self._contains_chinese(answer):
+                raise ProjectError(f"生成題目第 {index} 筆未使用繁體中文，請重新生成")
             if not isinstance(source_ids, list) or not source_ids or any(
                 not isinstance(source_id, str) or source_id not in source_by_id for source_id in source_ids
             ):
@@ -280,6 +285,10 @@ class QuestionGenerationService:
                 )
             )
         return questions
+
+    @staticmethod
+    def _contains_chinese(value: str) -> bool:
+        return re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", value) is not None
 
     @staticmethod
     def _validate_difficulty_sources(sources: list[SourceSample], difficulty: str, index: int) -> None:

@@ -98,6 +98,7 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         self.assertEqual(batch.questions[0].gold_evidence[0].chunk_ids, (sample_ids[0],))
         self.assertEqual(service.get("L33-SM3E", batch.generation_batch_id), batch)
         self.assertLess(len(client.calls[0][3]), 3000)
+        self.assertIn("必須使用繁體中文", client.calls[0][3])
 
     def test_generate_rejects_unknown_source_id_from_model(self) -> None:
         client = FakeGenerationClient(
@@ -114,6 +115,24 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         service = QuestionGenerationService(self.store, self.sampling, self.connections, client)
 
         with self.assertRaisesRegex(ProjectError, "不存在的 sample_id"):
+            service.generate("L33-SM3E", self.sample_batch.sample_batch_id, 1)
+
+    def test_generate_rejects_english_only_question_or_answer(self) -> None:
+        sample_id = self.sample_batch.samples[0].sample_id
+        client = FakeGenerationClient(
+            {
+                "questions": [
+                    {
+                        "question": "What should be checked first?",
+                        "reference_answer": "Check the fuse and power supply.",
+                        "source_sample_ids": [sample_id],
+                    }
+                ]
+            }
+        )
+        service = QuestionGenerationService(self.store, self.sampling, self.connections, client)
+
+        with self.assertRaisesRegex(ProjectError, "未使用繁體中文"):
             service.generate("L33-SM3E", self.sample_batch.sample_batch_id, 1)
 
     def test_cross_section_requires_sources_from_two_sections(self) -> None:

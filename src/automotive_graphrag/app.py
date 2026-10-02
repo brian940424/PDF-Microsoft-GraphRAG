@@ -1247,6 +1247,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Markdown("## AI 題目生成與人工審核")
             gr.Markdown(
                 "每個批次只呼叫 API 一次，使用連線設定中的 Chat Model（預設 `gpt-4o-mini`）。"
+                "問題與參考答案固定使用繁體中文，技術代號可保留英文。"
                 "生成結果只會引用上述取樣原文，且匯出前必須人工核准。"
             )
             with gr.Row():
