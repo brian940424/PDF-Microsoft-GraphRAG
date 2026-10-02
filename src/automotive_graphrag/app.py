@@ -14,6 +14,7 @@ from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_sets import QuestionSet, QuestionSetService
+from .reviews import ReviewService
 
 
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "更新時間"]
@@ -28,6 +29,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     indexing = IndexingService(store, connection_settings=connections)
     querying = QueryService(store, connection_settings=connections)
     question_sets = QuestionSetService(store, querying)
+    reviews = ReviewService(store, question_sets)
 
     def connection_status() -> str:
         return f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key()}"
@@ -160,6 +162,85 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             return f"❌ {exc}", None, None
         return "✅ 已匯出 JSON 與 CSV", str(json_path), str(csv_path)
+
+    def review_view(project_id: str | None, question_set_id: str | None, index: int = 0):
+        if not project_id or not question_set_id:
+            return "", "", None, "", 0, gr.Number(value=1, maximum=1), "尚未選擇題目集"
+        records = reviews.records(project_id, question_set_id)
+        if not records:
+            return "", "", None, "", 0, gr.Number(value=1, maximum=1), "題目集沒有題目"
+        safe_index = min(max(int(index), 0), len(records) - 1)
+        record = records[safe_index]
+        progress = reviews.progress(project_id, question_set_id)
+        question_text = f"### {record.question_id}\n\n{record.question}"
+        answer_text = record.answer or f"*沒有回答（狀態：{record.answer_status}）*"
+        progress_text = f"審查進度：{progress.reviewed} / {progress.total}｜目前第 {safe_index + 1} 題"
+        return (
+            question_text,
+            answer_text,
+            record.human_label,
+            record.reviewer_note,
+            safe_index,
+            gr.Number(value=safe_index + 1, minimum=1, maximum=len(records)),
+            progress_text,
+        )
+
+    def save_current_review(
+        project_id: str,
+        question_set_id: str,
+        index: int,
+        label: str | None,
+        note: str,
+        require_label: bool,
+    ) -> str:
+        if not label:
+            if require_label:
+                raise ProjectError("請先選擇正確性標籤")
+            return ""
+        records = reviews.records(project_id, question_set_id)
+        if not records:
+            raise ProjectError("題目集沒有題目")
+        safe_index = min(max(int(index), 0), len(records) - 1)
+        reviews.save(project_id, question_set_id, records[safe_index].question_id, label, note)
+        return "已自動儲存目前評測"
+
+    def navigate_review(
+        project_id: str | None,
+        question_set_id: str | None,
+        index: int,
+        label: str | None,
+        note: str,
+        offset: int,
+        require_label: bool = False,
+    ):
+        if not project_id or not question_set_id:
+            return *review_view(None, None), "❌ 請先選擇專案與題目集"
+        try:
+            saved = save_current_review(project_id, question_set_id, index, label, note, require_label)
+            view = review_view(project_id, question_set_id, int(index) + offset)
+        except ProjectError as exc:
+            return *review_view(project_id, question_set_id, index), f"❌ {exc}"
+        return *view, f"✅ {saved}" if saved else ""
+
+    def jump_review(
+        project_id: str | None,
+        question_set_id: str | None,
+        index: int,
+        label: str | None,
+        note: str,
+        target_number: float,
+    ):
+        target_index = max(int(target_number or 1) - 1, 0)
+        return navigate_review(project_id, question_set_id, index, label, note, target_index - int(index))
+
+    def export_reviews(project_id: str | None, question_set_id: str | None):
+        if not project_id or not question_set_id:
+            return "❌ 請先選擇專案與題目集", None, None
+        try:
+            json_path, csv_path = reviews.export(project_id, question_set_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", None, None
+        return "✅ 已匯出人工評測 JSON 與 CSV", str(json_path), str(csv_path)
 
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
@@ -428,6 +509,37 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 batch_json_export = gr.File(label="JSON 匯出")
                 batch_csv_export = gr.File(label="CSV 匯出")
 
+        with gr.Tab("人工檢查"):
+            with gr.Row():
+                review_project = gr.Dropdown(choices=project_choices(), label="專案")
+                review_project_refresh = gr.Button("重新整理專案")
+                review_question_set = gr.Dropdown(label="題目集")
+            review_progress = gr.Markdown("尚未選擇題目集")
+            review_question = gr.Markdown()
+            gr.Markdown("### 系統回答")
+            review_answer = gr.Markdown()
+            review_label = gr.Radio(
+                choices=[
+                    ("正確", "correct"),
+                    ("部分正確", "partially_correct"),
+                    ("錯誤", "incorrect"),
+                    ("資料不足", "insufficient"),
+                ],
+                label="正確性",
+            )
+            review_note = gr.Textbox(label="審查備註", lines=3)
+            review_index = gr.State(0)
+            with gr.Row():
+                previous_review_button = gr.Button("上一題")
+                save_next_review_button = gr.Button("儲存並下一題", variant="primary")
+                review_number = gr.Number(label="跳到題號", value=1, minimum=1, maximum=1)
+                jump_review_button = gr.Button("跳轉")
+                export_reviews_button = gr.Button("匯出評測結果")
+            review_result = gr.Markdown()
+            with gr.Row():
+                review_json_export = gr.File(label="人工評測 JSON")
+                review_csv_export = gr.File(label="人工評測 CSV")
+
         refresh_button.click(
             refresh_project_views,
             inputs=selected_project,
@@ -553,6 +665,86 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             export_batch,
             inputs=[batch_project, question_set_selector],
             outputs=[batch_result, batch_json_export, batch_csv_export],
+        )
+        review_project_refresh.click(
+            lambda: gr.Dropdown(choices=project_choices()),
+            outputs=review_project,
+        )
+        review_project.change(
+            lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
+            inputs=review_project,
+            outputs=review_question_set,
+        )
+        review_question_set.input(
+            lambda project_id, question_set_id: review_view(project_id, question_set_id, 0),
+            inputs=[review_project, review_question_set],
+            outputs=[
+                review_question,
+                review_answer,
+                review_label,
+                review_note,
+                review_index,
+                review_number,
+                review_progress,
+            ],
+        )
+        previous_review_button.click(
+            lambda project_id, question_set_id, index, label, note: navigate_review(
+                project_id, question_set_id, index, label, note, -1
+            ),
+            inputs=[review_project, review_question_set, review_index, review_label, review_note],
+            outputs=[
+                review_question,
+                review_answer,
+                review_label,
+                review_note,
+                review_index,
+                review_number,
+                review_progress,
+                review_result,
+            ],
+        )
+        save_next_review_button.click(
+            lambda project_id, question_set_id, index, label, note: navigate_review(
+                project_id, question_set_id, index, label, note, 1, True
+            ),
+            inputs=[review_project, review_question_set, review_index, review_label, review_note],
+            outputs=[
+                review_question,
+                review_answer,
+                review_label,
+                review_note,
+                review_index,
+                review_number,
+                review_progress,
+                review_result,
+            ],
+        )
+        jump_review_button.click(
+            jump_review,
+            inputs=[
+                review_project,
+                review_question_set,
+                review_index,
+                review_label,
+                review_note,
+                review_number,
+            ],
+            outputs=[
+                review_question,
+                review_answer,
+                review_label,
+                review_note,
+                review_index,
+                review_number,
+                review_progress,
+                review_result,
+            ],
+        )
+        export_reviews_button.click(
+            export_reviews,
+            inputs=[review_project, review_question_set],
+            outputs=[review_result, review_json_export, review_csv_export],
         )
         test_connection_button.click(
             test_connection,
