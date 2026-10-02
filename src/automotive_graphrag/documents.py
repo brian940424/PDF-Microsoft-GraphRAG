@@ -223,10 +223,15 @@ class DocumentService:
             records.append(
                 {
                     "id": f"{project_id}-{document_stem}-p{page_number:04d}",
+                    "chunk_id": f"{project_id}-{document_stem}-p{page_number:04d}-b01",
+                    "project_id": project_id,
+                    "section_id": document_stem,
+                    "section_name": source.stem,
                     "title": f"{source.name} - Page {page_number}",
                     "text": text,
                     "document_id": source.name,
                     "page": page_number,
+                    "block_id": "b01",
                 }
             )
             totals["successful_pages"] += 1

@@ -18,9 +18,11 @@ import yaml
 
 from .connections import ConnectionSettings
 from .projects import ProjectError, ProjectStore
+from .source_metadata import SourceMetadataService
 
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
+MetadataBuilder = Callable[[str], object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,12 +45,14 @@ class IndexingService:
         chat_model: str | None = None,
         embedding_model: str | None = None,
         connection_settings: ConnectionSettings | None = None,
+        metadata_builder: MetadataBuilder | None = None,
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
         self.chat_model = chat_model
         self.embedding_model = embedding_model
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
+        self.metadata_builder = metadata_builder or SourceMetadataService(projects).build
         self._active_log: Path | None = None
 
     def initialize(self, project_id: str) -> Path:
@@ -110,6 +114,7 @@ class IndexingService:
                 raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
             if not output.is_dir():
                 raise ProjectError("GraphRAG 建圖完成但找不到 output 目錄")
+            self.metadata_builder(project_id)
             if backup.exists():
                 shutil.rmtree(backup)
             status = "INDEXED"

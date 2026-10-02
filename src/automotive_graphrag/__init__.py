@@ -7,6 +7,7 @@ from .projects import Project, ProjectError, ProjectStore
 from .querying import QueryResult, QueryService
 from .question_sets import BatchQuestion, BatchSummary, QuestionSet, QuestionSetService
 from .reviews import ReviewProgress, ReviewRecord, ReviewService
+from .source_metadata import SourceMetadata, SourceMetadataService
 
 __all__ = [
     "DocumentInfo",
@@ -28,4 +29,6 @@ __all__ = [
     "ReviewProgress",
     "ReviewRecord",
     "ReviewService",
+    "SourceMetadata",
+    "SourceMetadataService",
 ]

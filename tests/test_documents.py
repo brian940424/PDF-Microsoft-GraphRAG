@@ -113,10 +113,15 @@ class DocumentServiceTests(unittest.TestCase):
             records[1],
             {
                 "id": "L33-SM3E-WW-p0001",
+                "chunk_id": "L33-SM3E-WW-p0001-b01",
+                "project_id": "L33-SM3E",
+                "section_id": "WW",
+                "section_name": "WW",
                 "title": "WW.pdf - Page 1",
                 "text": "雨刷檢修內容",
                 "document_id": "WW.pdf",
                 "page": 1,
+                "block_id": "b01",
             },
         )
         details = json.loads((processed / "report.json").read_text())

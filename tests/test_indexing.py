@@ -54,13 +54,22 @@ class IndexingServiceTests(unittest.TestCase):
             lambda base_url, key: ConnectionTestResult(True, "ok"),
         )
         self.connections.save("https://api.openai.com/v1", "test-key")
+        self.metadata_projects: list[str] = []
+
+    def build_metadata(self, project_id: str) -> None:
+        self.metadata_projects.append(project_id)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
     def test_initialize_uses_cli_and_configures_jsonl_input(self) -> None:
         runner = FakeGraphRag()
-        service = IndexingService(self.store, runner, connection_settings=self.connections)
+        service = IndexingService(
+            self.store,
+            runner,
+            connection_settings=self.connections,
+            metadata_builder=self.build_metadata,
+        )
 
         settings_path = service.initialize("L33-SM3E")
 
@@ -88,7 +97,12 @@ class IndexingServiceTests(unittest.TestCase):
 
     def test_successful_build_sets_indexed_and_saves_result(self) -> None:
         runner = FakeGraphRag()
-        service = IndexingService(self.store, runner, connection_settings=self.connections)
+        service = IndexingService(
+            self.store,
+            runner,
+            connection_settings=self.connections,
+            metadata_builder=self.build_metadata,
+        )
 
         result = service.build("L33-SM3E")
 
@@ -96,6 +110,7 @@ class IndexingServiceTests(unittest.TestCase):
         self.assertEqual(self.store.get("L33-SM3E").status, "INDEXED")
         self.assertTrue((self.store.path_for("L33-SM3E") / "graphrag" / "output" / "entities.parquet").is_file())
         self.assertEqual(service.last_result("L33-SM3E"), result)
+        self.assertEqual(self.metadata_projects, ["L33-SM3E"])
         self.assertFalse((self.store.path_for("L33-SM3E") / "graphrag" / ".indexing.lock").exists())
 
     def test_failed_rebuild_restores_last_successful_output(self) -> None:
@@ -109,6 +124,7 @@ class IndexingServiceTests(unittest.TestCase):
             self.store,
             FakeGraphRag(fail_index=True),
             connection_settings=self.connections,
+            metadata_builder=self.build_metadata,
         )
 
         result = service.build("L33-SM3E")
@@ -128,6 +144,7 @@ class IndexingServiceTests(unittest.TestCase):
                 self.store,
                 FakeGraphRag(),
                 connection_settings=self.connections,
+                metadata_builder=self.build_metadata,
             ).build("L33-SM3E")
 
         self.assertEqual(self.store.get("L33-SM3E").status, "READY")
@@ -140,6 +157,7 @@ class IndexingServiceTests(unittest.TestCase):
                 self.store,
                 FakeGraphRag(),
                 connection_settings=self.connections,
+                metadata_builder=self.build_metadata,
             ).build("L33-SM3E")
 
 
