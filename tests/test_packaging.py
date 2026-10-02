@@ -25,19 +25,27 @@ class PackagingConfigurationTests(unittest.TestCase):
         dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
 
         requirements_copy = dockerfile.index("COPY requirements.docker.txt")
-        dependency_install = dockerfile.index("uv pip install --system --index-url")
+        dependency_install = dockerfile.index("uv pip install --system")
         source_copy = dockerfile.index("COPY . .")
         application_install = dockerfile.index("uv pip install --system --no-deps .")
         self.assertLess(requirements_copy, dependency_install)
         self.assertLess(dependency_install, source_copy)
         self.assertLess(source_copy, application_install)
-        self.assertIn("python -m pip install --index-url \"${PYPI_INDEX_URL}\" uv", dockerfile)
+        self.assertIn(
+            "COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/",
+            dockerfile,
+        )
+        self.assertNotIn("pip install uv", dockerfile)
+        self.assertIn('--default-index "${PYPI_INDEX_URL}"', dockerfile)
         self.assertGreaterEqual(
             dockerfile.count("--mount=type=cache,target=/root/.cache/uv"),
             2,
         )
         self.assertIn("# syntax=docker/dockerfile:1.7", dockerfile)
-        self.assertIn("ARG PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple", dockerfile)
+        self.assertIn(
+            'ARG PYPI_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"',
+            dockerfile,
+        )
 
 
 if __name__ == "__main__":

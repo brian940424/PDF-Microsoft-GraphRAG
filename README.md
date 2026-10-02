@@ -121,20 +121,20 @@ Windows PowerShell（單行）：
 $env:DOCKER_BUILDKIT="1"; docker build --progress=plain -t automotive-graphrag:local .
 ```
 
-Dockerfile 會先從 PyPI 鏡像安裝 `uv`，再以 `uv pip install --system` 並行下載及安裝 `requirements.docker.txt` 中已驗證的固定版本，最後才複製應用程式碼。如此可避免 pip 在 GraphRAG 與 Pandas 版本間大量回溯；後續只修改原始碼或 README 時，也會直接沿用依賴 layer 與 `/root/.cache/uv` BuildKit 快取。
+Dockerfile 會直接從 Astral 官方容器映像複製 `uv` 與 `uvx` 二進位檔，不依賴 PyPI 鏡像是否收錄 `uv`；接著以 `uv pip install --system` 並行下載及安裝 `requirements.docker.txt` 中已驗證的固定版本，最後才複製應用程式碼。如此可避免 pip 在 GraphRAG 與 Pandas 版本間大量回溯；後續只修改原始碼或 README 時，也會直接沿用依賴 layer 與 `/root/.cache/uv` BuildKit 快取。
 
-預設使用清華 PyPI 鏡像。若所在網路使用國網中心較快，可在建置時覆寫：
+預設使用清華 TUNA PyPI 鏡像。若所在網路使用阿里雲較快，可在建置時覆寫：
 
 Linux／macOS：
 
 ```bash
-DOCKER_BUILDKIT=1 docker build --build-arg PYPI_INDEX_URL=https://free.nchc.org.tw/pypi/simple/ --progress=plain -t automotive-graphrag:local .
+DOCKER_BUILDKIT=1 docker build --build-arg PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ --progress=plain -t automotive-graphrag:local .
 ```
 
 Windows PowerShell（單行）：
 
 ```powershell
-$env:DOCKER_BUILDKIT="1"; docker build --build-arg PYPI_INDEX_URL=https://free.nchc.org.tw/pypi/simple/ --progress=plain -t automotive-graphrag:local .
+$env:DOCKER_BUILDKIT="1"; docker build --build-arg PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ --progress=plain -t automotive-graphrag:local .
 ```
 
 也可將 `PYPI_INDEX_URL` 改回 `https://pypi.org/simple`。請只使用信任且支援 HTTPS 的鏡像站。

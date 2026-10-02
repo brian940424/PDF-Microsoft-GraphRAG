@@ -10,18 +10,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Override at build time when another mirror is faster or required.
-ARG PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# Copy the standalone binaries from Astral's official image so uv does not
+# depend on the selected Python package mirror being synchronized.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Install uv separately so dependency resolution and downloads use its parallel Rust implementation.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --index-url "${PYPI_INDEX_URL}" uv
+# Override at build time when another mirror is faster or required.
+ARG PYPI_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # Keep the large GraphRAG dependency layer independent from application source.
 # BuildKit reuses both this layer and uv's package cache on later builds.
 COPY requirements.docker.txt ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --index-url "${PYPI_INDEX_URL}" -r requirements.docker.txt
+    uv pip install --system \
+    --default-index "${PYPI_INDEX_URL}" \
+    -r requirements.docker.txt
 
 # Source changes only invalidate the lightweight application install layer below.
 COPY . .
