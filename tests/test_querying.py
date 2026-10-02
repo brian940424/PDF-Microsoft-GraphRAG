@@ -65,6 +65,11 @@ class QueryServiceTests(unittest.TestCase):
             settings["completion_models"]["default_completion_model"]["api_base"],
             "https://api.openai.com/v1",
         )
+        self.assertEqual(settings["completion_models"]["default_completion_model"]["model"], "gpt-4o-mini")
+        self.assertEqual(
+            settings["embedding_models"]["default_embedding_model"]["model"],
+            "text-embedding-3-small",
+        )
 
     def test_failed_query_is_saved_with_error(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(return_code=2), self.connections)

@@ -46,15 +46,15 @@ class IndexingService:
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
-        self.chat_model = chat_model or os.environ.get("GRAPHRAG_CHAT_MODEL", "gpt-4.1")
-        self.embedding_model = embedding_model or os.environ.get(
-            "GRAPHRAG_EMBEDDING_MODEL", "text-embedding-3-large"
-        )
+        self.chat_model = chat_model
+        self.embedding_model = embedding_model
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
         self._active_log: Path | None = None
 
     def initialize(self, project_id: str) -> Path:
         self.connection_settings.apply_to_environment()
+        chat_model = self.chat_model or self.connection_settings.get_chat_model()
+        embedding_model = self.embedding_model or self.connection_settings.get_embedding_model()
         project_path = self.projects.path_for(project_id)
         graph_root = project_path / "graphrag"
         settings = graph_root / "settings.yaml"
@@ -68,9 +68,9 @@ class IndexingService:
                     "--root",
                     str(graph_root),
                     "--model",
-                    self.chat_model,
+                    chat_model,
                     "--embedding",
-                    self.embedding_model,
+                    embedding_model,
                 ]
             )
             if result.returncode:
@@ -79,6 +79,7 @@ class IndexingService:
             raise ProjectError("GraphRAG 初始化後未產生 settings.yaml")
         self._configure_jsonl_input(settings)
         self._configure_api_base(settings, self.connection_settings.get_api_base_url())
+        self._configure_models(settings, chat_model, embedding_model)
         self._sync_input(project_path, graph_root)
         return settings
 
@@ -206,6 +207,15 @@ class IndexingService:
         for section in ("completion_models", "embedding_models"):
             for model in value.get(section, {}).values():
                 model["api_base"] = api_base_url
+        IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
+
+    @staticmethod
+    def _configure_models(settings_path: Path, chat_model: str, embedding_model: str) -> None:
+        value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
+        for model in value.get("completion_models", {}).values():
+            model["model"] = chat_model
+        for model in value.get("embedding_models", {}).values():
+            model["model"] = embedding_model
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
 
     @staticmethod

@@ -18,6 +18,10 @@ from .projects import ProjectError
 API_KEY_ENVIRONMENT_VARIABLE = "GRAPHRAG_API_KEY"
 API_BASE_ENVIRONMENT_VARIABLE = "GRAPHRAG_API_BASE"
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
+ALLOWED_CHAT_MODELS = ("gpt-4o-mini", "gpt-4.1-mini")
+ALLOWED_EMBEDDING_MODELS = ("text-embedding-3-small", "text-embedding-3-large")
+DEFAULT_CHAT_MODEL = "gpt-4o-mini"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +64,24 @@ class ConnectionSettings:
             return os.environ.get(API_BASE_ENVIRONMENT_VARIABLE, DEFAULT_API_BASE_URL).rstrip("/")
         return self._validate_api_base_url(value.get("api_base_url", DEFAULT_API_BASE_URL))
 
+    def get_chat_model(self) -> str:
+        value = self._read()
+        model = (
+            value.get("chat_model", DEFAULT_CHAT_MODEL)
+            if value is not None
+            else os.environ.get("GRAPHRAG_CHAT_MODEL", DEFAULT_CHAT_MODEL)
+        )
+        return self._validate_model(model, ALLOWED_CHAT_MODELS, "Chat")
+
+    def get_embedding_model(self) -> str:
+        value = self._read()
+        model = (
+            value.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
+            if value is not None
+            else os.environ.get("GRAPHRAG_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+        )
+        return self._validate_model(model, ALLOWED_EMBEDDING_MODELS, "Embedding")
+
     def _read(self) -> dict[str, str] | None:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
@@ -72,10 +94,27 @@ class ConnectionSettings:
         return value
 
     def save_api_key(self, api_key: str) -> None:
-        self.save(self.get_api_base_url(), api_key)
+        self.save(
+            self.get_api_base_url(),
+            api_key,
+            self.get_chat_model(),
+            self.get_embedding_model(),
+        )
 
-    def save(self, api_base_url: str, api_key: str) -> None:
+    def save(
+        self,
+        api_base_url: str,
+        api_key: str,
+        chat_model: str = DEFAULT_CHAT_MODEL,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    ) -> None:
         base_url = self._validate_api_base_url(api_base_url)
+        selected_chat_model = self._validate_model(chat_model, ALLOWED_CHAT_MODELS, "Chat")
+        selected_embedding_model = self._validate_model(
+            embedding_model,
+            ALLOWED_EMBEDDING_MODELS,
+            "Embedding",
+        )
         key = api_key.strip()
         if not key:
             raise ProjectError("API Key 為必填")
@@ -86,7 +125,15 @@ class ConnectionSettings:
         try:
             os.fchmod(handle, 0o600)
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:
-                json.dump({"api_base_url": base_url, "api_key": key}, temporary)
+                json.dump(
+                    {
+                        "api_base_url": base_url,
+                        "api_key": key,
+                        "chat_model": selected_chat_model,
+                        "embedding_model": selected_embedding_model,
+                    },
+                    temporary,
+                )
                 temporary.write("\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
@@ -97,6 +144,8 @@ class ConnectionSettings:
                 os.unlink(temporary_name)
         os.environ[API_KEY_ENVIRONMENT_VARIABLE] = key
         os.environ[API_BASE_ENVIRONMENT_VARIABLE] = base_url
+        os.environ["GRAPHRAG_CHAT_MODEL"] = selected_chat_model
+        os.environ["GRAPHRAG_EMBEDDING_MODEL"] = selected_embedding_model
 
     def apply_to_environment(self) -> str:
         key = self.get_api_key()
@@ -104,6 +153,8 @@ class ConnectionSettings:
             raise ProjectError("尚未設定共用 GRAPHRAG_API_KEY，請先到連線設定頁設定")
         os.environ[API_KEY_ENVIRONMENT_VARIABLE] = key
         os.environ[API_BASE_ENVIRONMENT_VARIABLE] = self.get_api_base_url()
+        os.environ["GRAPHRAG_CHAT_MODEL"] = self.get_chat_model()
+        os.environ["GRAPHRAG_EMBEDDING_MODEL"] = self.get_embedding_model()
         return key
 
     def test(self, api_base_url: str | None = None, api_key: str | None = None) -> ConnectionTestResult:
@@ -122,6 +173,12 @@ class ConnectionSettings:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ProjectError("API Base URL 必須是有效的 HTTP(S) 網址")
         return value
+
+    @staticmethod
+    def _validate_model(model: object, allowed: tuple[str, ...], label: str) -> str:
+        if not isinstance(model, str) or model not in allowed:
+            raise ProjectError(f"{label} 模型不在允許清單：{', '.join(allowed)}")
+        return model
 
     @staticmethod
     def _test_openai(api_base_url: str, api_key: str) -> ConnectionTestResult:

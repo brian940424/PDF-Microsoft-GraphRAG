@@ -64,7 +64,12 @@ class QueryService:
         if not (graph_root / "output").is_dir():
             raise ProjectError("找不到此專案的 GraphRAG 索引輸出")
         self.connection_settings.apply_to_environment()
-        self._configure_api_base(graph_root / "settings.yaml", self.connection_settings.get_api_base_url())
+        self._configure_connection(
+            graph_root / "settings.yaml",
+            self.connection_settings.get_api_base_url(),
+            self.connection_settings.get_chat_model(),
+            self.connection_settings.get_embedding_model(),
+        )
         started = datetime.now(timezone.utc)
         started_clock = time.monotonic()
         result = self.runner(
@@ -121,7 +126,12 @@ class QueryService:
         return lines[-1] if lines else f"GraphRAG 查詢失敗（exit {result.returncode}）"
 
     @staticmethod
-    def _configure_api_base(settings_path: Path, api_base_url: str) -> None:
+    def _configure_connection(
+        settings_path: Path,
+        api_base_url: str,
+        chat_model: str,
+        embedding_model: str,
+    ) -> None:
         try:
             value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
         except FileNotFoundError as exc:
@@ -129,6 +139,10 @@ class QueryService:
         for section in ("completion_models", "embedding_models"):
             for model in value.get(section, {}).values():
                 model["api_base"] = api_base_url
+        for model in value.get("completion_models", {}).values():
+            model["model"] = chat_model
+        for model in value.get("embedding_models", {}).values():
+            model["model"] = embedding_model
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:

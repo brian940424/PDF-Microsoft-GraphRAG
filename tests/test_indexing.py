@@ -65,10 +65,10 @@ class IndexingServiceTests(unittest.TestCase):
         settings_path = service.initialize("L33-SM3E")
 
         self.assertIn("init", runner.commands[0])
-        self.assertEqual(runner.commands[0][runner.commands[0].index("--model") + 1], "gpt-4.1")
+        self.assertEqual(runner.commands[0][runner.commands[0].index("--model") + 1], "gpt-4o-mini")
         self.assertEqual(
             runner.commands[0][runner.commands[0].index("--embedding") + 1],
-            "text-embedding-3-large",
+            "text-embedding-3-small",
         )
         settings = yaml.safe_load(settings_path.read_text())
         self.assertEqual(settings["input"]["type"], "jsonl")
@@ -77,6 +77,11 @@ class IndexingServiceTests(unittest.TestCase):
         self.assertEqual(
             settings["completion_models"]["default_completion_model"]["api_base"],
             "https://api.openai.com/v1",
+        )
+        self.assertEqual(settings["completion_models"]["default_completion_model"]["model"], "gpt-4o-mini")
+        self.assertEqual(
+            settings["embedding_models"]["default_embedding_model"]["model"],
+            "text-embedding-3-small",
         )
         graph_input = settings_path.parent / "input" / "input.jsonl"
         self.assertIn('"id":"p1"', graph_input.read_text())

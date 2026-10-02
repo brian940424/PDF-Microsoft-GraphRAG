@@ -8,7 +8,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from .connections import ConnectionSettings
+from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
 from .documents import DocumentInfo, DocumentService
 from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
@@ -32,14 +32,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     reviews = ReviewService(store, question_sets)
 
     def connection_status() -> str:
-        return f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key()}"
+        return (
+            f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key()}；"
+            f"Chat `{connections.get_chat_model()}`；Embedding `{connections.get_embedding_model()}`"
+        )
 
-    def save_connection(api_base_url: str, api_key: str):
+    def save_connection(api_base_url: str, api_key: str, chat_model: str, embedding_model: str):
         try:
-            connections.save(api_base_url, api_key)
+            connections.save(api_base_url, api_key, chat_model, embedding_model)
         except ProjectError as exc:
-            return f"❌ {exc}", api_base_url, api_key
-        return f"✅ 連線設定已儲存。{connection_status()}", api_base_url, api_key
+            return f"❌ {exc}", api_base_url, api_key, chat_model, embedding_model
+        return (
+            f"✅ 連線設定已儲存。{connection_status()}",
+            api_base_url,
+            api_key,
+            chat_model,
+            embedding_model,
+        )
 
     def test_connection(api_base_url: str, api_key: str):
         try:
@@ -421,6 +430,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
             api_key = gr.Textbox(label="API Key", type="password", placeholder="輸入 API Key")
             with gr.Row():
+                chat_model = gr.Dropdown(
+                    choices=list(ALLOWED_CHAT_MODELS),
+                    value=connections.get_chat_model,
+                    label="Chat 模型",
+                )
+                embedding_model = gr.Dropdown(
+                    choices=list(ALLOWED_EMBEDDING_MODELS),
+                    value=connections.get_embedding_model,
+                    label="Embedding 模型",
+                )
+            gr.Markdown("開發測試建議使用 `gpt-4o-mini` 與 `text-embedding-3-small` 以降低成本。")
+            with gr.Row():
                 test_connection_button = gr.Button("測試連線")
                 save_connection_button = gr.Button("儲存連線設定", variant="primary")
             connection_result = gr.Markdown()
@@ -753,8 +774,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         save_connection_button.click(
             save_connection,
-            inputs=[api_base_url, api_key],
-            outputs=[connection_result, api_base_url, api_key],
+            inputs=[api_base_url, api_key, chat_model, embedding_model],
+            outputs=[connection_result, api_base_url, api_key, chat_model, embedding_model],
         ).then(connection_status, outputs=connection_state)
     return demo
 
