@@ -16,6 +16,7 @@ from typing import Callable
 
 import yaml
 
+from .connections import ConnectionSettings
 from .projects import ProjectError, ProjectStore
 
 
@@ -41,6 +42,7 @@ class IndexingService:
         runner: CommandRunner | None = None,
         chat_model: str | None = None,
         embedding_model: str | None = None,
+        connection_settings: ConnectionSettings | None = None,
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
@@ -48,9 +50,11 @@ class IndexingService:
         self.embedding_model = embedding_model or os.environ.get(
             "GRAPHRAG_EMBEDDING_MODEL", "text-embedding-3-large"
         )
+        self.connection_settings = connection_settings or ConnectionSettings(projects.root)
         self._active_log: Path | None = None
 
     def initialize(self, project_id: str) -> Path:
+        self.connection_settings.apply_to_environment()
         project_path = self.projects.path_for(project_id)
         graph_root = project_path / "graphrag"
         settings = graph_root / "settings.yaml"

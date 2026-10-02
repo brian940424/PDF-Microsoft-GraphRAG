@@ -1,5 +1,6 @@
 """Automotive repair manual GraphRAG platform."""
 
+from .connections import ConnectionSettings, ConnectionTestResult
 from .documents import DocumentInfo, DocumentService, ProcessingReport
 from .indexing import IndexingResult, IndexingService
 from .projects import Project, ProjectError, ProjectStore
@@ -7,6 +8,8 @@ from .projects import Project, ProjectError, ProjectStore
 __all__ = [
     "DocumentInfo",
     "DocumentService",
+    "ConnectionSettings",
+    "ConnectionTestResult",
     "IndexingResult",
     "IndexingService",
     "ProcessingReport",

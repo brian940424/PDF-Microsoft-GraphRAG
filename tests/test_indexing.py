@@ -5,6 +5,7 @@ from pathlib import Path
 
 import yaml
 
+from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult
 from automotive_graphrag.indexing import IndexingService
 from automotive_graphrag.projects import ProjectError, ProjectStore
 
@@ -43,13 +44,18 @@ class IndexingServiceTests(unittest.TestCase):
         project_path = self.store.path_for("L33-SM3E")
         (project_path / "processed" / "input.jsonl").write_text('{"id":"p1","title":"Page","text":"content"}\n')
         self.store.update_status("L33-SM3E", "READY")
+        self.connections = ConnectionSettings(
+            self.store.root,
+            lambda key: ConnectionTestResult(True, "ok"),
+        )
+        self.connections.save_api_key("test-key")
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
     def test_initialize_uses_cli_and_configures_jsonl_input(self) -> None:
         runner = FakeGraphRag()
-        service = IndexingService(self.store, runner)
+        service = IndexingService(self.store, runner, connection_settings=self.connections)
 
         settings_path = service.initialize("L33-SM3E")
 
@@ -68,7 +74,7 @@ class IndexingServiceTests(unittest.TestCase):
 
     def test_successful_build_sets_indexed_and_saves_result(self) -> None:
         runner = FakeGraphRag()
-        service = IndexingService(self.store, runner)
+        service = IndexingService(self.store, runner, connection_settings=self.connections)
 
         result = service.build("L33-SM3E")
 
@@ -85,7 +91,11 @@ class IndexingServiceTests(unittest.TestCase):
         output.mkdir()
         (output / "previous.parquet").write_bytes(b"previous")
         self.store.update_status("L33-SM3E", "STALE")
-        service = IndexingService(self.store, FakeGraphRag(fail_index=True))
+        service = IndexingService(
+            self.store,
+            FakeGraphRag(fail_index=True),
+            connection_settings=self.connections,
+        )
 
         result = service.build("L33-SM3E")
 
@@ -100,7 +110,11 @@ class IndexingServiceTests(unittest.TestCase):
         lock.write_text("busy")
 
         with self.assertRaisesRegex(ProjectError, "正在執行"):
-            IndexingService(self.store, FakeGraphRag()).build("L33-SM3E")
+            IndexingService(
+                self.store,
+                FakeGraphRag(),
+                connection_settings=self.connections,
+            ).build("L33-SM3E")
 
         self.assertEqual(self.store.get("L33-SM3E").status, "READY")
 
@@ -108,7 +122,11 @@ class IndexingServiceTests(unittest.TestCase):
         self.store.update_status("L33-SM3E", "UPLOADED")
 
         with self.assertRaisesRegex(ProjectError, "不允許建圖"):
-            IndexingService(self.store, FakeGraphRag()).build("L33-SM3E")
+            IndexingService(
+                self.store,
+                FakeGraphRag(),
+                connection_settings=self.connections,
+            ).build("L33-SM3E")
 
 
 if __name__ == "__main__":

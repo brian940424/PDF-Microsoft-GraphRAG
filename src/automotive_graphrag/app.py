@@ -7,6 +7,7 @@ from pathlib import Path
 
 import gradio as gr
 
+from .connections import ConnectionSettings
 from .documents import DocumentInfo, DocumentService
 from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
@@ -18,8 +19,27 @@ DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "�
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     store = ProjectStore(project_root or os.environ.get("PROJECTS_ROOT", "projects"))
+    connections = ConnectionSettings(store.root)
     documents = DocumentService(store)
-    indexing = IndexingService(store)
+    indexing = IndexingService(store, connection_settings=connections)
+
+    def connection_status() -> str:
+        return f"目前狀態：{connections.masked_api_key()}"
+
+    def save_connection(api_key: str):
+        try:
+            connections.save_api_key(api_key)
+        except ProjectError as exc:
+            return f"❌ {exc}", api_key
+        return f"✅ API Key 已儲存。{connection_status()}", ""
+
+    def test_connection(api_key: str):
+        try:
+            result = connections.test(api_key or None)
+        except ProjectError as exc:
+            return f"❌ {exc}"
+        icon = "✅" if result.success else "❌"
+        return f"{icon} {result.message}"
 
     def refresh_projects() -> list[list[str | int]]:
         return store.table_rows()
@@ -136,6 +156,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
             indexing_log = gr.Textbox(label="建圖日誌", lines=12, interactive=False)
 
+        with gr.Tab("連線設定"):
+            gr.Markdown("## GraphRAG 共用連線設定")
+            gr.Markdown("此 API Key 由所有 Project 共用；畫面不會顯示已儲存的完整 Key。")
+            connection_state = gr.Markdown(value=connection_status)
+            api_key = gr.Textbox(label="OpenAI API Key", type="password", placeholder="輸入新的 API Key")
+            with gr.Row():
+                test_connection_button = gr.Button("測試連線")
+                save_connection_button = gr.Button("儲存 API Key", variant="primary")
+            connection_result = gr.Markdown()
+
         refresh_button.click(refresh_projects, outputs=project_table)
         create_button.click(
             create_project,
@@ -164,6 +194,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         index_button.click(build_index, inputs=document_project, outputs=[document_result, indexing_log])
         document_refresh_button.click(document_rows, inputs=document_project, outputs=document_table)
+        test_connection_button.click(test_connection, inputs=api_key, outputs=connection_result)
+        save_connection_button.click(
+            save_connection,
+            inputs=api_key,
+            outputs=[connection_result, api_key],
+        ).then(connection_status, outputs=connection_state)
     return demo
 
 
