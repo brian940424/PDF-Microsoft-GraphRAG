@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+.pytest_cache
+__pycache__
+*.py[cod]
+*.log
+.env
+.connection.json
+projects
+tests
+UI設計書.md
+專案進度.md
