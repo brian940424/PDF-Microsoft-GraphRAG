@@ -6,6 +6,7 @@ from .evidence import Evidence, EvidenceService
 from .ground_truth import GroundTruthService
 from .indexing import IndexingResult, IndexingService
 from .projects import Project, ProjectError, ProjectStore
+from .question_generation import GeneratedQuestion, GeneratedQuestionBatch, QuestionGenerationService
 from .querying import QueryExecution, QueryResult, QueryService
 from .question_sets import BatchQuestion, BatchSummary, GoldEvidence, QuestionSet, QuestionSetService
 from .reviews import ReviewProgress, ReviewRecord, ReviewService
@@ -31,6 +32,9 @@ __all__ = [
     "Project",
     "ProjectError",
     "ProjectStore",
+    "GeneratedQuestion",
+    "GeneratedQuestionBatch",
+    "QuestionGenerationService",
     "QueryResult",
     "QueryExecution",
     "QueryService",

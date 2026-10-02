@@ -15,6 +15,7 @@ from .ground_truth import GroundTruthService
 from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
+from .question_generation import GeneratedQuestion, QuestionGenerationService
 from .question_sets import QuestionSet, QuestionSetService
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
@@ -28,6 +29,7 @@ EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "Retrieved", "First Relevant Rank", "Pass@K"]
 SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk ID"]
+GENERATED_QUESTION_COLUMNS = ["Question ID", "Question", "Difficulty", "Status", "Sources"]
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -41,6 +43,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     ground_truth = GroundTruthService(store, question_sets)
     retrieval_evaluation = RetrievalEvaluationService(store, question_sets)
     source_sampling = SourceSamplingService(store)
+    question_generation = QuestionGenerationService(store, source_sampling, connections)
 
     def connection_status() -> str:
         return (
@@ -528,6 +531,108 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", None, None
         return "✅ 已匯出原文取樣 JSON 與 CSV", str(json_path), str(csv_path)
 
+    @staticmethod
+    def generated_question_rows(questions: list[GeneratedQuestion]) -> list[list[str | int]]:
+        return [
+            [
+                item.question_id,
+                item.question,
+                item.difficulty,
+                item.generation_status,
+                len(item.source_sample_ids),
+            ]
+            for item in questions
+        ]
+
+    def generated_question_detail(question_id: str | None, values: list[dict[str, object]]):
+        for item in values or []:
+            if item.get("question_id") == question_id:
+                return (
+                    str(item.get("question", "")),
+                    str(item.get("reference_answer", "")),
+                    str(item.get("generation_status", "pending_review")),
+                    {
+                        "source_sample_ids": item.get("source_sample_ids", []),
+                        "gold_evidence": item.get("gold_evidence", []),
+                    },
+                )
+        return "", "", "pending_review", {}
+
+    def generate_questions(
+        project_id: str | None,
+        sample_batch_id: str,
+        count: float,
+        difficulty: str,
+        maximum_source_characters: float,
+    ):
+        empty = ([], gr.Dropdown(choices=[]), "", "", "pending_review", {}, [], "")
+        if not project_id or not sample_batch_id:
+            return ("❌ 請先選擇專案並建立取樣批次", *empty)
+        try:
+            batch = question_generation.generate(
+                project_id,
+                sample_batch_id,
+                int(count),
+                difficulty,
+                int(maximum_source_characters),
+            )
+        except ProjectError as exc:
+            return (f"❌ {exc}", *empty)
+        questions = list(batch.questions)
+        values = [asdict(item) for item in questions]
+        first_id = questions[0].question_id if questions else None
+        selector = gr.Dropdown(
+            choices=[(item.question_id, item.question_id) for item in questions],
+            value=first_id,
+        )
+        detail = generated_question_detail(first_id, values)
+        return (
+            f"✅ 已用 {batch.model} 單次呼叫生成 {len(questions)} 題；請逐題人工審核",
+            generated_question_rows(questions),
+            selector,
+            *detail,
+            values,
+            batch.generation_batch_id,
+        )
+
+    def update_generated_question(
+        project_id: str | None,
+        generation_batch_id: str,
+        question_id: str | None,
+        question: str,
+        reference_answer: str,
+        generation_status: str,
+    ):
+        if not project_id or not generation_batch_id or not question_id:
+            return "❌ 尚未選擇生成題目", [], gr.Dropdown(choices=[]), [], ""
+        try:
+            batch = question_generation.update_question(
+                project_id,
+                generation_batch_id,
+                question_id,
+                question,
+                reference_answer,
+                generation_status,
+            )
+        except ProjectError as exc:
+            return f"❌ {exc}", [], gr.Dropdown(), [], generation_batch_id
+        questions = list(batch.questions)
+        values = [asdict(item) for item in questions]
+        selector = gr.Dropdown(
+            choices=[(item.question_id, item.question_id) for item in questions],
+            value=question_id,
+        )
+        return "✅ 題目與審核狀態已儲存", generated_question_rows(questions), selector, values, generation_batch_id
+
+    def export_generated_question_set(project_id: str | None, generation_batch_id: str):
+        if not project_id or not generation_batch_id:
+            return "❌ 尚未建立題目生成批次", None
+        try:
+            path = question_generation.export_question_set(project_id, generation_batch_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", None
+        return "✅ 已匯出所有已核准題目的 question_set JSON", str(path)
+
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
             return {}
@@ -951,6 +1056,56 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 sampling_json_export = gr.File(label="取樣 JSON")
                 sampling_csv_export = gr.File(label="取樣 CSV")
 
+            gr.Markdown("## AI 題目生成與人工審核")
+            gr.Markdown(
+                "每個批次只呼叫 API 一次，使用連線設定中的 Chat Model（預設 `gpt-4o-mini`）。"
+                "生成結果只會引用上述取樣原文，且匯出前必須人工核准。"
+            )
+            with gr.Row():
+                generation_count = gr.Number(label="生成題數", value=3, minimum=1, precision=0)
+                generation_difficulty = gr.Dropdown(
+                    choices=[
+                        ("簡單（單一來源）", "simple"),
+                        ("中等（至少兩筆來源）", "medium"),
+                        ("跨章節（至少兩個章節）", "cross_section"),
+                    ],
+                    value="simple",
+                    label="難度",
+                )
+                generation_source_limit = gr.Number(
+                    label="每筆來源字數上限",
+                    value=2500,
+                    minimum=200,
+                    precision=0,
+                )
+                generate_questions_button = gr.Button("呼叫 API 生成候選題", variant="primary")
+            generation_result = gr.Markdown()
+            generated_question_table = gr.Dataframe(
+                headers=GENERATED_QUESTION_COLUMNS,
+                interactive=False,
+                datatype=["str", "str", "str", "str", "number"],
+                label="生成候選題",
+            )
+            generated_values_state = gr.State([])
+            generation_batch_state = gr.State("")
+            generated_question_selector = gr.Dropdown(label="選擇要審核的題目")
+            generated_question_editor = gr.Textbox(label="問題", lines=3)
+            generated_answer_editor = gr.Textbox(label="參考答案", lines=5)
+            with gr.Row():
+                generated_status = gr.Dropdown(
+                    choices=[
+                        ("待審核", "pending_review"),
+                        ("核准", "approved"),
+                        ("淘汰", "rejected"),
+                    ],
+                    value="pending_review",
+                    label="審核狀態",
+                )
+                save_generated_question_button = gr.Button("儲存編輯與審核狀態")
+                export_generated_questions_button = gr.Button("匯出已核准 question_set")
+            generated_evidence = gr.JSON(label="引用來源與 Gold Evidence")
+            generated_question_export = gr.File(label="Question Set JSON")
+
         refresh_button.click(
             refresh_project_views,
             inputs=selected_project,
@@ -1306,6 +1461,60 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             export_source_samples,
             inputs=[sampling_project, sampling_batch_state],
             outputs=[sampling_result, sampling_json_export, sampling_csv_export],
+        )
+        generate_questions_button.click(
+            generate_questions,
+            inputs=[
+                sampling_project,
+                sampling_batch_state,
+                generation_count,
+                generation_difficulty,
+                generation_source_limit,
+            ],
+            outputs=[
+                generation_result,
+                generated_question_table,
+                generated_question_selector,
+                generated_question_editor,
+                generated_answer_editor,
+                generated_status,
+                generated_evidence,
+                generated_values_state,
+                generation_batch_state,
+            ],
+        )
+        generated_question_selector.input(
+            generated_question_detail,
+            inputs=[generated_question_selector, generated_values_state],
+            outputs=[
+                generated_question_editor,
+                generated_answer_editor,
+                generated_status,
+                generated_evidence,
+            ],
+        )
+        save_generated_question_button.click(
+            update_generated_question,
+            inputs=[
+                sampling_project,
+                generation_batch_state,
+                generated_question_selector,
+                generated_question_editor,
+                generated_answer_editor,
+                generated_status,
+            ],
+            outputs=[
+                generation_result,
+                generated_question_table,
+                generated_question_selector,
+                generated_values_state,
+                generation_batch_state,
+            ],
+        )
+        export_generated_questions_button.click(
+            export_generated_question_set,
+            inputs=[sampling_project, generation_batch_state],
+            outputs=[generation_result, generated_question_export],
         )
         test_connection_button.click(
             test_connection,
