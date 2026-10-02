@@ -123,6 +123,9 @@ class ProjectStore:
                 projects.append(self.get(path.name))
         return sorted(projects, key=lambda project: project.project_id.casefold())
 
+    def queryable_projects(self) -> list[Project]:
+        return [project for project in self.list() if project.status == "INDEXED" and project.enabled]
+
     def get(self, project_id: str) -> Project:
         if not PROJECT_ID_PATTERN.fullmatch(project_id):
             raise ProjectError("Project ID 格式不正確")

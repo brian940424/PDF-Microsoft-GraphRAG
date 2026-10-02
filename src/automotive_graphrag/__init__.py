@@ -5,6 +5,7 @@ from .automatic_evaluation import (
     AutomaticEvaluationResult,
     AutomaticEvaluationService,
 )
+from .cases import CaseRecord, CaseService
 from .connections import ConnectionSettings, ConnectionTestResult
 from .documents import DocumentInfo, DocumentService, ProcessingReport
 from .evidence import Evidence, EvidenceService
@@ -27,6 +28,8 @@ __all__ = [
     "AutomaticEvaluationItem",
     "AutomaticEvaluationResult",
     "AutomaticEvaluationService",
+    "CaseRecord",
+    "CaseService",
     "DocumentInfo",
     "DocumentService",
     "Evidence",

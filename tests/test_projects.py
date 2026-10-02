@@ -72,6 +72,19 @@ class ProjectStoreTests(unittest.TestCase):
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         self.assertTrue(self.store.get(project.project_id).enabled)
 
+    def test_queryable_projects_only_include_enabled_indexed_projects(self) -> None:
+        available = self.create_project()
+        disabled = self.create_project(project_id="T30-SM5E", display_name="T30 / SM5E")
+        self.store.update_status(available.project_id, "INDEXED")
+        self.store.update_status(disabled.project_id, "INDEXED")
+        self.store.set_enabled(disabled.project_id, False)
+        self.create_project(project_id="K14-SM1E", display_name="K14 / SM1E")
+
+        self.assertEqual(
+            [project.project_id for project in self.store.queryable_projects()],
+            [available.project_id],
+        )
+
     def test_required_display_fields_are_validated(self) -> None:
         with self.assertRaisesRegex(ProjectError, "顯示名稱為必填"):
             self.create_project(display_name="  ")
