@@ -1160,8 +1160,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 sampling_project_refresh = gr.Button("重新整理專案")
                 sampling_sections = gr.Dropdown(multiselect=True, label="章節（空白代表全部）")
             with gr.Row():
-                sampling_page_from = gr.Number(label="起始頁碼", minimum=1, precision=0)
-                sampling_page_to = gr.Number(label="結束頁碼", minimum=1, precision=0)
+                sampling_page_from = gr.Number(label="起始頁碼", value=1, minimum=1, precision=0)
+                sampling_page_to = gr.Number(label="結束頁碼", value=1, minimum=1, precision=0)
                 sampling_content_type = gr.Dropdown(
                     choices=[
                         ("全部", "all"),

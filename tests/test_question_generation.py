@@ -187,6 +187,13 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         self.assertIn("生成題數", labels)
         self.assertIn("選擇要審核的題目", labels)
         self.assertIn("Question Set JSON", labels)
+        page_values = {
+            component.get_config().get("label"): component.get_config().get("value")
+            for component in app.blocks.values()
+            if hasattr(component, "get_config")
+            and component.get_config().get("label") in {"起始頁碼", "結束頁碼"}
+        }
+        self.assertEqual(page_values, {"起始頁碼": 1, "結束頁碼": 1})
 
 
 if __name__ == "__main__":
