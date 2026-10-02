@@ -25,18 +25,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     indexing = IndexingService(store, connection_settings=connections)
 
     def connection_status() -> str:
-        return f"目前狀態：{connections.masked_api_key()}"
+        return f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key()}"
 
-    def save_connection(api_key: str):
+    def save_connection(api_base_url: str, api_key: str):
         try:
-            connections.save_api_key(api_key)
+            connections.save(api_base_url, api_key)
         except ProjectError as exc:
-            return f"❌ {exc}", api_key
-        return f"✅ API Key 已儲存。{connection_status()}", ""
+            return f"❌ {exc}", api_base_url, api_key
+        return f"✅ 連線設定已儲存。{connection_status()}", api_base_url, api_key
 
-    def test_connection(api_key: str):
+    def test_connection(api_base_url: str, api_key: str):
         try:
-            result = connections.test(api_key or None)
+            result = connections.test(api_base_url or None, api_key or None)
         except ProjectError as exc:
             return f"❌ {exc}"
         icon = "✅" if result.success else "❌"
@@ -192,6 +192,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             delete_confirmation = gr.Checkbox(label="我確認要永久刪除選取的專案及其所有資料")
             delete_button = gr.Button("刪除選取專案", variant="stop")
 
+        with gr.Tab("連線設定"):
+            gr.Markdown("## GraphRAG 共用連線設定")
+            gr.Markdown("API Base URL 與 API Key 由所有 Project 共用。")
+            connection_state = gr.Markdown(value=connection_status)
+            api_base_url = gr.Textbox(
+                label="API Base URL",
+                value=connections.get_api_base_url,
+                placeholder="https://api.openai.com/v1",
+            )
+            api_key = gr.Textbox(label="API Key", type="password", placeholder="輸入 API Key")
+            with gr.Row():
+                test_connection_button = gr.Button("測試連線")
+                save_connection_button = gr.Button("儲存連線設定", variant="primary")
+            connection_result = gr.Markdown()
+
         with gr.Tab("文件與建圖"):
             document_project = gr.Dropdown(choices=project_choices(), label="專案")
             uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
@@ -221,16 +236,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 label="Documents",
             )
             indexing_log = gr.Textbox(label="建圖日誌", lines=12, interactive=False)
-
-        with gr.Tab("連線設定"):
-            gr.Markdown("## GraphRAG 共用連線設定")
-            gr.Markdown("此 API Key 由所有 Project 共用；畫面不會顯示已儲存的完整 Key。")
-            connection_state = gr.Markdown(value=connection_status)
-            api_key = gr.Textbox(label="OpenAI API Key", type="password", placeholder="輸入新的 API Key")
-            with gr.Row():
-                test_connection_button = gr.Button("測試連線")
-                save_connection_button = gr.Button("儲存 API Key", variant="primary")
-            connection_result = gr.Markdown()
 
         refresh_button.click(
             refresh_project_views,
@@ -279,11 +284,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         index_button.click(build_index, inputs=document_project, outputs=[document_result, indexing_log])
         document_refresh_button.click(document_rows, inputs=document_project, outputs=document_table)
-        test_connection_button.click(test_connection, inputs=api_key, outputs=connection_result)
+        test_connection_button.click(
+            test_connection,
+            inputs=[api_base_url, api_key],
+            outputs=connection_result,
+        )
         save_connection_button.click(
             save_connection,
-            inputs=api_key,
-            outputs=[connection_result, api_key],
+            inputs=[api_base_url, api_key],
+            outputs=[connection_result, api_base_url, api_key],
         ).then(connection_status, outputs=connection_state)
     return demo
 

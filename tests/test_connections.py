@@ -33,13 +33,13 @@ class ConnectionSettingsTests(unittest.TestCase):
         tested: list[str] = []
         settings = ConnectionSettings(
             self.project_root,
-            lambda key: tested.append(key) or ConnectionTestResult(True, "連線成功"),
+            lambda base_url, key: tested.append(f"{base_url}|{key}") or ConnectionTestResult(True, "連線成功"),
         )
 
-        result = settings.test("candidate-key")
+        result = settings.test("https://gateway.example/v1/", "candidate-key")
 
         self.assertTrue(result.success)
-        self.assertEqual(tested, ["candidate-key"])
+        self.assertEqual(tested, ["https://gateway.example/v1|candidate-key"])
         self.assertFalse(settings.path.exists())
 
     def test_missing_key_blocks_graphrag_connection(self) -> None:
@@ -50,6 +50,19 @@ class ConnectionSettingsTests(unittest.TestCase):
     def test_blank_key_is_rejected(self) -> None:
         with self.assertRaisesRegex(ProjectError, "必填"):
             ConnectionSettings(self.project_root).save_api_key("  ")
+
+    def test_base_url_is_persisted_and_applied(self) -> None:
+        settings = ConnectionSettings(self.project_root)
+        settings.save("https://gateway.example/v1/", "shared-key")
+
+        with patch.dict(os.environ, {}, clear=True):
+            settings.apply_to_environment()
+            self.assertEqual(os.environ["GRAPHRAG_API_BASE"], "https://gateway.example/v1")
+        self.assertEqual(settings.get_api_base_url(), "https://gateway.example/v1")
+
+    def test_invalid_base_url_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ProjectError, "HTTP"):
+            ConnectionSettings(self.project_root).save("gateway.example", "shared-key")
 
 
 if __name__ == "__main__":

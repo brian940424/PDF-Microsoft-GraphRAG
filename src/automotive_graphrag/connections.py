@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,8 @@ from .projects import ProjectError
 
 
 API_KEY_ENVIRONMENT_VARIABLE = "GRAPHRAG_API_KEY"
-OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+API_BASE_ENVIRONMENT_VARIABLE = "GRAPHRAG_API_BASE"
+DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,11 +26,11 @@ class ConnectionTestResult:
     message: str
 
 
-ConnectionTester = Callable[[str], ConnectionTestResult]
+ConnectionTester = Callable[[str, str], ConnectionTestResult]
 
 
 class ConnectionSettings:
-    """Persist one API key shared by every project in a project root."""
+    """Persist one API endpoint and key shared by every project in a project root."""
 
     def __init__(self, project_root: str | Path, tester: ConnectionTester | None = None) -> None:
         self.path = Path(project_root) / ".connection.json"
@@ -44,18 +46,36 @@ class ConnectionSettings:
         return f"已設定（••••{key[-4:]}）"
 
     def get_api_key(self) -> str | None:
-        try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        value = self._read()
+        if value is None:
             return os.environ.get(API_KEY_ENVIRONMENT_VARIABLE) or None
-        except (json.JSONDecodeError, OSError) as exc:
-            raise ProjectError("共用連線設定無法讀取") from exc
         key = value.get("api_key")
         if not isinstance(key, str) or not key:
             raise ProjectError("共用連線設定缺少 API Key")
         return key
 
+    def get_api_base_url(self) -> str:
+        value = self._read()
+        if value is None:
+            return os.environ.get(API_BASE_ENVIRONMENT_VARIABLE, DEFAULT_API_BASE_URL).rstrip("/")
+        return self._validate_api_base_url(value.get("api_base_url", DEFAULT_API_BASE_URL))
+
+    def _read(self) -> dict[str, str] | None:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ProjectError("共用連線設定無法讀取") from exc
+        if not isinstance(value, dict):
+            raise ProjectError("共用連線設定格式錯誤")
+        return value
+
     def save_api_key(self, api_key: str) -> None:
+        self.save(self.get_api_base_url(), api_key)
+
+    def save(self, api_base_url: str, api_key: str) -> None:
+        base_url = self._validate_api_base_url(api_base_url)
         key = api_key.strip()
         if not key:
             raise ProjectError("API Key 為必填")
@@ -66,7 +86,7 @@ class ConnectionSettings:
         try:
             os.fchmod(handle, 0o600)
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:
-                json.dump({"api_key": key}, temporary)
+                json.dump({"api_base_url": base_url, "api_key": key}, temporary)
                 temporary.write("\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
@@ -76,24 +96,37 @@ class ConnectionSettings:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
         os.environ[API_KEY_ENVIRONMENT_VARIABLE] = key
+        os.environ[API_BASE_ENVIRONMENT_VARIABLE] = base_url
 
     def apply_to_environment(self) -> str:
         key = self.get_api_key()
         if not key:
             raise ProjectError("尚未設定共用 GRAPHRAG_API_KEY，請先到連線設定頁設定")
         os.environ[API_KEY_ENVIRONMENT_VARIABLE] = key
+        os.environ[API_BASE_ENVIRONMENT_VARIABLE] = self.get_api_base_url()
         return key
 
-    def test(self, api_key: str | None = None) -> ConnectionTestResult:
+    def test(self, api_base_url: str | None = None, api_key: str | None = None) -> ConnectionTestResult:
+        base_url = self._validate_api_base_url(api_base_url) if api_base_url else self.get_api_base_url()
         key = api_key.strip() if api_key else self.get_api_key()
         if not key:
             return ConnectionTestResult(False, "尚未設定 API Key")
-        return self.tester(key)
+        return self.tester(base_url, key)
 
     @staticmethod
-    def _test_openai(api_key: str) -> ConnectionTestResult:
+    def _validate_api_base_url(api_base_url: object) -> str:
+        if not isinstance(api_base_url, str) or not api_base_url.strip():
+            raise ProjectError("API Base URL 為必填")
+        value = api_base_url.strip().rstrip("/")
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ProjectError("API Base URL 必須是有效的 HTTP(S) 網址")
+        return value
+
+    @staticmethod
+    def _test_openai(api_base_url: str, api_key: str) -> ConnectionTestResult:
         request = urllib.request.Request(
-            OPENAI_MODELS_URL,
+            f"{api_base_url}/models",
             headers={"Authorization": f"Bearer {api_key}", "User-Agent": "automotive-graphrag/0.1"},
         )
         try:

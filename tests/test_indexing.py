@@ -20,7 +20,12 @@ class FakeGraphRag:
         root = Path(command[command.index("--root") + 1])
         if "init" in command:
             (root / "prompts").mkdir(exist_ok=True)
-            (root / "settings.yaml").write_text("input: {}\n", encoding="utf-8")
+            (root / "settings.yaml").write_text(
+                "input: {}\n"
+                "completion_models:\n  default_completion_model: {}\n"
+                "embedding_models:\n  default_embedding_model: {}\n",
+                encoding="utf-8",
+            )
             return subprocess.CompletedProcess(command, 0, "initialized\n", "")
         if self.fail_index:
             (root / "output").mkdir(exist_ok=True)
@@ -46,9 +51,9 @@ class IndexingServiceTests(unittest.TestCase):
         self.store.update_status("L33-SM3E", "READY")
         self.connections = ConnectionSettings(
             self.store.root,
-            lambda key: ConnectionTestResult(True, "ok"),
+            lambda base_url, key: ConnectionTestResult(True, "ok"),
         )
-        self.connections.save_api_key("test-key")
+        self.connections.save("https://api.openai.com/v1", "test-key")
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -69,6 +74,10 @@ class IndexingServiceTests(unittest.TestCase):
         self.assertEqual(settings["input"]["type"], "jsonl")
         self.assertEqual(settings["input"]["file_pattern"], r".*\.jsonl$$")
         self.assertEqual(settings["input"]["storage"]["base_dir"], "input")
+        self.assertEqual(
+            settings["completion_models"]["default_completion_model"]["api_base"],
+            "https://api.openai.com/v1",
+        )
         graph_input = settings_path.parent / "input" / "input.jsonl"
         self.assertIn('"id":"p1"', graph_input.read_text())
 

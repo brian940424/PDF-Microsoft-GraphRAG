@@ -78,6 +78,7 @@ class IndexingService:
         if not settings.is_file():
             raise ProjectError("GraphRAG 初始化後未產生 settings.yaml")
         self._configure_jsonl_input(settings)
+        self._configure_api_base(settings, self.connection_settings.get_api_base_url())
         self._sync_input(project_path, graph_root)
         return settings
 
@@ -198,6 +199,14 @@ class IndexingService:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+    @staticmethod
+    def _configure_api_base(settings_path: Path, api_base_url: str) -> None:
+        value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
+        for section in ("completion_models", "embedding_models"):
+            for model in value.get(section, {}).values():
+                model["api_base"] = api_base_url
+        IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
 
     @staticmethod
     def _acquire_lock(path: Path) -> int:
