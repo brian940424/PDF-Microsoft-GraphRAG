@@ -80,7 +80,7 @@ class QueryService:
         graph_root = project_path / "graphrag"
         if not (graph_root / "output").is_dir():
             raise ProjectError("找不到此專案的 GraphRAG 索引輸出")
-        self.connection_settings.apply_to_environment()
+        self.connection_settings.apply_to_environment(project_id)
         self._configure_connection(
             graph_root / "settings.yaml",
             self.connection_settings.get_api_base_url(),

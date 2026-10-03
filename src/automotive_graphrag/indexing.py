@@ -54,9 +54,10 @@ class IndexingService:
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
         self.metadata_builder = metadata_builder or SourceMetadataService(projects).build
         self._active_log: Path | None = None
+        self._log_callback: Callable[[str], None] | None = None
 
     def initialize(self, project_id: str) -> Path:
-        self.connection_settings.apply_to_environment()
+        self.connection_settings.apply_to_environment(project_id)
         chat_model = self.chat_model or self.connection_settings.get_chat_model()
         embedding_model = self.embedding_model or self.connection_settings.get_embedding_model()
         project_path = self.projects.path_for(project_id)
@@ -87,7 +88,11 @@ class IndexingService:
         self._sync_input(project_path, graph_root)
         return settings
 
-    def build(self, project_id: str) -> IndexingResult:
+    def build(
+        self,
+        project_id: str,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> IndexingResult:
         project = self.projects.get(project_id)
         if project.status not in {"READY", "STALE", "FAILED"}:
             raise ProjectError(f"專案狀態 {project.status} 不允許建圖")
@@ -102,14 +107,19 @@ class IndexingService:
         backup = graph_root / ".last-successful-output"
         previous_index = output.exists() and project.status in {"STALE", "FAILED"}
         try:
+            self._active_log = log_path
+            self._active_log.write_text("", encoding="utf-8")
+            self._log_callback = log_callback
             self.initialize(project_id)
             self.projects.update_status(project_id, "INDEXING")
             if backup.exists():
                 shutil.rmtree(backup)
             if previous_index:
                 output.replace(backup)
-            self._active_log = log_path
             result = self.runner([sys.executable, "-m", "graphrag", "index", "--root", str(graph_root), "--verbose"])
+            if self.runner != self._run:
+                for line in ((result.stdout or "") + (result.stderr or "")).splitlines(keepends=True):
+                    self._write_log(line)
             if result.returncode:
                 raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
             if not output.is_dir():
@@ -141,6 +151,7 @@ class IndexingService:
                 last_message = str(exc)
         finally:
             self._active_log = None
+            self._log_callback = None
             os.close(lock_descriptor)
             lock_path.unlink(missing_ok=True)
 
@@ -166,10 +177,28 @@ class IndexingService:
             return None
 
     def _run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
-        if self._active_log is not None:
-            self._active_log.write_text((result.stdout or "") + (result.stderr or ""), encoding="utf-8")
-        return result
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        output: list[str] = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            output.append(line)
+            self._write_log(line)
+        return_code = process.wait()
+        return subprocess.CompletedProcess(command, return_code, "".join(output), "")
+
+    def _write_log(self, text: str) -> None:
+        if self._active_log is not None and text:
+            with self._active_log.open("a", encoding="utf-8") as log:
+                log.write(text)
+                log.flush()
+        if self._log_callback is not None and text:
+            self._log_callback(text)
 
     @staticmethod
     def _configure_jsonl_input(settings_path: Path) -> None:

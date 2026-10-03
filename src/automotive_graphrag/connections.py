@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from dotenv import dotenv_values
+
 from .projects import ProjectError
 
 
@@ -40,19 +42,25 @@ class ConnectionSettings:
         self.path = Path(project_root) / ".connection.json"
         self.tester = tester or self._test_openai
 
-    def has_api_key(self) -> bool:
-        return self.get_api_key() is not None
+    def has_api_key(self, project_id: str | None = None) -> bool:
+        return self.get_api_key(project_id) is not None
 
-    def masked_api_key(self) -> str:
-        key = self.get_api_key()
+    def masked_api_key(self, project_id: str | None = None) -> str:
+        key = self.get_api_key(project_id)
         if not key:
             return "尚未設定"
         return f"已設定（••••{key[-4:]}）"
 
-    def get_api_key(self) -> str | None:
+    def get_api_key(self, project_id: str | None = None) -> str | None:
+        key = os.environ.get(API_KEY_ENVIRONMENT_VARIABLE)
+        if key and not self._is_placeholder_key(key):
+            return key
+        key = self._dotenv_api_key(project_id)
+        if key:
+            return key
         value = self._read()
         if value is None:
-            return os.environ.get(API_KEY_ENVIRONMENT_VARIABLE) or None
+            return None
         key = value.get("api_key")
         if not isinstance(key, str) or not key:
             raise ProjectError("共用連線設定缺少 API Key")
@@ -147,8 +155,8 @@ class ConnectionSettings:
         os.environ["GRAPHRAG_CHAT_MODEL"] = selected_chat_model
         os.environ["GRAPHRAG_EMBEDDING_MODEL"] = selected_embedding_model
 
-    def apply_to_environment(self) -> str:
-        key = self.get_api_key()
+    def apply_to_environment(self, project_id: str | None = None) -> str:
+        key = self.get_api_key(project_id)
         if not key:
             raise ProjectError("尚未設定共用 GRAPHRAG_API_KEY，請先到連線設定頁設定")
         os.environ[API_KEY_ENVIRONMENT_VARIABLE] = key
@@ -156,6 +164,30 @@ class ConnectionSettings:
         os.environ["GRAPHRAG_CHAT_MODEL"] = self.get_chat_model()
         os.environ["GRAPHRAG_EMBEDDING_MODEL"] = self.get_embedding_model()
         return key
+
+    def _dotenv_api_key(self, project_id: str | None) -> str | None:
+        paths = [self.path.parent.parent / ".env", self.path.parent / ".env"]
+        if project_id:
+            paths.append(self.path.parent / project_id / "graphrag" / ".env")
+        else:
+            paths.extend(sorted(self.path.parent.glob("*/graphrag/.env")))
+        for path in paths:
+            if not path.is_file():
+                continue
+            key = dotenv_values(path).get(API_KEY_ENVIRONMENT_VARIABLE)
+            if isinstance(key, str) and key.strip() and not self._is_placeholder_key(key):
+                return key.strip()
+        return None
+
+    @staticmethod
+    def _is_placeholder_key(key: str) -> bool:
+        return key.strip().lower() in {
+            "your-api-key",
+            "your_api_key",
+            "insert_key_here",
+            "changeme",
+            "<your-api-key>",
+        }
 
     def test(self, api_base_url: str | None = None, api_key: str | None = None) -> ConnectionTestResult:
         base_url = self._validate_api_base_url(api_base_url) if api_base_url else self.get_api_base_url()

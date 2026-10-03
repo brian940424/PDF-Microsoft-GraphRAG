@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Protocol
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
 
 import pymupdf
 
@@ -50,8 +50,6 @@ class ProcessingReport:
     empty_pages: int
     error_pages: int
     documents_with_errors: int
-    header_ignore_percent: float
-    footer_ignore_percent: float
     output: str
     completed_at: str
 
@@ -128,6 +126,19 @@ class DocumentService:
         except ProjectError:
             return []
 
+    def processing_options(self, project_id: str) -> dict[str, dict[str, object]]:
+        report_by_name = self._document_reports(project_id)
+        option_names = (
+            "header_ignore_percent",
+            "footer_ignore_percent",
+            "start_page",
+            "end_page",
+        )
+        return {
+            filename: {name: value[name] for name in option_names if name in value}
+            for filename, value in report_by_name.items()
+        }
+
     def remove_pdf(self, project_id: str, filename: str) -> None:
         project_path = self.projects.path_for(project_id)
         if not filename or Path(filename).name != filename or Path(filename).suffix.lower() != ".pdf":
@@ -151,17 +162,17 @@ class DocumentService:
     def preprocess(
         self,
         project_id: str,
-        header_ignore_percent: float = 0,
-        footer_ignore_percent: float = 0,
+        options_by_filename: Mapping[str, Mapping[str, object]] | None = None,
     ) -> ProcessingReport:
-        header_ignore_percent, footer_ignore_percent = self._validate_ignored_margins(
-            header_ignore_percent,
-            footer_ignore_percent,
-        )
+        project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
         sources = sorted((project_path / "source").glob("*.pdf"), key=lambda item: item.name.casefold())
         if not sources:
             raise ProjectError("專案中沒有可處理的 PDF")
+        source_names = {source.name for source in sources}
+        unknown_options = set(options_by_filename or {}) - source_names
+        if unknown_options:
+            raise ProjectError(f"前處理設定含有不存在的 PDF：{', '.join(sorted(unknown_options))}")
 
         self.projects.update_status(project_id, "PROCESSING")
         processed_directory = project_path / "processed"
@@ -176,16 +187,13 @@ class DocumentService:
                     source,
                     records,
                     totals,
-                    header_ignore_percent,
-                    footer_ignore_percent,
+                    (options_by_filename or {}).get(source.name, {}),
                 )
                 document_reports.append(document_report)
             report = ProcessingReport(
                 project_id=project_id,
                 documents=len(sources),
                 documents_with_errors=sum(1 for item in document_reports if item["error"] or item["error_pages"]),
-                header_ignore_percent=header_ignore_percent,
-                footer_ignore_percent=footer_ignore_percent,
                 output="input.jsonl",
                 completed_at=datetime.now(timezone.utc).isoformat(),
                 **totals,
@@ -197,8 +205,11 @@ class DocumentService:
             )
             self.projects.update_status(project_id, "READY")
             return report
-        except Exception:
-            self.projects.update_status(project_id, "FAILED")
+        except Exception as exc:
+            self.projects.update_status(
+                project_id,
+                project.status if isinstance(exc, ProjectError) else "FAILED",
+            )
             raise
 
     def _process_document(
@@ -207,8 +218,7 @@ class DocumentService:
         source: Path,
         records: list[dict[str, Any]],
         totals: dict[str, int],
-        header_ignore_percent: float,
-        footer_ignore_percent: float,
+        options: Mapping[str, object],
     ) -> dict[str, Any]:
         report: dict[str, Any] = {
             "filename": source.name,
@@ -229,11 +239,43 @@ class DocumentService:
             report.update(status="ERROR", error=str(exc))
             return report
 
-        report["pages"] = len(pages)
-        totals["pages"] += len(pages)
+        page_count = len(pages)
+        report["pages"] = page_count
+        if page_count == 0:
+            report.update(status="ERROR", error="PDF 沒有頁面")
+            self._close_document(document)
+            return report
+        try:
+            header_ignore_percent, footer_ignore_percent = self._validate_ignored_margins(
+                options.get("header_ignore_percent", 0),
+                options.get("footer_ignore_percent", 0),
+            )
+            start_page = self._page_index(options.get("start_page", 0), "起始頁")
+            end_value = options.get("end_page", page_count - 1)
+            end_page = page_count - 1 if end_value in (None, "") else self._page_index(end_value, "結束頁")
+        except Exception:
+            self._close_document(document)
+            raise
+        if start_page > end_page:
+            self._close_document(document)
+            raise ProjectError(f"{source.name} 的起始頁不可大於結束頁")
+        if end_page >= page_count:
+            self._close_document(document)
+            raise ProjectError(f"{source.name} 的結束頁超出範圍（最後一頁索引為 {page_count - 1}）")
+        report.update(
+            start_page=start_page,
+            end_page=end_page,
+            header_ignore_percent=header_ignore_percent,
+            footer_ignore_percent=footer_ignore_percent,
+            selected_pages=end_page - start_page + 1,
+        )
+        totals["pages"] += end_page - start_page + 1
         document_stem = self._safe_identifier(source.stem)
         try:
-            for page_number, page in enumerate(pages, start=1):
+            for page_index, page in enumerate(pages):
+                if not start_page <= page_index <= end_page:
+                    continue
+                page_number = page_index + 1
                 try:
                     text = self._extract_page_text(page, header_ignore_percent, footer_ignore_percent).strip()
                 except Exception as exc:
@@ -280,6 +322,16 @@ class DocumentService:
         if header + footer >= 100:
             raise ProjectError("頁首與頁尾忽略比例合計必須小於 100%")
         return header, footer
+
+    @staticmethod
+    def _page_index(value: object, label: str) -> int:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ProjectError(f"{label}必須是整數頁面索引") from exc
+        if not number.is_integer() or number < 0:
+            raise ProjectError(f"{label}必須是 0 或更大的整數頁面索引")
+        return int(number)
 
     @staticmethod
     def _extract_page_text(page: PdfPage, header_percent: float, footer_percent: float) -> str:

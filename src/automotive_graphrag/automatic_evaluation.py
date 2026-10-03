@@ -105,7 +105,7 @@ class AutomaticEvaluationService:
             raise ProjectError(f"以下題目尚未完成系統回答：{', '.join(incomplete)}")
 
         prompt = self._build_prompt(eligible, top_k, maximum_evidence_characters)
-        api_key = self.connections.apply_to_environment()
+        api_key = self.connections.apply_to_environment(project_id)
         base_url = self.connections.get_api_base_url()
         model = self.connections.get_chat_model()
         try:

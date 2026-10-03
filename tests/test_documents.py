@@ -160,15 +160,16 @@ class DocumentServiceTests(unittest.TestCase):
         )
         self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
 
-        report = self.service.preprocess("L33-SM3E", header_ignore_percent=10, footer_ignore_percent=10)
+        report = self.service.preprocess(
+            "L33-SM3E",
+            {"WW.pdf": {"header_ignore_percent": 10, "footer_ignore_percent": 10}},
+        )
 
         processed = self.store.path_for("L33-SM3E") / "processed"
         record = json.loads((processed / "input.jsonl").read_text().strip())
         self.assertEqual(record["text"], "維修內文")
-        self.assertEqual((report.header_ignore_percent, report.footer_ignore_percent), (10, 10))
-        summary = json.loads((processed / "report.json").read_text())["summary"]
-        self.assertEqual(summary["header_ignore_percent"], 10)
-        self.assertEqual(summary["footer_ignore_percent"], 10)
+        ww_report = next(item for item in json.loads((processed / "report.json").read_text())["documents"] if item["filename"] == "WW.pdf")
+        self.assertEqual((ww_report["header_ignore_percent"], ww_report["footer_ignore_percent"]), (10, 10))
 
     def test_pymupdf_extracts_traditional_chinese_and_clips_margins(self) -> None:
         pdf = self.root / "uploads" / "ZH.pdf"
@@ -183,7 +184,10 @@ class DocumentServiceTests(unittest.TestCase):
         service = DocumentService(self.store)
         service.import_pdfs("L33-SM3E", [pdf])
 
-        service.preprocess("L33-SM3E", header_ignore_percent=10, footer_ignore_percent=10)
+        service.preprocess(
+            "L33-SM3E",
+            {"ZH.pdf": {"header_ignore_percent": 10, "footer_ignore_percent": 10}},
+        )
 
         processed = self.store.path_for("L33-SM3E") / "processed" / "input.jsonl"
         record = json.loads(processed.read_text(encoding="utf-8").strip())
@@ -193,7 +197,10 @@ class DocumentServiceTests(unittest.TestCase):
         self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
 
         with self.assertRaisesRegex(ProjectError, "合計必須小於 100"):
-            self.service.preprocess("L33-SM3E", header_ignore_percent=50, footer_ignore_percent=50)
+            self.service.preprocess(
+                "L33-SM3E",
+                {"WW.pdf": {"header_ignore_percent": 50, "footer_ignore_percent": 50}},
+            )
 
         self.assertEqual(self.store.get("L33-SM3E").status, "UPLOADED")
 

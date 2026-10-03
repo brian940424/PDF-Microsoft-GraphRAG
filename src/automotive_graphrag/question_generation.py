@@ -84,7 +84,7 @@ class QuestionGenerationService:
             normalized_difficulty,
             maximum_source_characters,
         )
-        api_key = self.connections.apply_to_environment()
+        api_key = self.connections.apply_to_environment(project_id)
         api_base_url = self.connections.get_api_base_url()
         model = self.connections.get_chat_model()
         try:

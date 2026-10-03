@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import threading
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,6 +28,7 @@ from .source_sampling import SourceSample, SourceSamplingService
 
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
+PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
 BATCH_COLUMNS = ["題號", "問題", "狀態", "耗時 (秒)", "錯誤"]
 EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
@@ -57,9 +60,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     question_generation = QuestionGenerationService(store, source_sampling, connections)
     automatic_evaluation = AutomaticEvaluationService(store, question_sets, connections)
 
-    def connection_status() -> str:
+    def connection_status(project_id: str | None = None) -> str:
         return (
-            f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key()}；"
+            f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key(project_id)}；"
             f"Chat `{connections.get_chat_model()}`；Embedding `{connections.get_embedding_model()}`"
         )
 
@@ -90,23 +93,33 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def project_choices() -> list[tuple[str, str]]:
         return [(project.display_name, project.project_id) for project in store.list()]
 
-    def query_project_choices() -> list[tuple[str, str]]:
-        return [
-            (
-                f"{project.display_name}｜{project.vehicle_name}｜{project.manual_version}",
-                project.project_id,
-            )
-            for project in store.list()
-            if project.status == "INDEXED"
-        ]
+    def active_project_label(project_id: str | None) -> str:
+        if not project_id:
+            return "目前沒有開啟的專案。請先到「專案設定」選取並開啟專案。"
+        try:
+            project = store.get(project_id)
+        except ProjectError:
+            return "目前開啟的專案已不存在，請重新選取專案。"
+        return (
+            f"目前開啟專案：**{project.display_name}** (`{project.project_id}`)｜"
+            f"狀態：{project.status}"
+        )
 
-    def refresh_query_projects(project_id: str | None):
-        choices = query_project_choices()
-        available_ids = {value for _, value in choices}
-        return gr.Dropdown(
-            choices=choices,
-            value=project_id if project_id in available_ids else None,
-            allow_custom_value=True,
+    def open_project(project_id: str | None):
+        if not project_id:
+            return None, active_project_label(None), {}, connections.get_api_key() or "", "請先選取專案", connection_status()
+        try:
+            project = store.get(project_id)
+        except ProjectError as exc:
+            return None, active_project_label(None), {}, connections.get_api_key() or "", f"❌ {exc}", connection_status()
+        key = connections.get_api_key(project.project_id) or ""
+        return (
+            project.project_id,
+            active_project_label(project.project_id),
+            asdict(project),
+            key,
+            f"✅ 已開啟專案 {project.project_id}，後續分頁將使用此專案",
+            connection_status(project.project_id),
         )
 
     def ask_question(project_id: str | None, question: str, method: str):
@@ -731,6 +744,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def project_details(project_id: str | None) -> dict[str, str]:
         if not project_id:
             return {}
+        try:
+            return asdict(store.get(project_id))
+        except ProjectError:
+            return {}
 
     def project_enabled_value(project_id: str | None) -> bool:
         try:
@@ -747,98 +764,164 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", store.table_rows(), project_details(project_id)
         state = "啟用" if project.enabled else "停用"
         return f"✅ 已{state}專案 {project.project_id}", store.table_rows(), asdict(project)
-        try:
-            return asdict(store.get(project_id))
-        except ProjectError:
-            return {}
 
-    def refresh_project_views(project_id: str | None):
+    def refresh_project_views(project_id: str | None, active_id: str | None):
         available_ids = {project.project_id for project in store.list()}
         selected = project_id if project_id in available_ids else None
+        active = active_id if active_id in available_ids else None
         choices = project_choices()
         return (
             store.table_rows(),
             gr.Dropdown(choices=choices, value=selected, allow_custom_value=True),
             project_details(selected),
-            gr.Dropdown(choices=choices, value=selected, allow_custom_value=True),
+            active,
+            active_project_label(active),
         )
 
-    def delete_project(project_id: str | None, confirmed: bool):
+    def delete_project(project_id: str | None, confirmed: bool, active_id: str | None):
         if not project_id:
-            return "❌ 請先選擇專案", *refresh_project_views(None), False
+            return "❌ 請先選擇專案", *refresh_project_views(None, active_id), False
         if not confirmed:
-            return "❌ 請勾選刪除確認", *refresh_project_views(project_id), False
+            return "❌ 請勾選刪除確認", *refresh_project_views(project_id, active_id), False
         try:
             store.delete(project_id)
         except ProjectError as exc:
-            return f"❌ {exc}", *refresh_project_views(project_id), False
-        return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None), False
+            return f"❌ {exc}", *refresh_project_views(project_id, active_id), False
+        next_active = None if project_id == active_id else active_id
+        return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None, next_active), False
 
     def document_rows(project_id: str | None) -> list[list[str | int | None]]:
         return [document_row(document) for document in documents.list_documents_if_available(project_id)]
 
+    def processing_option_rows(project_id: str | None) -> list[list[str | int | float]]:
+        if not project_id:
+            return []
+        saved = documents.processing_options(project_id)
+        rows: list[list[str | int | float]] = []
+        for document in documents.list_documents_if_available(project_id):
+            options = saved.get(document.filename, {})
+            pages = document.pages or 0
+            rows.append(
+                [
+                    document.filename,
+                    pages,
+                    float(options.get("header_ignore_percent", 0)),
+                    float(options.get("footer_ignore_percent", 0)),
+                    int(options.get("start_page", 0)),
+                    int(options.get("end_page", max(pages - 1, 0))),
+                ]
+            )
+        return rows
+
+    def parse_processing_options(rows: list[list[object]] | None) -> dict[str, dict[str, object]]:
+        options: dict[str, dict[str, object]] = {}
+        for row in rows or []:
+            if len(row) < 6 or row[0] in (None, ""):
+                continue
+            filename = Path(str(row[0])).name
+            options[filename] = {
+                "header_ignore_percent": row[2] if row[2] not in (None, "") else 0,
+                "footer_ignore_percent": row[3] if row[3] not in (None, "") else 0,
+                "start_page": row[4] if row[4] not in (None, "") else 0,
+                "end_page": row[5],
+            }
+        return options
+
     def document_view(project_id: str | None):
         rows = document_rows(project_id)
         choices = [row[0] for row in rows]
-        return rows, gr.Dropdown(choices=choices, value=None)
+        return rows, processing_option_rows(project_id), gr.Dropdown(choices=choices, value=None)
+
+    def active_project_views(project_id: str | None):
+        documents_view = document_view(project_id)
+        choices = question_set_choices(project_id) if project_id else []
+        return (
+            *documents_view,
+            gr.Dropdown(choices=choices, value=None),
+            gr.Dropdown(choices=choices, value=None),
+            gr.Dropdown(choices=choices, value=None),
+            gr.Dropdown(choices=choices, value=None),
+            gr.Dropdown(choices=sampling_section_choices(project_id) if project_id else [], value=[]),
+        )
 
     def import_documents(project_id: str | None, files: list[str] | None):
         if not project_id:
-            return "❌ 請先選擇專案", [], gr.Dropdown(choices=[])
+            return "❌ 請先到「專案設定」開啟專案", [], [], gr.Dropdown(choices=[])
         try:
             imported = documents.import_pdfs(project_id, files or [])
         except ProjectError as exc:
-            rows, selector = document_view(project_id)
-            return f"❌ {exc}", rows, selector
+            rows, settings, selector = document_view(project_id)
+            return f"❌ {exc}", rows, settings, selector
         rows = [document_row(item) for item in imported]
-        return f"✅ 已匯入 {len(files or [])} 份 PDF", rows, gr.Dropdown(choices=[row[0] for row in rows])
+        return (
+            f"✅ 已匯入 {len(files or [])} 份 PDF",
+            rows,
+            processing_option_rows(project_id),
+            gr.Dropdown(choices=[row[0] for row in rows]),
+        )
 
-    def preprocess_documents(
-        project_id: str | None,
-        header_ignore_percent: float,
-        footer_ignore_percent: float,
-    ):
+    def preprocess_documents(project_id: str | None, option_rows: list[list[object]] | None):
         if not project_id:
-            return "❌ 請先選擇專案", [], gr.Dropdown(choices=[])
+            return "❌ 請先到「專案設定」開啟專案", [], [], gr.Dropdown(choices=[])
         try:
-            report = documents.preprocess(project_id, header_ignore_percent, footer_ignore_percent)
+            report = documents.preprocess(project_id, parse_processing_options(option_rows))
         except (ProjectError, OSError) as exc:
-            rows, selector = document_view(project_id)
-            return f"❌ {exc}", rows, selector
+            rows, settings, selector = document_view(project_id)
+            return f"❌ {exc}", rows, settings, selector
         message = (
             f"✅ 前處理完成：成功 {report.successful_pages} 頁、"
             f"無文字 {report.empty_pages} 頁、錯誤 {report.error_pages} 頁"
         )
-        rows, selector = document_view(project_id)
-        return message, rows, selector
+        rows, settings, selector = document_view(project_id)
+        return message, rows, settings, selector
 
     def remove_document(project_id: str | None, filename: str | None, confirmed: bool):
         if not project_id or not filename:
-            rows, selector = document_view(project_id)
-            return "❌ 請先選擇專案與 PDF", rows, selector, False
+            rows, settings, selector = document_view(project_id)
+            return "❌ 請先選擇 PDF", rows, settings, selector, False
         if not confirmed:
-            rows, selector = document_view(project_id)
-            return "❌ 請勾選移除確認", rows, selector, False
+            rows, settings, selector = document_view(project_id)
+            return "❌ 請勾選移除確認", rows, settings, selector, False
         try:
             documents.remove_pdf(project_id, filename)
         except ProjectError as exc:
-            rows, selector = document_view(project_id)
-            return f"❌ {exc}", rows, selector, False
-        rows, selector = document_view(project_id)
-        return f"✅ 已移除 {filename}；請重新執行前處理與建圖", rows, selector, False
+            rows, settings, selector = document_view(project_id)
+            return f"❌ {exc}", rows, settings, selector, False
+        rows, settings, selector = document_view(project_id)
+        return f"✅ 已移除 {filename}；請重新執行前處理與建圖", rows, settings, selector, False
 
     def build_index(project_id: str | None):
         if not project_id:
-            return "❌ 請先選擇專案", ""
-        try:
-            result = indexing.build(project_id)
-        except ProjectError as exc:
-            return f"❌ {exc}", ""
+            yield "❌ 請先到「專案設定」開啟專案", ""
+            return
+        chunks: queue.Queue[str] = queue.Queue()
+        result_holder: list[object] = []
+        error_holder: list[Exception] = []
+
+        def run_index() -> None:
+            try:
+                result_holder.append(indexing.build(project_id, log_callback=chunks.put))
+            except Exception as exc:
+                error_holder.append(exc)
+
+        worker = threading.Thread(target=run_index, daemon=True)
+        worker.start()
+        log = ""
+        yield "⏳ GraphRAG 建圖執行中…", log
+        while worker.is_alive() or not chunks.empty():
+            try:
+                log += chunks.get(timeout=0.25)
+            except queue.Empty:
+                pass
+            yield "⏳ GraphRAG 建圖執行中…", log
+        worker.join()
+        if error_holder:
+            yield f"❌ {error_holder[0]}", log
+            return
+        result = result_holder[0]
         icon = "✅" if result.status == "INDEXED" else "❌"
         summary = f"{icon} {result.status}｜耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}"
-        log_path = store.path_for(project_id) / "graphrag" / result.log_file
-        log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-        return summary, log
+        yield summary, log
 
     def create_project(
         project_id: str,
@@ -866,7 +949,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 manual_version,
                 description,
                 selector,
-                selector,
                 {},
             )
         selector = gr.Dropdown(
@@ -883,18 +965,30 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             "",
             "",
             selector,
-            selector,
             asdict(project),
         )
 
     with gr.Blocks(title="汽車維修 GraphRAG 管理後台") as demo:
         gr.Markdown("# 汽車維修 GraphRAG 管理後台")
+        active_project_id = gr.State(value=None)
+        active_project_banner = gr.Markdown(active_project_label(None))
+        document_project = active_project_id
+        query_project = active_project_id
+        batch_project = active_project_id
+        review_project = active_project_id
+        gold_project = active_project_id
+        retrieval_project = active_project_id
+        automatic_project = active_project_id
+        sampling_project = active_project_id
         with gr.Tab("專案設定"):
-            selected_project = gr.Dropdown(
-                choices=project_choices(),
-                label="選擇專案紀錄",
-                allow_custom_value=True,
-            )
+            with gr.Row():
+                selected_project = gr.Dropdown(
+                    choices=project_choices(),
+                    label="選取專案",
+                    allow_custom_value=True,
+                )
+                open_project_button = gr.Button("開啟專案", variant="primary")
+            open_project_result = gr.Markdown()
             selected_project_details = gr.JSON(label="專案資料")
             project_table = gr.Dataframe(
                 headers=PROJECT_COLUMNS,
@@ -930,7 +1024,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 value=connections.get_api_base_url,
                 placeholder="https://api.openai.com/v1",
             )
-            api_key = gr.Textbox(label="API Key", type="password", placeholder="輸入 API Key")
+            api_key = gr.Textbox(
+                label="API Key",
+                value=connections.get_api_key() or "",
+                type="password",
+                placeholder="輸入 API Key",
+            )
             with gr.Row():
                 chat_model = gr.Dropdown(
                     choices=list(ALLOWED_CHAT_MODELS),
@@ -949,25 +1048,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             connection_result = gr.Markdown()
 
         with gr.Tab("文件與建圖"):
-            document_project = gr.Dropdown(
-                choices=project_choices(),
-                label="專案",
-                allow_custom_value=True,
-            )
             uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
-            with gr.Row():
-                header_ignore_percent = gr.Number(
-                    label="忽略頁首高度 (%)",
-                    value=0,
-                    minimum=0,
-                    maximum=99,
-                )
-                footer_ignore_percent = gr.Number(
-                    label="忽略頁尾高度 (%)",
-                    value=0,
-                    minimum=0,
-                    maximum=99,
-                )
             with gr.Row():
                 upload_button = gr.Button("上傳")
                 preprocess_button = gr.Button("開始前處理", variant="primary")
@@ -980,20 +1061,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 datatype=["str", "number", "number", "str", "number", "number", "str"],
                 label="Documents",
             )
+            processing_options_table = gr.Dataframe(
+                headers=PROCESSING_COLUMNS,
+                interactive=True,
+                datatype=["str", "number", "number", "number", "number", "number"],
+                type="array",
+                static_columns=[0, 1],
+                label="各 PDF 前處理設定（頁面索引從 0 開始，結束頁包含在範圍內）",
+            )
             with gr.Row():
                 removable_pdf = gr.Dropdown(label="選擇要移除的 PDF")
                 remove_pdf_confirmation = gr.Checkbox(label="我確認要移除選取的 PDF")
                 remove_pdf_button = gr.Button("移除 PDF", variant="stop")
-            indexing_log = gr.Textbox(label="建圖日誌", lines=12, interactive=False)
+            indexing_log = gr.Textbox(label="建圖日誌", lines=12, interactive=False, autoscroll=True)
 
         with gr.Tab("問答測試"):
-            with gr.Row():
-                query_project = gr.Dropdown(
-                    choices=query_project_choices(),
-                    label="已建圖專案",
-                    allow_custom_value=True,
-                )
-                query_project_refresh = gr.Button("重新整理專案")
             with gr.Row():
                 with gr.Column():
                     question = gr.Textbox(label="問題", lines=5)
@@ -1021,12 +1103,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
             gr.Markdown("## 題目集批次問答")
             with gr.Row():
-                batch_project = gr.Dropdown(
-                    choices=project_choices(),
-                    label="專案",
-                    allow_custom_value=True,
-                )
-                batch_project_refresh = gr.Button("重新整理專案")
+                batch_project_refresh = gr.Button("重新整理題目集")
                 question_set_selector = gr.Dropdown(label="題目集")
             question_set_file = gr.File(file_types=[".json"], type="filepath", label="匯入 question_set.json")
             with gr.Row():
@@ -1057,12 +1134,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("人工檢查"):
             with gr.Row():
-                review_project = gr.Dropdown(
-                    choices=project_choices(),
-                    label="專案",
-                    allow_custom_value=True,
-                )
-                review_project_refresh = gr.Button("重新整理專案")
+                review_project_refresh = gr.Button("重新整理題目集")
                 review_question_set = gr.Dropdown(label="題目集")
             review_progress = gr.Markdown("尚未選擇題目集")
             review_question = gr.Markdown()
@@ -1092,12 +1164,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("Gold Evidence"):
             with gr.Row():
-                gold_project = gr.Dropdown(
-                    choices=project_choices(),
-                    label="專案",
-                    allow_custom_value=True,
-                )
-                gold_project_refresh = gr.Button("重新整理專案")
+                gold_project_refresh = gr.Button("重新整理題目集與來源")
                 gold_question_set = gr.Dropdown(label="題目集")
                 gold_question = gr.Dropdown(label="題目")
             gold_question_text = gr.Markdown()
@@ -1117,12 +1184,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("Retrieval 評估"):
             with gr.Row():
-                retrieval_project = gr.Dropdown(
-                    choices=project_choices(),
-                    label="專案",
-                    allow_custom_value=True,
-                )
-                retrieval_project_refresh = gr.Button("重新整理專案")
+                retrieval_project_refresh = gr.Button("重新整理題目集")
                 retrieval_question_set = gr.Dropdown(label="題目集")
             with gr.Row():
                 retrieval_top_k = gr.Number(label="Top-K", value=5, minimum=1, precision=0)
@@ -1159,12 +1221,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 "每批 Judge 僅呼叫 API 一次，預設使用 `gpt-4o-mini`；低分、Retrieval 失敗或低信心結果會標記待人工審查。"
             )
             with gr.Row():
-                automatic_project = gr.Dropdown(
-                    choices=project_choices(),
-                    label="專案",
-                    allow_custom_value=True,
-                )
-                automatic_project_refresh = gr.Button("重新整理專案")
+                automatic_project_refresh = gr.Button("重新整理題目集")
                 automatic_question_set = gr.Dropdown(label="題目集")
             with gr.Row():
                 automatic_top_k = gr.Number(label="Top-K", value=5, minimum=1, precision=0)
@@ -1203,12 +1260,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         with gr.Tab("題目生成"):
             gr.Markdown("## 原文取樣器")
             with gr.Row():
-                sampling_project = gr.Dropdown(
-                    choices=project_choices(),
-                    label="專案",
-                    allow_custom_value=True,
-                )
-                sampling_project_refresh = gr.Button("重新整理專案")
+                sampling_project_refresh = gr.Button("重新整理章節")
                 sampling_sections = gr.Dropdown(multiselect=True, label="章節（空白代表全部）")
             with gr.Row():
                 sampling_page_from = gr.Number(label="起始頁碼", value=1, minimum=1, precision=0)
@@ -1304,8 +1356,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         refresh_button.click(
             refresh_project_views,
+            inputs=[selected_project, active_project_id],
+            outputs=[project_table, selected_project, selected_project_details, active_project_id, active_project_banner],
+        )
+        open_project_button.click(
+            open_project,
             inputs=selected_project,
-            outputs=[project_table, selected_project, selected_project_details, document_project],
+            outputs=[active_project_id, active_project_banner, selected_project_details, api_key, open_project_result, connection_state],
+        ).then(
+            active_project_views,
+            inputs=active_project_id,
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections],
         )
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
@@ -1329,52 +1390,46 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 manual_version,
                 description,
                 selected_project,
-                document_project,
                 selected_project_details,
             ],
         )
         delete_button.click(
             delete_project,
-            inputs=[selected_project, delete_confirmation],
+            inputs=[selected_project, delete_confirmation, active_project_id],
             outputs=[
                 result,
                 project_table,
                 selected_project,
                 selected_project_details,
-                document_project,
+                active_project_id,
+                active_project_banner,
                 delete_confirmation,
             ],
-        )
-        document_project.change(
-            document_view,
-            inputs=document_project,
-            outputs=[document_table, removable_pdf],
+        ).then(
+            active_project_views,
+            inputs=active_project_id,
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections],
         )
         upload_button.click(
             import_documents,
             inputs=[document_project, uploaded_files],
-            outputs=[document_result, document_table, removable_pdf],
+            outputs=[document_result, document_table, processing_options_table, removable_pdf],
         )
         preprocess_button.click(
             preprocess_documents,
-            inputs=[document_project, header_ignore_percent, footer_ignore_percent],
-            outputs=[document_result, document_table, removable_pdf],
+            inputs=[document_project, processing_options_table],
+            outputs=[document_result, document_table, processing_options_table, removable_pdf],
         )
         index_button.click(build_index, inputs=document_project, outputs=[document_result, indexing_log])
         document_refresh_button.click(
             document_view,
             inputs=document_project,
-            outputs=[document_table, removable_pdf],
+            outputs=[document_table, processing_options_table, removable_pdf],
         )
         remove_pdf_button.click(
             remove_document,
             inputs=[document_project, removable_pdf, remove_pdf_confirmation],
-            outputs=[document_result, document_table, removable_pdf, remove_pdf_confirmation],
-        )
-        query_project_refresh.click(
-            refresh_query_projects,
-            inputs=query_project,
-            outputs=query_project,
+            outputs=[document_result, document_table, processing_options_table, removable_pdf, remove_pdf_confirmation],
         )
         ask_button.click(
             ask_question,
@@ -1408,10 +1463,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ],
         )
         batch_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
-            outputs=batch_project,
-        )
-        batch_project.change(
             lambda project_id: question_set_view(project_id, None),
             inputs=batch_project,
             outputs=[question_set_selector, batch_table, selected_batch_questions, batch_status],
@@ -1460,10 +1511,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[batch_result, batch_json_export, batch_csv_export],
         )
         review_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
-            outputs=review_project,
-        )
-        review_project.change(
             lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
             inputs=review_project,
             outputs=review_question_set,
@@ -1540,10 +1587,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[review_result, review_json_export, review_csv_export],
         )
         gold_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
-            outputs=gold_project,
-        )
-        gold_project.change(
             lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
             inputs=gold_project,
             outputs=gold_question_set,
@@ -1570,10 +1613,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[gold_evidence_result, gold_evidence_editor],
         )
         retrieval_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
-            outputs=retrieval_project,
-        )
-        retrieval_project.change(
             lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
             inputs=retrieval_project,
             outputs=retrieval_question_set,
@@ -1610,10 +1649,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[retrieval_result, retrieval_json_export, retrieval_csv_export],
         )
         automatic_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
-            outputs=automatic_project,
-        )
-        automatic_project.change(
             lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
             inputs=automatic_project,
             outputs=automatic_question_set,
@@ -1651,10 +1686,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[automatic_result, automatic_json_export, automatic_csv_export],
         )
         sampling_project_refresh.click(
-            lambda: gr.Dropdown(choices=project_choices(), allow_custom_value=True),
-            outputs=sampling_project,
-        )
-        sampling_project.change(
             sampling_section_choices,
             inputs=sampling_project,
             outputs=sampling_sections,

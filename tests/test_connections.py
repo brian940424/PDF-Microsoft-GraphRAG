@@ -47,6 +47,18 @@ class ConnectionSettingsTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ProjectError, "尚未設定"):
             settings.apply_to_environment()
 
+    def test_project_dotenv_key_is_read_and_applied(self) -> None:
+        graph_root = self.project_root / "L33-SM3E" / "graphrag"
+        graph_root.mkdir(parents=True)
+        (graph_root / ".env").write_text("GRAPHRAG_API_KEY=project-dotenv-key\n", encoding="utf-8")
+        settings = ConnectionSettings(self.project_root)
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.get_api_key(), "project-dotenv-key")
+            self.assertEqual(settings.get_api_key("L33-SM3E"), "project-dotenv-key")
+            self.assertEqual(settings.apply_to_environment("L33-SM3E"), "project-dotenv-key")
+            self.assertEqual(os.environ["GRAPHRAG_API_KEY"], "project-dotenv-key")
+
     def test_blank_key_is_rejected(self) -> None:
         with self.assertRaisesRegex(ProjectError, "必填"):
             ConnectionSettings(self.project_root).save_api_key("  ")
