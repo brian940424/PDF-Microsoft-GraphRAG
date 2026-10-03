@@ -841,7 +841,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
-            gr.Dropdown(choices=sampling_section_choices(project_id) if project_id else [], value=[]),
+            sampling_section_choices(project_id),
         )
 
     def import_documents(project_id: str | None, files: list[str] | None):
