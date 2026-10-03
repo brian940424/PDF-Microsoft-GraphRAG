@@ -152,16 +152,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             [item.rank, item.evidence_id, item.document_id, item.page, item.chunk_id, item.score]
             for item in query_result.evidence
         ]
+        answer = query_result.answer
         if query_result.evidence:
-            references = "\n".join(
-                f"- [{item.evidence_id}] {item.document_id}，第 {item.page} 頁，Chunk `{item.chunk_id}`"
-                for item in query_result.evidence
-            )
-            answer = f"{query_result.answer}\n\n---\n### Evidence\n{references}"
             selected = query_result.evidence[0].evidence_id
             detail = evidence_markdown(selected, evidence_values)
         else:
-            answer = f"{query_result.answer}\n\n> ⚠️ 未驗證：Query Context 中沒有可回連的來源證據。"
             selected = None
             detail = ""
         selector = gr.Dropdown(
@@ -246,7 +241,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         question_set_id: str | None,
         current_question: str,
         answered_question: str,
-        answer: str,
+        system_answer: str,
+        edited_answer: str,
         method: str,
     ):
         if not project_id or not question_set_id:
@@ -254,17 +250,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         current_question_text = (current_question or "").strip()
         if not current_question_text or current_question_text != (answered_question or "").strip():
             return "❌ 請先對目前這個問題完成問答，再加入題目集", *saved_question_set_view(project_id, question_set_id)
+        if not (system_answer or "").strip():
+            return "❌ 請先完成問答，再修改及加入回答", *saved_question_set_view(project_id, question_set_id)
         try:
             question_set = question_sets.append_answered_question(
                 project_id,
                 question_set_id,
                 answered_question,
-                answer,
+                edited_answer,
                 method,
             )
         except ProjectError as exc:
             return f"❌ {exc}", *saved_question_set_view(project_id, question_set_id)
-        return "✅ 已將問題與系統回答一併加入題目集", *saved_question_set_view(
+        return "✅ 已將問題與答案一併加入題目集", *saved_question_set_view(
             project_id,
             question_set.question_set_id,
         )
@@ -1107,8 +1105,30 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         ask_button = gr.Button("送出問題", variant="primary")
                         clear_question_button = gr.Button("清除")
                 with gr.Column():
-                    query_answer = gr.Markdown(label="系統回答")
+                    query_answer = gr.Textbox(
+                label="系統回答（可編輯，加入題目集時會保存修改後內容）",
+                        lines=10,
+                        interactive=True,
+                    )
                     query_summary = gr.Markdown(label="查詢資訊")
+            gr.Markdown("## 題目集")
+            with gr.Row():
+                question_set_name = gr.Textbox(label="新題目集名稱")
+                question_set_description = gr.Textbox(label="說明（選填）")
+                create_question_set_button = gr.Button("建立題目集", variant="primary")
+            question_set_selector = gr.Dropdown(label="題目集")
+            with gr.Row():
+                refresh_question_sets_button = gr.Button("重新整理")
+                load_question_set_button = gr.Button("載入題目集")
+                add_qa_to_question_set_button = gr.Button("將目前問題與編輯後答案加入題目集")
+            question_set_result = gr.Markdown()
+            question_set_summary = gr.Markdown("請建立或載入題目集")
+            saved_questions_table = gr.Dataframe(
+                headers=["題號", "問題", "答案"],
+                interactive=False,
+                datatype=["str", "str", "str"],
+                label="題目集內容（每題均包含問題與答案）",
+            )
             gr.Markdown("### Evidence 詳情")
             query_evidence_state = gr.State([])
             query_question_state = gr.State("")
@@ -1122,24 +1142,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_evidence_selector = gr.Dropdown(label="選取證據全文")
             query_evidence_detail = gr.Markdown()
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
-            gr.Markdown("## 題目集")
-            with gr.Row():
-                question_set_name = gr.Textbox(label="新題目集名稱")
-                question_set_description = gr.Textbox(label="說明（選填）")
-                create_question_set_button = gr.Button("建立題目集", variant="primary")
-            question_set_selector = gr.Dropdown(label="題目集")
-            with gr.Row():
-                refresh_question_sets_button = gr.Button("重新整理")
-                load_question_set_button = gr.Button("載入題目集")
-                add_qa_to_question_set_button = gr.Button("將目前問題與回答加入題目集")
-            question_set_result = gr.Markdown()
-            question_set_summary = gr.Markdown("請建立或載入題目集")
-            saved_questions_table = gr.Dataframe(
-                headers=["題號", "問題", "系統回答"],
-                interactive=False,
-                datatype=["str", "str", "str"],
-                label="題目集內容（每題均包含問題與系統回答）",
-            )
 
         with gr.Tab("人工檢查"):
             with gr.Row():
@@ -1498,6 +1500,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question,
                 query_question_state,
                 query_answer_state,
+                query_answer,
                 query_method,
             ],
             outputs=[question_set_result, question_set_selector, saved_questions_table, question_set_summary],
