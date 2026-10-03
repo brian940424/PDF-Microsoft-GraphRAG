@@ -813,9 +813,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
         return rows
 
-    def parse_processing_options(rows: list[list[object]] | None) -> dict[str, dict[str, object]]:
+    def parse_processing_options(rows: object | None) -> dict[str, dict[str, object]]:
         options: dict[str, dict[str, object]] = {}
-        for row in rows or []:
+        if rows is None:
+            return options
+        # Gradio's Dataframe(type="array") may submit a NumPy array; avoid
+        # truth-value checks, which are ambiguous for arrays with multiple rows.
+        for row in rows:
             if len(row) < 6 or row[0] in (None, ""):
                 continue
             filename = Path(str(row[0])).name
@@ -865,7 +869,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "❌ 請先到「專案設定」開啟專案", [], [], gr.Dropdown(choices=[])
         try:
             report = documents.preprocess(project_id, parse_processing_options(option_rows))
-        except (ProjectError, OSError) as exc:
+        except (ProjectError, OSError, TypeError, ValueError) as exc:
             rows, settings, selector = document_view(project_id)
             return f"❌ {exc}", rows, settings, selector
         message = (
