@@ -29,7 +29,6 @@ from .source_sampling import SourceSample, SourceSamplingService
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
-BATCH_COLUMNS = ["題號", "問題", "狀態", "耗時 (秒)", "錯誤"]
 EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "Retrieved", "First Relevant Rank", "Pass@K"]
@@ -44,6 +43,15 @@ AUTOMATIC_EVALUATION_COLUMNS = [
     "Human Review",
     "Judge Reason",
 ]
+INDEXING_LOG_AUTOSCROLL_JS = """() => {
+    let previousLog = null;
+    window.setInterval(() => {
+        const log = document.querySelector("#indexing-log textarea");
+        if (!log || log.value === previousLog) return;
+        previousLog = log.value;
+        log.scrollTop = log.scrollHeight;
+    }, 100);
+}"""
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -123,21 +131,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def ask_question(project_id: str | None, question: str, method: str):
-        yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, []
+        yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, [], "", ""
         if not project_id:
-            yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
+            yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, [], "", ""
             return
         try:
             query_result = querying.ask(project_id, question, method)
         except ProjectError as exc:
-            yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
+            yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, [], "", ""
             return
         summary = (
             f"狀態：{query_result.status}｜方法：{query_result.method}｜"
             f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
         )
         if query_result.status == "FAILED":
-            yield "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, []
+            yield "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, [], "", ""
             return
         evidence_values = [asdict(item) for item in query_result.evidence]
         evidence_rows = [
@@ -168,6 +176,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             detail,
             querying.context_summary(query_result.context),
             evidence_values,
+            question,
+            query_result.answer,
         )
 
     def evidence_markdown(evidence_id: str | None, evidence_values: list[dict[str, object]]) -> str:
@@ -189,79 +199,75 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError:
             return []
 
-    def batch_rows(question_set: QuestionSet | None) -> list[list[str | float | None]]:
+    def answered_question_rows(question_set: QuestionSet | None) -> list[list[str]]:
         if question_set is None:
             return []
         return [
-            [item.question_id, item.question, item.status, item.duration_seconds, item.error]
+            [item.question_id, item.question, item.reference_answer]
             for item in question_set.questions
         ]
 
-    def batch_summary(question_set: QuestionSet) -> str:
-        summary = question_sets.summary(question_set)
-        return (
-            f"題目集：{question_set.name}｜總計 {summary.total}｜完成 {summary.completed}｜"
-            f"失敗 {summary.failed}｜待執行 {summary.pending}｜執行中 {summary.running}"
-        )
-
-    def question_set_view(project_id: str | None, question_set_id: str | None):
+    def saved_question_set_view(project_id: str | None, question_set_id: str | None):
         choices = question_set_choices(project_id)
         if not project_id or not question_set_id:
-            return gr.Dropdown(choices=choices), [], gr.Dropdown(choices=[]), ""
+            return gr.Dropdown(choices=choices, value=None), [], "請選取或建立題目集"
         try:
             question_set = question_sets.get(project_id, question_set_id)
-        except ProjectError:
-            return gr.Dropdown(choices=choices), [], gr.Dropdown(choices=[]), ""
-        question_choices = [(item.question_id, item.question_id) for item in question_set.questions]
+        except ProjectError as exc:
+            return gr.Dropdown(choices=choices, value=None), [], f"❌ {exc}"
         return (
-            gr.Dropdown(choices=choices, value=question_set_id),
-            batch_rows(question_set),
-            gr.Dropdown(choices=question_choices, value=[]),
-            batch_summary(question_set),
+            gr.Dropdown(choices=choices, value=question_set.question_set_id),
+            answered_question_rows(question_set),
+            f"目前題目集：**{question_set.name}**｜共 {len(question_set.questions)} 題",
         )
 
-    def import_question_set(project_id: str | None, source: str | None):
-        if not project_id or not source:
-            return "❌ 請選擇專案與題目集 JSON", {"errors": ["缺少專案或檔案"]}, *question_set_view(project_id, None)
-        try:
-            imported = question_sets.import_file(project_id, source)
-        except ProjectError as exc:
-            return f"❌ {exc}", {"errors": str(exc).splitlines()}, *question_set_view(project_id, None)
-        view = question_set_view(project_id, imported.question_set_id)
-        return f"✅ 已匯入 {len(imported.questions)} 題", {}, *view
+    def load_saved_question_set(project_id: str | None, question_set_id: str | None):
+        selector, rows, summary = saved_question_set_view(project_id, question_set_id)
+        if not project_id or not question_set_id:
+            result = "❌ 請選擇題目集"
+        elif summary.startswith("❌"):
+            result = summary
+        else:
+            result = "✅ 已載入題目集"
+        return result, selector, rows, summary
 
-    def run_batch(
+    def create_saved_question_set(project_id: str | None, name: str, description: str):
+        if not project_id:
+            return "❌ 請先開啟專案", gr.Dropdown(choices=[]), [], ""
+        try:
+            question_set = question_sets.create(project_id, name, description)
+        except ProjectError as exc:
+            return f"❌ {exc}", gr.Dropdown(choices=question_set_choices(project_id)), [], ""
+        selector, rows, status = saved_question_set_view(project_id, question_set.question_set_id)
+        return f"✅ 已建立題目集「{question_set.name}」", selector, rows, status
+
+    def add_current_answer_to_question_set(
         project_id: str | None,
         question_set_id: str | None,
+        current_question: str,
+        answered_question: str,
+        answer: str,
         method: str,
-        selected_question_ids: list[str] | None,
-        mode: str,
     ):
         if not project_id or not question_set_id:
-            return "❌ 請先選擇專案與題目集", [], ""
-        if mode == "selected" and not selected_question_ids:
-            return "❌ 請至少選擇一題", batch_rows(question_sets.get(project_id, question_set_id)), ""
+            return "❌ 請先選取題目集", gr.Dropdown(choices=question_set_choices(project_id)), [], ""
+        current_question_text = (current_question or "").strip()
+        if not current_question_text or current_question_text != (answered_question or "").strip():
+            return "❌ 請先對目前這個問題完成問答，再加入題目集", *saved_question_set_view(project_id, question_set_id)
         try:
-            result = question_sets.run(
+            question_set = question_sets.append_answered_question(
                 project_id,
                 question_set_id,
+                answered_question,
+                answer,
                 method,
-                selected_question_ids=selected_question_ids if mode == "selected" else None,
-                resume=mode == "resume",
             )
         except ProjectError as exc:
-            return f"❌ {exc}", [], ""
-        return f"✅ 批次執行完成｜{batch_summary(result)}", batch_rows(result), batch_summary(result)
-
-    def export_batch(project_id: str | None, question_set_id: str | None):
-        if not project_id or not question_set_id:
-            return "❌ 請先選擇專案與題目集", None, None
-        try:
-            json_path, csv_path = question_sets.export(project_id, question_set_id)
-            json_path, csv_path = stage_downloads((json_path, csv_path))
-        except ProjectError as exc:
-            return f"❌ {exc}", None, None
-        return "✅ 已匯出 JSON 與 CSV", str(json_path), str(csv_path)
+            return f"❌ {exc}", *saved_question_set_view(project_id, question_set_id)
+        return "✅ 已將問題與系統回答一併加入題目集", *saved_question_set_view(
+            project_id,
+            question_set.question_set_id,
+        )
 
     def review_view(project_id: str | None, question_set_id: str | None, index: int = 0):
         if not project_id or not question_set_id:
@@ -525,7 +531,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def sampling_section_choices(project_id: str | None):
         if not project_id:
-            return gr.Dropdown(choices=[], value=[])
+            return gr.Dropdown(choices=[], value=None)
         try:
             sections = source_sampling.available_sections(project_id)
         except ProjectError:
@@ -847,6 +853,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
             sampling_section_choices(project_id),
+            [],
+            "請選取或建立題目集",
         )
 
     def import_documents(project_id: str | None, files: list[str] | None):
@@ -973,18 +981,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             asdict(project),
         )
 
-    with gr.Blocks(
-        title="汽車維修 GraphRAG 管理後台",
-        js="""() => {
-            let previousLog = null;
-            window.setInterval(() => {
-                const log = document.querySelector("#indexing-log textarea");
-                if (!log || log.value === previousLog) return;
-                previousLog = log.value;
-                log.scrollTop = log.scrollHeight;
-            }, 100);
-        }""",
-    ) as demo:
+    with gr.Blocks(title="汽車維修 GraphRAG 管理後台") as demo:
         gr.Markdown("# 汽車維修 GraphRAG 管理後台")
         active_project_id = gr.State(value=None)
         active_project_banner = gr.Markdown(active_project_label(None))
@@ -1114,6 +1111,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     query_summary = gr.Markdown(label="查詢資訊")
             gr.Markdown("### Evidence 詳情")
             query_evidence_state = gr.State([])
+            query_question_state = gr.State("")
+            query_answer_state = gr.State("")
             query_evidence_table = gr.Dataframe(
                 headers=EVIDENCE_COLUMNS,
                 interactive=False,
@@ -1123,36 +1122,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_evidence_selector = gr.Dropdown(label="選取證據全文")
             query_evidence_detail = gr.Markdown()
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
-            gr.Markdown("## 題目集批次問答")
+            gr.Markdown("## 題目集")
             with gr.Row():
-                batch_project_refresh = gr.Button("重新整理題目集")
-                question_set_selector = gr.Dropdown(label="題目集")
-            question_set_file = gr.File(file_types=[".json"], type="filepath", label="匯入 question_set.json")
+                question_set_name = gr.Textbox(label="新題目集名稱")
+                question_set_description = gr.Textbox(label="說明（選填）")
+                create_question_set_button = gr.Button("建立題目集", variant="primary")
+            question_set_selector = gr.Dropdown(label="題目集")
             with gr.Row():
-                import_question_set_button = gr.Button("匯入並驗證")
-                batch_method = gr.Dropdown(
-                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                    value="local",
-                    label="查詢方法",
-                )
-            question_set_validation = gr.JSON(label="驗證錯誤")
-            selected_batch_questions = gr.Dropdown(multiselect=True, label="選擇題目（選題執行用）")
-            with gr.Row():
-                run_all_button = gr.Button("執行全部", variant="primary")
-                run_selected_button = gr.Button("執行選取題目")
-                resume_batch_button = gr.Button("繼續未完成")
-                export_batch_button = gr.Button("匯出結果")
-            batch_result = gr.Markdown()
-            batch_status = gr.Markdown()
-            batch_table = gr.Dataframe(
-                headers=BATCH_COLUMNS,
+                refresh_question_sets_button = gr.Button("重新整理")
+                load_question_set_button = gr.Button("載入題目集")
+                add_qa_to_question_set_button = gr.Button("將目前問題與回答加入題目集")
+            question_set_result = gr.Markdown()
+            question_set_summary = gr.Markdown("請建立或載入題目集")
+            saved_questions_table = gr.Dataframe(
+                headers=["題號", "問題", "系統回答"],
                 interactive=False,
-                datatype=["str", "str", "str", "number", "str"],
-                label="批次題目狀態",
+                datatype=["str", "str", "str"],
+                label="題目集內容（每題均包含問題與系統回答）",
             )
-            with gr.Row():
-                batch_json_export = gr.File(label="JSON 匯出")
-                batch_csv_export = gr.File(label="CSV 匯出")
 
         with gr.Tab("人工檢查"):
             with gr.Row():
@@ -1388,7 +1375,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections],
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
         )
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
@@ -1430,7 +1417,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections],
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
         )
         upload_button.click(
             import_documents,
@@ -1464,6 +1451,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail,
                 query_context,
                 query_evidence_state,
+                query_question_state,
+                query_answer_state,
             ],
         )
         query_evidence_selector.input(
@@ -1472,7 +1461,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=query_evidence_detail,
         )
         clear_question_button.click(
-            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, []),
+            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, [], "", ""),
             outputs=[
                 question,
                 query_answer,
@@ -1482,55 +1471,36 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail,
                 query_context,
                 query_evidence_state,
+                query_question_state,
+                query_answer_state,
             ],
         )
-        batch_project_refresh.click(
-            lambda project_id: question_set_view(project_id, None),
-            inputs=batch_project,
-            outputs=[question_set_selector, batch_table, selected_batch_questions, batch_status],
+        create_question_set_button.click(
+            create_saved_question_set,
+            inputs=[query_project, question_set_name, question_set_description],
+            outputs=[question_set_result, question_set_selector, saved_questions_table, question_set_summary],
         )
-        question_set_selector.input(
-            question_set_view,
-            inputs=[batch_project, question_set_selector],
-            outputs=[question_set_selector, batch_table, selected_batch_questions, batch_status],
+        refresh_question_sets_button.click(
+            lambda project_id: saved_question_set_view(project_id, None),
+            inputs=query_project,
+            outputs=[question_set_selector, saved_questions_table, question_set_summary],
         )
-        import_question_set_button.click(
-            import_question_set,
-            inputs=[batch_project, question_set_file],
-            outputs=[
-                batch_result,
-                question_set_validation,
+        load_question_set_button.click(
+            load_saved_question_set,
+            inputs=[query_project, question_set_selector],
+            outputs=[question_set_result, question_set_selector, saved_questions_table, question_set_summary],
+        )
+        add_qa_to_question_set_button.click(
+            add_current_answer_to_question_set,
+            inputs=[
+                query_project,
                 question_set_selector,
-                batch_table,
-                selected_batch_questions,
-                batch_status,
+                question,
+                query_question_state,
+                query_answer_state,
+                query_method,
             ],
-        )
-        run_all_button.click(
-            lambda project_id, question_set_id, method, selected: run_batch(
-                project_id, question_set_id, method, selected, "all"
-            ),
-            inputs=[batch_project, question_set_selector, batch_method, selected_batch_questions],
-            outputs=[batch_result, batch_table, batch_status],
-        )
-        run_selected_button.click(
-            lambda project_id, question_set_id, method, selected: run_batch(
-                project_id, question_set_id, method, selected, "selected"
-            ),
-            inputs=[batch_project, question_set_selector, batch_method, selected_batch_questions],
-            outputs=[batch_result, batch_table, batch_status],
-        )
-        resume_batch_button.click(
-            lambda project_id, question_set_id, method, selected: run_batch(
-                project_id, question_set_id, method, selected, "resume"
-            ),
-            inputs=[batch_project, question_set_selector, batch_method, selected_batch_questions],
-            outputs=[batch_result, batch_table, batch_status],
-        )
-        export_batch_button.click(
-            export_batch,
-            inputs=[batch_project, question_set_selector],
-            outputs=[batch_result, batch_json_export, batch_csv_export],
+            outputs=[question_set_result, question_set_selector, saved_questions_table, question_set_summary],
         )
         review_project_refresh.click(
             lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
@@ -1841,7 +1811,7 @@ def document_row(document: DocumentInfo) -> list[str | int | None]:
 
 
 def main() -> None:
-    create_app().queue(default_concurrency_limit=1).launch()
+    create_app().queue(default_concurrency_limit=1).launch(js=INDEXING_LOG_AUTOSCROLL_JS)
 
 
 if __name__ == "__main__":

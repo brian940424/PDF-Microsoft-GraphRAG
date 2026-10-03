@@ -96,6 +96,63 @@ class QuestionSetService:
         self._write(question_set)
         return question_set
 
+    def create(self, project_id: str, name: str, description: str = "") -> QuestionSet:
+        self.projects.get(project_id)
+        if not isinstance(name, str) or not name.strip():
+            raise ProjectError("題目集名稱不可空白")
+        if not isinstance(description, str):
+            raise ProjectError("題目集說明格式錯誤")
+        now = datetime.now(timezone.utc).isoformat()
+        question_set = QuestionSet(
+            question_set_id=uuid.uuid4().hex,
+            project_id=project_id,
+            name=name.strip(),
+            description=description.strip(),
+            method="local",
+            imported_at=now,
+            updated_at=now,
+            questions=(),
+        )
+        self._write(question_set)
+        return question_set
+
+    def append_answered_question(
+        self,
+        project_id: str,
+        question_set_id: str,
+        question: str,
+        answer: str,
+        method: str = "local",
+    ) -> QuestionSet:
+        if not isinstance(question, str) or not question.strip():
+            raise ProjectError("問題不可空白")
+        if not isinstance(answer, str) or not answer.strip():
+            raise ProjectError("系統回答不可空白，請先完成問答再加入題目集")
+        question_set = self.get(project_id, question_set_id)
+        if any(item.question.strip() == question.strip() for item in question_set.questions):
+            raise ProjectError("題目集已存在相同問題")
+        used_ids = {item.question_id for item in question_set.questions}
+        used_numbers = {
+            int(item_id[1:])
+            for item_id in used_ids
+            if item_id.startswith("Q") and item_id[1:].isdigit()
+        }
+        next_number = max(used_numbers, default=0) + 1
+        while f"Q{next_number:04d}" in used_ids:
+            next_number += 1
+        now = datetime.now(timezone.utc).isoformat()
+        answered = BatchQuestion(
+            question_id=f"Q{next_number:04d}",
+            question=question.strip(),
+            reference_answer=answer.strip(),
+            status="COMPLETED",
+            answer=answer.strip(),
+            completed_at=now,
+        )
+        updated = self._replace(question_set, [*question_set.questions, answered], method)
+        self._write(updated)
+        return updated
+
     def list(self, project_id: str) -> list[QuestionSet]:
         directory = self.projects.path_for(project_id) / "question_sets"
         result = [self._read(path) for path in directory.glob("*.json") if path.is_file()]

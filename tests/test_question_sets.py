@@ -76,6 +76,36 @@ class QuestionSetServiceTests(unittest.TestCase):
         self.assertEqual(question_set.questions[0].reference_answer, "參考答案一")
         self.assertEqual(self.service.get("L33-SM3E", question_set.question_set_id), question_set)
 
+    def test_create_set_and_append_question_with_answer(self) -> None:
+        question_set = self.service.create("L33-SM3E", "單次問答收藏", "滿意的回答")
+
+        updated = self.service.append_answered_question(
+            "L33-SM3E",
+            question_set.question_set_id,
+            "如何檢查雨刷馬達？",
+            "先確認保險絲，再檢查馬達供電。",
+        )
+
+        self.assertEqual(len(updated.questions), 1)
+        self.assertEqual(updated.questions[0].question, "如何檢查雨刷馬達？")
+        self.assertEqual(updated.questions[0].reference_answer, "先確認保險絲，再檢查馬達供電。")
+        self.assertEqual(updated.questions[0].answer, updated.questions[0].reference_answer)
+        self.assertEqual(
+            self.service.get("L33-SM3E", question_set.question_set_id),
+            updated,
+        )
+
+    def test_append_rejects_missing_answer(self) -> None:
+        question_set = self.service.create("L33-SM3E", "空題目集")
+
+        with self.assertRaisesRegex(ProjectError, "系統回答不可空白"):
+            self.service.append_answered_question(
+                "L33-SM3E",
+                question_set.question_set_id,
+                "沒有答案的問題",
+                "",
+            )
+
     def test_import_reports_duplicate_id_with_array_position(self) -> None:
         value = self.valid_value()
         value["questions"][1]["question_id"] = "Q001"  # type: ignore[index]
