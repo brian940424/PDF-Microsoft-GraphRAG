@@ -845,6 +845,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
+            gr.Dropdown(choices=choices, value=None),
             sampling_section_choices(project_id),
         )
 
