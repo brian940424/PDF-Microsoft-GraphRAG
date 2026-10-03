@@ -55,16 +55,13 @@ class ConnectionSettings:
         key = os.environ.get(API_KEY_ENVIRONMENT_VARIABLE)
         if key and not self._is_placeholder_key(key):
             return key
-        key = self._dotenv_api_key(project_id)
-        if key:
-            return key
         value = self._read()
-        if value is None:
-            return None
-        key = value.get("api_key")
-        if not isinstance(key, str) or not key:
-            raise ProjectError("共用連線設定缺少 API Key")
-        return key
+        if value is not None:
+            key = value.get("api_key")
+            if not isinstance(key, str) or not key:
+                raise ProjectError("共用連線設定缺少 API Key")
+            return key
+        return self._dotenv_api_key(project_id)
 
     def get_api_base_url(self) -> str:
         value = self._read()

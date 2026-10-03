@@ -59,6 +59,17 @@ class ConnectionSettingsTests(unittest.TestCase):
             self.assertEqual(settings.apply_to_environment("L33-SM3E"), "project-dotenv-key")
             self.assertEqual(os.environ["GRAPHRAG_API_KEY"], "project-dotenv-key")
 
+    def test_saved_key_wins_over_project_dotenv_after_restart(self) -> None:
+        graph_root = self.project_root / "L33-SM3E" / "graphrag"
+        graph_root.mkdir(parents=True)
+        (graph_root / ".env").write_text("GRAPHRAG_API_KEY=old-dotenv-key\n", encoding="utf-8")
+        settings = ConnectionSettings(self.project_root)
+        settings.save("https://api.openai.com/v1", "new-saved-key")
+
+        # Simulate a fresh app process, where save()'s environment update is gone.
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.get_api_key("L33-SM3E"), "new-saved-key")
+
     def test_blank_key_is_rejected(self) -> None:
         with self.assertRaisesRegex(ProjectError, "必填"):
             ConnectionSettings(self.project_root).save_api_key("  ")
