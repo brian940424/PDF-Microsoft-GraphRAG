@@ -9,19 +9,25 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Iterator, Protocol
 
-from pypdf import PdfReader
+import pymupdf
 
 from .projects import ProjectError, ProjectStore
 
 
 class PdfPage(Protocol):
-    def extract_text(self, **kwargs: Any) -> str | None: ...
+    rect: Any
+
+    def get_text(self, option: str = "text", *, clip: Any = None) -> str: ...
 
 
 class PdfDocument(Protocol):
-    pages: Iterable[PdfPage]
+    def __iter__(self) -> Iterator[PdfPage]: ...
+
+    def __len__(self) -> int: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +60,7 @@ class DocumentService:
     def __init__(
         self,
         projects: ProjectStore,
-        reader_factory: Callable[[str | Path], PdfDocument] = PdfReader,
+        reader_factory: Callable[[str | Path], PdfDocument] = pymupdf.open,
     ) -> None:
         self.projects = projects
         self.reader_factory = reader_factory
@@ -90,11 +96,16 @@ class DocumentService:
             status = previous.get("status", "UPLOADED")
             error = previous.get("error")
             if pages is None:
+                document: PdfDocument | None = None
                 try:
-                    pages = len(list(self.reader_factory(path).pages))
+                    document = self.reader_factory(path)
+                    pages = len(document)
                 except Exception as exc:
                     status = "ERROR"
                     error = str(exc)
+                finally:
+                    if document is not None:
+                        self._close_document(document)
             documents.append(
                 DocumentInfo(
                     filename=path.name,
@@ -208,42 +219,49 @@ class DocumentService:
             "error": None,
             "page_errors": [],
         }
+        document: PdfDocument | None = None
         try:
-            pages = list(self.reader_factory(source).pages)
+            document = self.reader_factory(source)
+            pages = list(document)
         except Exception as exc:
+            if document is not None:
+                self._close_document(document)
             report.update(status="ERROR", error=str(exc))
             return report
 
         report["pages"] = len(pages)
         totals["pages"] += len(pages)
         document_stem = self._safe_identifier(source.stem)
-        for page_number, page in enumerate(pages, start=1):
-            try:
-                text = self._extract_page_text(page, header_ignore_percent, footer_ignore_percent).strip()
-            except Exception as exc:
-                report["error_pages"] += 1
-                totals["error_pages"] += 1
-                report["page_errors"].append({"page": page_number, "error": str(exc)})
-                continue
-            if not text:
-                report["empty_pages"] += 1
-                totals["empty_pages"] += 1
-                continue
-            records.append(
-                {
-                    "id": f"{project_id}-{document_stem}-p{page_number:04d}",
-                    "chunk_id": f"{project_id}-{document_stem}-p{page_number:04d}-b01",
-                    "project_id": project_id,
-                    "section_id": document_stem,
-                    "section_name": source.stem,
-                    "title": f"{source.name} - Page {page_number}",
-                    "text": text,
-                    "document_id": source.name,
-                    "page": page_number,
-                    "block_id": "b01",
-                }
-            )
-            totals["successful_pages"] += 1
+        try:
+            for page_number, page in enumerate(pages, start=1):
+                try:
+                    text = self._extract_page_text(page, header_ignore_percent, footer_ignore_percent).strip()
+                except Exception as exc:
+                    report["error_pages"] += 1
+                    totals["error_pages"] += 1
+                    report["page_errors"].append({"page": page_number, "error": str(exc)})
+                    continue
+                if not text:
+                    report["empty_pages"] += 1
+                    totals["empty_pages"] += 1
+                    continue
+                records.append(
+                    {
+                        "id": f"{project_id}-{document_stem}-p{page_number:04d}",
+                        "chunk_id": f"{project_id}-{document_stem}-p{page_number:04d}-b01",
+                        "project_id": project_id,
+                        "section_id": document_stem,
+                        "section_name": source.stem,
+                        "title": f"{source.name} - Page {page_number}",
+                        "text": text,
+                        "document_id": source.name,
+                        "page": page_number,
+                        "block_id": "b01",
+                    }
+                )
+                totals["successful_pages"] += 1
+        finally:
+            self._close_document(document)
         if report["error_pages"]:
             report["status"] = "PROCESSED_WITH_ERRORS"
         elif report["empty_pages"]:
@@ -266,31 +284,25 @@ class DocumentService:
     @staticmethod
     def _extract_page_text(page: PdfPage, header_percent: float, footer_percent: float) -> str:
         if header_percent == 0 and footer_percent == 0:
-            return page.extract_text() or ""
+            return page.get_text("text") or ""
 
         try:
-            page_height = float(page.mediabox.height)  # type: ignore[attr-defined]
-            page_bottom = float(page.mediabox.bottom)  # type: ignore[attr-defined]
-            page_top = float(page.mediabox.top)  # type: ignore[attr-defined]
+            page_left = float(page.rect.x0)
+            page_top = float(page.rect.y0)
+            page_right = float(page.rect.x1)
+            page_bottom = float(page.rect.y1)
+            page_height = float(page.rect.height)
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError("無法取得 PDF 頁面高度以套用頁首頁尾忽略比例") from exc
-        footer_limit = page_bottom + page_height * footer_percent / 100
-        header_limit = page_top - page_height * header_percent / 100
-        fragments: list[str] = []
+        clip_top = page_top + page_height * header_percent / 100
+        clip_bottom = page_bottom - page_height * footer_percent / 100
+        return page.get_text("text", clip=(page_left, clip_top, page_right, clip_bottom)) or ""
 
-        def collect_text(
-            text: str,
-            _current_transformation_matrix: list[float],
-            text_matrix: list[float],
-            _font_dictionary: dict[str, Any] | None,
-            _font_size: float,
-        ) -> None:
-            y_position = float(text_matrix[5])
-            if footer_limit <= y_position <= header_limit:
-                fragments.append(text)
-
-        page.extract_text(visitor_text=collect_text)
-        return "".join(fragments)
+    @staticmethod
+    def _close_document(document: PdfDocument) -> None:
+        close = getattr(document, "close", None)
+        if callable(close):
+            close()
 
     def _document_reports(self, project_id: str) -> dict[str, dict[str, Any]]:
         report_path = self.projects.path_for(project_id) / "processed" / "report.json"

@@ -12,7 +12,7 @@ dependencies = [
     "gradio>=6.29,<6.30",
     "pandas>=3.0,<3.1",
     "pyarrow>=25,<26",
-    "pypdf>=6.19,<7",
+    "pymupdf>=1.26,<2",
 ]
 
 [project.optional-dependencies]

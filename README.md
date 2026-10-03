@@ -49,7 +49,7 @@
 
 ```text
 PDF
-  → PyPDF 逐頁擷取文字
+  → PyMuPDF 逐頁擷取文字
   → 排除指定比例的頁首／頁尾
   → processed/input.jsonl
   → Microsoft GraphRAG index

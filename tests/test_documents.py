@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pymupdf
+
 from automotive_graphrag.documents import DocumentService
 from automotive_graphrag.projects import ProjectError, ProjectStore
 
@@ -12,7 +14,7 @@ class FakePage:
         self.text = text
         self.error = error
 
-    def extract_text(self) -> str | None:
+    def get_text(self, option: str = "text", *, clip=None) -> str | None:
         if self.error:
             raise RuntimeError(self.error)
         return self.text
@@ -22,25 +24,34 @@ class FakeDocument:
     def __init__(self, pages: list[FakePage]) -> None:
         self.pages = pages
 
+    def __iter__(self):
+        return iter(self.pages)
 
-class FakeMediaBox:
+    def __len__(self) -> int:
+        return len(self.pages)
+
+    def close(self) -> None:
+        pass
+
+
+class FakeRect:
+    x0 = 0
+    y0 = 0
+    x1 = 100
+    y1 = 100
     height = 100
-    bottom = 0
-    top = 100
 
 
 class PositionedFakePage:
-    mediabox = FakeMediaBox()
+    rect = FakeRect()
 
     def __init__(self, fragments: list[tuple[str, float]]) -> None:
         self.fragments = fragments
 
-    def extract_text(self, visitor_text=None) -> str:
-        if visitor_text is None:
+    def get_text(self, option: str = "text", *, clip=None) -> str:
+        if clip is None:
             return "".join(text for text, _ in self.fragments)
-        for text, y_position in self.fragments:
-            visitor_text(text, [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, y_position], None, 12)
-        return ""
+        return "".join(text for text, y_position in self.fragments if clip[1] <= y_position <= clip[3])
 
 
 class DocumentServiceTests(unittest.TestCase):
@@ -158,6 +169,25 @@ class DocumentServiceTests(unittest.TestCase):
         summary = json.loads((processed / "report.json").read_text())["summary"]
         self.assertEqual(summary["header_ignore_percent"], 10)
         self.assertEqual(summary["footer_ignore_percent"], 10)
+
+    def test_pymupdf_extracts_traditional_chinese_and_clips_margins(self) -> None:
+        pdf = self.root / "uploads" / "ZH.pdf"
+        pdf.parent.mkdir(exist_ok=True)
+        document = pymupdf.open()
+        page = document.new_page(width=595, height=842)
+        page.insert_text((72, 40), "重複頁首", fontname="china-t")
+        page.insert_text((72, 420), "繁體中文維修內容", fontname="china-t")
+        page.insert_text((72, 810), "第 1 頁", fontname="china-t")
+        document.save(pdf)
+        document.close()
+        service = DocumentService(self.store)
+        service.import_pdfs("L33-SM3E", [pdf])
+
+        service.preprocess("L33-SM3E", header_ignore_percent=10, footer_ignore_percent=10)
+
+        processed = self.store.path_for("L33-SM3E") / "processed" / "input.jsonl"
+        record = json.loads(processed.read_text(encoding="utf-8").strip())
+        self.assertEqual(record["text"], "繁體中文維修內容")
 
     def test_preprocess_rejects_margins_that_remove_the_whole_page(self) -> None:
         self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])

@@ -13,7 +13,7 @@ class PackagingConfigurationTests(unittest.TestCase):
 
         self.assertEqual(
             set(pins),
-            {"graphrag", "gradio", "pandas", "pyarrow", "pypdf"},
+            {"graphrag", "gradio", "pandas", "pyarrow", "pymupdf"},
         )
         for package in pins:
             self.assertTrue(
