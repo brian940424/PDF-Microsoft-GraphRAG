@@ -973,7 +973,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             asdict(project),
         )
 
-    with gr.Blocks(title="汽車維修 GraphRAG 管理後台") as demo:
+    with gr.Blocks(
+        title="汽車維修 GraphRAG 管理後台",
+        js="""() => {
+            let previousLog = null;
+            window.setInterval(() => {
+                const log = document.querySelector("#indexing-log textarea");
+                if (!log || log.value === previousLog) return;
+                previousLog = log.value;
+                log.scrollTop = log.scrollHeight;
+            }, 100);
+        }""",
+    ) as demo:
         gr.Markdown("# 汽車維修 GraphRAG 管理後台")
         active_project_id = gr.State(value=None)
         active_project_banner = gr.Markdown(active_project_label(None))
@@ -1078,7 +1089,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 removable_pdf = gr.Dropdown(label="選擇要移除的 PDF")
                 remove_pdf_confirmation = gr.Checkbox(label="我確認要移除選取的 PDF")
                 remove_pdf_button = gr.Button("移除 PDF", variant="stop")
-            indexing_log = gr.Textbox(label="建圖日誌", lines=12, interactive=False, autoscroll=True)
+            indexing_log = gr.Textbox(
+                label="建圖日誌",
+                lines=12,
+                interactive=False,
+                autoscroll=True,
+                elem_id="indexing-log",
+            )
 
         with gr.Tab("問答測試"):
             with gr.Row():
