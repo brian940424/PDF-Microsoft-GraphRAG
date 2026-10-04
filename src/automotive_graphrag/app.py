@@ -1032,9 +1032,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             *documents_view,
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
-            gr.Dropdown(choices=choices, value=None),
-            gr.Dropdown(choices=choices, value=None),
-            gr.Dropdown(choices=choices, value=None),
             sampling_section_choices(project_id),
             [],
             "請選取或建立題目集",
@@ -1376,89 +1373,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_evidence_detail = gr.Markdown()
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
 
-        with gr.Tab("人工檢查"):
-            with gr.Row():
-                review_project_refresh = gr.Button("重新整理題目集")
-                review_question_set = gr.Dropdown(label="題目集")
-            review_progress = gr.Markdown("尚未選擇題目集")
-            review_question = gr.Markdown()
-            gr.Markdown("### 系統回答")
-            review_answer = gr.Markdown()
-            review_label = gr.Radio(
-                choices=[
-                    ("正確", "correct"),
-                    ("部分正確", "partially_correct"),
-                    ("錯誤", "incorrect"),
-                    ("資料不足", "insufficient"),
-                ],
-                label="正確性",
-            )
-            review_note = gr.Textbox(label="審查備註", lines=3)
-            review_index = gr.State(0)
-            with gr.Row():
-                previous_review_button = gr.Button("上一題")
-                save_next_review_button = gr.Button("儲存並下一題", variant="primary")
-                review_number = gr.Number(label="跳到題號", value=1, minimum=1, maximum=1)
-                jump_review_button = gr.Button("跳轉")
-                export_reviews_button = gr.Button("匯出評測結果")
-            review_result = gr.Markdown()
-            with gr.Row():
-                review_json_export = gr.File(label="人工評測 JSON")
-                review_csv_export = gr.File(label="人工評測 CSV")
-
-        with gr.Tab("Gold Evidence"):
-            with gr.Row():
-                gold_project_refresh = gr.Button("重新整理題目集與來源")
-                gold_question_set = gr.Dropdown(label="題目集")
-                gold_question = gr.Dropdown(label="題目")
-            gold_question_text = gr.Markdown()
-            gr.Markdown(
-                "請參考可用來源填寫 JSON；每筆需包含 `document_id`、`pages`、`chunk_ids`，可用 `[]` 清除標記。"
-            )
-            with gr.Row():
-                available_source_table = gr.Dataframe(
-                    headers=SOURCE_COLUMNS,
-                    interactive=False,
-                    datatype=["str", "number", "str", "str", "str"],
-                    label="索引中的可用來源",
-                )
-                gold_evidence_editor = gr.Code(language="json", value="[]", label="Gold Evidence JSON", lines=16)
-            save_gold_evidence_button = gr.Button("驗證並儲存 Gold Evidence", variant="primary")
-            gold_evidence_result = gr.Markdown()
-
-        with gr.Tab("Retrieval 評估"):
-            with gr.Row():
-                retrieval_project_refresh = gr.Button("重新整理題目集")
-                retrieval_question_set = gr.Dropdown(label="題目集")
-            with gr.Row():
-                retrieval_top_k = gr.Number(label="Top-K", value=5, minimum=1, precision=0)
-                retrieval_method = gr.Dropdown(
-                    choices=[("Local", "local")],
-                    value="local",
-                    label="查詢方法",
-                )
-                retrieval_rerun = gr.Checkbox(
-                    label="重新執行查詢（會產生 API Token 費用）",
-                    value=False,
-                )
-            with gr.Row():
-                run_retrieval_button = gr.Button("執行評估", variant="primary")
-                export_retrieval_button = gr.Button("匯出結果")
-            retrieval_result = gr.Markdown()
-            retrieval_summary = gr.Markdown()
-            retrieval_table = gr.Dataframe(
-                headers=RETRIEVAL_COLUMNS,
-                interactive=False,
-                datatype=["str", "number", "number", "number", "bool"],
-                label="逐題 Retrieval 結果",
-            )
-            retrieval_items_state = gr.State([])
-            retrieval_item_selector = gr.Dropdown(label="查看逐題 Evidence 詳情")
-            retrieval_item_json = gr.JSON(label="Gold／Retrieved Evidence")
-            with gr.Row():
-                retrieval_json_export = gr.File(label="Retrieval JSON")
-                retrieval_csv_export = gr.File(label="Retrieval CSV")
-
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
                 "## 回答與證據自動評測\n"
@@ -1610,7 +1524,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
         )
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
@@ -1652,7 +1566,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
         )
         upload_button.click(
             import_documents,
@@ -1765,144 +1679,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_method,
             ],
             outputs=[question_set_result, question_set_selector, saved_questions_table, question_set_summary],
-        )
-        review_project_refresh.click(
-            lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
-            inputs=review_project,
-            outputs=review_question_set,
-        )
-        review_question_set.input(
-            lambda project_id, question_set_id: review_view(project_id, question_set_id, 0),
-            inputs=[review_project, review_question_set],
-            outputs=[
-                review_question,
-                review_answer,
-                review_label,
-                review_note,
-                review_index,
-                review_number,
-                review_progress,
-            ],
-        )
-        previous_review_button.click(
-            lambda project_id, question_set_id, index, label, note: navigate_review(
-                project_id, question_set_id, index, label, note, -1
-            ),
-            inputs=[review_project, review_question_set, review_index, review_label, review_note],
-            outputs=[
-                review_question,
-                review_answer,
-                review_label,
-                review_note,
-                review_index,
-                review_number,
-                review_progress,
-                review_result,
-            ],
-        )
-        save_next_review_button.click(
-            lambda project_id, question_set_id, index, label, note: navigate_review(
-                project_id, question_set_id, index, label, note, 1, True
-            ),
-            inputs=[review_project, review_question_set, review_index, review_label, review_note],
-            outputs=[
-                review_question,
-                review_answer,
-                review_label,
-                review_note,
-                review_index,
-                review_number,
-                review_progress,
-                review_result,
-            ],
-        )
-        jump_review_button.click(
-            jump_review,
-            inputs=[
-                review_project,
-                review_question_set,
-                review_index,
-                review_label,
-                review_note,
-                review_number,
-            ],
-            outputs=[
-                review_question,
-                review_answer,
-                review_label,
-                review_note,
-                review_index,
-                review_number,
-                review_progress,
-                review_result,
-            ],
-        )
-        export_reviews_button.click(
-            export_reviews,
-            inputs=[review_project, review_question_set],
-            outputs=[review_result, review_json_export, review_csv_export],
-        )
-        gold_project_refresh.click(
-            lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
-            inputs=gold_project,
-            outputs=gold_question_set,
-        )
-        gold_question_set.input(
-            ground_truth_set_view,
-            inputs=[gold_project, gold_question_set],
-            outputs=[
-                gold_question,
-                gold_question_text,
-                gold_evidence_editor,
-                available_source_table,
-                gold_evidence_result,
-            ],
-        )
-        gold_question.input(
-            ground_truth_question_view,
-            inputs=[gold_project, gold_question_set, gold_question],
-            outputs=[gold_question_text, gold_evidence_editor],
-        )
-        save_gold_evidence_button.click(
-            save_ground_truth,
-            inputs=[gold_project, gold_question_set, gold_question, gold_evidence_editor],
-            outputs=[gold_evidence_result, gold_evidence_editor],
-        )
-        retrieval_project_refresh.click(
-            lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
-            inputs=retrieval_project,
-            outputs=retrieval_question_set,
-        )
-        run_retrieval_button.click(
-            run_retrieval_evaluation,
-            inputs=[
-                retrieval_project,
-                retrieval_question_set,
-                retrieval_top_k,
-                retrieval_rerun,
-                retrieval_method,
-            ],
-            outputs=[
-                retrieval_result,
-                retrieval_summary,
-                retrieval_table,
-                retrieval_item_selector,
-                retrieval_items_state,
-            ],
-        ).then(
-            retrieval_item_detail,
-            inputs=[retrieval_item_selector, retrieval_items_state],
-            outputs=retrieval_item_json,
-        )
-        retrieval_item_selector.input(
-            retrieval_item_detail,
-            inputs=[retrieval_item_selector, retrieval_items_state],
-            outputs=retrieval_item_json,
-        )
-        export_retrieval_button.click(
-            export_retrieval_evaluation,
-            inputs=[retrieval_project, retrieval_question_set],
-            outputs=[retrieval_result, retrieval_json_export, retrieval_csv_export],
         )
         automatic_project_refresh.click(
             lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
