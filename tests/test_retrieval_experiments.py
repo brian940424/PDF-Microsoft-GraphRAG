@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
@@ -14,6 +15,7 @@ from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectStore
 from automotive_graphrag.question_sets import BatchQuestion, QuestionSetService
 from automotive_graphrag.retrieval_experiments import ExperimentGroup, RetrievalExperimentService
+from automotive_graphrag.source_metadata import SourceMetadata
 
 
 class FakeJudge:
@@ -196,6 +198,21 @@ class RetrievalExperimentTests(unittest.TestCase):
             self.assertFalse(kwargs["streaming"])
             self.assertTrue(kwargs["output_is_symlink"])
             self.assertEqual(kwargs["completion_model"], "gpt-4.1-mini")
+
+    def test_resolved_sources_reads_document_id_from_source_metadata(self):
+        source = SourceMetadata(
+            text_unit_id="unit-1", chunk_id="chunk-1", project_id="project",
+            section_id="S1", section_name="Section", document_id="manual.pdf",
+            page=12, block_id="b1", text="來源文字",
+        )
+        evidence = SimpleNamespace(text_unit_id="unit-1", document_id="graph-document-id")
+        with patch("automotive_graphrag.retrieval_experiments.EvidenceService") as evidence_service:
+            evidence_service.return_value.from_context.return_value = [evidence]
+            evidence_service.return_value.metadata.load.return_value = [source]
+
+            resolved = self.service._resolved_sources("project", {"sources": ["unit-1"]})
+
+        self.assertEqual(resolved, ("manual.pdf",))
 
     def test_app_exposes_retrieval_experiment_page_and_controls(self):
         from gradio.context import LocalContext

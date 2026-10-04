@@ -455,7 +455,10 @@ class RetrievalExperimentService:
         if not isinstance(raw, list) or not raw:
             return ()
         evidence = EvidenceService(self.projects).from_context(project_id, context)
-        metadata = {item.text_unit_id: item.document_name for item in EvidenceService(self.projects).metadata.load(project_id)}
+        metadata = {
+            item.text_unit_id: getattr(item, "document_name", None) or item.document_id
+            for item in EvidenceService(self.projects).metadata.load(project_id)
+        }
         return tuple(dict.fromkeys(metadata.get(item.text_unit_id, item.document_id) for item in evidence))
 
     def _graphrag_query(self, project_id: str, question: str, method: str, model: str) -> tuple[str, dict[str, object]]:
