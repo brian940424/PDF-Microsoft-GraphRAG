@@ -998,6 +998,32 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ 匯出失敗：{exc}", None, None
         return "✅ 已匯出精簡摘要與逐題結果 JSON", *(str(path) for path in paths)
 
+    def update_retrieval_experiment_judgments(project_id: str | None, table_data):
+        if not project_id:
+            return "❌ 請先開啟專案", [], []
+        if hasattr(table_data, "to_numpy"):
+            table_rows = table_data.to_numpy().tolist()
+        elif isinstance(table_data, dict):
+            table_rows = table_data.get("data", [])
+        else:
+            table_rows = table_data or []
+        judgments = []
+        for row in table_rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 7:
+                continue
+            flag = row[6]
+            if isinstance(flag, str):
+                is_correct = flag.strip().lower() in {"true", "1", "yes", "是", "正確"}
+            else:
+                is_correct = bool(flag)
+            judgments.append((str(row[0]), str(row[1]), is_correct))
+        try:
+            retrieval_experiments.update_manual_judgments(project_id, judgments)
+        except ProjectError as exc:
+            return f"❌ 儲存人工判斷失敗：{exc}", [], []
+        view = experiment_view(project_id, "✅ 人工判斷已儲存，實驗組摘要已更新。")
+        return view[0], view[3], view[4]
+
     def autosave_automatic_questions(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
             return "尚未建立題目集"
@@ -1907,7 +1933,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
             experiment_result_table = gr.Dataframe(
                 headers=["實驗組名稱", "題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
-                interactive=False,
+                interactive=True,
                 datatype=["str", "str", "str", "str", "str", "str", "bool", "str"],
                 column_widths=["8%", "6%", "10%", "14%", "21%", "18%", "8%", "15%"],
                 label="逐題實驗結果",
@@ -2192,6 +2218,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button],
+        )
+        experiment_result_table.change(
+            update_retrieval_experiment_judgments,
+            inputs=[active_project_id, experiment_result_table],
+            outputs=[experiment_status, experiment_summary_table, experiment_result_table],
         )
         experiment_stop_button.click(
             stop_retrieval_experiment,

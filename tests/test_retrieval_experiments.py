@@ -155,6 +155,30 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(details["question_results"][0]["answer_model"], "gpt-4o-mini")
         self.assertEqual(details["question_results"][0]["judge_model"], "gpt-4.1-mini")
 
+        self.service.update_manual_judgments("project", [("Local baseline", "Q0001", False)])
+        reloaded = RetrievalExperimentService(
+            self.projects, self.question_sets, self.connections, FakeJudge(), query_function=lambda *args: ("", {})
+        ).load("project")["run"]
+        local_group = next(group for group in reloaded["groups"] if group["group_name"] == "Local baseline")
+        edited_result = next(
+            item for item in reloaded["results"]
+            if item["group_name"] == "Local baseline" and item["question_id"] == "Q0001"
+        )
+        self.assertEqual(local_group["correct_count"], 1)
+        self.assertEqual(local_group["accuracy"], 0.5)
+        self.assertEqual(edited_result["evaluation_result"], "錯誤")
+        self.assertEqual(edited_result["evaluation_reason"], "")
+        updated_summary, updated_details = self.service.export("project")
+        updated_summary = json.loads(updated_summary.read_text(encoding="utf-8"))
+        updated_details = json.loads(updated_details.read_text(encoding="utf-8"))
+        updated_edited_result = next(
+            item for item in updated_details["question_results"]
+            if item["group_name"] == "Local baseline" and item["question_id"] == "Q0001"
+        )
+        self.assertEqual(updated_summary["summary"]["correct_total"], "3 / 4")
+        self.assertEqual(updated_summary["groups"][0]["summary"]["correct_total"], "1 / 2")
+        self.assertEqual(updated_edited_result["evaluation_result"], "錯誤")
+
     def test_answer_generation_and_evaluation_are_separate_persisted_steps(self):
         judge = FakeJudge()
         self.service.judging = judge
@@ -347,6 +371,7 @@ class RetrievalExperimentTests(unittest.TestCase):
             ["實驗組名稱", "題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
         )
         self.assertEqual(experiment_results["datatype"][6], "bool")
+        self.assertTrue(experiment_results["interactive"])
         self.assertEqual(
             experiment_results["column_widths"],
             ["8%", "6%", "10%", "14%", "21%", "18%", "8%", "15%"],

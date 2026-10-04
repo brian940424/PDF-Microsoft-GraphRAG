@@ -466,6 +466,39 @@ class RetrievalExperimentService:
         event.set()
         return True
 
+    def update_manual_judgments(
+        self, project_id: str, judgments: Sequence[tuple[str, str, bool]]
+    ) -> dict[str, object]:
+        """Persist user-edited correctness flags and refresh per-group accuracy."""
+        state = self.load(project_id)
+        run = state.get("run")
+        if not isinstance(run, dict):
+            raise ProjectError("目前沒有可修改的檢索實驗結果")
+        results = run.get("results", [])
+        changed = False
+        for group_name, question_id, is_correct in judgments:
+            for item in results:
+                if item.get("group_name") != group_name or item.get("question_id") != question_id:
+                    continue
+                next_result = "正確" if is_correct else "錯誤"
+                if item.get("evaluation_result") == "評判失敗" and not is_correct:
+                    continue
+                if item.get("evaluation_result") != next_result:
+                    item["evaluation_result"] = next_result
+                    item["evaluation_reason"] = ""
+                    item["error"] = None
+                    item["status"] = "completed"
+                    changed = True
+        if changed:
+            for group in run.get("groups", []):
+                group_results = [item for item in results if item.get("group_id") == group.get("group_id")]
+                judged = [item for item in group_results if item.get("evaluation_result") in {"正確", "錯誤"}]
+                correct = sum(item.get("evaluation_result") == "正確" for item in judged)
+                group["correct_count"] = correct
+                group["accuracy"] = correct / len(judged) if judged else None
+            self._write(project_id, state)
+        return run
+
     def export(self, project_id: str) -> tuple[Path, Path]:
         state = self.load(project_id)
         if state.get("run") is None:
