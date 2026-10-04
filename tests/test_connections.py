@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult
+from automotive_graphrag.connections import (
+    ALLOWED_CHAT_MODELS,
+    ConnectionSettings,
+    ConnectionTestResult,
+    chat_completion_api_params,
+    configure_completion_model,
+)
 from automotive_graphrag.projects import ProjectError
 
 
@@ -103,6 +109,34 @@ class ConnectionSettingsTests(unittest.TestCase):
                 "gpt-4.1",
                 "text-embedding-3-small",
             )
+
+    def test_gpt6_luna_uses_reasoning_compatible_chat_completion_parameters(self) -> None:
+        self.assertIn("gpt-6-luna", ALLOWED_CHAT_MODELS)
+        self.assertEqual(
+            chat_completion_api_params("gpt-6-luna", 4000),
+            {"max_completion_tokens": 4000, "reasoning_effort": "medium"},
+        )
+        self.assertEqual(
+            chat_completion_api_params("gpt-4o-mini", 4000),
+            {"temperature": 0, "max_tokens": 4000},
+        )
+
+    def test_gpt6_luna_graph_rag_settings_drop_incompatible_sampling_options(self) -> None:
+        model_config = {
+            "model": "gpt-4o-mini",
+            "call_args": {"temperature": 0, "top_p": 1, "max_tokens": 1200},
+        }
+
+        configure_completion_model(model_config, "gpt-6-luna")
+
+        self.assertEqual(model_config["model"], "gpt-6-luna")
+        self.assertEqual(
+            model_config["call_args"],
+            {"max_completion_tokens": 1200, "reasoning_effort": "medium"},
+        )
+
+        configure_completion_model(model_config, "gpt-4o-mini")
+        self.assertEqual(model_config["call_args"], {"max_tokens": 1200})
 
 
 if __name__ == "__main__":

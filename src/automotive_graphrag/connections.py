@@ -20,10 +20,47 @@ from .projects import ProjectError
 API_KEY_ENVIRONMENT_VARIABLE = "GRAPHRAG_API_KEY"
 API_BASE_ENVIRONMENT_VARIABLE = "GRAPHRAG_API_BASE"
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
-ALLOWED_CHAT_MODELS = ("gpt-4o-mini", "gpt-4.1-mini")
+GPT6_LUNA_MODEL = "gpt-6-luna"
+DEFAULT_REASONING_EFFORT = "medium"
+ALLOWED_CHAT_MODELS = ("gpt-4o-mini", "gpt-4.1-mini", GPT6_LUNA_MODEL)
 ALLOWED_EMBEDDING_MODELS = ("text-embedding-3-small", "text-embedding-3-large")
 DEFAULT_CHAT_MODEL = "gpt-4o-mini"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+
+
+def chat_completion_api_params(model: str, max_tokens: int) -> dict[str, object]:
+    """Return parameters compatible with the selected model's Chat Completions API."""
+    if model == GPT6_LUNA_MODEL:
+        # GPT-6 reasoning requests use max_completion_tokens and reject sampling
+        # parameters such as temperature/top_p when reasoning is enabled.
+        return {
+            "max_completion_tokens": max_tokens,
+            "reasoning_effort": DEFAULT_REASONING_EFFORT,
+        }
+    return {"temperature": 0, "max_tokens": max_tokens}
+
+
+def configure_completion_model(model_config: dict[str, object], model: str) -> None:
+    """Set a GraphRAG model and its model-specific Chat Completions arguments."""
+    model_config["model"] = model
+    raw_call_args = model_config.get("call_args")
+    call_args = dict(raw_call_args) if isinstance(raw_call_args, dict) else {}
+    if model != GPT6_LUNA_MODEL:
+        # The same project settings file is reused when users switch models.
+        # Remove GPT-6-only arguments so they cannot leak into a GPT-4 request.
+        call_args.pop("reasoning_effort", None)
+        completion_limit = call_args.pop("max_completion_tokens", None)
+        if completion_limit is not None:
+            call_args.setdefault("max_tokens", completion_limit)
+        model_config["call_args"] = call_args
+        return
+    for key in ("temperature", "top_p", "top_logprobs", "logprobs"):
+        call_args.pop(key, None)
+    legacy_max_tokens = call_args.pop("max_tokens", None)
+    if legacy_max_tokens is not None:
+        call_args.setdefault("max_completion_tokens", legacy_max_tokens)
+    call_args["reasoning_effort"] = DEFAULT_REASONING_EFFORT
+    model_config["call_args"] = call_args
 
 
 @dataclass(frozen=True, slots=True)

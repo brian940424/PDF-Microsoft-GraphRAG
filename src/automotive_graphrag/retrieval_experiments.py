@@ -16,7 +16,13 @@ from typing import Callable, Sequence
 import yaml
 
 from .automatic_evaluation import AutomaticEvaluationService
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings
+from .connections import (
+    ALLOWED_CHAT_MODELS,
+    DEFAULT_REASONING_EFFORT,
+    GPT6_LUNA_MODEL,
+    ConnectionSettings,
+    configure_completion_model,
+)
 from .evidence import EvidenceService
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
@@ -524,6 +530,11 @@ class RetrievalExperimentService:
                 "parameters": {
                     "answer_model": summary.get("answer_model"),
                     "retrieval_mode": self._retrieval_mode_label(summary.get("method")),
+                    "answer_reasoning_effort": (
+                        DEFAULT_REASONING_EFFORT
+                        if summary.get("answer_model") == GPT6_LUNA_MODEL
+                        else None
+                    ),
                 },
                 "summary": {
                     "answer_model": summary.get("answer_model"),
@@ -545,7 +556,11 @@ class RetrievalExperimentService:
             "max_concurrent_requests": state.get("max_concurrency", 5),
             "evaluation": {
                 "judge_model": state.get("judge_model", ""),
-                "judge_reasoning_effort": None,
+                "judge_reasoning_effort": (
+                    DEFAULT_REASONING_EFFORT
+                    if state.get("judge_model") == GPT6_LUNA_MODEL
+                    else None
+                ),
             },
             "summary": {
                 "question_count": expected_count,
@@ -736,6 +751,11 @@ class RetrievalExperimentService:
     def _graphrag_query(self, project_id: str, question: str, method: str, model: str) -> tuple[str, dict[str, object]]:
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
+        if method == "drift" and model == GPT6_LUNA_MODEL:
+            raise ProjectError(
+                "GPT-6 Luna 的 medium 推理模式不接受 GraphRAG DRIFT 目前固定傳入的 temperature/top_p；"
+                "請改用 Local、Global 或 Basic，或為 DRIFT 選擇其他模型。"
+            )
         project_path = self.projects.path_for(project_id) / "graphrag"
         settings_path = project_path / "settings.yaml"
         try:
@@ -746,7 +766,7 @@ class RetrievalExperimentService:
             for config in settings.get(section, {}).values():
                 config["api_base"] = self.connections.get_api_base_url()
         for config in settings.get("completion_models", {}).values():
-            config["model"] = model
+            configure_completion_model(config, model)
         api_key = self.connections.apply_to_environment(project_id)
         del api_key  # GraphRAG reads the standard API key environment variable.
 

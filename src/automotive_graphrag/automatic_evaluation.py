@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings
+from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, chat_completion_api_params
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .reviews import ReviewService
@@ -344,10 +344,9 @@ class AutomaticEvaluationService:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "max_tokens": 4000,
             "response_format": {"type": "json_object"},
         }
+        payload.update(chat_completion_api_params(model, 4000))
         request = urllib.request.Request(
             f"{api_base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),

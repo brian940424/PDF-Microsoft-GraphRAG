@@ -16,7 +16,7 @@ from typing import Callable
 
 import yaml
 
-from .connections import ConnectionSettings
+from .connections import ConnectionSettings, configure_completion_model
 from .projects import ProjectError, ProjectStore
 from .source_metadata import SourceMetadataService
 
@@ -247,7 +247,7 @@ class IndexingService:
     def _configure_models(settings_path: Path, chat_model: str, embedding_model: str) -> None:
         value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
         for model in value.get("completion_models", {}).values():
-            model["model"] = chat_model
+            configure_completion_model(model, chat_model)
         for model in value.get("embedding_models", {}).values():
             model["model"] = embedding_model
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))

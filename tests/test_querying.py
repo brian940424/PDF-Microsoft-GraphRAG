@@ -119,6 +119,24 @@ class QueryServiceTests(unittest.TestCase):
         settings = yaml.safe_load((self.graph_root / "settings.yaml").read_text())
         self.assertEqual(settings["completion_models"]["default_completion_model"]["model"], "gpt-4.1-mini")
 
+    def test_gpt6_query_sets_medium_reasoning_compatibility_args(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+
+        service.ask("L33-SM3E", "測試 GPT-6", chat_model="gpt-6-luna")
+
+        settings = yaml.safe_load((self.graph_root / "settings.yaml").read_text())
+        model = settings["completion_models"]["default_completion_model"]
+        self.assertEqual(model["model"], "gpt-6-luna")
+        self.assertEqual(model["call_args"]["reasoning_effort"], "medium")
+        self.assertNotIn("temperature", model["call_args"])
+        self.assertNotIn("top_p", model["call_args"])
+
+    def test_gpt6_drift_reports_sampling_parameter_incompatibility(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+
+        with self.assertRaisesRegex(ProjectError, "DRIFT.*temperature/top_p"):
+            service.ask("L33-SM3E", "測試 GPT-6", method="drift", chat_model="gpt-6-luna")
+
     def test_query_rejects_unknown_chat_model(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)
 

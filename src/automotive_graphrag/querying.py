@@ -18,7 +18,7 @@ from typing import Any, Callable
 import pandas as pd
 import yaml
 
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings
+from .connections import ALLOWED_CHAT_MODELS, GPT6_LUNA_MODEL, ConnectionSettings, configure_completion_model
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 
@@ -87,6 +87,11 @@ class QueryService:
         selected_model = chat_model or self.connection_settings.get_chat_model()
         if selected_model not in ALLOWED_CHAT_MODELS:
             raise ProjectError(f"不支援的 Chat 模型：{selected_model}")
+        if normalized_method == "drift" and selected_model == GPT6_LUNA_MODEL:
+            raise ProjectError(
+                "GPT-6 Luna 的 medium 推理模式不接受 GraphRAG DRIFT 目前固定傳入的 temperature/top_p；"
+                "請改用 Local、Global 或 Basic，或為 DRIFT 選擇其他模型。"
+            )
 
         graph_root = project_path / "graphrag"
         if not (graph_root / "output").is_dir():
@@ -238,7 +243,7 @@ class QueryService:
             for model in value.get(section, {}).values():
                 model["api_base"] = api_base_url
         for model in value.get("completion_models", {}).values():
-            model["model"] = chat_model
+            configure_completion_model(model, chat_model)
         for model in value.get("embedding_models", {}).values():
             model["model"] = embedding_model
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")
