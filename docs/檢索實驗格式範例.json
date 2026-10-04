@@ -1,0 +1,35 @@
+{
+  "name": "跨文件檢索比較範例",
+  "description": "供檢索實驗頁匯入；欄位相容於專案既有 Question Set JSON 格式。",
+  "questions": [
+    {
+      "question_id": "Q0001",
+      "question": "執行檢查前需要完成哪些準備？",
+      "correct_answer": "先確認設備已關閉，準備指定工具，並依序完成安全檢查。",
+      "question_sources": [
+        {
+          "document_id": "manual-a.pdf",
+          "document_name": "操作手冊 A.pdf",
+          "pages": [12, 13]
+        },
+        {
+          "document_id": "appendix.pdf",
+          "document_name": "安全附錄.pdf",
+          "pages": [4]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_id": "manual-a.pdf",
+          "document_name": "操作手冊 A.pdf",
+          "pages": [13, 14]
+        },
+        {
+          "document_id": "appendix.pdf",
+          "document_name": "安全附錄.pdf",
+          "pages": [5]
+        }
+      ]
+    }
+  ]
+}

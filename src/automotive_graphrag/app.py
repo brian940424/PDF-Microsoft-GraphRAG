@@ -24,6 +24,10 @@ from .question_generation import GeneratedQuestion, QuestionGenerationService
 from .question_sets import BatchQuestion, GoldEvidence, QuestionSet, QuestionSetService
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
+from .retrieval_experiments import (
+    ExperimentGroup,
+    RetrievalExperimentService,
+)
 from .source_sampling import SourceSample, SourceSamplingService
 
 
@@ -64,6 +68,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     source_sampling = SourceSamplingService(store)
     question_generation = QuestionGenerationService(store, source_sampling, connections)
     automatic_evaluation = AutomaticEvaluationService(store, question_sets, connections)
+    retrieval_experiments = RetrievalExperimentService(
+        store, question_sets, connections, automatic_evaluation
+    )
     automatic_qa = AutomaticQATestService(
         store, source_sampling, question_generation, querying, question_sets,
         automatic_evaluation, retrieval_evaluation,
@@ -731,6 +738,174 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             summary,
             result_rows,
         )
+
+    def experiment_group_objects(project_id: str) -> list[ExperimentGroup]:
+        state = retrieval_experiments.load(project_id)
+        return [ExperimentGroup(**item) for item in state.get("groups", [])]
+
+    def experiment_group_rows(project_id: str) -> list[list[str]]:
+        return [
+            [item.group_id, item.name, item.answer_model, item.judge_model, item.method]
+            for item in experiment_group_objects(project_id)
+        ]
+
+    def experiment_view(project_id: str | None, message: str = ""):
+        if not project_id:
+            return (
+                message or "請先在「專案設定」開啟專案", [], gr.Dropdown(choices=[]),
+                gr.Dropdown(choices=[("Local", "local")], value="local"), "", [], [], [], 5,
+            )
+        try:
+            state = retrieval_experiments.load(project_id)
+            groups = state.get("groups", [])
+            group_choices = [(f"{item['group_id']}｜{item['name']}", item["group_id"]) for item in groups]
+            selected_group = group_choices[0][1] if group_choices else None
+            selected_method = next(
+                (item.get("method", "local") for item in groups if item.get("group_id") == selected_group),
+                "local",
+            )
+            question_set_id = str(state.get("question_set_id", ""))
+            question_rows = []
+            if question_set_id:
+                question_set = question_sets.get(project_id, question_set_id)
+                for item in question_set.questions:
+                    question_sources = item.question_source_evidence or item.gold_evidence
+                    answer_sources = item.answer_source_evidence or item.gold_evidence
+                    question_rows.append([
+                        item.question_id, item.question, item.reference_answer,
+                        format_autoqa_sources(question_sources), format_autoqa_sources(answer_sources),
+                    ])
+            run = state.get("run") or {}
+            summaries = [
+                [
+                    item.get("group_name"), item.get("answer_model"), item.get("judge_model"),
+                    item.get("method"), item.get("question_count"), item.get("completed_count"),
+                    item.get("correct_count"),
+                    f"{item['accuracy']:.1%}" if item.get("accuracy") is not None else "—",
+                    f"{item['recall_at_5']:.1%}" if item.get("recall_at_5") is not None else "不可計算",
+                    f"{item['recall_at_10']:.1%}" if item.get("recall_at_10") is not None else "不可計算",
+                    f"{item['mrr']:.3f}" if item.get("mrr") is not None else "不可計算",
+                    item.get("retrieval_metrics_status", ""),
+                ]
+                for item in run.get("groups", [])
+            ]
+            results = [
+                [
+                    item.get("group_name"), item.get("answer_model"), item.get("judge_model"),
+                    item.get("question_id"), item.get("question"), ", ".join(item.get("source_documents", [])),
+                    item.get("correct_answer"), item.get("actual_answer"), item.get("evaluation_result"),
+                    item.get("evaluation_reason"), item.get("answer_source_rank"),
+                    item.get("retrieval_metrics_status"), item.get("status"), item.get("error"),
+                ]
+                for item in run.get("results", [])
+            ]
+            status = message or (
+                f"最近實驗狀態：{run.get('status', '尚未執行')}｜題目集：{run.get('question_set_name', '尚未匯入')}"
+            )
+            return (
+                status, experiment_group_rows(project_id),
+                gr.Dropdown(choices=group_choices, value=selected_group),
+                gr.Dropdown(choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")], value=selected_method),
+                question_set_id, question_rows, summaries, results, state.get("max_concurrency", 5),
+            )
+        except ProjectError as exc:
+            return (f"❌ {exc}", [], gr.Dropdown(choices=[]), gr.Dropdown(choices=[("Local", "local")], value="local"), "", [], [], [], 5)
+
+    def import_experiment_questions(project_id: str | None, filepath: str | None):
+        if not project_id or not filepath:
+            return experiment_view(project_id, "❌ 請先開啟專案並選擇 JSON 題目集")
+        try:
+            question_set = retrieval_experiments.import_question_set(project_id, filepath)
+        except (ProjectError, OSError) as exc:
+            return experiment_view(project_id, f"❌ 題目集匯入失敗：{exc}")
+        return experiment_view(project_id, f"✅ 已匯入「{question_set.name}」共 {len(question_set.questions)} 題")
+
+    def save_experiment_groups(project_id: str | None, rows, question_set_id: str | None, concurrency):
+        if not project_id:
+            return "請先開啟專案"
+        try:
+            state = retrieval_experiments.update_group_fields(project_id, rows)
+            old_limit = int(state.get("max_concurrency", 5))
+            try:
+                limit = int(concurrency) if concurrency not in (None, "") else old_limit
+            except (TypeError, ValueError, OverflowError):
+                limit = old_limit
+            saved_qid = str(question_set_id or state.get("question_set_id", ""))
+            retrieval_experiments.save_configuration(
+                project_id, [ExperimentGroup(**item) for item in state["groups"]], saved_qid, limit
+            )
+        except (ProjectError, TypeError, ValueError) as exc:
+            return f"❌ 設定尚未儲存：{exc}"
+        return "✅ 實驗組設定已自動儲存"
+
+    def add_experiment_group(project_id: str | None):
+        if not project_id:
+            return experiment_view(project_id, "❌ 請先開啟專案")
+        try:
+            retrieval_experiments.add_group(project_id)
+        except ProjectError as exc:
+            return experiment_view(project_id, f"❌ {exc}")
+        return experiment_view(project_id, "✅ 已新增並儲存實驗組")
+
+    def remove_experiment_group(project_id: str | None, group_id: str | None):
+        if not project_id or not group_id:
+            return experiment_view(project_id, "❌ 請選取要移除的實驗組")
+        retrieval_experiments.remove_group(project_id, group_id)
+        return experiment_view(project_id, f"✅ 已明確移除實驗組 {group_id}")
+
+    def select_experiment_group(project_id: str | None, group_id: str | None):
+        if not project_id or not group_id:
+            return gr.Dropdown(choices=[("Local", "local")], value="local")
+        state = retrieval_experiments.load(project_id)
+        method = next((g.get("method", "local") for g in state["groups"] if g.get("group_id") == group_id), "local")
+        return gr.Dropdown(
+            choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+            value=method,
+        )
+
+    def save_experiment_method(project_id: str | None, group_id: str | None, method: str):
+        if not project_id or not group_id:
+            return "請先選取實驗組"
+        try:
+            retrieval_experiments.set_group_method(project_id, group_id, method)
+        except ProjectError as exc:
+            return f"❌ {exc}"
+        return f"✅ {group_id} 檢索策略已儲存"
+
+    def run_retrieval_experiment(
+        project_id: str | None, question_set_id: str | None, rows, concurrency,
+        selected_group: str | None, selected_method: str,
+    ):
+        if not project_id or not question_set_id:
+            return experiment_view(project_id, "❌ 請先匯入題目集並開啟專案")
+        try:
+            state = retrieval_experiments.update_group_fields(project_id, rows)
+            if selected_group:
+                state = retrieval_experiments.set_group_method(project_id, selected_group, selected_method)
+            groups = [ExperimentGroup(**item) for item in state["groups"]]
+            limit = int(concurrency)
+            retrieval_experiments.save_configuration(project_id, groups, question_set_id, limit)
+            run = retrieval_experiments.run(project_id, question_set_id, groups, limit)
+        except (ProjectError, TypeError, ValueError, OSError) as exc:
+            return experiment_view(project_id, f"❌ 實驗執行失敗：{exc}")
+        state_label = "已停止並保存部分結果" if run.status == "stopped" else "已完成"
+        return experiment_view(project_id, f"✅ 檢索實驗{state_label}：完成 {len(run.results)}/{len(groups) * run.question_count} 筆")
+
+    def stop_retrieval_experiment(project_id: str | None):
+        if not project_id:
+            return "請先開啟專案"
+        if retrieval_experiments.stop(project_id):
+            return "🛑 已要求停止；執行中的 API 請求完成後會保存部分結果。"
+        return "目前沒有正在執行的實驗。"
+
+    def export_retrieval_experiment(project_id: str | None):
+        if not project_id:
+            return "❌ 請先開啟專案", None
+        try:
+            path = stage_downloads((retrieval_experiments.export(project_id),))[0]
+        except (ProjectError, OSError) as exc:
+            return f"❌ 匯出失敗：{exc}", None
+        return "✅ 已匯出檢索實驗 JSON", str(path)
 
     def autosave_automatic_questions(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
@@ -1465,6 +1640,66 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 wrap=True,
             )
 
+        with gr.Tab("檢索實驗"):
+            gr.Markdown(
+                "以同一份題目集比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略。"
+                "來源排名只有在 GraphRAG 明確提供可靠排序時才計算；目前 API context 不保證依檢索相關度排序，因此會如實標示不可計算。"
+            )
+            with gr.Row():
+                experiment_question_file = gr.File(label="匯入既有格式 JSON 題目集", file_types=[".json"], type="filepath")
+                experiment_import_button = gr.Button("匯入題目集")
+                experiment_question_set_state = gr.State("")
+            experiment_question_preview = gr.Dataframe(
+                headers=["題號", "題目", "正確答案", "題目來源", "答案來源"],
+                interactive=False,
+                datatype=["str", "str", "str", "str", "str"],
+                label="目前匯入題目集",
+                wrap=True,
+            )
+            gr.Markdown("題目 JSON 沿用自動問答匯入格式；文件與跨頁來源分別使用 `question_sources` / `answer_sources` 陣列，範例見 `docs/檢索實驗格式範例.json`。")
+            gr.Markdown("### 實驗組設定（欄位變更會自動儲存；只有「移除所選組別」會刪除組別）")
+            experiment_group_table = gr.Dataframe(
+                headers=["組別ID", "實驗組名稱", "回答模型", "評測模型", "GraphRAG 策略"],
+                value=[],
+                type="array",
+                datatype=["str", "str", "str", "str", "str"],
+                interactive=True,
+                static_columns=[0, 4],
+                label="實驗組",
+                wrap=True,
+            )
+            with gr.Row():
+                experiment_add_group_button = gr.Button("新增實驗組")
+                experiment_selected_group = gr.Dropdown(label="編輯策略的實驗組")
+                experiment_method_editor = gr.Dropdown(
+                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+                    value="local",
+                    label="GraphRAG 檢索策略",
+                )
+                experiment_remove_group_button = gr.Button("移除所選組別", variant="stop")
+            experiment_group_save_status = gr.Markdown()
+            with gr.Row():
+                experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
+                experiment_run_button = gr.Button("執行實驗", variant="primary")
+                experiment_stop_button = gr.Button("停止實驗", variant="stop")
+                experiment_export_button = gr.Button("匯出實驗結果 JSON")
+                experiment_export_file = gr.File(label="實驗結果 JSON")
+            experiment_status = gr.Markdown()
+            experiment_summary_table = gr.Dataframe(
+                headers=["實驗組名稱", "回答模型", "評測模型", "策略", "題數", "已完成", "答對", "正確率", "Recall@5", "Recall@10", "MRR", "檢索指標狀態"],
+                interactive=False,
+                datatype=["str"] * 12,
+                label="實驗組摘要",
+                wrap=True,
+            )
+            experiment_result_table = gr.Dataframe(
+                headers=["實驗組名稱", "回答模型", "評測模型", "題號", "題目", "來源文件", "標準答案", "實際答案", "評測結果", "評測理由", "答案來源排名", "檢索指標狀態", "狀態", "錯誤"],
+                interactive=False,
+                datatype=["str"] * 14,
+                label="逐題實驗結果",
+                wrap=True,
+            )
+
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
                 "## 答案正確性自動評測\n"
@@ -1601,6 +1836,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             refresh_project_views,
             inputs=[selected_project, active_project_id],
             outputs=[project_table, selected_project, selected_project_details, active_project_id, active_project_banner],
+        ).then(
+            experiment_view,
+            inputs=active_project_id,
+            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
+                     experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency],
         )
         open_project_button.click(
             open_project,
@@ -1614,6 +1855,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             automatic_qa_saved_view,
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary, autoqa_table],
+        ).then(
+            experiment_view,
+            inputs=active_project_id,
+            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
+                     experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency],
         )
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
@@ -1660,6 +1907,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             automatic_qa_saved_view,
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary, autoqa_table],
+        ).then(
+            experiment_view,
+            inputs=active_project_id,
+            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
+                     experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency],
         )
         upload_button.click(
             import_documents,
@@ -1681,6 +1934,65 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             remove_document,
             inputs=[document_project, removable_pdf, remove_pdf_confirmation],
             outputs=[document_result, document_table, processing_options_table, removable_pdf, remove_pdf_confirmation],
+        )
+        experiment_import_button.click(
+            import_experiment_questions,
+            inputs=[active_project_id, experiment_question_file],
+            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
+                     experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency],
+        )
+        experiment_add_group_button.click(
+            add_experiment_group,
+            inputs=active_project_id,
+            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
+                     experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency],
+        )
+        experiment_remove_group_button.click(
+            remove_experiment_group,
+            inputs=[active_project_id, experiment_selected_group],
+            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
+                     experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency],
+        )
+        experiment_selected_group.change(
+            select_experiment_group,
+            inputs=[active_project_id, experiment_selected_group],
+            outputs=experiment_method_editor,
+        )
+        experiment_method_editor.change(
+            save_experiment_method,
+            inputs=[active_project_id, experiment_selected_group, experiment_method_editor],
+            outputs=experiment_group_save_status,
+        )
+        experiment_group_table.change(
+            save_experiment_groups,
+            inputs=[active_project_id, experiment_group_table, experiment_question_set_state, experiment_max_concurrency],
+            outputs=experiment_group_save_status,
+        )
+        experiment_max_concurrency.change(
+            save_experiment_groups,
+            inputs=[active_project_id, experiment_group_table, experiment_question_set_state, experiment_max_concurrency],
+            outputs=experiment_group_save_status,
+        )
+        experiment_run_button.click(
+            run_retrieval_experiment,
+            inputs=[active_project_id, experiment_question_set_state, experiment_group_table,
+                    experiment_max_concurrency, experiment_selected_group, experiment_method_editor],
+            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
+                     experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency],
+        )
+        experiment_stop_button.click(
+            stop_retrieval_experiment,
+            inputs=active_project_id,
+            outputs=experiment_status,
+        )
+        experiment_export_button.click(
+            export_retrieval_experiment,
+            inputs=active_project_id,
+            outputs=[experiment_status, experiment_export_file],
         )
         autoqa_generate_button.click(
             generate_automatic_qa,

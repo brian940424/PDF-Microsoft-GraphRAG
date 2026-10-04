@@ -124,6 +124,36 @@ class AutomaticEvaluationService:
         self._write(result)
         return result
 
+    def evaluate_single_answer(
+        self,
+        project_id: str,
+        question_id: str,
+        question: str,
+        correct_answer: str,
+        system_answer: str,
+        model: str,
+    ) -> AutomaticEvaluationItem:
+        """Judge one answer without retrieval evidence or shared question-set mutation."""
+        if model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError(f"不支援的評判模型：{model}")
+        case = BatchQuestion(
+            question_id=question_id,
+            question=question,
+            reference_answer=correct_answer,
+            answer=system_answer,
+        )
+        prompt = self._build_prompt([case])
+        api_key = self.connections.apply_to_environment(project_id)
+        try:
+            response = self.client(
+                self.connections.get_api_base_url(), api_key, model, prompt
+            )
+        except ProjectError:
+            raise
+        except Exception as exc:
+            raise ProjectError(f"答案評判 API 呼叫失敗：{exc}") from exc
+        return self._parse_response(response, [case])[0]
+
     def last_result(self, project_id: str, question_set_id: str) -> AutomaticEvaluationResult | None:
         try:
             value = json.loads(self._path(project_id, question_set_id).read_text(encoding="utf-8"))
