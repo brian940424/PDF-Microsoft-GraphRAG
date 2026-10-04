@@ -559,37 +559,29 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 item.reference_answer,
                 QuestionSetService._format_source_pages(question_sources),
                 QuestionSetService._format_source_pages(answer_sources),
-                "; ".join(QuestionSetService._source_documents(item)),
             ])
         return rows
 
-    def parse_autoqa_pages(value, fallback_documents, existing):
+    def parse_autoqa_sources(value, existing):
         text = str(value or "").strip()
         if not text:
             return ()
+        try:
+            records = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ProjectError("來源欄位必須是 JSON 陣列，每筆包含文件 ID、文件名稱及頁碼") from exc
+        parsed = QuestionSetService._parse_source_pages(records, "source_records")
         result = []
-        for entry in text.split(";"):
-            entry = entry.strip()
-            if not entry:
-                continue
-            if ":" in entry:
-                document_id, page_text = entry.rsplit(":", 1)
-            elif len(fallback_documents) == 1:
-                document_id, page_text = fallback_documents[0], entry
-            else:
-                raise ProjectError("多份來源文件時，頁碼請使用「文件名.pdf: 1, 2」格式")
-            try:
-                pages = tuple(dict.fromkeys(int(page.strip()) for page in page_text.split(",") if page.strip()))
-            except ValueError as exc:
-                raise ProjectError(f"來源頁碼格式錯誤：{page_text}") from exc
-            if not document_id.strip() or any(page < 1 for page in pages):
-                raise ProjectError("來源文件不可空白，頁碼必須是正整數")
+        for item in parsed:
             previous = next(
-                (item for item in existing if item.document_id == document_id.strip() and item.pages == pages),
+                (source for source in existing if source.document_id == item.document_id and source.pages == item.pages),
                 None,
             )
             result.append(GoldEvidence(
-                document_id.strip(), pages, previous.chunk_ids if previous else ()
+                item.document_id,
+                item.pages,
+                previous.chunk_ids if previous else item.chunk_ids,
+                item.document_name,
             ))
         return tuple(result)
 
@@ -606,36 +598,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         else:
             editable_rows = list(rows)
         for row in editable_rows:
-            if len(row) < 6:
+            if len(row) < 5:
                 raise ProjectError("編輯表格欄位不完整")
             question_id = str(row[0])
             if question_id not in by_id:
                 raise ProjectError(f"題目集找不到題號：{question_id}")
             old = by_id[question_id]
+            question_sources = parse_autoqa_sources(
+                row[3], old.question_source_evidence or old.gold_evidence
+            )
+            answer_sources = parse_autoqa_sources(
+                row[4], old.answer_source_evidence or old.gold_evidence
+            )
             source_documents = tuple(dict.fromkeys(
-                part.strip() for part in str(row[5] or "").split(";") if part.strip()
+                source.document_id for source in (*question_sources, *answer_sources)
             ))
-            question_sources = parse_autoqa_pages(
-                row[3], source_documents, old.question_source_evidence or old.gold_evidence
-            )
-            answer_sources = parse_autoqa_pages(
-                row[4], source_documents, old.answer_source_evidence or old.gold_evidence
-            )
-            if len(source_documents) == 1:
-                document_id = source_documents[0]
-                question_sources = tuple(
-                    GoldEvidence(document_id, item.pages, item.chunk_ids if item.document_id == document_id else ())
-                    for item in question_sources
-                )
-                answer_sources = tuple(
-                    GoldEvidence(document_id, item.pages, item.chunk_ids if item.document_id == document_id else ())
-                    for item in answer_sources
-                )
-            elif source_documents and any(
-                item.document_id not in source_documents
-                for item in (*question_sources, *answer_sources)
-            ):
-                raise ProjectError("來源文件清單與題目／答案來源頁碼中的文件不一致")
             updated.append(BatchQuestion(
                 question_id=question_id,
                 question=str(row[1] or "").strip(),
@@ -1333,9 +1310,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             autoqa_result = gr.Markdown()
             autoqa_question_set_state = gr.State("")
             autoqa_questions_table = gr.Dataframe(
-                headers=["題號", "題目", "正確答案", "題目來源頁碼（文件: 頁碼）", "答案來源頁碼（文件: 頁碼）", "來源文件"],
+                headers=["題號", "題目", "正確答案", "題目來源（文件 ID／名稱／頁碼 JSON 陣列）", "答案來源（文件 ID／名稱／頁碼 JSON 陣列）"],
                 interactive=True,
-                datatype=["str", "str", "str", "str", "str", "str"],
+                datatype=["str", "str", "str", "str", "str"],
                 label="生成題目與來源（可直接編輯）",
                 wrap=True,
             )

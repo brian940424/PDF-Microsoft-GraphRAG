@@ -166,9 +166,15 @@ class QuestionSetServiceTests(unittest.TestCase):
                     "Q0001",
                     "問題",
                     reference_answer="正確答案",
-                    gold_evidence=(GoldEvidence("manual.pdf", (5, 6), ("chunk-a",)),),
-                    question_source_evidence=(GoldEvidence("manual.pdf", (2, 3), ()),),
-                    answer_source_evidence=(GoldEvidence("manual.pdf", (5, 6), ()),),
+                    gold_evidence=(GoldEvidence("doc-003", (27,), ("chunk-a",), "零件手冊.pdf"),),
+                    question_source_evidence=(
+                        GoldEvidence("doc-001", (12, 13), (), "維修手冊.pdf"),
+                        GoldEvidence("doc-002", (4,), (), "保養指南.pdf"),
+                    ),
+                    answer_source_evidence=(
+                        GoldEvidence("doc-001", (13,), (), "維修手冊.pdf"),
+                        GoldEvidence("doc-003", (27,), (), "零件手冊.pdf"),
+                    ),
                 )
             ],
         )
@@ -179,19 +185,32 @@ class QuestionSetServiceTests(unittest.TestCase):
         self.assertEqual(row["question_id"], "Q0001")
         self.assertEqual(row["question"], "問題")
         self.assertEqual(row["correct_answer"], "正確答案")
-        self.assertEqual(row["question_source_pages"], [{"document_id": "manual.pdf", "pages": [2, 3]}])
-        self.assertEqual(row["answer_source_pages"], [{"document_id": "manual.pdf", "pages": [5, 6]}])
-        self.assertEqual(row["source_documents"], ["manual.pdf"])
+        self.assertEqual(row["question_sources"], [
+            {"document_id": "doc-001", "document_name": "維修手冊.pdf", "pages": [12, 13]},
+            {"document_id": "doc-002", "document_name": "保養指南.pdf", "pages": [4]},
+        ])
+        self.assertEqual(row["answer_sources"], [
+            {"document_id": "doc-001", "document_name": "維修手冊.pdf", "pages": [13]},
+            {"document_id": "doc-003", "document_name": "零件手冊.pdf", "pages": [27]},
+        ])
+        self.assertEqual(row["source_documents"], ["doc-001", "doc-002", "doc-003"])
 
         imported = self.service.import_file("L33-SM3E", json_path)
-        self.assertEqual(imported.questions[0].question_source_evidence[0].pages, (2, 3))
-        self.assertEqual(imported.questions[0].answer_source_evidence[0].pages, (5, 6))
+        self.assertEqual(
+            [(source.document_id, source.document_name, source.pages) for source in imported.questions[0].question_source_evidence],
+            [("doc-001", "維修手冊.pdf", (12, 13)), ("doc-002", "保養指南.pdf", (4,))],
+        )
+        self.assertEqual(
+            [(source.document_id, source.document_name, source.pages) for source in imported.questions[0].answer_source_evidence],
+            [("doc-001", "維修手冊.pdf", (13,)), ("doc-003", "零件手冊.pdf", (27,))],
+        )
+        reloaded = self.service.get("L33-SM3E", imported.question_set_id)
+        self.assertEqual(reloaded.questions[0].question_source_evidence, imported.questions[0].question_source_evidence)
         with csv_path.open(encoding="utf-8", newline="") as source:
             csv_row = next(csv.DictReader(source))
         self.assertEqual(csv_row["correct_answer"], "正確答案")
-        self.assertIn("manual.pdf: 2, 3", csv_row["question_source_pages"])
-        self.assertIn("manual.pdf: 5, 6", csv_row["answer_source_pages"])
-        self.assertEqual(csv_row["source_documents"], "manual.pdf")
+        self.assertEqual(json.loads(csv_row["question_sources"]), row["question_sources"])
+        self.assertEqual(json.loads(csv_row["answer_sources"]), row["answer_sources"])
 
     def test_batch_requires_indexed_project(self) -> None:
         imported = self.service.import_file("L33-SM3E", self.write_question_set(self.valid_value()))

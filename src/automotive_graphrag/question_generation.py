@@ -255,12 +255,20 @@ class QuestionGenerationService:
                     "correct_answer": item.reference_answer,
                     "reference_answer": item.reference_answer,
                     "gold_evidence": [asdict(gold) for gold in item.gold_evidence],
-                    "question_source_pages": [
-                        {"document_id": source.document_id, "pages": list(source.pages)}
+                    "question_sources": [
+                        {
+                            "document_id": source.document_id,
+                            "document_name": source.document_name or source.document_id,
+                            "pages": list(source.pages),
+                        }
                         for source in (item.question_source_evidence or item.gold_evidence)
                     ],
-                    "answer_source_pages": [
-                        {"document_id": source.document_id, "pages": list(source.pages)}
+                    "answer_sources": [
+                        {
+                            "document_id": source.document_id,
+                            "document_name": source.document_name or source.document_id,
+                            "pages": list(source.pages),
+                        }
                         for source in (item.answer_source_evidence or item.gold_evidence)
                     ],
                     "source_documents": list(
@@ -401,9 +409,12 @@ class QuestionGenerationService:
 
     @staticmethod
     def _gold_evidence(sources: list[SourceSample]) -> tuple[GoldEvidence, ...]:
-        grouped: dict[str, dict[str, list[Any]]] = {}
+        grouped: dict[str, dict[str, Any]] = {}
         for source in sources:
-            group = grouped.setdefault(source.document_id, {"pages": [], "chunk_ids": []})
+            group = grouped.setdefault(
+                source.document_id,
+                {"pages": [], "chunk_ids": [], "document_name": source.document_id},
+            )
             group["pages"].append(source.page)
             group["chunk_ids"].append(source.chunk_id)
         return tuple(
@@ -411,6 +422,7 @@ class QuestionGenerationService:
                 document_id=document_id,
                 pages=tuple(dict.fromkeys(values["pages"])),
                 chunk_ids=tuple(dict.fromkeys(values["chunk_ids"])),
+                document_name=values["document_name"],
             )
             for document_id, values in grouped.items()
         )
@@ -455,6 +467,7 @@ class QuestionGenerationService:
                 document_id=item["document_id"],
                 pages=tuple(item.get("pages", [])),
                 chunk_ids=tuple(item.get("chunk_ids", [])),
+                document_name=item.get("document_name", item["document_id"]),
             )
             for item in value.get("gold_evidence", [])
         )
@@ -465,6 +478,7 @@ class QuestionGenerationService:
                     document_id=item["document_id"],
                     pages=tuple(item.get("pages", [])),
                     chunk_ids=tuple(item.get("chunk_ids", [])),
+                    document_name=item.get("document_name", item["document_id"]),
                 )
                 for item in value.get(field_name, [])
             )
