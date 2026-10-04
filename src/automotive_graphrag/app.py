@@ -1719,7 +1719,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
                 interactive=True,
                 datatype=["str", "str", "str", "str", "str", "bool", "str"],
-                column_widths=["64px", "100px", "140px", "170px", "140px", "62px", "130px"],
+                column_widths=["64px", "100px", "140px", "240px", "230px", "76px", "130px"],
                 label="評測結果（勾選表示正確；修改後評判理由清空並自動重算正確率）",
                 wrap=True,
             )
