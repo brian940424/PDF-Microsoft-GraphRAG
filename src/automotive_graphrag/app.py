@@ -1711,6 +1711,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
                 interactive=True,
                 datatype=["str", "str", "str", "str", "str"],
+                column_widths=["8%", "22%", "18%", "26%", "26%"],
                 label="生成題目與來源（可直接編輯）",
                 wrap=True,
             )
