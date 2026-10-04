@@ -49,25 +49,18 @@ class AutomaticQATestService:
         self.judging = judging
         self.retrieval = retrieval
 
-    def generate_and_run(
+    def generate_question_set(
         self,
         project_id: str,
         questions_per_pdf: int,
         parallel_pdf_generation: bool,
         generation_model: str,
-        answer_model: str,
-        judge_model: str,
-        method: str,
-        answer_concurrency: int,
-        top_k: int = 5,
-    ) -> AutomaticQAReport:
+        method: str = "local",
+    ) -> QuestionSet:
         if questions_per_pdf < 1:
             raise ProjectError("每份 PDF 題數必須是正整數")
-        if answer_concurrency < 1 or answer_concurrency > 32:
-            raise ProjectError("回答並行數必須介於 1 到 32")
-        for label, model in (("生題", generation_model), ("回答", answer_model), ("評判", judge_model)):
-            if model not in ALLOWED_CHAT_MODELS:
-                raise ProjectError(f"不支援的{label}模型：{model}")
+        if generation_model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError(f"不支援的生題模型：{generation_model}")
         project = self.projects.get(project_id)
         if project.status != "INDEXED":
             raise ProjectError(f"專案狀態 {project.status} 尚未完成建圖")
@@ -146,18 +139,32 @@ class AutomaticQATestService:
             project_id,
             f"自動問答測試-{stamp}",
             batch_questions,
-            description=f"每份 PDF 目標 {questions_per_pdf} 題；生題模型 {generation_model}。",
+            description=(
+                f"每份 PDF 目標 {questions_per_pdf} 題；生題模型 {generation_model}。"
+                + ("未完成項目：" + "；".join(errors) if errors else "")
+            ),
             method=method,
         )
+        return question_set
+
+    def generate_and_run(
+        self,
+        project_id: str,
+        questions_per_pdf: int,
+        parallel_pdf_generation: bool,
+        generation_model: str,
+        answer_model: str,
+        judge_model: str,
+        method: str,
+        answer_concurrency: int,
+        top_k: int = 5,
+    ) -> AutomaticQAReport:
+        question_set = self.generate_question_set(
+            project_id, questions_per_pdf, parallel_pdf_generation, generation_model, method
+        )
         return self._run_existing(
-            question_set,
-            generation_model,
-            answer_model,
-            judge_model,
-            method,
-            answer_concurrency,
-            top_k,
-            tuple(errors),
+            question_set, generation_model, answer_model, judge_model,
+            method, answer_concurrency, top_k, (),
         )
 
     def run_existing(

@@ -46,6 +46,7 @@ class BatchQuestion:
     retrieved_evidence: tuple[Evidence, ...] = ()
     question_source_evidence: tuple[GoldEvidence, ...] = ()
     answer_source_evidence: tuple[GoldEvidence, ...] = ()
+    source_documents: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,9 +182,30 @@ class QuestionSetService:
                     retrieved_evidence=result.evidence,
                     question_source_evidence=item.question_source_evidence,
                     answer_source_evidence=item.answer_source_evidence,
+                    source_documents=item.source_documents,
                 )
             )
         updated = self._replace(question_set, questions, method)
+        self._write(updated)
+        return updated
+
+    def update_questions(
+        self,
+        project_id: str,
+        question_set_id: str,
+        questions: Sequence[BatchQuestion],
+    ) -> QuestionSet:
+        question_set = self.get(project_id, question_set_id)
+        previous_ids = {item.question_id for item in question_set.questions}
+        updated_ids = {item.question_id for item in questions}
+        if previous_ids != updated_ids or len(updated_ids) != len(questions):
+            raise ProjectError("編輯後的題號不可變更或重複")
+        if any(not item.question.strip() or not item.reference_answer.strip() for item in questions):
+            raise ProjectError("問題與正確答案不可空白")
+        normalized = ["".join(item.question.casefold().split()) for item in questions]
+        if len(set(normalized)) != len(normalized):
+            raise ProjectError("題目集不可包含重複問題")
+        updated = self._replace(question_set, list(questions), question_set.method)
         self._write(updated)
         return updated
 
@@ -432,6 +454,7 @@ class QuestionSetService:
             error = raw.get("error")
             duration_seconds = raw.get("duration_seconds")
             completed_at = raw.get("completed_at")
+            source_documents_raw = raw.get("source_documents", [])
             retrieved_raw = raw.get("retrieved_evidence", [])
             try:
                 if not isinstance(retrieved_raw, list):
@@ -479,6 +502,11 @@ class QuestionSetService:
                 errors.append(f"{location}.reference_answer：必須是字串")
             if not isinstance(answer, str):
                 errors.append(f"{location}.answer：必須是字串")
+            if not isinstance(source_documents_raw, list) or any(
+                not isinstance(document, str) or not document.strip() for document in source_documents_raw
+            ):
+                errors.append(f"{location}.source_documents：必須是非空白文件名稱陣列")
+                source_documents_raw = []
             if status not in QUESTION_STATUSES:
                 errors.append(f"{location}.status：不支援的狀態")
             if (
@@ -502,6 +530,7 @@ class QuestionSetService:
                         retrieved_evidence=retrieved_evidence,
                         question_source_evidence=question_sources,
                         answer_source_evidence=answer_sources,
+                        source_documents=tuple(dict.fromkeys(item.strip() for item in source_documents_raw)),
                     )
                 )
         if errors:
@@ -551,7 +580,10 @@ class QuestionSetService:
         answer_sources = question.answer_source_evidence or question.gold_evidence
         return tuple(
             dict.fromkeys(
-                item.document_id for item in (*question_sources, *answer_sources)
+                (
+                    *(item.document_id for item in (*question_sources, *answer_sources)),
+                    *question.source_documents,
+                )
             )
         )
 
@@ -604,9 +636,7 @@ class QuestionSetService:
         value = json.loads(path.read_text(encoding="utf-8"))
         questions = []
         for item in value.pop("questions"):
-            for derived in (
-                "correct_answer", "question_source_pages", "answer_source_pages", "source_documents"
-            ):
+            for derived in ("correct_answer", "question_source_pages", "answer_source_pages"):
                 item.pop(derived, None)
             item["gold_evidence"] = tuple(
                 GoldEvidence(
@@ -628,6 +658,7 @@ class QuestionSetService:
                     )
                     for source in item.get(source_key, [])
                 )
+            item["source_documents"] = tuple(item.get("source_documents", []))
             questions.append(BatchQuestion(**item))
         return QuestionSet(**value, questions=tuple(questions))
 

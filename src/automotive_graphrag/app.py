@@ -21,7 +21,7 @@ from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_generation import GeneratedQuestion, QuestionGenerationService
-from .question_sets import QuestionSet, QuestionSetService
+from .question_sets import BatchQuestion, GoldEvidence, QuestionSet, QuestionSetService
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
 from .source_sampling import SourceSample, SourceSamplingService
@@ -535,11 +535,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def automatic_qa_rows(report):
         questions = {item.question_id: item for item in report.question_set.questions}
         judges = {item.question_id: item for item in report.judge.items} if report.judge else {}
-        retrieval = {item.question_id: item for item in report.retrieval.items} if report.retrieval else {}
         rows = []
         for question_id, question in questions.items():
             judged = judges.get(question_id)
-            retrieved = retrieval.get(question_id)
             evidence_docs = ", ".join(dict.fromkeys(item.document_id for item in question.gold_evidence)) or "—"
             rows.append([
                 evidence_docs, question.question, question.answer, question.reference_answer,
@@ -547,10 +545,107 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 judged.answer_score if judged else None,
                 judged.evidence_support_score if judged else None,
                 judged.judge_reason if judged else (question.error or "尚無評判結果"),
-                retrieved.recall_at_5 if retrieved else None,
-                (1 / retrieved.first_relevant_rank if retrieved and retrieved.first_relevant_rank else 0) if retrieved else None,
             ])
         return rows
+
+    def autoqa_question_rows(question_set):
+        rows = []
+        for item in question_set.questions:
+            question_sources = item.question_source_evidence or item.gold_evidence
+            answer_sources = item.answer_source_evidence or item.gold_evidence
+            rows.append([
+                item.question_id,
+                item.question,
+                item.reference_answer,
+                QuestionSetService._format_source_pages(question_sources),
+                QuestionSetService._format_source_pages(answer_sources),
+                "; ".join(QuestionSetService._source_documents(item)),
+            ])
+        return rows
+
+    def parse_autoqa_pages(value, fallback_documents, existing):
+        text = str(value or "").strip()
+        if not text:
+            return ()
+        result = []
+        for entry in text.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" in entry:
+                document_id, page_text = entry.rsplit(":", 1)
+            elif len(fallback_documents) == 1:
+                document_id, page_text = fallback_documents[0], entry
+            else:
+                raise ProjectError("多份來源文件時，頁碼請使用「文件名.pdf: 1, 2」格式")
+            try:
+                pages = tuple(dict.fromkeys(int(page.strip()) for page in page_text.split(",") if page.strip()))
+            except ValueError as exc:
+                raise ProjectError(f"來源頁碼格式錯誤：{page_text}") from exc
+            if not document_id.strip() or any(page < 1 for page in pages):
+                raise ProjectError("來源文件不可空白，頁碼必須是正整數")
+            previous = next(
+                (item for item in existing if item.document_id == document_id.strip() and item.pages == pages),
+                None,
+            )
+            result.append(GoldEvidence(
+                document_id.strip(), pages, previous.chunk_ids if previous else ()
+            ))
+        return tuple(result)
+
+    def save_autoqa_edits(project_id, question_set_id, rows):
+        if not project_id or not question_set_id:
+            raise ProjectError("請先生成或匯入題目集")
+        current = question_sets.get(project_id, question_set_id)
+        by_id = {item.question_id: item for item in current.questions}
+        updated = []
+        for row in rows or []:
+            if len(row) < 6:
+                raise ProjectError("編輯表格欄位不完整")
+            question_id = str(row[0])
+            if question_id not in by_id:
+                raise ProjectError(f"題目集找不到題號：{question_id}")
+            old = by_id[question_id]
+            source_documents = tuple(dict.fromkeys(
+                part.strip() for part in str(row[5] or "").split(";") if part.strip()
+            ))
+            question_sources = parse_autoqa_pages(
+                row[3], source_documents, old.question_source_evidence or old.gold_evidence
+            )
+            answer_sources = parse_autoqa_pages(
+                row[4], source_documents, old.answer_source_evidence or old.gold_evidence
+            )
+            if len(source_documents) == 1:
+                document_id = source_documents[0]
+                question_sources = tuple(
+                    GoldEvidence(document_id, item.pages, item.chunk_ids if item.document_id == document_id else ())
+                    for item in question_sources
+                )
+                answer_sources = tuple(
+                    GoldEvidence(document_id, item.pages, item.chunk_ids if item.document_id == document_id else ())
+                    for item in answer_sources
+                )
+            elif source_documents and any(
+                item.document_id not in source_documents
+                for item in (*question_sources, *answer_sources)
+            ):
+                raise ProjectError("來源文件清單與題目／答案來源頁碼中的文件不一致")
+            updated.append(BatchQuestion(
+                question_id=question_id,
+                question=str(row[1] or "").strip(),
+                reference_answer=str(row[2] or "").strip(),
+                status=old.status,
+                answer=old.answer,
+                error=old.error,
+                duration_seconds=old.duration_seconds,
+                completed_at=old.completed_at,
+                gold_evidence=answer_sources,
+                retrieved_evidence=old.retrieved_evidence,
+                question_source_evidence=question_sources,
+                answer_source_evidence=answer_sources,
+                source_documents=source_documents,
+            ))
+        return question_sets.update_questions(project_id, question_set_id, updated)
 
     def automatic_qa_summary(report):
         total = len(report.question_set.questions)
@@ -580,50 +675,59 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             lines.append("**部分 PDF 生題未完成：** " + "；".join(report.generation_errors))
         return "\n\n".join(lines)
 
-    def run_automatic_qa(project_id, count, parallel_generation, generation_model, answer_model, judge_model, method, concurrency):
+    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method):
         if not project_id:
-            return "❌ 請先開啟專案", "", [], gr.Dropdown(choices=[]), None, None
+            return "❌ 請先開啟專案", [], ""
         try:
-            report = automatic_qa.generate_and_run(
-                project_id, int(count), parallel_generation, generation_model,
-                answer_model, judge_model, method, int(concurrency),
+            question_set = automatic_qa.generate_question_set(
+                project_id, int(count), parallel_generation, generation_model, method,
             )
-            json_path, csv_path = question_sets.export(project_id, report.question_set.question_set_id)
-            json_path, csv_path = stage_downloads((json_path, csv_path))
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), "", [], gr.Dropdown(choices=question_set_choices(project_id)), None, None
+            return "❌ " + str(exc), [], ""
         return (
-            "✅ 自動問答測試完成", automatic_qa_summary(report), automatic_qa_rows(report),
-            gr.Dropdown(choices=question_set_choices(project_id), value=report.question_set.question_set_id),
-            str(json_path), str(csv_path),
+            f"✅ 已生成 {len(question_set.questions)} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。\n\n{question_set.description}",
+            autoqa_question_rows(question_set),
+            question_set.question_set_id,
         )
 
-    def run_selected_automatic_qa(project_id, question_set_id, answer_model, judge_model, method, concurrency):
+    def run_automatic_qa(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency):
         if not project_id or not question_set_id:
-            return "❌ 請選取題目集", "", [], None, None
+            return "❌ 請先生成或匯入題目集", "", []
         try:
+            save_autoqa_edits(project_id, question_set_id, rows)
             report = automatic_qa.run_existing(
                 project_id, question_set_id, answer_model, judge_model, method, int(concurrency)
             )
-            json_path, csv_path = question_sets.export(project_id, question_set_id)
-            json_path, csv_path = stage_downloads((json_path, csv_path))
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), "", [], None, None
-        return "✅ 已完成所選題目集測試", automatic_qa_summary(report), automatic_qa_rows(report), str(json_path), str(csv_path)
+            return "❌ " + str(exc), "", []
+        return "✅ 自動問答測試完成", automatic_qa_summary(report), automatic_qa_rows(report)
 
     def import_automatic_question_set(project_id, uploaded):
         if not project_id or not uploaded:
-            return "❌ 請先開啟專案並選擇 JSON 題目集", gr.Dropdown(choices=question_set_choices(project_id))
+            return "❌ 請先開啟專案並選擇 JSON 題目集", [], ""
         source = uploaded if isinstance(uploaded, (str, Path)) else getattr(uploaded, "name", None)
         if not source:
-            return "❌ 無法讀取上傳檔案", gr.Dropdown(choices=question_set_choices(project_id))
+            return "❌ 無法讀取上傳檔案", [], ""
         try:
             question_set = question_sets.import_file(project_id, source)
         except ProjectError as exc:
-            return "❌ " + str(exc), gr.Dropdown(choices=question_set_choices(project_id))
-        return "✅ 已匯入題目集「" + question_set.name + "」", gr.Dropdown(
-            choices=question_set_choices(project_id), value=question_set.question_set_id
+            return "❌ " + str(exc), [], ""
+        return (
+            "✅ 已匯入題目集「" + question_set.name + "」，可先編輯再測試。",
+            autoqa_question_rows(question_set),
+            question_set.question_set_id,
         )
+
+    def export_automatic_question_set(project_id, question_set_id, rows):
+        if not project_id or not question_set_id:
+            return "❌ 請先生成或匯入題目集", None, None
+        try:
+            save_autoqa_edits(project_id, question_set_id, rows)
+            json_path, csv_path = question_sets.export(project_id, question_set_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
+        except (ProjectError, ValueError) as exc:
+            return "❌ " + str(exc), None, None
+        return "✅ 已匯出目前編輯後的題目集 JSON／CSV", str(json_path), str(csv_path)
 
     def sampling_section_choices(project_id: str | None):
         if not project_id:
@@ -948,7 +1052,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
-            gr.Dropdown(choices=choices, value=None),
             sampling_section_choices(project_id),
             [],
             "請選取或建立題目集",
@@ -1214,24 +1317,31 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     value="local", label="檢索模式",
                 )
                 autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=2, minimum=1, maximum=32, precision=0)
-            autoqa_generate_button = gr.Button("生成題目並開始自動測試", variant="primary")
+            autoqa_generate_button = gr.Button("生成題目", variant="primary")
             with gr.Row():
                 autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
                 autoqa_import_button = gr.Button("匯入題目集")
-                autoqa_question_set = gr.Dropdown(label="已載入／已匯入題目集")
-                autoqa_run_selected_button = gr.Button("執行所選題目集")
+                autoqa_export_button = gr.Button("匯出目前題目集")
+                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
+                autoqa_csv_export = gr.File(label="題目集 CSV（匯出）")
             autoqa_result = gr.Markdown()
+            autoqa_question_set_state = gr.State("")
+            autoqa_questions_table = gr.Dataframe(
+                headers=["題號", "題目", "正確答案", "題目來源頁碼（文件: 頁碼）", "答案來源頁碼（文件: 頁碼）", "來源文件"],
+                interactive=True,
+                datatype=["str", "str", "str", "str", "str", "str"],
+                label="生成題目與來源（可直接編輯）",
+                wrap=True,
+            )
+            autoqa_test_button = gr.Button("開始自動問答測試", variant="primary")
             autoqa_summary = gr.Markdown()
             autoqa_table = gr.Dataframe(
-                headers=["PDF", "問題", "系統回答", "正確答案", "評判結果", "答案分數", "證據支持", "評判理由", "Recall@5", "RR"],
+                headers=["來源文件", "題目", "系統回答", "正確答案", "評判結果", "答案分數", "證據支持", "評判理由"],
                 interactive=False,
-                datatype=["str", "str", "str", "str", "str", "number", "number", "str", "number", "number"],
+                datatype=["str", "str", "str", "str", "str", "number", "number", "str"],
                 label="逐題自動問答測試結果",
                 wrap=True,
             )
-            with gr.Row():
-                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
-                autoqa_csv_export = gr.File(label="題目集 CSV（匯出）")
 
         with gr.Tab("問答測試"):
             with gr.Row():
@@ -1518,7 +1628,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, autoqa_question_set, sampling_sections, saved_questions_table, question_set_summary],
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
         )
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
@@ -1560,7 +1670,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, autoqa_question_set, sampling_sections, saved_questions_table, question_set_summary],
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
         )
         upload_button.click(
             import_documents,
@@ -1584,32 +1694,32 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[document_result, document_table, processing_options_table, removable_pdf, remove_pdf_confirmation],
         )
         autoqa_generate_button.click(
-            run_automatic_qa,
+            generate_automatic_qa,
             inputs=[
                 automatic_project, autoqa_questions_per_pdf, autoqa_parallel_generation,
-                autoqa_generation_model, autoqa_answer_model, autoqa_judge_model,
-                autoqa_method, autoqa_answer_concurrency,
+                autoqa_generation_model, autoqa_method,
             ],
             outputs=[
-                autoqa_result, autoqa_summary, autoqa_table, autoqa_question_set,
-                autoqa_json_export, autoqa_csv_export,
+                autoqa_result, autoqa_questions_table, autoqa_question_set_state,
             ],
         )
         autoqa_import_button.click(
             import_automatic_question_set,
             inputs=[automatic_project, autoqa_import_file],
-            outputs=[autoqa_result, autoqa_question_set],
+            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state],
         )
-        autoqa_run_selected_button.click(
-            run_selected_automatic_qa,
+        autoqa_test_button.click(
+            run_automatic_qa,
             inputs=[
-                automatic_project, autoqa_question_set, autoqa_answer_model,
+                automatic_project, autoqa_question_set_state, autoqa_questions_table, autoqa_answer_model,
                 autoqa_judge_model, autoqa_method, autoqa_answer_concurrency,
             ],
-            outputs=[
-                autoqa_result, autoqa_summary, autoqa_table,
-                autoqa_json_export, autoqa_csv_export,
-            ],
+            outputs=[autoqa_result, autoqa_summary, autoqa_table],
+        )
+        autoqa_export_button.click(
+            export_automatic_question_set,
+            inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
+            outputs=[autoqa_result, autoqa_json_export, autoqa_csv_export],
         )
         ask_button.click(
             ask_question,
