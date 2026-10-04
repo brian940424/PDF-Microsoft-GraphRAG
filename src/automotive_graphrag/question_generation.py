@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import tempfile
 import unicodedata
@@ -135,32 +136,44 @@ class QuestionGenerationService:
         document_samples = tuple(item for item in samples if item.document_id == document_id)
         if not document_samples:
             raise ProjectError(f"PDF {document_id} 沒有可用的前處理原文")
-        document_samples = self._select_representative_samples(document_samples, question_count)
+        pdf_path = self.projects.path_for(project_id) / "source" / document_id
+        try:
+            import fitz
+
+            with fitz.open(pdf_path) as pdf:
+                page_count = pdf.page_count
+        except (ImportError, OSError, RuntimeError):
+            page_count = max(sample.page for sample in document_samples)
+        windows = self._sample_page_windows(document_samples, question_count, page_count)
+        source_by_id = {
+            sample.sample_id: sample
+            for _, _, window_samples in windows
+            for sample in window_samples
+        }
+        window_source_ids = [
+            {sample.sample_id for sample in window_samples}
+            for _, _, window_samples in windows
+        ]
+        selected_samples = tuple(source_by_id.values())
 
         sample_batch = SourceSampleBatch(
             sample_batch_id=uuid.uuid4().hex,
             project_id=project_id,
             created_at=datetime.now(timezone.utc).isoformat(),
-            section_ids=tuple(sorted({item.section_id for item in document_samples})),
+            section_ids=tuple(sorted({item.section_id for item in selected_samples})),
             page_from=None,
             page_to=None,
             content_type="all",
             minimum_characters=1,
             seed=0,
-            requested_count=len(document_samples),
-            samples=document_samples,
+            requested_count=len(selected_samples),
+            samples=selected_samples,
         )
-        prompt = self._build_prompt(
-            sample_batch,
-            question_count,
-            "simple",
+        prompt = self._build_windowed_prompt(
+            windows,
             maximum_source_characters,
+            excluded_questions,
         )
-        if excluded_questions:
-            prompt += (
-                "\n以下既有題目禁止重複或只換同義詞，請生成不同考點的問題："
-                + json.dumps(list(excluded_questions), ensure_ascii=False)
-            )
         api_key = self.connections.apply_to_environment(project_id)
         try:
             response = self.client(
@@ -173,7 +186,13 @@ class QuestionGenerationService:
             raise
         except Exception as exc:
             raise ProjectError(f"{document_id} 題目生成 API 呼叫失敗：{exc}") from exc
-        questions = self._parse_response(response, sample_batch, question_count, "simple")
+        questions = self._parse_response(
+            response,
+            sample_batch,
+            question_count,
+            "window",
+            allowed_source_ids_by_question=window_source_ids,
+        )
         seen: set[str] = set()
         for item in questions:
             normalized = normalize_question(item.question)
@@ -183,16 +202,77 @@ class QuestionGenerationService:
         return tuple(questions)
 
     @staticmethod
-    def _select_representative_samples(samples: Sequence[SourceSample], question_count: int) -> tuple[SourceSample, ...]:
-        """Bound prompt size while spreading selected evidence across the document."""
-        limit = min(24, max(12, question_count * 2))
-        if len(samples) <= limit:
-            return tuple(samples)
-        indexes = {
-            round(index * (len(samples) - 1) / (limit - 1))
-            for index in range(limit)
-        }
-        return tuple(samples[index] for index in sorted(indexes))
+    def _sample_page_windows(
+        samples: Sequence[SourceSample], question_count: int, page_count: int | None = None
+    ) -> list[tuple[int, int, tuple[SourceSample, ...]]]:
+        samples_by_page: dict[int, list[SourceSample]] = {}
+        for sample in samples:
+            samples_by_page.setdefault(sample.page, []).append(sample)
+        max_page = max(page_count or 0, max(samples_by_page))
+        window_size = min(5, max_page)
+        last_start = max(1, max_page - window_size + 1)
+        candidates = []
+        for start in range(1, last_start + 1):
+            end = start + window_size - 1
+            window_samples = tuple(
+                sample
+                for page in range(start, end + 1)
+                for sample in samples_by_page.get(page, ())
+            )
+            if window_samples:
+                candidates.append((start, end, window_samples))
+        if not candidates:
+            raise ProjectError("找不到可用的連續頁面原文")
+        rng = random.SystemRandom()
+        if question_count <= len(candidates):
+            return rng.sample(candidates, question_count)
+        return rng.sample(candidates, len(candidates)) + [
+            rng.choice(candidates) for _ in range(question_count - len(candidates))
+        ]
+
+    @staticmethod
+    def _build_windowed_prompt(
+        windows: Sequence[tuple[int, int, tuple[SourceSample, ...]]],
+        maximum_source_characters: int,
+        excluded_questions: Sequence[str],
+    ) -> str:
+        window_payload = [
+            {
+                "window_id": f"W{index:04d}",
+                "pages": list(range(start, end + 1)),
+                "sources": [
+                    {
+                        "sample_id": sample.sample_id,
+                        "page": sample.page,
+                        "section_id": sample.section_id,
+                        "text": sample.text[:maximum_source_characters],
+                    }
+                    for sample in samples
+                ],
+            }
+            for index, (start, end, samples) in enumerate(windows, start=1)
+        ]
+        prompt = (
+            "你是汽車維修手冊題目設計器。只能使用提供的原文，不可加入外部知識。\n"
+            "每個 window 是為一道題隨機抽取的連續五頁（文件不足五頁時使用該文件全部頁面）。"
+            "每個 window 必須且只能生成一道題，依照 window 順序輸出；不得跨 window 混用來源。\n"
+            "問題與參考答案必須使用繁體中文；零件名稱、縮寫、DTC、單位與原廠術語可保留英文。"
+            "不得因翻譯加入原文沒有的資訊。問題不可直接暴露答案。\n"
+            "參考答案要完整且具體，不可只給一句結論或過度簡化；整理原文中直接回答問題的必要細節。"
+            "若原文有，必須保留操作步驟與順序、前置條件、判定標準、數值與單位、注意事項及警告；"
+            "適合時用條列或編號呈現。只在原文本身資訊有限時才給簡短答案。\n"
+            "每題的題目來源與答案來源 sample_id 都必須取自該題對應 window；答案來源需完整支持答案。\n"
+            "只輸出 JSON object，格式為 "
+            '{"questions":[{"question":"...","reference_answer":"...",'
+            '"question_source_sample_ids":["..."],"answer_source_sample_ids":["..."]}]}。\n'
+            f"Windows：{json.dumps(window_payload, ensure_ascii=False)}"
+        )
+        if excluded_questions:
+            prompt += (
+                "\n以下既有題目禁止重複或只換同義詞，請生成不同考點的問題："
+                + json.dumps(list(excluded_questions), ensure_ascii=False)
+            )
+        return prompt
 
     def get(self, project_id: str, generation_batch_id: str) -> GeneratedQuestionBatch:
         if not generation_batch_id.isalnum():
@@ -350,6 +430,7 @@ class QuestionGenerationService:
         sample_batch: SourceSampleBatch,
         count: int,
         difficulty: str,
+        allowed_source_ids_by_question: Sequence[set[str]] | None = None,
     ) -> list[GeneratedQuestion]:
         if isinstance(response, str):
             try:
@@ -388,6 +469,10 @@ class QuestionGenerationService:
                 raise ProjectError(f"生成題目第 {index} 筆引用不存在的 sample_id")
             question_ids = tuple(dict.fromkeys(question_source_ids))
             answer_ids = tuple(dict.fromkeys(answer_source_ids))
+            if allowed_source_ids_by_question is not None:
+                allowed_ids = allowed_source_ids_by_question[index - 1]
+                if not set(question_ids).issubset(allowed_ids) or not set(answer_ids).issubset(allowed_ids):
+                    raise ProjectError(f"生成題目第 {index} 筆引用了所屬五頁範圍以外的來源")
             question_sources = [source_by_id[source_id] for source_id in question_ids]
             answer_sources = [source_by_id[source_id] for source_id in answer_ids]
             self._validate_difficulty_sources(answer_sources, difficulty, index)
@@ -416,6 +501,8 @@ class QuestionGenerationService:
 
     @staticmethod
     def _validate_difficulty_sources(sources: list[SourceSample], difficulty: str, index: int) -> None:
+        if difficulty == "window":
+            return
         if difficulty == "simple" and len(sources) != 1:
             raise ProjectError(f"生成題目第 {index} 筆的 simple 難度必須引用一筆來源")
         if difficulty == "medium" and len(sources) < 2:

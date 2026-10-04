@@ -156,22 +156,23 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         self.assertEqual(len(questions), 1)
         self.assertEqual(questions[0].gold_evidence[0].document_id, "WW.pdf")
 
-    def test_document_generation_limits_samples_and_spreads_them_across_the_document(self) -> None:
+    def test_document_generation_randomly_selects_consecutive_five_page_windows(self) -> None:
         sample = self.sample_batch.samples[0]
         samples = [
             replace(sample, sample_id=f"sample-{index}", chunk_id=f"chunk-{index}", page=index + 1)
             for index in range(60)
         ]
 
-        selected = QuestionGenerationService._select_representative_samples(samples, question_count=10)
+        windows = QuestionGenerationService._sample_page_windows(samples, question_count=10)
 
-        self.assertEqual(len(selected), 20)
-        self.assertEqual(selected[0].page, 1)
-        self.assertEqual(selected[-1].page, 60)
-        self.assertEqual(list(selected), sorted(selected, key=lambda item: item.page))
+        self.assertEqual(len(windows), 10)
+        for start, end, selected in windows:
+            self.assertEqual(end - start + 1, 5)
+            self.assertTrue(all(start <= item.page <= end for item in selected))
+            self.assertEqual({item.page for item in selected}, set(range(start, end + 1)))
 
     def test_generated_question_tracks_question_and_answer_pages_separately(self) -> None:
-        samples = [item for item in self.sample_batch.samples if item.document_id == "WW.pdf"]
+        samples = [item for item in self.sampling.scan("L33-SM3E", minimum_characters=1) if item.document_id == "WW.pdf"]
         client = FakeGenerationClient({
             "questions": [{
                 "question": "雨刷馬達的檢查程序為何？",
