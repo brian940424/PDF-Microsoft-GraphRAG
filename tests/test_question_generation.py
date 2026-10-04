@@ -154,6 +154,26 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         self.assertEqual(len(questions), 1)
         self.assertEqual(questions[0].gold_evidence[0].document_id, "WW.pdf")
 
+    def test_generated_question_tracks_question_and_answer_pages_separately(self) -> None:
+        samples = [item for item in self.sample_batch.samples if item.document_id == "WW.pdf"]
+        client = FakeGenerationClient({
+            "questions": [{
+                "question": "雨刷馬達的檢查程序為何？",
+                "reference_answer": "檢查馬達與線束。",
+                "question_source_sample_ids": [samples[0].sample_id],
+                "answer_source_sample_ids": [samples[1].sample_id],
+            }]
+        })
+        service = QuestionGenerationService(self.store, self.sampling, self.connections, client)
+
+        question = service.generate_for_document(
+            "L33-SM3E", "WW.pdf", samples, 1, "gpt-4o-mini"
+        )[0]
+
+        self.assertEqual(question.question_source_evidence[0].pages, (25,))
+        self.assertEqual(question.answer_source_evidence[0].pages, (26,))
+        self.assertEqual(question.gold_evidence[0].pages, (26,))
+
     def test_duplicate_question_normalization_ignores_punctuation_and_width(self) -> None:
         self.assertEqual(normalize_question("ＡＢＣ？ 雨刷！"), normalize_question("abc 雨刷"))
 

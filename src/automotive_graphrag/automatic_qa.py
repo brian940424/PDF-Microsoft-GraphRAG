@@ -134,6 +134,8 @@ class AutomaticQATestService:
                         question=question.question,
                         reference_answer=question.reference_answer,
                         gold_evidence=question.gold_evidence,
+                        question_source_evidence=question.question_source_evidence,
+                        answer_source_evidence=question.answer_source_evidence or question.gold_evidence,
                     )
                 )
         if not batch_questions:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
-from automotive_graphrag.question_sets import QuestionSetService
+from automotive_graphrag.question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 
 
 class FakeQuestionRunner:
@@ -156,6 +156,42 @@ class QuestionSetServiceTests(unittest.TestCase):
             rows = list(csv.DictReader(source))
         self.assertEqual(rows[0]["question_id"], "Q001")
         self.assertEqual(rows[0]["status"], "COMPLETED")
+
+    def test_question_set_export_import_preserves_source_page_ranges(self) -> None:
+        question_set = self.service.create_with_questions(
+            "L33-SM3E",
+            "來源頁碼測試",
+            [
+                BatchQuestion(
+                    "Q0001",
+                    "問題",
+                    reference_answer="正確答案",
+                    gold_evidence=(GoldEvidence("manual.pdf", (5, 6), ("chunk-a",)),),
+                    question_source_evidence=(GoldEvidence("manual.pdf", (2, 3), ()),),
+                    answer_source_evidence=(GoldEvidence("manual.pdf", (5, 6), ()),),
+                )
+            ],
+        )
+
+        json_path, csv_path = self.service.export("L33-SM3E", question_set.question_set_id)
+        exported = json.loads(json_path.read_text(encoding="utf-8"))
+        row = exported["questions"][0]
+        self.assertEqual(row["question_id"], "Q0001")
+        self.assertEqual(row["question"], "問題")
+        self.assertEqual(row["correct_answer"], "正確答案")
+        self.assertEqual(row["question_source_pages"], [{"document_id": "manual.pdf", "pages": [2, 3]}])
+        self.assertEqual(row["answer_source_pages"], [{"document_id": "manual.pdf", "pages": [5, 6]}])
+        self.assertEqual(row["source_documents"], ["manual.pdf"])
+
+        imported = self.service.import_file("L33-SM3E", json_path)
+        self.assertEqual(imported.questions[0].question_source_evidence[0].pages, (2, 3))
+        self.assertEqual(imported.questions[0].answer_source_evidence[0].pages, (5, 6))
+        with csv_path.open(encoding="utf-8", newline="") as source:
+            csv_row = next(csv.DictReader(source))
+        self.assertEqual(csv_row["correct_answer"], "正確答案")
+        self.assertIn("manual.pdf: 2, 3", csv_row["question_source_pages"])
+        self.assertIn("manual.pdf: 5, 6", csv_row["answer_source_pages"])
+        self.assertEqual(csv_row["source_documents"], "manual.pdf")
 
     def test_batch_requires_indexed_project(self) -> None:
         imported = self.service.import_file("L33-SM3E", self.write_question_set(self.valid_value()))

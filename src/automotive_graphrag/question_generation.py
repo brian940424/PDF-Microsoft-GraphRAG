@@ -35,6 +35,8 @@ class GeneratedQuestion:
     source_sample_ids: tuple[str, ...]
     difficulty: str
     generation_status: str
+    question_source_evidence: tuple[GoldEvidence, ...] = ()
+    answer_source_evidence: tuple[GoldEvidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,8 +252,26 @@ class QuestionGenerationService:
                 {
                     "question_id": item.question_id,
                     "question": item.question,
+                    "correct_answer": item.reference_answer,
                     "reference_answer": item.reference_answer,
                     "gold_evidence": [asdict(gold) for gold in item.gold_evidence],
+                    "question_source_pages": [
+                        {"document_id": source.document_id, "pages": list(source.pages)}
+                        for source in (item.question_source_evidence or item.gold_evidence)
+                    ],
+                    "answer_source_pages": [
+                        {"document_id": source.document_id, "pages": list(source.pages)}
+                        for source in (item.answer_source_evidence or item.gold_evidence)
+                    ],
+                    "source_documents": list(
+                        dict.fromkeys(
+                            source.document_id
+                            for source in (
+                                *(item.question_source_evidence or item.gold_evidence),
+                                *(item.answer_source_evidence or item.gold_evidence),
+                            )
+                        )
+                    ),
                     "difficulty": item.difficulty,
                     "generation_status": item.generation_status,
                 }
@@ -294,7 +314,8 @@ class QuestionGenerationService:
             "不得因翻譯加入原文沒有的資訊。\n"
             f"生成 {count} 題，難度固定為 {difficulty}。問題不可直接暴露答案；參考答案必須可由引用原文完整支持。\n"
             "只輸出 JSON object，格式為 "
-            '{"questions":[{"question":"...","reference_answer":"...","source_sample_ids":["..."]}]}。\n'
+            '{"questions":[{"question":"...","reference_answer":"...","question_source_sample_ids":["..."],'
+            '"answer_source_sample_ids":["..."]}]}。\n'
             "simple 每題只能引用一筆來源；medium 每題至少兩筆來源；cross_section 每題至少引用兩個不同 section。\n"
             f"來源：{json.dumps(sources, ensure_ascii=False)}"
         )
@@ -323,31 +344,44 @@ class QuestionGenerationService:
                 raise ProjectError(f"生成題目第 {index} 筆格式錯誤")
             question = raw.get("question")
             answer = raw.get("reference_answer")
-            source_ids = raw.get("source_sample_ids")
+            fallback_source_ids = raw.get("source_sample_ids")
+            question_source_ids = raw.get("question_source_sample_ids", fallback_source_ids)
+            answer_source_ids = raw.get("answer_source_sample_ids", fallback_source_ids)
             if not isinstance(question, str) or not question.strip():
                 raise ProjectError(f"生成題目第 {index} 筆缺少問題")
             if not isinstance(answer, str) or not answer.strip():
                 raise ProjectError(f"生成題目第 {index} 筆缺少參考答案")
             if not self._contains_chinese(question) or not self._contains_chinese(answer):
                 raise ProjectError(f"生成題目第 {index} 筆未使用繁體中文，請重新生成")
-            if not isinstance(source_ids, list) or not source_ids or any(
-                not isinstance(source_id, str) or source_id not in source_by_id for source_id in source_ids
-            ):
+            valid_source_ids = lambda values: (
+                isinstance(values, list)
+                and bool(values)
+                and all(isinstance(source_id, str) and source_id in source_by_id for source_id in values)
+            )
+            if not valid_source_ids(question_source_ids):
+                raise ProjectError(f"生成題目第 {index} 筆引用不存在的 sample_id（question source）")
+            if not valid_source_ids(answer_source_ids):
                 raise ProjectError(f"生成題目第 {index} 筆引用不存在的 sample_id")
-            unique_ids = tuple(dict.fromkeys(source_ids))
-            selected_sources = [source_by_id[source_id] for source_id in unique_ids]
-            self._validate_difficulty_sources(selected_sources, difficulty, index)
-            sections = sorted({item.section_id for item in selected_sources})
+            question_ids = tuple(dict.fromkeys(question_source_ids))
+            answer_ids = tuple(dict.fromkeys(answer_source_ids))
+            question_sources = [source_by_id[source_id] for source_id in question_ids]
+            answer_sources = [source_by_id[source_id] for source_id in answer_ids]
+            self._validate_difficulty_sources(answer_sources, difficulty, index)
+            selected_sources = list({item.sample_id: item for item in (*question_sources, *answer_sources)}.values())
+            unique_ids = tuple(item.sample_id for item in selected_sources)
+            sections = sorted({item.section_id for item in answer_sources})
             section_label = sections[0] if len(sections) == 1 else "CROSS"
             questions.append(
                 GeneratedQuestion(
                     question_id=f"AUTO-{section_label}-{index:04d}",
                     question=question.strip(),
                     reference_answer=answer.strip(),
-                    gold_evidence=self._gold_evidence(selected_sources),
+                    gold_evidence=self._gold_evidence(answer_sources),
                     source_sample_ids=unique_ids,
                     difficulty=difficulty,
                     generation_status="pending_review",
+                    question_source_evidence=self._gold_evidence(question_sources),
+                    answer_source_evidence=self._gold_evidence(answer_sources),
                 )
             )
         return questions
@@ -425,6 +459,15 @@ class QuestionGenerationService:
             for item in value.get("gold_evidence", [])
         )
         value["source_sample_ids"] = tuple(value.get("source_sample_ids", []))
+        for field_name in ("question_source_evidence", "answer_source_evidence"):
+            value[field_name] = tuple(
+                GoldEvidence(
+                    document_id=item["document_id"],
+                    pages=tuple(item.get("pages", [])),
+                    chunk_ids=tuple(item.get("chunk_ids", [])),
+                )
+                for item in value.get(field_name, [])
+            )
         return GeneratedQuestion(**value)
 
     @staticmethod

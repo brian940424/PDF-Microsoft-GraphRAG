@@ -44,6 +44,8 @@ class BatchQuestion:
     completed_at: str | None = None
     gold_evidence: tuple[GoldEvidence, ...] = ()
     retrieved_evidence: tuple[Evidence, ...] = ()
+    question_source_evidence: tuple[GoldEvidence, ...] = ()
+    answer_source_evidence: tuple[GoldEvidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +179,8 @@ class QuestionSetService:
                     completed_at=result.completed_at,
                     gold_evidence=item.gold_evidence,
                     retrieved_evidence=result.evidence,
+                    question_source_evidence=item.question_source_evidence,
+                    answer_source_evidence=item.answer_source_evidence,
                 )
             )
         updated = self._replace(question_set, questions, method)
@@ -339,7 +343,11 @@ class QuestionSetService:
             fieldnames=[
                 "question_id",
                 "question",
+                "correct_answer",
                 "reference_answer",
+                "question_source_pages",
+                "answer_source_pages",
+                "source_documents",
                 "status",
                 "answer",
                 "error",
@@ -352,6 +360,16 @@ class QuestionSetService:
         writer.writeheader()
         for item in question_set.questions:
             row = asdict(item)
+            row["correct_answer"] = item.reference_answer
+            row.pop("question_source_evidence", None)
+            row.pop("answer_source_evidence", None)
+            row["question_source_pages"] = self._format_source_pages(
+                item.question_source_evidence or item.gold_evidence
+            )
+            row["answer_source_pages"] = self._format_source_pages(
+                item.answer_source_evidence or item.gold_evidence
+            )
+            row["source_documents"] = "; ".join(self._source_documents(item))
             row["gold_evidence"] = json.dumps(row["gold_evidence"], ensure_ascii=False)
             row["retrieved_evidence"] = json.dumps(row["retrieved_evidence"], ensure_ascii=False)
             writer.writerow(row)
@@ -408,7 +426,7 @@ class QuestionSetService:
                 continue
             question_id = raw.get("question_id")
             question = raw.get("question")
-            reference_answer = raw.get("reference_answer", "")
+            reference_answer = raw.get("correct_answer", raw.get("reference_answer", ""))
             answer = raw.get("answer", "")
             status = raw.get("status", "PENDING")
             error = raw.get("error")
@@ -427,6 +445,28 @@ class QuestionSetService:
             except ProjectError as exc:
                 errors.extend(str(exc).splitlines())
                 gold_evidence = ()
+            question_sources_raw = raw.get("question_source_evidence", raw.get("question_source_pages"))
+            answer_sources_raw = raw.get("answer_source_evidence", raw.get("answer_source_pages"))
+            try:
+                question_sources = (
+                    QuestionSetService._parse_source_pages(
+                        question_sources_raw, location + ".question_source_pages"
+                    )
+                    if question_sources_raw is not None
+                    else gold_evidence
+                )
+                answer_sources = (
+                    QuestionSetService._parse_source_pages(
+                        answer_sources_raw, location + ".answer_source_pages"
+                    )
+                    if answer_sources_raw is not None
+                    else gold_evidence
+                )
+            except ProjectError as exc:
+                errors.extend(str(exc).splitlines())
+                question_sources = answer_sources = gold_evidence
+            if not gold_evidence:
+                gold_evidence = answer_sources
             if not isinstance(question_id, str) or not question_id.strip():
                 errors.append(f"{location}.question_id：必須是非空白字串")
             elif question_id.strip() in seen:
@@ -460,11 +500,60 @@ class QuestionSetService:
                         completed_at=completed_at if isinstance(completed_at, str) else None,
                         gold_evidence=gold_evidence,
                         retrieved_evidence=retrieved_evidence,
+                        question_source_evidence=question_sources,
+                        answer_source_evidence=answer_sources,
                     )
                 )
         if errors:
             raise ProjectError("題目集格式錯誤：\n- " + "\n- ".join(errors))
         return name.strip(), description.strip(), questions
+
+    @staticmethod
+    def _parse_source_pages(value: object, location: str) -> tuple[GoldEvidence, ...]:
+        if not isinstance(value, list):
+            raise ProjectError(f"{location}：必須是文件／頁碼陣列")
+        parsed: list[GoldEvidence] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ProjectError(f"{location}[{index}]：必須是 object")
+            document_id = item.get("document_id")
+            pages = item.get("pages", [])
+            chunk_ids = item.get("chunk_ids", [])
+            if (
+                not isinstance(document_id, str) or not document_id.strip()
+                or not isinstance(pages, list)
+                or any(not isinstance(page, int) or page < 1 for page in pages)
+                or not isinstance(chunk_ids, list)
+                or any(not isinstance(chunk, str) for chunk in chunk_ids)
+            ):
+                raise ProjectError(f"{location}[{index}]：文件、頁碼或 chunk_ids 格式錯誤")
+            if not pages and not chunk_ids:
+                raise ProjectError(f"{location}[{index}]：至少要有一個頁碼或 chunk_id")
+            parsed.append(
+                GoldEvidence(
+                    document_id.strip(),
+                    tuple(dict.fromkeys(pages)),
+                    tuple(dict.fromkeys(chunk_ids)),
+                )
+            )
+        return tuple(parsed)
+
+    @staticmethod
+    def _format_source_pages(evidence: Sequence[GoldEvidence]) -> str:
+        return "; ".join(
+            f"{item.document_id}: {', '.join(str(page) for page in item.pages) or '頁碼未提供'}"
+            for item in evidence
+        )
+
+    @staticmethod
+    def _source_documents(question: BatchQuestion) -> tuple[str, ...]:
+        question_sources = question.question_source_evidence or question.gold_evidence
+        answer_sources = question.answer_source_evidence or question.gold_evidence
+        return tuple(
+            dict.fromkeys(
+                item.document_id for item in (*question_sources, *answer_sources)
+            )
+        )
 
     @staticmethod
     def parse_gold_evidence(value: object, location: str = "gold_evidence") -> tuple[GoldEvidence, ...]:
@@ -515,6 +604,10 @@ class QuestionSetService:
         value = json.loads(path.read_text(encoding="utf-8"))
         questions = []
         for item in value.pop("questions"):
+            for derived in (
+                "correct_answer", "question_source_pages", "answer_source_pages", "source_documents"
+            ):
+                item.pop(derived, None)
             item["gold_evidence"] = tuple(
                 GoldEvidence(
                     document_id=gold["document_id"],
@@ -526,13 +619,38 @@ class QuestionSetService:
             item["retrieved_evidence"] = tuple(
                 Evidence(**evidence) for evidence in item.get("retrieved_evidence", [])
             )
+            for source_key in ("question_source_evidence", "answer_source_evidence"):
+                item[source_key] = tuple(
+                    GoldEvidence(
+                        document_id=source["document_id"],
+                        pages=tuple(source.get("pages", [])),
+                        chunk_ids=tuple(source.get("chunk_ids", [])),
+                    )
+                    for source in item.get(source_key, [])
+                )
             questions.append(BatchQuestion(**item))
         return QuestionSet(**value, questions=tuple(questions))
 
     @staticmethod
     def _to_dict(question_set: QuestionSet) -> dict[str, object]:
         value = asdict(question_set)
-        value["questions"] = [asdict(item) for item in question_set.questions]
+        questions = []
+        for item in question_set.questions:
+            row = asdict(item)
+            question_sources = item.question_source_evidence or item.gold_evidence
+            answer_sources = item.answer_source_evidence or item.gold_evidence
+            row["correct_answer"] = item.reference_answer
+            row["question_source_pages"] = [
+                {"document_id": source.document_id, "pages": list(source.pages)}
+                for source in question_sources
+            ]
+            row["answer_source_pages"] = [
+                {"document_id": source.document_id, "pages": list(source.pages)}
+                for source in answer_sources
+            ]
+            row["source_documents"] = list(QuestionSetService._source_documents(item))
+            questions.append(row)
+        value["questions"] = questions
         return value
 
     @staticmethod
