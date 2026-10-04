@@ -34,7 +34,6 @@ class ExperimentGroup:
     group_id: str
     name: str
     answer_model: str
-    judge_model: str
     method: str
 
 
@@ -116,13 +115,24 @@ class RetrievalExperimentService:
         try:
             value = json.loads(self._path(project_id).read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return {"groups": [], "question_set_id": "", "max_concurrency": 5, "run": None}
+            return {"groups": [], "question_set_id": "", "max_concurrency": 5,
+                    "judge_model": self.connections.get_chat_model(), "run": None}
         except (OSError, json.JSONDecodeError) as exc:
             raise ProjectError("檢索實驗保存資料無法讀取") from exc
         value.setdefault("groups", [])
         value.setdefault("question_set_id", "")
         value.setdefault("max_concurrency", 5)
         value.setdefault("run", None)
+        legacy_groups = value.get("groups", [])
+        legacy_judge = next((
+            item.get("judge_model") for item in legacy_groups
+            if isinstance(item, dict) and item.get("judge_model")
+        ), None)
+        value.setdefault("judge_model", legacy_judge or self.connections.get_chat_model())
+        value["groups"] = [
+            {key: field for key, field in item.items() if key != "judge_model"}
+            for item in legacy_groups if isinstance(item, dict)
+        ]
         return value
 
     def save_configuration(
@@ -131,11 +141,16 @@ class RetrievalExperimentService:
         groups: Sequence[ExperimentGroup],
         question_set_id: str,
         max_concurrency: int,
+        judge_model: str | None = None,
     ) -> None:
         if not 1 <= max_concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
         current = self.load(project_id)
         current["groups"] = [asdict(group) for group in groups]
+        if judge_model is not None:
+            if judge_model not in ALLOWED_CHAT_MODELS:
+                raise ProjectError("全域評測模型不支援")
+            current["judge_model"] = judge_model
         current["question_set_id"] = question_set_id
         current["max_concurrency"] = max_concurrency
         self._write(project_id, current)
@@ -151,13 +166,11 @@ class RetrievalExperimentService:
         current = self.load(project_id)
         raw_groups = current["groups"]
         used = {str(group.get("group_id", "")) for group in raw_groups if isinstance(group, dict)}
-        index = 1
+        index = max((int(group_id[1:]) for group_id in used
+                     if group_id.startswith("G") and group_id[1:].isdigit()), default=0) + 1
         while f"G{index:02d}" in used:
             index += 1
-        group = ExperimentGroup(
-            f"G{index:02d}", f"實驗組 {index}", self.connections.get_chat_model(),
-            self.connections.get_chat_model(), "local",
-        )
+        group = ExperimentGroup(f"G{index:02d}", f"實驗組{index}", "", "")
         current["groups"] = [*raw_groups, asdict(group)]
         self._write(project_id, current)
         return current
@@ -170,19 +183,26 @@ class RetrievalExperimentService:
         if rows is None:
             return current
         for row in rows:
-            if isinstance(row, (str, bytes)) or not hasattr(row, "__len__") or len(row) < 5:
+            if isinstance(row, (str, bytes)) or not hasattr(row, "__len__") or len(row) < 4:
                 continue
             group = by_id.get(str(row[0] or ""))
             if group is None:
                 continue
-            for index, field_name in enumerate(("name", "answer_model", "judge_model"), start=1):
+            for index, field_name in enumerate(("name", "answer_model"), start=1):
                 raw_value = row[index]
                 if raw_value is None or (isinstance(raw_value, float) and math.isnan(raw_value)):
                     continue
                 value = str(raw_value).strip()
                 if value:
+                    if field_name == "answer_model" and value not in ALLOWED_CHAT_MODELS:
+                        raise ProjectError(f"{group.get('group_id')} 的回答模型不支援")
                     group[field_name] = value
-            # The strategy is edited through the constrained dropdown, never free text.
+            if len(row) >= 4:
+                method = str(row[3] or "").strip()
+                if method in EXPERIMENT_METHODS:
+                    group["method"] = method
+                elif method:
+                    raise ProjectError(f"{group.get('group_id')} 的 GraphRAG 策略不支援")
         current["groups"] = groups
         self._write(project_id, current)
         return current
@@ -213,12 +233,17 @@ class RetrievalExperimentService:
         groups: Sequence[ExperimentGroup],
         max_concurrency: int = 5,
         update_callback: UpdateFunction | None = None,
+        judge_model: str | None = None,
     ) -> RetrievalExperimentRun:
         if not groups:
             raise ProjectError("請先新增至少一個實驗組")
         if not 1 <= max_concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
         self._validate_groups(groups)
+        state = self.load(project_id)
+        judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
+        if judge_model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError("全域評測模型不支援")
         project = self.projects.get(project_id)
         question_set = self.question_sets.get(project_id, question_set_id)
         if project.status != "INDEXED":
@@ -235,7 +260,7 @@ class RetrievalExperimentService:
         start = datetime.now(timezone.utc).isoformat()
         results: dict[tuple[str, str], ExperimentQuestionResult] = {}
         run_status = "running"
-        self._persist_run(project_id, question_set_id, groups, max_concurrency, start, run_status, results)
+        self._persist_run(project_id, question_set_id, groups, judge_model, max_concurrency, start, run_status, results)
         work = [(group, question) for group in groups for question in question_set.questions]
         executor = ThreadPoolExecutor(max_workers=max_concurrency)
         work_iter = iter(work)
@@ -247,7 +272,7 @@ class RetrievalExperimentService:
                     group, question = next(work_iter)
                 except StopIteration:
                     return
-                futures[executor.submit(self._run_case, project_id, group, question)] = (group, question)
+                futures[executor.submit(self._run_case, project_id, group, question, judge_model)] = (group, question)
 
         fill_available_workers()
         try:
@@ -258,11 +283,11 @@ class RetrievalExperimentService:
                     try:
                         result = future.result()
                     except Exception as exc:  # Preserve an individual failure instead of losing the run.
-                        result = self._failed_result(group, question, str(exc))
+                        result = self._failed_result(group, question, judge_model, str(exc))
                     results[(group.group_id, question.question_id)] = result
                     run_status = "stopping" if stop_event.is_set() else "running"
                     run = self._persist_run(
-                        project_id, question_set_id, groups, max_concurrency, start, run_status, results
+                        project_id, question_set_id, groups, judge_model, max_concurrency, start, run_status, results
                     )
                     if update_callback:
                         update_callback(run)
@@ -271,7 +296,7 @@ class RetrievalExperimentService:
         except BaseException:
             stop_event.set()
             executor.shutdown(wait=True, cancel_futures=True)
-            self._persist_run(project_id, question_set_id, groups, max_concurrency, start, "stopped", results)
+            self._persist_run(project_id, question_set_id, groups, judge_model, max_concurrency, start, "stopped", results)
             raise
         finally:
             with self._lock:
@@ -280,7 +305,7 @@ class RetrievalExperimentService:
         run_status = "stopped" if stop_event.is_set() else "completed"
         completed_at = datetime.now(timezone.utc).isoformat()
         return self._persist_run(
-            project_id, question_set_id, groups, max_concurrency, start, run_status, results, completed_at
+            project_id, question_set_id, groups, judge_model, max_concurrency, start, run_status, results, completed_at
         )
 
     def stop(self, project_id: str) -> bool:
@@ -304,7 +329,11 @@ class RetrievalExperimentService:
             "execution_status": run.get("status"),
             "question_count": run.get("question_count", 0),
             "max_concurrency": state.get("max_concurrency", 5),
-            "experiment_groups": state.get("groups", []),
+            "experiment_groups": [
+                {**group, "judge_model": state.get("judge_model", "")}
+                for group in state.get("groups", [])
+            ],
+            "judge_model": state.get("judge_model", ""),
             "summary": run.get("groups", []),
             "question_results": run.get("results", []),
             "last_run": run,
@@ -313,16 +342,16 @@ class RetrievalExperimentService:
         return path
 
     def _run_case(
-        self, project_id: str, group: ExperimentGroup, question: BatchQuestion
+        self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str
     ) -> ExperimentQuestionResult:
         try:
             answer, context = self.query_function(project_id, question.question, group.method, group.answer_model)
         except Exception as exc:
-            return self._failed_result(group, question, str(exc))
+            return self._failed_result(group, question, judge_model, str(exc))
         try:
             judged = self.judging.evaluate_single_answer(
                 project_id, question.question_id, question.question,
-                question.reference_answer, answer, group.judge_model,
+                question.reference_answer, answer, judge_model,
             )
             try:
                 retrieved = self._resolved_sources(project_id, context)
@@ -339,13 +368,13 @@ class RetrievalExperimentService:
                 + list(question.source_documents)
             ))
             return ExperimentQuestionResult(
-                group.group_id, group.name, group.answer_model, group.judge_model, group.method,
+                group.group_id, group.name, group.answer_model, judge_model, group.method,
                 question.question_id, question.question, source_docs, question.reference_answer,
                 answer, "正確" if judged.is_correct else "錯誤", judged.judge_reason, None,
                 UNRANKED_REASON, "completed",
             )
         except Exception as exc:
-            failed = self._failed_result(group, question, str(exc))
+            failed = self._failed_result(group, question, judge_model, str(exc))
             return ExperimentQuestionResult(
                 failed.group_id, failed.group_name, failed.answer_model, failed.judge_model,
                 failed.method, failed.question_id, failed.question, failed.source_documents,
@@ -354,7 +383,7 @@ class RetrievalExperimentService:
             )
 
     def _failed_result(
-        self, group: ExperimentGroup, question: BatchQuestion, error: str
+        self, group: ExperimentGroup, question: BatchQuestion, judge_model: str, error: str
     ) -> ExperimentQuestionResult:
         source_docs = tuple(dict.fromkeys(
             item.document_name or item.document_id
@@ -365,7 +394,7 @@ class RetrievalExperimentService:
             )
         ))
         return ExperimentQuestionResult(
-            group.group_id, group.name, group.answer_model, group.judge_model, group.method,
+            group.group_id, group.name, group.answer_model, judge_model, group.method,
             question.question_id, question.question, source_docs, question.reference_answer,
             "", "未評判", error, None, UNRANKED_REASON, "failed", error,
         )
@@ -375,6 +404,7 @@ class RetrievalExperimentService:
         project_id: str,
         question_set_id: str,
         groups: Sequence[ExperimentGroup],
+        judge_model: str,
         max_concurrency: int,
         started_at: str,
         status: str,
@@ -390,7 +420,7 @@ class RetrievalExperimentService:
             judged = [item for item in group_items if item.evaluation_result in {"正確", "錯誤"}]
             correct = sum(item.evaluation_result == "正確" for item in judged)
             summaries.append(ExperimentGroupSummary(
-                group.group_id, group.name, group.answer_model, group.judge_model, group.method,
+                group.group_id, group.name, group.answer_model, judge_model, group.method,
                 len(question_set.questions), len(group_items), correct,
                 correct / len(group_items) if group_items else None,
                 None, None, None, UNRANKED_REASON,
@@ -401,6 +431,7 @@ class RetrievalExperimentService:
             tuple(summaries), result_items,
         )
         state = self.load(project_id)
+        state["judge_model"] = judge_model
         state["run"] = asdict(run)
         self._write(project_id, state)
         return run
@@ -463,8 +494,6 @@ class RetrievalExperimentService:
                 raise ProjectError(f"{group.group_id} 的實驗組名稱不可空白")
             if group.answer_model not in ALLOWED_CHAT_MODELS:
                 raise ProjectError(f"{group.group_id} 的回答模型不支援")
-            if group.judge_model not in ALLOWED_CHAT_MODELS:
-                raise ProjectError(f"{group.group_id} 的評測模型不支援")
             if group.method not in EXPERIMENT_METHODS:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 策略不支援")
 

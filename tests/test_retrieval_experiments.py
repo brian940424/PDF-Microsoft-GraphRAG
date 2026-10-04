@@ -63,13 +63,19 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(self.service.load("project")["question_set_id"], question_set.question_set_id)
 
     def test_group_settings_autosave_reload_and_only_explicit_remove_deletes(self):
-        self.service.add_group("project")
         state = self.service.add_group("project")
+        self.assertEqual(state["groups"][0]["name"], "實驗組1")
+        self.assertEqual(state["groups"][0]["answer_model"], "")
+        self.assertEqual(state["groups"][0]["method"], "")
+        state = self.service.add_group("project")
+        self.assertEqual(state["groups"][1]["name"], "實驗組2")
         original = [dict(item) for item in state["groups"]]
-        rows = [[original[0]["group_id"], "", "", "", ""]]
+        rows = [[original[0]["group_id"], "實驗組1", "gpt-4o-mini", "local"]]
         state = self.service.update_group_fields("project", np.array(rows, dtype=object))
+        self.assertEqual(state["groups"][0]["method"], "local")
+        self.assertNotIn("judge_model", state["groups"][0])
         groups = [ExperimentGroup(**item) for item in state["groups"]]
-        self.service.save_configuration("project", groups, "question-set-id", 5)
+        self.service.save_configuration("project", groups, "question-set-id", 5, "gpt-4.1-mini")
 
         reloaded = RetrievalExperimentService(
             self.projects, self.question_sets, self.connections, FakeJudge(), query_function=lambda *args: ("", {})
@@ -77,16 +83,32 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(len(reloaded["groups"]), 2)
         self.assertEqual(reloaded["groups"][0]["name"], original[0]["name"])
         self.assertEqual(reloaded["question_set_id"], "question-set-id")
+        self.assertEqual(reloaded["judge_model"], "gpt-4.1-mini")
         self.service.remove_group("project", original[0]["group_id"])
         self.assertEqual(len(self.service.load("project")["groups"]), 1)
+
+    def test_legacy_per_group_judge_model_migrates_to_global_setting(self):
+        path = self.service._path("project")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "groups": [{
+                "group_id": "G01", "name": "舊組別", "answer_model": "gpt-4o-mini",
+                "judge_model": "gpt-4.1-mini", "method": "local",
+            }],
+        }), encoding="utf-8")
+
+        migrated = self.service.load("project")
+
+        self.assertEqual(migrated["judge_model"], "gpt-4.1-mini")
+        self.assertNotIn("judge_model", migrated["groups"][0])
 
     def test_run_judges_each_group_and_persists_summary_and_results(self):
         question_set = self.service.import_question_set("project", self.question_file)
         groups = [
-            ExperimentGroup("G01", "Local baseline", "gpt-4o-mini", "gpt-4.1-mini", "local"),
-            ExperimentGroup("G02", "Basic baseline", "gpt-4.1-mini", "gpt-4o-mini", "basic"),
+            ExperimentGroup("G01", "Local baseline", "gpt-4o-mini", "local"),
+            ExperimentGroup("G02", "Basic baseline", "gpt-4.1-mini", "basic"),
         ]
-        self.service.save_configuration("project", groups, question_set.question_set_id, 2)
+        self.service.save_configuration("project", groups, question_set.question_set_id, 2, "gpt-4.1-mini")
 
         run = self.service.run("project", question_set.question_set_id, groups, max_concurrency=2)
         loaded = self.service.load("project")["run"]
@@ -96,6 +118,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual({call[2] for call in self.calls}, {"local", "basic"})
         self.assertEqual({call[3] for call in self.calls}, {"gpt-4o-mini", "gpt-4.1-mini"})
         self.assertTrue(all(result.evaluation_result == "正確" for result in run.results))
+        self.assertTrue(all(result.judge_model == "gpt-4.1-mini" for result in run.results))
         self.assertTrue(all(result.answer_source_rank is None for result in run.results))
         self.assertTrue(all(group.recall_at_5 is None and group.mrr is None for group in run.groups))
         self.assertEqual(loaded["status"], "completed")
@@ -114,7 +137,7 @@ class RetrievalExperimentTests(unittest.TestCase):
                 BatchQuestion(f"Q{i}", f"問題{i}", reference_answer="標準答案") for i in range(1, 5)
             ],
         )
-        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "gpt-4o-mini", "local")
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
 
         def stop_after_first(run):
             if run.results:
