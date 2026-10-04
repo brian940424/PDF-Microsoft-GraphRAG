@@ -8,7 +8,7 @@ import os
 import tempfile
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
@@ -159,6 +159,7 @@ class RetrievalExperimentService:
         question_set = self.question_sets.import_file(project_id, filepath)
         current = self.load(project_id)
         current["question_set_id"] = question_set.question_set_id
+        current["run"] = None
         self._write(project_id, current)
         return question_set
 
@@ -248,6 +249,7 @@ class RetrievalExperimentService:
         max_concurrency: int = 5,
         update_callback: UpdateFunction | None = None,
         judge_model: str | None = None,
+        evaluate: bool = True,
     ) -> RetrievalExperimentRun:
         if not groups:
             raise ProjectError("請先新增至少一個實驗組")
@@ -274,7 +276,8 @@ class RetrievalExperimentService:
         start = datetime.now(timezone.utc).isoformat()
         results: dict[tuple[str, str], ExperimentQuestionResult] = {}
         run_status = "running"
-        self._persist_run(project_id, question_set_id, groups, judge_model, max_concurrency, start, run_status, results)
+        initial_status = "generating_answers" if not evaluate else run_status
+        self._persist_run(project_id, question_set_id, groups, judge_model, max_concurrency, start, initial_status, results)
         work = [(group, question) for group in groups for question in question_set.questions]
         executor = ThreadPoolExecutor(max_workers=max_concurrency)
         work_iter = iter(work)
@@ -286,7 +289,8 @@ class RetrievalExperimentService:
                     group, question = next(work_iter)
                 except StopIteration:
                     return
-                futures[executor.submit(self._run_case, project_id, group, question, judge_model)] = (group, question)
+                worker = self._run_case if evaluate else self._generate_case
+                futures[executor.submit(worker, project_id, group, question, judge_model)] = (group, question)
 
         fill_available_workers()
         try:
@@ -299,7 +303,9 @@ class RetrievalExperimentService:
                     except Exception as exc:  # Preserve an individual failure instead of losing the run.
                         result = self._failed_result(group, question, judge_model, str(exc))
                     results[(group.group_id, question.question_id)] = result
-                    run_status = "stopping" if stop_event.is_set() else "running"
+                    run_status = "stopping" if stop_event.is_set() else (
+                        "evaluating" if evaluate else "generating_answers"
+                    )
                     run = self._persist_run(
                         project_id, question_set_id, groups, judge_model, max_concurrency, start, run_status, results
                     )
@@ -316,10 +322,140 @@ class RetrievalExperimentService:
             with self._lock:
                 self._stop_events.pop(project_id, None)
 
-        run_status = "stopped" if stop_event.is_set() else "completed"
+        if stop_event.is_set():
+            run_status = "stopped"
+        elif evaluate:
+            run_status = "completed"
+        else:
+            expected_count = len(groups) * len(question_set.questions)
+            run_status = "answers_completed" if len(results) == expected_count and all(
+                item.status == "answered" and item.actual_answer.strip()
+                for item in results.values()
+            ) else "answers_partial"
         completed_at = datetime.now(timezone.utc).isoformat()
         return self._persist_run(
             project_id, question_set_id, groups, judge_model, max_concurrency, start, run_status, results, completed_at
+        )
+
+    def generate_answers(
+        self,
+        project_id: str,
+        question_set_id: str,
+        groups: Sequence[ExperimentGroup],
+        max_concurrency: int = 5,
+        update_callback: UpdateFunction | None = None,
+        judge_model: str | None = None,
+    ) -> RetrievalExperimentRun:
+        """Run retrieval and answer generation only; judging is a separate action."""
+        return self.run(
+            project_id,
+            question_set_id,
+            groups,
+            max_concurrency,
+            update_callback,
+            judge_model,
+            evaluate=False,
+        )
+
+    def evaluate_answers(
+        self,
+        project_id: str,
+        question_set_id: str,
+        judge_model: str | None = None,
+        max_concurrency: int | None = None,
+        update_callback: UpdateFunction | None = None,
+    ) -> RetrievalExperimentRun:
+        """Evaluate previously saved answers without repeating GraphRAG retrieval."""
+        state = self.load(project_id)
+        run_state = state.get("run")
+        if not isinstance(run_state, dict) or run_state.get("question_set_id") != question_set_id:
+            raise ProjectError("請先執行「檢索並生成答案」")
+        groups = [ExperimentGroup(**item) for item in state.get("groups", [])]
+        if not groups:
+            raise ProjectError("請先新增至少一個實驗組")
+        judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
+        if judge_model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError("全域評測模型不支援")
+        concurrency = int(max_concurrency or state.get("max_concurrency", 5))
+        if not 1 <= concurrency <= 32:
+            raise ProjectError("最大並行請求數必須介於 1 到 32")
+        question_set = self.question_sets.get(project_id, question_set_id)
+        question_by_id = {item.question_id: item for item in question_set.questions}
+        results: dict[tuple[str, str], ExperimentQuestionResult] = {}
+        for item in run_state.get("results", []):
+            result = ExperimentQuestionResult(**item)
+            results[(result.group_id, result.question_id)] = result
+        work: list[tuple[ExperimentGroup, BatchQuestion, ExperimentQuestionResult]] = []
+        for group in groups:
+            for question in question_set.questions:
+                result = results.get((group.group_id, question.question_id))
+                if result is None or not result.actual_answer.strip():
+                    raise ProjectError(
+                        f"{group.name} 的題目 {question.question_id} 尚未完成回答；請先生成所有答案"
+                    )
+                if result.answer_model != group.answer_model or result.method != group.method:
+                    raise ProjectError(f"{group.name} 的模型或檢索策略已變更；請重新生成答案")
+                if result.question != question.question or result.correct_answer != question.reference_answer:
+                    raise ProjectError(f"題目 {question.question_id} 已變更；請重新生成答案")
+                work.append((group, question_by_id[question.question_id], result))
+
+        stop_event = threading.Event()
+        with self._lock:
+            self._stop_events[project_id] = stop_event
+        started_at = str(run_state.get("started_at") or datetime.now(timezone.utc).isoformat())
+        self._persist_run(
+            project_id, question_set_id, groups, judge_model, concurrency,
+            started_at, "evaluating", results,
+        )
+        futures: dict[Future[ExperimentQuestionResult], tuple[ExperimentGroup, BatchQuestion]] = {}
+        work_iter = iter(work)
+        executor = ThreadPoolExecutor(max_workers=concurrency)
+
+        def fill_available_workers() -> None:
+            while not stop_event.is_set() and len(futures) < concurrency:
+                try:
+                    group, question, result = next(work_iter)
+                except StopIteration:
+                    return
+                future = executor.submit(self._evaluate_case, project_id, group, question, judge_model, result)
+                futures[future] = (group, question)
+
+        fill_available_workers()
+        try:
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    group, question = futures.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = self._failed_result(group, question, judge_model, str(exc))
+                    results[(group.group_id, question.question_id)] = result
+                    status = "stopping" if stop_event.is_set() else "evaluating"
+                    updated = self._persist_run(
+                        project_id, question_set_id, groups, judge_model, concurrency,
+                        started_at, status, results,
+                    )
+                    if update_callback:
+                        update_callback(updated)
+                fill_available_workers()
+            executor.shutdown(wait=True, cancel_futures=True)
+        except BaseException:
+            stop_event.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._persist_run(
+                project_id, question_set_id, groups, judge_model, concurrency,
+                started_at, "stopped", results,
+            )
+            raise
+        finally:
+            with self._lock:
+                self._stop_events.pop(project_id, None)
+
+        run_status = "stopped" if stop_event.is_set() else "completed"
+        return self._persist_run(
+            project_id, question_set_id, groups, judge_model, concurrency,
+            started_at, run_status, results, datetime.now(timezone.utc).isoformat(),
         )
 
     def stop(self, project_id: str) -> bool:
@@ -358,15 +494,19 @@ class RetrievalExperimentService:
     def _run_case(
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str
     ) -> ExperimentQuestionResult:
+        generated = self._generate_case(project_id, group, question, judge_model)
+        if generated.status != "answered":
+            return generated
+        return self._evaluate_case(project_id, group, question, judge_model, generated)
+
+    def _generate_case(
+        self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str
+    ) -> ExperimentQuestionResult:
         try:
             answer, context = self.query_function(project_id, question.question, group.method, group.answer_model)
         except Exception as exc:
             return self._failed_result(group, question, judge_model, str(exc))
         try:
-            judged = self.judging.evaluate_single_answer(
-                project_id, question.question_id, question.question,
-                question.reference_answer, answer, judge_model,
-            )
             try:
                 retrieved = self._resolved_sources(project_id, context)
             except (ProjectError, OSError, ValueError, TypeError):
@@ -384,16 +524,40 @@ class RetrievalExperimentService:
             return ExperimentQuestionResult(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 question.question_id, question.question, source_docs, question.reference_answer,
-                answer, "正確" if judged.is_correct else "錯誤", judged.judge_reason, None,
-                UNRANKED_REASON, "completed",
+                answer, "待評測", "", None, UNRANKED_REASON, "answered",
             )
         except Exception as exc:
-            failed = self._failed_result(group, question, judge_model, str(exc))
-            return ExperimentQuestionResult(
-                failed.group_id, failed.group_name, failed.answer_model, failed.judge_model,
-                failed.method, failed.question_id, failed.question, failed.source_documents,
-                failed.correct_answer, answer, "評判失敗", failed.error, None,
-                failed.retrieval_metrics_status, "failed", failed.error,
+            return self._failed_result(group, question, judge_model, str(exc))
+
+    def _evaluate_case(
+        self,
+        project_id: str,
+        group: ExperimentGroup,
+        question: BatchQuestion,
+        judge_model: str,
+        generated: ExperimentQuestionResult,
+    ) -> ExperimentQuestionResult:
+        try:
+            judged = self.judging.evaluate_single_answer(
+                project_id, question.question_id, question.question,
+                question.reference_answer, generated.actual_answer, judge_model,
+            )
+            return replace(
+                generated,
+                judge_model=judge_model,
+                evaluation_result="正確" if judged.is_correct else "錯誤",
+                evaluation_reason=judged.judge_reason,
+                status="completed",
+                error=None,
+            )
+        except Exception as exc:
+            return replace(
+                generated,
+                judge_model=judge_model,
+                evaluation_result="評判失敗",
+                evaluation_reason=str(exc),
+                status="evaluation_failed",
+                error=str(exc),
             )
 
     def _failed_result(
@@ -433,10 +597,11 @@ class RetrievalExperimentService:
             group_items = [item for item in result_items if item.group_id == group.group_id]
             judged = [item for item in group_items if item.evaluation_result in {"正確", "錯誤"}]
             correct = sum(item.evaluation_result == "正確" for item in judged)
+            answered = sum(bool(item.actual_answer.strip()) for item in group_items)
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
-                len(question_set.questions), len(group_items), correct,
-                correct / len(group_items) if group_items else None,
+                len(question_set.questions), answered, correct,
+                correct / len(judged) if judged else None,
                 None, None, None, UNRANKED_REASON,
             ))
         run = RetrievalExperimentRun(

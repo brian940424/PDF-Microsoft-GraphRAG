@@ -12,14 +12,18 @@ import gradio as gr
 from automotive_graphrag.app import create_app
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationItem, AutomaticEvaluationService
 from automotive_graphrag.connections import ConnectionSettings
-from automotive_graphrag.projects import ProjectStore
+from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.question_sets import BatchQuestion, QuestionSetService
 from automotive_graphrag.retrieval_experiments import ExperimentGroup, RetrievalExperimentService
 from automotive_graphrag.source_metadata import SourceMetadata
 
 
 class FakeJudge:
+    def __init__(self):
+        self.calls = []
+
     def evaluate_single_answer(self, project_id, question_id, question, correct, actual, model):
+        self.calls.append((project_id, question_id, question, correct, actual, model))
         return AutomaticEvaluationItem(question_id, actual == correct, f"model={model}")
 
 
@@ -136,6 +140,62 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(payload["question_results"][0]["answer_model"], "gpt-4o-mini")
         self.assertEqual(payload["question_results"][0]["judge_model"], "gpt-4.1-mini")
 
+    def test_answer_generation_and_evaluation_are_separate_persisted_steps(self):
+        judge = FakeJudge()
+        self.service.judging = judge
+        question_set = self.question_sets.create_with_questions(
+            "project", "split flow", [BatchQuestion("Q1", "問題", "標準答案")]
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        self.service.save_configuration(
+            "project", [group], question_set.question_set_id, 1, "gpt-4o-mini"
+        )
+
+        generated = self.service.generate_answers(
+            "project", question_set.question_set_id, [group], max_concurrency=1
+        )
+
+        self.assertEqual(generated.status, "answers_completed")
+        self.assertEqual(generated.results[0].status, "answered")
+        self.assertEqual(generated.results[0].evaluation_result, "待評測")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(judge.calls, [])
+        self.assertEqual(self.service.load("project")["run"]["status"], "answers_completed")
+
+        evaluated = self.service.evaluate_answers(
+            "project", question_set.question_set_id, judge_model="gpt-4o-mini", max_concurrency=1
+        )
+
+        self.assertEqual(evaluated.status, "completed")
+        self.assertEqual(evaluated.results[0].status, "completed")
+        self.assertIn(evaluated.results[0].evaluation_result, {"正確", "錯誤"})
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(len(self.calls), 1, "evaluation must not repeat GraphRAG retrieval")
+        self.assertEqual(self.service.load("project")["run"]["status"], "completed")
+
+    def test_evaluation_is_rejected_before_answers_exist(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        self.service.add_group("project")
+
+        with self.assertRaisesRegex(ProjectError, "執行「檢索並生成答案」"):
+            self.service.evaluate_answers("project", question_set.question_set_id)
+
+    def test_evaluation_requires_answers_to_match_current_group_settings(self):
+        question_set = self.question_sets.create_with_questions(
+            "project", "changed config", [BatchQuestion("Q1", "問題", "標準答案")]
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        self.service.save_configuration(
+            "project", [group], question_set.question_set_id, 1, "gpt-4o-mini"
+        )
+        self.service.generate_answers(
+            "project", question_set.question_set_id, [group], max_concurrency=1
+        )
+        self.service.set_group_method("project", group.group_id, "basic")
+
+        with self.assertRaisesRegex(ProjectError, "檢索策略已變更"):
+            self.service.evaluate_answers("project", question_set.question_set_id)
+
     def test_stop_keeps_completed_results_and_saves_partial_summary(self):
         question_set = self.question_sets.create_with_questions(
             "project", "many questions", [
@@ -241,6 +301,13 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertIn("測試最大並行請求數", labels)
         self.assertIn("實驗組摘要", labels)
         self.assertIn("逐題實驗結果", labels)
+        button_values = [
+            component.get_config().get("value")
+            for component in app.blocks.values()
+            if hasattr(component, "get_config")
+        ]
+        self.assertIn("檢索並生成答案", button_values)
+        self.assertIn("評測答案", button_values)
         component_configs = [
             component.get_config()
             for component in app.blocks.values()

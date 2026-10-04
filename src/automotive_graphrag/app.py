@@ -758,14 +758,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id:
             return (
                 message or "請先在「專案設定」開啟專案", "", [], [], [], 5,
-                gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
+                gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
+                "尚未生成答案。", gr.update(interactive=False),
             )
         try:
             state = retrieval_experiments.load(project_id)
             question_set_id = str(state.get("question_set_id", ""))
             question_rows = []
+            question_by_id = {}
             if question_set_id:
                 question_set = question_sets.get(project_id, question_set_id)
+                question_by_id = {item.question_id: item for item in question_set.questions}
                 for item in question_set.questions:
                     question_sources = item.question_source_evidence or item.gold_evidence
                     answer_sources = item.answer_source_evidence or item.gold_evidence
@@ -774,6 +777,38 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         format_autoqa_sources(question_sources), format_autoqa_sources(answer_sources),
                     ])
             run = state.get("run") or {}
+            raw_results = run.get("results", [])
+            group_by_id = {item.get("group_id"): item for item in state.get("groups", [])}
+            expected_answers = len(group_by_id) * len(question_by_id)
+            has_all_answers = expected_answers > 0 and len(raw_results) == expected_answers and all(
+                str(item.get("actual_answer", "") or "").strip()
+                and item.get("status") in {"answered", "completed", "evaluation_failed"}
+                for item in raw_results
+            )
+            answers_match_settings = has_all_answers and all(
+                item.get("group_id") in group_by_id
+                and item.get("answer_model") == group_by_id[item.get("group_id")].get("answer_model")
+                and item.get("method") == group_by_id[item.get("group_id")].get("method")
+                and item.get("question_id") in question_by_id
+                and item.get("question") == question_by_id[item.get("question_id")].question
+                and item.get("correct_answer") == question_by_id[item.get("question_id")].reference_answer
+                for item in raw_results
+            )
+            answers_ready = (
+                run.get("question_set_id") == question_set_id
+                and has_all_answers
+                and answers_match_settings
+            )
+            if run.get("status") == "answers_partial":
+                generation_status = "⚠️ 答案生成未全部完成；請重新執行檢索並生成答案。"
+            elif answers_ready:
+                generation_status = "✅ 已保存所有組別的答案，可以進行評測。"
+            elif has_all_answers:
+                generation_status = "⚠️ 題目或實驗組設定已變更；請重新檢索並生成答案。"
+            elif run.get("status") in {"generating_answers", "running"}:
+                generation_status = "⏳ 答案生成尚在執行中。"
+            else:
+                generation_status = "尚未完成檢索並生成所有答案。"
             summaries = [
                 [
                     item.get("group_name"), item.get("answer_model"), item.get("judge_model"),
@@ -792,21 +827,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("group_name"), item.get("question_id"),
                     ", ".join(item.get("source_documents", [])), item.get("question"),
                     item.get("actual_answer"), item.get("correct_answer"),
-                    item.get("evaluation_result") == "correct",
+                    item.get("evaluation_result") == "正確",
                     item.get("evaluation_reason") or item.get("error") or "",
                 ]
-                for item in run.get("results", [])
+                for item in raw_results
+                if item.get("evaluation_result") in {"正確", "錯誤", "評判失敗"}
             ]
             status = message or (
                 f"最近實驗狀態：{run.get('status', '尚未執行')}｜題目集：{run.get('question_set_name', '尚未匯入')}"
             )
             return (
                 status, question_set_id, question_rows, summaries, results, state.get("max_concurrency", 5),
-                gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=state.get("judge_model", connections.get_chat_model())),
+                gr.update(choices=list(ALLOWED_CHAT_MODELS), value=state.get("judge_model", connections.get_chat_model())),
+                generation_status, gr.update(interactive=answers_ready),
             )
         except ProjectError as exc:
             return (f"❌ {exc}", "", [], [], [], 5,
-                    gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()))
+                    gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
+                    "載入實驗狀態失敗。", gr.update(interactive=False))
 
     def import_experiment_questions(project_id: str | None, filepath: str | None):
         if not project_id or not filepath:
@@ -872,23 +910,78 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", int(revision or 0)
         return f"✅ {group_id} 檢索策略已儲存", refresh_experiment_groups(revision)
 
-    def run_retrieval_experiment(
+    def generate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
         judge_model: str | None,
     ):
         if not project_id or not question_set_id:
-            return experiment_view(project_id, "❌ 請先匯入題目集並開啟專案")
+            view = list(experiment_view(project_id, "❌ 請先匯入題目集並開啟專案"))
+            view[8] = gr.update(interactive=False)
+            yield tuple(view)
+            return
+        pending = list(experiment_view(project_id))
+        pending[0] = "⏳ 正在依各實驗組策略檢索並生成答案…"
+        pending[7] = "⏳ 答案生成中；完成前無法評測。"
+        pending[8] = gr.update(interactive=False)
+        yield tuple(pending)
         try:
             state = retrieval_experiments.load(project_id)
             groups = [ExperimentGroup(**item) for item in state["groups"]]
             limit = int(concurrency)
             judge_model = judge_model or str(state.get("judge_model", connections.get_chat_model()))
             retrieval_experiments.save_configuration(project_id, groups, question_set_id, limit, judge_model)
-            run = retrieval_experiments.run(project_id, question_set_id, groups, limit, judge_model=judge_model)
+            run = retrieval_experiments.generate_answers(
+                project_id, question_set_id, groups, limit, judge_model=judge_model
+            )
         except (ProjectError, TypeError, ValueError, OSError) as exc:
-            return experiment_view(project_id, f"❌ 實驗執行失敗：{exc}")
-        state_label = "已停止並保存部分結果" if run.status == "stopped" else "已完成"
-        return experiment_view(project_id, f"✅ 檢索實驗{state_label}：完成 {len(run.results)}/{len(groups) * run.question_count} 筆")
+            view = list(experiment_view(project_id, f"❌ 答案生成失敗：{exc}"))
+            view[8] = gr.update(interactive=False)
+            yield tuple(view)
+            return
+        if run.status == "answers_completed":
+            message = f"✅ 檢索並生成答案完成：{len(run.results)}/{len(groups) * run.question_count} 筆。"
+        elif run.status == "stopped":
+            message = f"🛑 已停止並保存部分答案：{len(run.results)}/{len(groups) * run.question_count} 筆。"
+        else:
+            message = f"⚠️ 答案生成部分完成：{len(run.results)}/{len(groups) * run.question_count} 筆；請檢查失敗項目並重試。"
+        yield experiment_view(project_id, message)
+
+    def evaluate_retrieval_experiment_answers(
+        project_id: str | None, question_set_id: str | None, concurrency,
+        judge_model: str | None,
+    ):
+        if not project_id or not question_set_id:
+            view = list(experiment_view(project_id, "❌ 請先匯入題目集並開啟專案"))
+            view[8] = gr.update(interactive=False)
+            yield tuple(view)
+            return
+        pending = list(experiment_view(project_id))
+        pending[0] = "⏳ 正在評測已保存的答案…"
+        pending[8] = gr.update(interactive=False)
+        yield tuple(pending)
+        try:
+            state = retrieval_experiments.load(project_id)
+            limit = int(concurrency)
+            selected_judge_model = judge_model or str(state.get("judge_model", connections.get_chat_model()))
+            retrieval_experiments.save_configuration(
+                project_id,
+                [ExperimentGroup(**item) for item in state["groups"]],
+                question_set_id,
+                limit,
+                selected_judge_model,
+            )
+            run = retrieval_experiments.evaluate_answers(
+                project_id,
+                question_set_id,
+                judge_model=selected_judge_model,
+                max_concurrency=limit,
+            )
+        except (ProjectError, TypeError, ValueError, OSError) as exc:
+            view = list(experiment_view(project_id, f"❌ 評測失敗：{exc}"))
+            yield tuple(view)
+            return
+        evaluated = sum(item.evaluation_result in {"正確", "錯誤"} for item in run.results)
+        yield experiment_view(project_id, f"✅ 評測完成：{evaluated}/{len(run.results)} 筆答案已評判。")
 
     def stop_retrieval_experiment(project_id: str | None):
         if not project_id:
@@ -1801,8 +1894,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     label="全域評測模型（套用至所有實驗組）",
                 )
                 experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
-                experiment_run_button = gr.Button("執行實驗", variant="primary")
+                experiment_run_button = gr.Button("檢索並生成答案", variant="primary")
                 experiment_stop_button = gr.Button("停止實驗", variant="stop")
+            experiment_generation_status = gr.Markdown("尚未生成答案。完成前不能評測。")
+            experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
             experiment_status = gr.Markdown()
             experiment_summary_table = gr.Dataframe(
                 headers=["實驗組名稱", "回答模型", "評測模型（全域）", "策略", "題數", "已完成", "答對", "正確率", "Recall@5", "Recall@10", "MRR", "檢索指標狀態"],
@@ -1965,7 +2060,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_view,
             inputs=active_project_id,
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_generation_status, experiment_evaluate_button],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         open_project_button.click(
             open_project,
@@ -1984,7 +2080,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_view,
             inputs=active_project_id,
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_generation_status, experiment_evaluate_button],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
@@ -2036,7 +2133,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_view,
             inputs=active_project_id,
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_generation_status, experiment_evaluate_button],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         upload_button.click(
             import_documents,
@@ -2063,7 +2161,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             import_experiment_questions,
             inputs=[active_project_id, experiment_question_file],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_generation_status, experiment_evaluate_button],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         experiment_add_group_button.click(
             add_experiment_group,
@@ -2081,11 +2180,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=experiment_group_save_status,
         )
         experiment_run_button.click(
-            run_retrieval_experiment,
+            generate_retrieval_experiment_answers,
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_generation_status, experiment_evaluate_button],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
+        experiment_evaluate_button.click(
+            evaluate_retrieval_experiment_answers,
+            inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
+            outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_generation_status, experiment_evaluate_button],
+        )
         experiment_stop_button.click(
             stop_retrieval_experiment,
             inputs=active_project_id,
