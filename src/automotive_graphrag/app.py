@@ -1669,11 +1669,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             answer_model = gr.Dropdown(
                                 choices=list(ALLOWED_CHAT_MODELS), value=group.get("answer_model", connections.get_chat_model()),
                                 label="回答模型",
+                                interactive=True,
                                 key=f"experiment-answer-model-{group['group_id']}",
                             )
                             strategy = gr.Dropdown(
                                 choices=strategy_choices, value=group.get("method", "local"),
                                 label="GraphRAG 檢索策略",
+                                interactive=True,
                                 key=f"experiment-strategy-{group['group_id']}",
                             )
                     answer_model.input(

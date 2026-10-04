@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import yaml
 import numpy as np
+import gradio as gr
 
 from automotive_graphrag.app import create_app
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationItem, AutomaticEvaluationService
@@ -235,6 +236,12 @@ class RetrievalExperimentTests(unittest.TestCase):
         dynamic_handlers = [
             fn for fn in app.default_config.fns.values() if fn.rendered_in is renderer
         ]
+        dynamic_dropdowns = [
+            component for component in app.default_config.blocks.values()
+            if isinstance(component, gr.Dropdown) and component.rendered_in is renderer
+        ]
+        self.assertEqual({component.label for component in dynamic_dropdowns}, {"回答模型", "GraphRAG 檢索策略"})
+        self.assertTrue(all(component.interactive is True for component in dynamic_dropdowns))
         self.assertEqual(
             {fn.fn.__name__ for fn in dynamic_handlers},
             {"save_experiment_answer_model", "save_experiment_method", "remove_experiment_group"},
