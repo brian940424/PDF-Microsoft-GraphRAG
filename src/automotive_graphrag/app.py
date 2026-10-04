@@ -37,11 +37,7 @@ SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk
 GENERATED_QUESTION_COLUMNS = ["Question ID", "Question", "Difficulty", "Status", "Sources"]
 AUTOMATIC_EVALUATION_COLUMNS = [
     "Question ID",
-    "Retrieval Pass",
-    "Answer Score",
-    "Evidence Support",
-    "Confidence",
-    "Human Review",
+    "判斷",
     "Judge Reason",
 ]
 INDEXING_LOG_AUTOSCROLL_JS = """() => {
@@ -476,10 +472,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def run_automatic_evaluation(
         project_id: str | None,
         question_set_id: str | None,
-        top_k: float,
         rerun_answers: bool,
         only_failures: bool,
-        evidence_limit: float,
     ):
         if not project_id or not question_set_id:
             return "❌ 請先選擇專案與題目集", "", [], gr.Dropdown(choices=[]), []
@@ -487,21 +481,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             result = automatic_evaluation.evaluate(
                 project_id,
                 question_set_id,
-                top_k=int(top_k),
                 rerun_answers=rerun_answers,
                 only_previous_failures=only_failures,
-                maximum_evidence_characters=int(evidence_limit),
             )
         except ProjectError as exc:
             return f"❌ {exc}", "", [], gr.Dropdown(choices=[]), []
         rows = [
             [
                 item.question_id,
-                item.retrieval_pass,
-                item.answer_score,
-                item.evidence_support_score,
-                item.judge_confidence,
-                item.needs_human_review,
+                "正確" if item.is_correct else "錯誤",
                 item.judge_reason,
             ]
             for item in result.items
@@ -514,8 +502,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         summary = (
             f"模型 `{result.model}`｜Prompt `{result.prompt_version}`｜題數 {result.question_count}｜"
-            f"平均答案分數 `{result.average_answer_score:.2f}`｜平均證據支持分數 "
-            f"`{result.average_evidence_support_score:.2f}`｜待人工審查 {result.human_review_count}"
+            f"正確 {result.correct_count}/{result.question_count}"
         )
         return "✅ 自動評測完成（LLM Judge 結果仍需人工抽查）", summary, rows, selector, values
 
@@ -541,9 +528,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             evidence_docs = ", ".join(dict.fromkeys(item.document_id for item in question.gold_evidence)) or "—"
             rows.append([
                 evidence_docs, question.question, question.answer, question.reference_answer,
-                "答對" if judged and judged.answer_score >= 4 else ("未評判" if not judged else "答錯"),
-                judged.answer_score if judged else None,
-                judged.evidence_support_score if judged else None,
+                "正確" if judged and judged.is_correct else ("尚未評判" if not judged else "錯誤"),
                 judged.judge_reason if judged else (question.error or "尚無評判結果"),
             ])
         return rows
@@ -667,7 +652,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def automatic_qa_summary(report):
         total = len(report.question_set.questions)
         judged = {item.question_id: item for item in report.judge.items} if report.judge else {}
-        correct = sum(item.answer_score >= 4 for item in judged.values())
+        correct = sum(item.is_correct for item in judged.values())
         lines = [
             "**題目集：** " + report.question_set.name + " (" + report.question_set.question_set_id + ")｜"
             + "**答對：** " + str(correct) + "/" + str(total) + "（" + format(correct / total, ".1%") + "）｜評判 "
@@ -718,16 +703,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 item.question,
                 item.answer,
                 item.reference_answer,
-                "答對" if judged and judged.answer_score >= 4 else (
-                    "答錯" if judged else ("尚未評判" if item.answer else "尚未測試")
+                "正確" if judged and judged.is_correct else (
+                    "錯誤" if judged else ("尚未評判" if item.answer else "尚未測試")
                 ),
-                judged.answer_score if judged else None,
-                judged.evidence_support_score if judged else None,
                 judged.judge_reason if judged else (item.error or "尚無評判結果"),
             ])
 
         total = len(question_set.questions)
-        correct = sum(item.answer_score >= 4 for item in judge_by_id.values())
+        correct = sum(item.is_correct for item in judge_by_id.values())
         if judge:
             summary = (
                 f"**最近題目集：** {question_set.name}｜**答對：** {correct}/{total} "
@@ -1476,35 +1459,28 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
             autoqa_summary = gr.Markdown()
             autoqa_table = gr.Dataframe(
-                headers=["來源文件", "題目", "系統回答", "正確答案", "評判結果", "答案分數", "證據支持", "評判理由"],
+                headers=["來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
                 interactive=False,
-                datatype=["str", "str", "str", "str", "str", "number", "number", "str"],
+                datatype=["str", "str", "str", "str", "str", "str"],
                 label="逐題自動問答測試結果",
                 wrap=True,
             )
 
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
-                "## 回答與證據自動評測\n"
-                "每批 Judge 僅呼叫 API 一次，預設使用 `gpt-4o-mini`；低分、Retrieval 失敗或低信心結果會標記待人工審查。"
+                "## 答案正確性自動評測\n"
+                "僅根據題目、正確答案和系統回答判斷正確／錯誤並說明理由，不使用 Evidence，也不採用數值評分。"
             )
             with gr.Row():
                 automatic_project_refresh = gr.Button("重新整理題目集")
                 automatic_question_set = gr.Dropdown(label="題目集")
             with gr.Row():
-                automatic_top_k = gr.Number(label="Top-K", value=5, minimum=1, precision=0)
-                automatic_evidence_limit = gr.Number(
-                    label="每筆 Evidence 字數上限",
-                    value=1200,
-                    minimum=200,
-                    precision=0,
-                )
                 automatic_rerun_answers = gr.Checkbox(
                     label="先重新執行系統回答（增加 API 成本）",
                     value=False,
                 )
                 automatic_only_failures = gr.Checkbox(
-                    label="只重跑前次待人工審查題目",
+                    label="只重跑前次答錯題目",
                     value=False,
                 )
             with gr.Row():
@@ -1515,7 +1491,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             automatic_table = gr.Dataframe(
                 headers=AUTOMATIC_EVALUATION_COLUMNS,
                 interactive=False,
-                datatype=["str", "bool", "number", "number", "str", "bool", "str"],
+                datatype=["str", "str", "str"],
                 label="逐題自動評測結果",
             )
             automatic_items_state = gr.State([])
@@ -1817,10 +1793,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[
                 automatic_project,
                 automatic_question_set,
-                automatic_top_k,
                 automatic_rerun_answers,
                 automatic_only_failures,
-                automatic_evidence_limit,
             ],
             outputs=[
                 automatic_result,

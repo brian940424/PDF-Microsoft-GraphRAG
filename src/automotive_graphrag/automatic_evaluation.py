@@ -15,26 +15,21 @@ from pathlib import Path
 from typing import Callable
 
 from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings
-from .evidence import Evidence
 from .projects import ProjectError, ProjectStore
-from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
+from .question_sets import BatchQuestion, QuestionSetService
 from .reviews import ReviewService
 
 
-PROMPT_VERSION = "answer-evidence-judge-v1"
-CONFIDENCE_LEVELS = {"high", "medium", "low"}
+PROMPT_VERSION = "answer-match-judge-v2"
+JUDGMENT_RESULTS = {"correct", "incorrect"}
 JudgeClient = Callable[[str, str, str, str], object]
 
 
 @dataclass(frozen=True, slots=True)
 class AutomaticEvaluationItem:
     question_id: str
-    retrieval_pass: bool
-    answer_score: int
-    evidence_support_score: int
+    is_correct: bool
     judge_reason: str
-    judge_confidence: str
-    needs_human_review: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,11 +40,8 @@ class AutomaticEvaluationResult:
     model: str
     prompt_version: str
     judge_prompt: str
-    top_k: int
     question_count: int
-    average_answer_score: float
-    average_evidence_support_score: float
-    human_review_count: int
+    correct_count: int
     items: tuple[AutomaticEvaluationItem, ...]
 
 
@@ -70,45 +62,37 @@ class AutomaticEvaluationService:
         self,
         project_id: str,
         question_set_id: str,
-        top_k: int = 5,
         rerun_answers: bool = False,
         only_previous_failures: bool = False,
-        maximum_evidence_characters: int = 1200,
         model: str | None = None,
-        allow_missing_gold: bool = False,
     ) -> AutomaticEvaluationResult:
-        if not isinstance(top_k, int) or top_k < 1:
-            raise ProjectError("Top-K 必須是正整數")
-        if maximum_evidence_characters < 200:
-            raise ProjectError("每筆 Evidence 字數上限不可小於 200")
         previous = self.last_result(project_id, question_set_id)
         selected_ids: set[str] | None = None
         if only_previous_failures:
             if previous is None:
                 raise ProjectError("尚無自動評測結果，無法只重跑失敗題")
-            selected_ids = {item.question_id for item in previous.items if item.needs_human_review}
+            selected_ids = {item.question_id for item in previous.items if not item.is_correct}
             if not selected_ids:
-                raise ProjectError("前次評測沒有需要重跑的題目")
+                raise ProjectError("前次評測沒有答錯的題目")
 
         question_set = self.question_sets.get(project_id, question_set_id)
         eligible = [
             item
             for item in question_set.questions
             if item.reference_answer
-            and (allow_missing_gold or item.gold_evidence)
             and (selected_ids is None or item.question_id in selected_ids)
         ]
         if not eligible:
-            raise ProjectError("題目集沒有包含可評判參考答案（及所需 Gold Evidence）的題目")
+            raise ProjectError("題目集沒有包含可供評判的正確答案")
         if rerun_answers:
             target_ids = [item.question_id for item in eligible]
             question_set = self.question_sets.run(project_id, question_set_id, selected_question_ids=target_ids)
             eligible = [item for item in question_set.questions if item.question_id in set(target_ids)]
         eligible = [item for item in eligible if item.status == "COMPLETED" and item.answer]
         if not eligible:
-            raise ProjectError("沒有已完成回答且包含參考答案的題目可供評判")
+            raise ProjectError("沒有已完成回答且包含正確答案的題目可供評判")
 
-        prompt = self._build_prompt(eligible, top_k, maximum_evidence_characters)
+        prompt = self._build_prompt(eligible)
         api_key = self.connections.apply_to_environment(project_id)
         base_url = self.connections.get_api_base_url()
         model = model or self.connections.get_chat_model()
@@ -120,7 +104,7 @@ class AutomaticEvaluationService:
             raise
         except Exception as exc:
             raise ProjectError(f"自動評測 API 呼叫失敗：{exc}") from exc
-        judged = self._parse_response(response, eligible, top_k)
+        judged = self._parse_response(response, eligible)
         if selected_ids is not None and previous is not None:
             judged_by_id = {item.question_id: item for item in judged}
             items = tuple(judged_by_id.get(item.question_id, item) for item in previous.items)
@@ -133,11 +117,8 @@ class AutomaticEvaluationService:
             model=model,
             prompt_version=PROMPT_VERSION,
             judge_prompt=prompt,
-            top_k=top_k,
             question_count=len(items),
-            average_answer_score=sum(item.answer_score for item in items) / len(items),
-            average_evidence_support_score=sum(item.evidence_support_score for item in items) / len(items),
-            human_review_count=sum(item.needs_human_review for item in items),
+            correct_count=sum(item.is_correct for item in items),
             items=items,
         )
         self._write(result)
@@ -150,7 +131,21 @@ class AutomaticEvaluationService:
             return None
         except json.JSONDecodeError as exc:
             raise ProjectError("自動評測紀錄格式錯誤") from exc
-        value["items"] = tuple(AutomaticEvaluationItem(**item) for item in value.get("items", []))
+        # Migrate records written by the former scored/evidence-based judge.
+        raw_items = value.pop("items", [])
+        migrated_items = []
+        for item in raw_items:
+            if "is_correct" not in item:
+                item = {
+                    "question_id": item["question_id"],
+                    "is_correct": item.get("answer_score", 0) >= 4,
+                    "judge_reason": item.get("judge_reason", "舊版評測結果；請重新評判"),
+                }
+            migrated_items.append(AutomaticEvaluationItem(**item))
+        allowed_fields = set(AutomaticEvaluationResult.__dataclass_fields__) - {"items"}
+        value = {key: field for key, field in value.items() if key in allowed_fields}
+        value.setdefault("correct_count", sum(item.is_correct for item in migrated_items))
+        value["items"] = tuple(migrated_items)
         return AutomaticEvaluationResult(**value)
 
     def export(self, project_id: str, question_set_id: str) -> tuple[Path, Path]:
@@ -189,39 +184,30 @@ class AutomaticEvaluationService:
         return json_path, csv_path
 
     @staticmethod
-    def _build_prompt(questions: list[BatchQuestion], top_k: int, maximum_characters: int) -> str:
+    def _build_prompt(questions: list[BatchQuestion]) -> str:
         cases = [
             {
                 "question_id": item.question_id,
                 "question": item.question,
-                "reference_answer": item.reference_answer,
+                "correct_answer": item.reference_answer,
                 "system_answer": item.answer,
-                "retrieved_evidence": [
-                    {
-                        "document_id": evidence.document_id,
-                        "page": evidence.page,
-                        "chunk_id": evidence.chunk_id,
-                        "text": evidence.text[:maximum_characters],
-                    }
-                    for evidence in item.retrieved_evidence[:top_k]
-                ],
             }
             for item in questions
         ]
         return (
-            "你是汽車維修問答評測員。只依參考答案與 Retrieved Evidence 評分，不可加入外部知識。\n"
-            "answer_score：1-5，評估系統答案相對參考答案的正確性與完整性。\n"
-            "evidence_support_score：1-5，評估 Retrieved Evidence 是否直接支持系統答案。\n"
-            "confidence 只能是 high、medium、low。reason 必須簡短指出缺漏、矛盾或支持依據。\n"
+            "你是答案比對員。只根據每筆資料中的題目、正確答案和系統回答判斷，不得使用外部知識或任何檢索證據。\n"
+            "若系統回答與正確答案表達的內容一致，且完整包含所有必要步驟、條件、順序與要求，判為 correct。\n"
+            "只要缺少必要內容／步驟、步驟順序錯誤、與正確答案矛盾，或加入正確答案未支持的額外步驟／實質資訊，判為 incorrect。"
+            "不要求字面完全相同；同義改寫可接受，但不能因此省略或新增實質內容。非流程型答案也不得缺漏或添加實質主張。\n"
             "只輸出 JSON object，格式為 "
-            '{"items":[{"question_id":"...","answer_score":1,"evidence_support_score":1,'
-            '"reason":"...","confidence":"high"}]}。每個輸入題號必須恰好出現一次。\n'
+            '{"items":[{"question_id":"...","result":"correct或incorrect","reason":"..."}]}。'
+            "每個輸入題號必須恰好出現一次。reason 簡短指出符合之處，或具體缺漏、錯誤、額外內容。\n"
             f"評測案例：{json.dumps(cases, ensure_ascii=False)}"
         )
 
-    @classmethod
+    @staticmethod
     def _parse_response(
-        cls, response: object, questions: list[BatchQuestion], top_k: int
+        response: object, questions: list[BatchQuestion]
     ) -> list[AutomaticEvaluationItem]:
         if isinstance(response, str):
             try:
@@ -240,50 +226,23 @@ class AutomaticEvaluationService:
             if not isinstance(raw, dict):
                 raise ProjectError("Judge 回傳項目格式錯誤")
             question_id = raw.get("question_id")
-            answer_score = raw.get("answer_score")
-            evidence_score = raw.get("evidence_support_score")
+            judgment = raw.get("result")
             reason = raw.get("reason")
-            confidence = raw.get("confidence")
             if not isinstance(question_id, str) or question_id not in question_by_id or question_id in seen:
                 raise ProjectError("Judge 回傳未知或重複的 question_id")
-            if not isinstance(answer_score, int) or isinstance(answer_score, bool) or not 1 <= answer_score <= 5:
-                raise ProjectError(f"{question_id} 的 answer_score 必須是 1 到 5")
-            if not isinstance(evidence_score, int) or isinstance(evidence_score, bool) or not 1 <= evidence_score <= 5:
-                raise ProjectError(f"{question_id} 的 evidence_support_score 必須是 1 到 5")
+            if not isinstance(judgment, str) or judgment not in JUDGMENT_RESULTS:
+                raise ProjectError(f"{question_id} 的 result 必須是 correct 或 incorrect")
             if not isinstance(reason, str) or not reason.strip():
                 raise ProjectError(f"{question_id} 缺少 Judge reason")
-            if confidence not in CONFIDENCE_LEVELS:
-                raise ProjectError(f"{question_id} 的 confidence 格式錯誤")
-            question = question_by_id[question_id]
-            retrieval_pass = any(
-                cls._is_relevant(evidence, question.gold_evidence)
-                for evidence in question.retrieved_evidence[:top_k]
-            )
-            needs_review = not retrieval_pass or answer_score < 4 or evidence_score < 4 or confidence != "high"
             result.append(
                 AutomaticEvaluationItem(
                     question_id=question_id,
-                    retrieval_pass=retrieval_pass,
-                    answer_score=answer_score,
-                    evidence_support_score=evidence_score,
+                    is_correct=judgment == "correct",
                     judge_reason=reason.strip(),
-                    judge_confidence=confidence,
-                    needs_human_review=needs_review,
                 )
             )
             seen.add(question_id)
         return result
-
-    @staticmethod
-    def _is_relevant(evidence: Evidence, gold_evidence: tuple[GoldEvidence, ...]) -> bool:
-        return any(
-            evidence.document_id == gold.document_id
-            and (
-                (bool(gold.chunk_ids) and evidence.chunk_id in gold.chunk_ids)
-                or (bool(gold.pages) and evidence.page in gold.pages)
-            )
-            for gold in gold_evidence
-        )
 
     @staticmethod
     def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str) -> object:

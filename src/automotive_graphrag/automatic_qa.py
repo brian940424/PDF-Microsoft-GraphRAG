@@ -244,8 +244,7 @@ class AutomaticQATestService:
         judge_error = None
         try:
             judge = self.judging.evaluate(
-                updated.project_id, updated.question_set_id, top_k=top_k,
-                model=judge_model, allow_missing_gold=True,
+                updated.project_id, updated.question_set_id, model=judge_model,
             )
         except ProjectError as exc:
             judge_error = str(exc)

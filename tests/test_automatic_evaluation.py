@@ -116,22 +116,18 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             "items": [
                 {
                     "question_id": "Q001",
-                    "answer_score": q1_score,
-                    "evidence_support_score": 5,
+                    "result": "incorrect" if q1_score < 4 else "correct",
                     "reason": "第一題評語",
-                    "confidence": "high",
                 },
                 {
                     "question_id": "Q002",
-                    "answer_score": 5,
-                    "evidence_support_score": 5,
+                    "result": "correct",
                     "reason": "第二題評語",
-                    "confidence": "high",
                 },
             ]
         }
 
-    def test_evaluate_uses_one_cheap_call_and_persists_three_layer_scores(self) -> None:
+    def test_evaluate_uses_one_call_and_judges_answers_without_evidence(self) -> None:
         judge = FakeJudge([self.judged()])
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
 
@@ -139,11 +135,17 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
         self.assertEqual(len(judge.calls), 1)
         self.assertEqual(judge.calls[0][2], "gpt-4o-mini")
-        self.assertTrue(all(item.retrieval_pass for item in result.items))
-        self.assertTrue(result.items[0].needs_human_review)
-        self.assertFalse(result.items[1].needs_human_review)
+        self.assertFalse(result.items[0].is_correct)
+        self.assertTrue(result.items[1].is_correct)
+        self.assertEqual(result.correct_count, 1)
         self.assertEqual(result.prompt_version, PROMPT_VERSION)
         self.assertIn("參考答案一", result.judge_prompt)
+        self.assertNotIn('"retrieved_evidence"', result.judge_prompt)
+        self.assertNotIn("汽車維修", result.judge_prompt)
+        self.assertNotIn("answer_score", result.judge_prompt)
+        self.assertNotIn("evidence_support_score", result.judge_prompt)
+        self.assertIn("必要步驟", result.judge_prompt)
+        self.assertIn("額外步驟", result.judge_prompt)
         self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
 
         ReviewService(self.store, self.question_sets).save(
@@ -170,7 +172,8 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("Q001", judge.calls[1][3])
         self.assertNotIn("Q002", judge.calls[1][3])
         self.assertEqual(result.question_count, 2)
-        self.assertEqual(result.human_review_count, 0)
+        self.assertTrue(result.items[0].is_correct)
+        self.assertTrue(result.items[1].is_correct)
 
     def test_rejects_invalid_or_invented_judge_result(self) -> None:
         response = self.judged()
@@ -190,7 +193,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             if hasattr(component, "get_config")
         }
         self.assertIn("逐題自動評測結果", labels)
-        self.assertIn("只重跑前次待人工審查題目", labels)
+        self.assertIn("只重跑前次答錯題目", labels)
         self.assertIn("自動評測 JSON", labels)
 
 
