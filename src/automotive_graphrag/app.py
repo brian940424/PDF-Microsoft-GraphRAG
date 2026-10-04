@@ -726,14 +726,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def export_automatic_question_set(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
-            return "❌ 請先生成或匯入題目集", None, None
+            return "❌ 請先生成或匯入題目集", None
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
-            json_path, csv_path = question_sets.export(project_id, question_set_id)
-            json_path, csv_path = stage_downloads((json_path, csv_path))
+            json_path = question_sets.export_json(project_id, question_set_id)
+            (json_path,) = stage_downloads((json_path,))
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), None, None
-        return "✅ 已匯出目前編輯後的題目集 JSON／CSV", str(json_path), str(csv_path)
+            return "❌ " + str(exc), None
+        return "✅ 已匯出目前編輯後的題目集 JSON", str(json_path)
 
     def sampling_section_choices(project_id: str | None):
         if not project_id:
@@ -1311,6 +1311,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_generation_model = gr.Dropdown(
                     choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
                 )
+            autoqa_generate_button = gr.Button("生成題目", variant="primary")
             with gr.Row():
                 autoqa_answer_model = gr.Dropdown(
                     choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
@@ -1323,14 +1324,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     value="local", label="檢索模式",
                 )
                 autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=2, minimum=1, maximum=32, precision=0)
-                autoqa_test_button = gr.Button("開始自動問答測試", variant="primary")
-            autoqa_generate_button = gr.Button("生成題目", variant="primary")
+            autoqa_test_button = gr.Button("開始自動問答測試", variant="primary")
             with gr.Row():
                 autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
                 autoqa_import_button = gr.Button("匯入題目集")
                 autoqa_export_button = gr.Button("匯出目前題目集")
                 autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
-                autoqa_csv_export = gr.File(label="題目集 CSV（匯出）")
             autoqa_result = gr.Markdown()
             autoqa_question_set_state = gr.State("")
             autoqa_questions_table = gr.Dataframe(
@@ -1725,7 +1724,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         autoqa_export_button.click(
             export_automatic_question_set,
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
-            outputs=[autoqa_result, autoqa_json_export, autoqa_csv_export],
+            outputs=[autoqa_result, autoqa_json_export],
         )
         ask_button.click(
             ask_question,

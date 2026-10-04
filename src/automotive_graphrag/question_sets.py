@@ -398,6 +398,12 @@ class QuestionSetService:
         self._atomic_text(csv_path, buffer.getvalue())
         return json_path, csv_path
 
+    def export_json(self, project_id: str, question_set_id: str) -> Path:
+        question_set = self.get(project_id, question_set_id)
+        json_path = self.projects.path_for(project_id) / "exports" / f"{question_set_id}.json"
+        self._atomic_text(json_path, json.dumps(self._to_dict(question_set), ensure_ascii=False, indent=2) + "\n")
+        return json_path
+
     def update_gold_evidence(
         self,
         project_id: str,
