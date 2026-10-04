@@ -1,5 +1,4 @@
 import json
-import re
 import tempfile
 import unittest
 from dataclasses import replace
@@ -19,20 +18,6 @@ class FakeGenerationClient:
 
     def __call__(self, base_url: str, api_key: str, model: str, prompt: str) -> object:
         self.calls.append((base_url, api_key, model, prompt))
-        if "技術手冊內容完整性檢查器" in prompt:
-            window_ids = list(dict.fromkeys(re.findall(r'"window_id":\s*"(W\d+)"', prompt)))
-            return {
-                "windows": [
-                    {
-                        "window_id": window_id,
-                        "complete": True,
-                        "expand_before": False,
-                        "expand_after": False,
-                        "reason": "邊界完整",
-                    }
-                    for window_id in window_ids
-                ]
-            }
         return self.response
 
 
@@ -167,68 +152,28 @@ class QuestionGenerationServiceTests(unittest.TestCase):
             "L33-SM3E", "WW.pdf", self.sample_batch.samples, 1, "gpt-4.1-mini"
         )
 
-        self.assertEqual(len(client.calls), 2)
         self.assertEqual(client.calls[0][2], "gpt-4.1-mini")
-        self.assertIn("內容完整性檢查器", client.calls[0][3])
-        self.assertIn("每個 window 必須且只能生成一道題", client.calls[1][3])
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("生成 1 題", client.calls[0][3])
         self.assertEqual(len(questions), 1)
         self.assertEqual(questions[0].gold_evidence[0].document_id, "WW.pdf")
 
-    def test_document_generation_randomly_selects_consecutive_five_page_windows(self) -> None:
+    def test_document_generation_limits_samples_and_spreads_them_across_the_document(self) -> None:
         sample = self.sample_batch.samples[0]
         samples = [
             replace(sample, sample_id=f"sample-{index}", chunk_id=f"chunk-{index}", page=index + 1)
             for index in range(60)
         ]
 
-        for initial_pages in (3, 5):
-            with self.subTest(initial_pages=initial_pages):
-                windows = QuestionGenerationService._sample_page_windows(
-                    samples, question_count=10, initial_pages=initial_pages
-                )
-                self.assertEqual(len(windows), 10)
-                for start, end, selected in windows:
-                    self.assertEqual(end - start + 1, initial_pages)
-                    self.assertTrue(all(start <= item.page <= end for item in selected))
-                    self.assertEqual({item.page for item in selected}, set(range(start, end + 1)))
+        selected = QuestionGenerationService._select_representative_samples(samples, question_count=10)
 
-    def test_incomplete_window_expands_before_and_after_then_is_rechecked(self) -> None:
-        sample = self.sample_batch.samples[0]
-        samples = [
-            replace(sample, sample_id=f"sample-{page}", chunk_id=f"chunk-{page}", page=page)
-            for page in range(1, 7)
-        ]
-
-        class ExpandingClient:
-            def __init__(self):
-                self.responses = [
-                    {"windows": [{"window_id": "W0001", "complete": False,
-                                  "expand_before": True, "expand_after": True, "reason": "程序承接前後文"}]},
-                    {"windows": [{"window_id": "W0001", "complete": True,
-                                  "expand_before": False, "expand_after": False, "reason": "內容完整"}]},
-                ]
-
-            def __call__(self, *args):
-                return self.responses.pop(0)
-
-        service = QuestionGenerationService(self.store, self.sampling, self.connections, ExpandingClient())
-        windows = [(2, 4, tuple(samples[1:4]))]
-
-        expanded = service._expand_incomplete_windows(
-            "WW.pdf", windows, samples, 6, "https://api.openai.com/v1", "test-key", "gpt-4o-mini"
-        )
-
-        self.assertEqual((expanded[0][0], expanded[0][1]), (1, 5))
-        self.assertEqual({item.page for item in expanded[0][2]}, {1, 2, 3, 4, 5})
+        self.assertEqual(len(selected), 20)
+        self.assertEqual(selected[0].page, 1)
+        self.assertEqual(selected[-1].page, 60)
+        self.assertEqual(list(selected), sorted(selected, key=lambda item: item.page))
 
     def test_generated_question_tracks_question_and_answer_pages_separately(self) -> None:
-        samples = [
-            replace(item, page=index)
-            for index, item in enumerate(
-                (item for item in self.sampling.scan("L33-SM3E", minimum_characters=1) if item.document_id == "WW.pdf"),
-                start=1,
-            )
-        ]
+        samples = [item for item in self.sample_batch.samples if item.document_id == "WW.pdf"]
         client = FakeGenerationClient({
             "questions": [{
                 "question": "雨刷馬達的檢查程序為何？",
@@ -243,9 +188,9 @@ class QuestionGenerationServiceTests(unittest.TestCase):
             "L33-SM3E", "WW.pdf", samples, 1, "gpt-4o-mini"
         )[0]
 
-        self.assertEqual(question.question_source_evidence[0].pages, (1,))
-        self.assertEqual(question.answer_source_evidence[0].pages, (2,))
-        self.assertEqual(question.gold_evidence[0].pages, (2,))
+        self.assertEqual(question.question_source_evidence[0].pages, (25,))
+        self.assertEqual(question.answer_source_evidence[0].pages, (26,))
+        self.assertEqual(question.gold_evidence[0].pages, (26,))
 
     def test_duplicate_question_normalization_ignores_punctuation_and_width(self) -> None:
         self.assertEqual(normalize_question("ＡＢＣ？ 雨刷！"), normalize_question("abc 雨刷"))
