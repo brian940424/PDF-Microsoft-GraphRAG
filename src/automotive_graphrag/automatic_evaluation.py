@@ -178,6 +178,51 @@ class AutomaticEvaluationService:
         value["items"] = tuple(migrated_items)
         return AutomaticEvaluationResult(**value)
 
+    def update_manual_results(
+        self, project_id: str, question_set_id: str, decisions: dict[str, str]
+    ) -> AutomaticEvaluationResult:
+        """Save manual correctness edits and clear stale judge reasons for changed decisions."""
+        result = self.last_result(project_id, question_set_id)
+        if result is None:
+            raise ProjectError("尚無評測結果可供修改")
+        unknown = set(decisions) - {item.question_id for item in result.items}
+        if unknown:
+            raise ProjectError("評測結果找不到題號：" + ", ".join(sorted(unknown)))
+        items = []
+        for item in result.items:
+            decision = decisions.get(item.question_id)
+            if decision is None:
+                items.append(item)
+                continue
+            if decision not in {"正確", "錯誤"}:
+                raise ProjectError(f"{item.question_id} 的判斷只能是「正確」或「錯誤」")
+            is_correct = decision == "正確"
+            items.append(AutomaticEvaluationItem(
+                question_id=item.question_id,
+                is_correct=is_correct,
+                judge_reason="" if is_correct != item.is_correct else item.judge_reason,
+            ))
+        updated = AutomaticEvaluationResult(
+            project_id=result.project_id,
+            question_set_id=result.question_set_id,
+            evaluated_at=result.evaluated_at,
+            model=result.model,
+            prompt_version=result.prompt_version,
+            judge_prompt=result.judge_prompt,
+            question_count=len(items),
+            correct_count=sum(item.is_correct for item in items),
+            items=tuple(items),
+        )
+        self._write(updated)
+        return updated
+
+    def clear_result(self, project_id: str, question_set_id: str) -> None:
+        path = self._path(project_id, question_set_id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ProjectError("無法清除舊評測結果") from exc
+
     def export(self, project_id: str, question_set_id: str) -> tuple[Path, Path]:
         result = self.last_result(project_id, question_set_id)
         if result is None:

@@ -40,6 +40,9 @@ class NoJudge:
     def evaluate(self, *args, **kwargs):
         raise ProjectError("test judge unavailable")
 
+    def clear_result(self, *args, **kwargs):
+        return None
+
 
 class NoRetrieval:
     def evaluate(self, *args, **kwargs):
@@ -96,6 +99,35 @@ class ConcurrentGeneration:
 
 
 class AutomaticQATests(unittest.TestCase):
+    def test_answer_existing_persists_answers_without_judging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "projects")
+            store.create(
+                project_id="TEST", display_name="Test", vehicle_name="Vehicle", manual_version="Version"
+            )
+            store.update_status("TEST", "INDEXED")
+            sets = QuestionSetService(store)
+            question_set = sets.create_with_questions(
+                "TEST", "automatic", [BatchQuestion("Q0001", "問題", "正解")]
+            )
+            query = ConcurrentQuery()
+            service = AutomaticQATestService(
+                store, object(), object(), query, sets, NoJudge(), NoRetrieval()
+            )
+
+            report = service.answer_existing(
+                "TEST", question_set.question_set_id, "gpt-4.1-mini", "local", 1
+            )
+
+            self.assertIsNone(report.judge)
+            self.assertEqual(report.question_set.questions[0].answer, "回答")
+            self.assertEqual(report.question_set.questions[0].status, "COMPLETED")
+            evaluated = service.evaluate_existing(
+                "TEST", question_set.question_set_id, "gpt-4.1-mini", "gpt-4o-mini", "local"
+            )
+            self.assertEqual(len(query.models), 1)
+            self.assertIn("test judge unavailable", evaluated.judge_error)
+
     def test_answer_concurrency_and_model_are_applied_to_all_questions(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = ProjectStore(Path(temporary) / "projects")

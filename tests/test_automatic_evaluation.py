@@ -184,6 +184,26 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "未知或重複"):
             service.evaluate("L33-SM3E", self.question_set_id)
 
+    def test_manual_judgement_edit_clears_stale_reason_and_recalculates_count(self) -> None:
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, FakeJudge([self.judged()])
+        )
+        service.evaluate("L33-SM3E", self.question_set_id)
+
+        updated = service.update_manual_results(
+            "L33-SM3E", self.question_set_id, {"Q001": "正確", "Q002": "正確"}
+        )
+
+        self.assertEqual(updated.correct_count, 2)
+        self.assertTrue(updated.items[0].is_correct)
+        self.assertEqual(updated.items[0].judge_reason, "")
+        self.assertTrue(updated.items[1].is_correct)
+        self.assertEqual(updated.items[1].judge_reason, "第二題評語")
+        self.assertEqual(
+            service.last_result("L33-SM3E", self.question_set_id),
+            updated,
+        )
+
     def test_app_builds_with_automatic_evaluation_controls(self) -> None:
         app = create_app(self.root / "ui-projects")
 
@@ -192,9 +212,16 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             for component in app.blocks.values()
             if hasattr(component, "get_config")
         }
+        button_values = [
+            component.get_config().get("value")
+            for component in app.blocks.values()
+            if hasattr(component, "get_config")
+        ]
         self.assertIn("逐題自動評測結果", labels)
         self.assertIn("只重跑前次答錯題目", labels)
         self.assertIn("自動評測 JSON", labels)
+        self.assertIn("生成回答", button_values)
+        self.assertIn("評測回答", button_values)
 
 
 if __name__ == "__main__":

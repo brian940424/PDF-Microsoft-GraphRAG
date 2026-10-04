@@ -206,6 +206,68 @@ class AutomaticQATestService:
             (),
         )
 
+    def answer_existing(
+        self,
+        project_id: str,
+        question_set_id: str,
+        answer_model: str,
+        method: str,
+        answer_concurrency: int,
+    ) -> AutomaticQAReport:
+        """Generate and persist answers only; judging is a separate user action."""
+        report = self._run_existing(
+            self.question_sets.get(project_id, question_set_id),
+            "—",
+            answer_model,
+            "—",
+            method,
+            answer_concurrency,
+            5,
+            (),
+            evaluate=False,
+        )
+        self.judging.clear_result(project_id, question_set_id)
+        return report
+
+    def evaluate_existing(
+        self,
+        project_id: str,
+        question_set_id: str,
+        answer_model: str,
+        judge_model: str,
+        method: str,
+        top_k: int = 5,
+    ) -> AutomaticQAReport:
+        question_set = self.question_sets.get(project_id, question_set_id)
+        if not any(item.status == "COMPLETED" and item.answer for item in question_set.questions):
+            raise ProjectError("請先按「生成回答」完成系統回答")
+        judge = None
+        judge_error = None
+        try:
+            judge = self.judging.evaluate(project_id, question_set_id, model=judge_model)
+        except ProjectError as exc:
+            judge_error = str(exc)
+        retrieval = None
+        retrieval_error = None
+        try:
+            retrieval = self.retrieval.evaluate(
+                project_id, question_set_id, top_k=top_k, method=method
+            )
+        except ProjectError as exc:
+            retrieval_error = str(exc)
+        return AutomaticQAReport(
+            question_set=question_set,
+            generation_model="—",
+            answer_model=answer_model,
+            judge_model=judge_model,
+            generation_errors=(),
+            answers=(),
+            judge=judge,
+            judge_error=judge_error,
+            retrieval=retrieval,
+            retrieval_error=retrieval_error,
+        )
+
     def _run_existing(
         self,
         question_set: QuestionSet,
@@ -216,6 +278,7 @@ class AutomaticQATestService:
         concurrency: int,
         top_k: int,
         generation_errors: tuple[str, ...],
+        evaluate: bool = True,
     ) -> AutomaticQAReport:
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("回答並行數必須介於 1 到 32")
@@ -240,6 +303,19 @@ class AutomaticQATestService:
         updated = self.question_sets.update_answers(
             question_set.project_id, question_set.question_set_id, results, method
         )
+        if not evaluate:
+            return AutomaticQAReport(
+                question_set=updated,
+                generation_model=generation_model,
+                answer_model=answer_model,
+                judge_model=judge_model,
+                generation_errors=generation_errors,
+                answers=tuple(results[item.question_id] for item in updated.questions),
+                judge=None,
+                judge_error=None,
+                retrieval=None,
+                retrieval_error=None,
+            )
         judge = None
         judge_error = None
         try:
