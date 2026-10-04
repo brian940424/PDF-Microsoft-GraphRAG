@@ -991,12 +991,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def export_retrieval_experiment(project_id: str | None):
         if not project_id:
-            return "❌ 請先開啟專案", None
+            return "❌ 請先開啟專案", None, None
         try:
-            path = stage_downloads((retrieval_experiments.export(project_id),))[0]
+            paths = stage_downloads(retrieval_experiments.export(project_id))
         except (ProjectError, OSError) as exc:
-            return f"❌ 匯出失敗：{exc}", None
-        return "✅ 已匯出檢索實驗 JSON", str(path)
+            return f"❌ 匯出失敗：{exc}", None, None
+        return "✅ 已匯出精簡摘要與逐題結果 JSON", *(str(path) for path in paths)
 
     def autosave_automatic_questions(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
@@ -1915,8 +1915,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
             gr.Markdown("### 匯出實驗結果")
             with gr.Row():
-                experiment_export_button = gr.Button("匯出實驗結果 JSON")
-                experiment_export_file = gr.File(label="實驗結果 JSON")
+                experiment_export_button = gr.Button("匯出兩種實驗結果 JSON")
+                experiment_summary_export_file = gr.File(label="精簡摘要 JSON")
+                experiment_details_export_file = gr.File(label="逐題結果 JSON")
             experiment_export_status = gr.Markdown()
 
         with gr.Tab("自動評測（已整合）", visible=False):
@@ -2200,7 +2201,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         experiment_export_button.click(
             export_retrieval_experiment,
             inputs=active_project_id,
-            outputs=[experiment_export_status, experiment_export_file],
+            outputs=[experiment_export_status, experiment_summary_export_file, experiment_details_export_file],
         )
         autoqa_generate_button.click(
             generate_automatic_qa,

@@ -131,26 +131,29 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertTrue(all(result.answer_source_rank is None for result in run.results))
         self.assertTrue(all(group.recall_at_5 is None and group.mrr is None for group in run.groups))
         self.assertEqual(loaded["status"], "completed")
-        payload = json.loads(self.service.export("project").read_text(encoding="utf-8"))
+        summary_path, details_path = self.service.export("project")
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        details = json.loads(details_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(payload["format"], "manual-graphrag-experiment-summary")
         self.assertEqual(payload["project"], {"project_id": "project", "name": "測試專案"})
-        self.assertEqual(payload["execution_status"], "completed")
         self.assertEqual(payload["max_concurrent_requests"], 2)
         self.assertEqual(payload["evaluation"]["judge_model"], "gpt-4.1-mini")
         self.assertIsNone(payload["evaluation"]["judge_reasoning_effort"])
         self.assertEqual(payload["summary"]["question_count"], 4)
-        self.assertEqual(payload["summary"]["evaluated_count"], 4)
         self.assertEqual(payload["summary"]["correct_total"], "4 / 4")
         self.assertEqual(len(payload["groups"]), 2)
-        self.assertEqual(len(payload["question_results"]), 4)
+        self.assertNotIn("question_results", payload)
         self.assertEqual(payload["groups"][0]["parameters"]["answer_model"], "gpt-4o-mini")
         self.assertEqual(payload["groups"][0]["parameters"]["retrieval_mode"], "Microsoft GraphRAG Local")
         self.assertEqual(payload["groups"][0]["summary"]["judge_model"], "gpt-4.1-mini")
         self.assertNotIn("top_k", payload["groups"][0]["parameters"])
         self.assertNotIn("use_reranker", payload["groups"][0]["parameters"])
-        self.assertEqual(payload["question_results"][0]["answer_model"], "gpt-4o-mini")
-        self.assertEqual(payload["question_results"][0]["judge_model"], "gpt-4.1-mini")
+        self.assertEqual(details["format"], "manual-graphrag-experiment-question-results")
+        self.assertEqual(details["execution_status"], "completed")
+        self.assertEqual(len(details["question_results"]), 4)
+        self.assertEqual(details["question_results"][0]["answer_model"], "gpt-4o-mini")
+        self.assertEqual(details["question_results"][0]["judge_model"], "gpt-4.1-mini")
 
     def test_answer_generation_and_evaluation_are_separate_persisted_steps(self):
         judge = FakeJudge()
@@ -357,9 +360,11 @@ class RetrievalExperimentTests(unittest.TestCase):
         export_button_position = next(
             index for index, component in enumerate(block_values)
             if hasattr(component, "get_config")
-            and component.get_config().get("value") == "匯出實驗結果 JSON"
+            and component.get_config().get("value") == "匯出兩種實驗結果 JSON"
         )
         self.assertGreater(export_button_position, result_table_position)
+        self.assertIn("精簡摘要 JSON", labels)
+        self.assertIn("逐題結果 JSON", labels)
 
         renderer = app.renderables[0]
         LocalContext.blocks_config.set(app.default_config)

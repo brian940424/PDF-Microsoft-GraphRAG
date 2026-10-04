@@ -466,11 +466,13 @@ class RetrievalExperimentService:
         event.set()
         return True
 
-    def export(self, project_id: str) -> Path:
+    def export(self, project_id: str) -> tuple[Path, Path]:
         state = self.load(project_id)
         if state.get("run") is None:
             raise ProjectError("目前沒有可匯出的檢索實驗結果")
-        path = self.projects.path_for(project_id) / "exports" / "retrieval-experiment.json"
+        export_dir = self.projects.path_for(project_id) / "exports"
+        summary_path = export_dir / "retrieval-experiment-summary.json"
+        details_path = export_dir / "retrieval-experiment-details.json"
         run = state["run"]
         run_groups = run.get("groups", [])
         run_results = run.get("results", [])
@@ -485,7 +487,6 @@ class RetrievalExperimentService:
             evaluated_count += group_evaluated
             correct_count += group_correct
             group_rows.append({
-                "group_id": summary.get("group_id"),
                 "name": summary.get("group_name"),
                 "parameters": {
                     "answer_model": summary.get("answer_model"),
@@ -495,7 +496,6 @@ class RetrievalExperimentService:
                     "answer_model": summary.get("answer_model"),
                     "judge_model": summary.get("judge_model"),
                     "question_count": summary.get("question_count", 0),
-                    "evaluated_count": group_evaluated,
                     "correct_count": group_correct,
                     "correct_total": f"{group_correct} / {group_evaluated}",
                     "accuracy": group_correct / group_evaluated if group_evaluated else None,
@@ -509,9 +509,6 @@ class RetrievalExperimentService:
             "schema_version": 1,
             "format": "manual-graphrag-experiment-summary",
             "project": {"project_id": project_id, "name": self.projects.get(project_id).display_name},
-            "execution_status": run.get("status"),
-            "question_set_id": state.get("question_set_id", ""),
-            "question_set_name": run.get("question_set_name", ""),
             "max_concurrent_requests": state.get("max_concurrency", 5),
             "evaluation": {
                 "judge_model": state.get("judge_model", ""),
@@ -519,7 +516,6 @@ class RetrievalExperimentService:
             },
             "summary": {
                 "question_count": expected_count,
-                "evaluated_count": evaluated_count,
                 "correct_count": correct_count,
                 "correct_total": f"{correct_count} / {evaluated_count}",
                 "accuracy": correct_count / evaluated_count if evaluated_count else None,
@@ -528,10 +524,29 @@ class RetrievalExperimentService:
                 "mrr": self._average_metric(run_groups, "mrr"),
             },
             "groups": group_rows,
+        }
+        details_payload = {
+            "schema_version": 1,
+            "format": "manual-graphrag-experiment-question-results",
+            "project": payload["project"],
+            "execution_status": run.get("status"),
+            "question_set_id": state.get("question_set_id", ""),
+            "question_set_name": run.get("question_set_name", ""),
+            "question_count": expected_count,
+            "groups": [
+                {
+                    "name": group.get("name"),
+                    "answer_model": group.get("parameters", {}).get("answer_model"),
+                    "retrieval_mode": group.get("parameters", {}).get("retrieval_mode"),
+                    "judge_model": group.get("summary", {}).get("judge_model"),
+                }
+                for group in group_rows
+            ],
             "question_results": run_results,
         }
-        self._atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        return path
+        self._atomic_write(summary_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        self._atomic_write(details_path, json.dumps(details_payload, ensure_ascii=False, indent=2) + "\n")
+        return summary_path, details_path
 
     @staticmethod
     def _retrieval_mode_label(method: str | None) -> str | None:
