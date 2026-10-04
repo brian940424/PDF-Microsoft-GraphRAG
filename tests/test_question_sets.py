@@ -1,4 +1,3 @@
-import csv
 import json
 import tempfile
 import unittest
@@ -144,18 +143,16 @@ class QuestionSetServiceTests(unittest.TestCase):
         self.assertEqual([item.status for item in resumed.questions], ["COMPLETED"] * 3)
         self.assertEqual(self.runner.questions, ["問題二", "問題一", "問題三"])
 
-    def test_export_writes_json_and_csv(self) -> None:
+    def test_export_writes_schema_v1_json(self) -> None:
         imported = self.service.import_file("L33-SM3E", self.write_question_set(self.valid_value()))
         self.service.run("L33-SM3E", imported.question_set_id, selected_question_ids=["Q001"])
 
-        json_path, csv_path = self.service.export("L33-SM3E", imported.question_set_id)
+        json_path = self.service.export("L33-SM3E", imported.question_set_id)
 
         exported = json.loads(json_path.read_text(encoding="utf-8"))
-        self.assertEqual(exported["name"], "雨刷測試集")
-        with csv_path.open(encoding="utf-8", newline="") as source:
-            rows = list(csv.DictReader(source))
-        self.assertEqual(rows[0]["question_id"], "Q001")
-        self.assertEqual(rows[0]["status"], "COMPLETED")
+        self.assertEqual(exported["schema_version"], 1)
+        self.assertEqual(exported["questions"][0]["number"], 1)
+        self.assertEqual(exported["questions"][0]["expected_answer"], "參考答案一")
 
     def test_question_set_export_import_preserves_source_page_ranges(self) -> None:
         question_set = self.service.create_with_questions(
@@ -179,12 +176,14 @@ class QuestionSetServiceTests(unittest.TestCase):
             ],
         )
 
-        json_path, csv_path = self.service.export("L33-SM3E", question_set.question_set_id)
+        json_path = self.service.export("L33-SM3E", question_set.question_set_id)
         exported = json.loads(json_path.read_text(encoding="utf-8"))
         row = exported["questions"][0]
-        self.assertEqual(row["question_id"], "Q0001")
+        self.assertEqual(row["number"], 1)
         self.assertEqual(row["question"], "問題")
-        self.assertEqual(row["correct_answer"], "正確答案")
+        self.assertEqual(row["expected_answer"], "正確答案")
+        self.assertEqual(row["document"], "維修手冊.pdf")
+        self.assertEqual(row["source_pages"], [12, 13])
         self.assertEqual(row["question_sources"], [
             {"document_id": "doc-001", "document_name": "維修手冊.pdf", "pages": [12, 13]},
             {"document_id": "doc-002", "document_name": "保養指南.pdf", "pages": [4]},
@@ -193,7 +192,6 @@ class QuestionSetServiceTests(unittest.TestCase):
             {"document_id": "doc-001", "document_name": "維修手冊.pdf", "pages": [13]},
             {"document_id": "doc-003", "document_name": "零件手冊.pdf", "pages": [27]},
         ])
-        self.assertEqual(row["source_documents"], ["doc-001", "doc-002", "doc-003"])
 
         imported = self.service.import_file("L33-SM3E", json_path)
         self.assertEqual(
@@ -206,11 +204,24 @@ class QuestionSetServiceTests(unittest.TestCase):
         )
         reloaded = self.service.get("L33-SM3E", imported.question_set_id)
         self.assertEqual(reloaded.questions[0].question_source_evidence, imported.questions[0].question_source_evidence)
-        with csv_path.open(encoding="utf-8", newline="") as source:
-            csv_row = next(csv.DictReader(source))
-        self.assertEqual(csv_row["correct_answer"], "正確答案")
-        self.assertEqual(json.loads(csv_row["question_sources"]), row["question_sources"])
-        self.assertEqual(json.loads(csv_row["answer_sources"]), row["answer_sources"])
+
+    def test_imports_requested_schema_v1_and_rejects_unsupported_version(self) -> None:
+        value = {
+            "schema_version": 1,
+            "questions": [{
+                "number": 7,
+                "question": "跨頁問題？",
+                "expected_answer": "完整答案",
+                "source_pages": [60, 61],
+                "document": "手冊.pdf",
+            }],
+        }
+        imported = self.service.import_file("L33-SM3E", self.write_question_set(value))
+        self.assertEqual(imported.questions[0].question_id, "Q0007")
+        self.assertEqual(imported.questions[0].reference_answer, "完整答案")
+        self.assertEqual(imported.questions[0].answer_source_evidence[0].pages, (60, 61))
+        with self.assertRaisesRegex(ProjectError, "schema_version"):
+            self.service.import_file("L33-SM3E", self.write_question_set({**value, "schema_version": 2}))
 
     def test_batch_requires_indexed_project(self) -> None:
         imported = self.service.import_file("L33-SM3E", self.write_question_set(self.valid_value()))

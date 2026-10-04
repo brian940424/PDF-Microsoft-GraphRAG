@@ -17,7 +17,7 @@ from typing import Any, Callable, Sequence
 
 from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings
 from .projects import ProjectError, ProjectStore
-from .question_sets import GoldEvidence
+from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 from .source_sampling import SourceSample, SourceSampleBatch, SourceSamplingService
 
 
@@ -258,47 +258,17 @@ class QuestionGenerationService:
         approved = [item for item in batch.questions if item.generation_status == "approved"]
         if not approved:
             raise ProjectError("沒有已核准的生成題目可匯出")
-        payload = {
-            "name": f"AUTO-{generation_batch_id[:8]}",
-            "description": f"由原文取樣批次 {batch.sample_batch_id} 生成；模型 {batch.model}",
-            "questions": [
-                {
-                    "question_id": item.question_id,
-                    "question": item.question,
-                    "correct_answer": item.reference_answer,
-                    "reference_answer": item.reference_answer,
-                    "gold_evidence": [asdict(gold) for gold in item.gold_evidence],
-                    "question_sources": [
-                        {
-                            "document_id": source.document_id,
-                            "document_name": source.document_name or source.document_id,
-                            "pages": list(source.pages),
-                        }
-                        for source in (item.question_source_evidence or item.gold_evidence)
-                    ],
-                    "answer_sources": [
-                        {
-                            "document_id": source.document_id,
-                            "document_name": source.document_name or source.document_id,
-                            "pages": list(source.pages),
-                        }
-                        for source in (item.answer_source_evidence or item.gold_evidence)
-                    ],
-                    "source_documents": list(
-                        dict.fromkeys(
-                            source.document_id
-                            for source in (
-                                *(item.question_source_evidence or item.gold_evidence),
-                                *(item.answer_source_evidence or item.gold_evidence),
-                            )
-                        )
-                    ),
-                    "difficulty": item.difficulty,
-                    "generation_status": item.generation_status,
-                }
-                for item in approved
-            ],
-        }
+        payload = QuestionSetService.to_schema_v1([
+            BatchQuestion(
+                question_id=item.question_id,
+                question=item.question,
+                reference_answer=item.reference_answer,
+                gold_evidence=item.gold_evidence,
+                question_source_evidence=item.question_source_evidence,
+                answer_source_evidence=item.answer_source_evidence,
+            )
+            for item in approved
+        ])
         path = self.projects.path_for(project_id) / "exports" / f"{generation_batch_id}-question_set.json"
         self._atomic_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         return path

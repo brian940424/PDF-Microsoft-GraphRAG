@@ -52,14 +52,14 @@ class RetrievalExperimentTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_import_existing_question_set_format_with_multi_document_sources(self):
+    def test_import_schema_v1_question_set_with_cross_page_source(self):
         question_set = self.service.import_question_set("project", self.question_file)
         question = question_set.questions[0]
 
         self.assertEqual(question.question_id, "Q0001")
-        self.assertEqual(len(question.question_source_evidence), 2)
-        self.assertEqual(question.question_source_evidence[0].pages, (12, 13))
-        self.assertEqual(len(question.answer_source_evidence), 2)
+        self.assertEqual(len(question.question_source_evidence), 1)
+        self.assertEqual(question.question_source_evidence[0].pages, (330,))
+        self.assertEqual(len(question.answer_source_evidence), 1)
         self.assertEqual(self.service.load("project")["question_set_id"], question_set.question_set_id)
 
     def test_group_settings_autosave_reload_and_only_explicit_remove_deletes(self):
@@ -92,7 +92,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         loaded = self.service.load("project")["run"]
 
         self.assertEqual(run.status, "completed")
-        self.assertEqual(len(run.results), 2)
+        self.assertEqual(len(run.results), 4)
         self.assertEqual({call[2] for call in self.calls}, {"local", "basic"})
         self.assertEqual({call[3] for call in self.calls}, {"gpt-4o-mini", "gpt-4.1-mini"})
         self.assertTrue(all(result.evaluation_result == "正確" for result in run.results))
@@ -102,7 +102,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         payload = json.loads(self.service.export("project").read_text(encoding="utf-8"))
         self.assertEqual(payload["execution_status"], "completed")
         self.assertEqual(len(payload["experiment_groups"]), 2)
-        self.assertEqual(len(payload["question_results"]), 2)
+        self.assertEqual(len(payload["question_results"]), 4)
         self.assertEqual(payload["experiment_groups"][0]["answer_model"], "gpt-4o-mini")
         self.assertEqual(payload["experiment_groups"][0]["judge_model"], "gpt-4.1-mini")
         self.assertEqual(payload["question_results"][0]["answer_model"], "gpt-4o-mini")

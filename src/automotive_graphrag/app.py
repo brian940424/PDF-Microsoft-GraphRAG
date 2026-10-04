@@ -1656,7 +1656,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 label="目前匯入題目集",
                 wrap=True,
             )
-            gr.Markdown("題目 JSON 沿用自動問答匯入格式；文件與跨頁來源分別使用 `question_sources` / `answer_sources` 陣列，範例見 `docs/檢索實驗格式範例.json`。")
+            gr.Markdown("題目 JSON 使用 `schema_version: 1`，欄位為題號、題目、正確答案、來源頁碼與來源文件；跨文件或題目／答案來源不同時，也支援選填 `question_sources` / `answer_sources` 來源明細。範例見 `docs/檢索實驗格式範例.json`。")
             gr.Markdown("### 實驗組設定（欄位變更會自動儲存；只有「移除所選組別」會刪除組別）")
             experiment_group_table = gr.Dataframe(
                 headers=["組別ID", "實驗組名稱", "回答模型", "評測模型", "GraphRAG 策略"],

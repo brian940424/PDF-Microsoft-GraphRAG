@@ -1,35 +1,24 @@
 {
-  "name": "跨文件檢索比較範例",
-  "description": "供檢索實驗頁匯入；欄位相容於專案既有 Question Set JSON 格式。",
+  "schema_version": 1,
   "questions": [
     {
-      "question_id": "Q0001",
-      "question": "執行檢查前需要完成哪些準備？",
-      "correct_answer": "先確認設備已關閉，準備指定工具，並依序完成安全檢查。",
-      "question_sources": [
-        {
-          "document_id": "manual-a.pdf",
-          "document_name": "操作手冊 A.pdf",
-          "pages": [12, 13]
-        },
-        {
-          "document_id": "appendix.pdf",
-          "document_name": "安全附錄.pdf",
-          "pages": [4]
-        }
+      "number": 1,
+      "question": "如何透過 Printer Setting Utility 進行色彩基準線調整？",
+      "expected_answer": "先確認設備已關閉，準備指定工具，並依序完成安全檢查。",
+      "source_pages": [
+        330
       ],
-      "answer_sources": [
-        {
-          "document_id": "manual-a.pdf",
-          "document_name": "操作手冊 A.pdf",
-          "pages": [13, 14]
-        },
-        {
-          "document_id": "appendix.pdf",
-          "document_name": "安全附錄.pdf",
-          "pages": [5]
-        }
-      ]
+      "document": "ALCX17_UsersGuide_TC_VersionUp.pdf"
+    },
+    {
+      "number": 2,
+      "question": "如何從操作面板將文件掃描至連接 USB 的電腦？",
+      "expected_answer": "先確認設備已關閉，準備指定工具，並依序完成安全檢查。",
+      "source_pages": [
+        173,
+        174
+      ],
+      "document": "ALCX17_UsersGuide_TC_VersionUp.pdf"
     }
   ]
 }
