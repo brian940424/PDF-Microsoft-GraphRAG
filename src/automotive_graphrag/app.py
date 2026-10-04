@@ -949,13 +949,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             [],
         )
 
-    def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, method):
+    def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency):
         if not project_id or not question_set_id:
             return "❌ 請先生成或匯入題目集", "", []
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
             report = automatic_qa.evaluate_existing(
-                project_id, question_set_id, answer_model, judge_model, method
+                project_id, question_set_id, answer_model, judge_model, method,
+                concurrency=int(concurrency),
             )
         except (ProjectError, ValueError) as exc:
             return "❌ " + str(exc), "", []
@@ -1666,9 +1667,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
             autoqa_answer_button = gr.Button("生成回答", variant="primary")
             gr.Markdown("### 評測設定")
-            autoqa_judge_model = gr.Dropdown(
-                choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
-            )
+            with gr.Row():
+                autoqa_judge_model = gr.Dropdown(
+                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
+                )
+                autoqa_judge_concurrency = gr.Number(
+                    label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
+                )
             autoqa_judge_button = gr.Button("評測回答", variant="primary")
             with gr.Row():
                 autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
@@ -2093,7 +2098,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             evaluate_automatic_answers,
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
-                autoqa_answer_model, autoqa_judge_model, autoqa_method,
+                autoqa_answer_model, autoqa_judge_model, autoqa_method, autoqa_judge_concurrency,
             ],
             outputs=[autoqa_result, autoqa_summary, autoqa_table],
         )

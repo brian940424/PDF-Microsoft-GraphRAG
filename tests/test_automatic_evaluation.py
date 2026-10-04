@@ -1,6 +1,8 @@
 import csv
 import json
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,10 +56,21 @@ class FakeJudge:
     def __init__(self, responses: list[object]) -> None:
         self.responses = responses
         self.calls: list[tuple[str, str, str, str]] = []
+        self.lock = threading.Lock()
+        self.calls_by_question: dict[str, int] = {}
 
     def __call__(self, base_url: str, api_key: str, model: str, prompt: str) -> object:
-        self.calls.append((base_url, api_key, model, prompt))
-        return self.responses[len(self.calls) - 1]
+        cases = json.loads(prompt.split("評測案例：", 1)[1])
+        question_id = cases[0]["question_id"]
+        with self.lock:
+            self.calls.append((base_url, api_key, model, prompt))
+            response_index = self.calls_by_question.get(question_id, 0)
+            self.calls_by_question[question_id] = response_index + 1
+            response = self.responses[min(response_index, len(self.responses) - 1)]
+        if isinstance(response, dict) and isinstance(response.get("items"), list):
+            matching = [item for item in response["items"] if item.get("question_id") == question_id]
+            return {"items": matching or response["items"]}
+        return response
 
 
 class AutomaticEvaluationServiceTests(unittest.TestCase):
@@ -127,13 +140,13 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             ]
         }
 
-    def test_evaluate_uses_one_call_and_judges_answers_without_evidence(self) -> None:
+    def test_evaluate_judges_each_answer_without_evidence(self) -> None:
         judge = FakeJudge([self.judged()])
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
 
         result = service.evaluate("L33-SM3E", self.question_set_id)
 
-        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(len(judge.calls), 2)
         self.assertEqual(judge.calls[0][2], "gpt-4o-mini")
         self.assertFalse(result.items[0].is_correct)
         self.assertTrue(result.items[1].is_correct)
@@ -168,21 +181,55 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
         result = service.evaluate("L33-SM3E", self.question_set_id, only_previous_failures=True)
 
-        self.assertEqual(len(judge.calls), 2)
-        self.assertIn("Q001", judge.calls[1][3])
-        self.assertNotIn("Q002", judge.calls[1][3])
+        self.assertEqual(len(judge.calls), 3)
+        rerun_prompt = next(
+            prompt
+            for _, _, _, prompt in judge.calls
+            if '"question_id": "Q001"' in prompt and "correct_answer" in prompt
+        )
+        self.assertIn("Q001", rerun_prompt)
+        self.assertNotIn("Q002", rerun_prompt)
         self.assertEqual(result.question_count, 2)
         self.assertTrue(result.items[0].is_correct)
         self.assertTrue(result.items[1].is_correct)
 
     def test_rejects_invalid_or_invented_judge_result(self) -> None:
-        response = self.judged()
-        response["items"][0]["question_id"] = "INVENTED"  # type: ignore[index]
+        response = {
+            "items": [{"question_id": "INVENTED", "result": "correct", "reason": "錯誤題號"}]
+        }
         judge = FakeJudge([response])
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
 
         with self.assertRaisesRegex(ProjectError, "未知或重複"):
             service.evaluate("L33-SM3E", self.question_set_id)
+
+    def test_evaluation_concurrency_limits_parallel_requests(self) -> None:
+        class SlowJudge:
+            def __init__(self):
+                self.active = 0
+                self.maximum = 0
+                self.lock = threading.Lock()
+
+            def __call__(self, base_url, api_key, model, prompt):
+                cases = json.loads(prompt.split("評測案例：", 1)[1])
+                question_id = cases[0]["question_id"]
+                with self.lock:
+                    self.active += 1
+                    self.maximum = max(self.maximum, self.active)
+                time.sleep(0.02)
+                with self.lock:
+                    self.active -= 1
+                return {"items": [{"question_id": question_id, "result": "correct", "reason": "符合"}]}
+
+        judge = SlowJudge()
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+        service.evaluate("L33-SM3E", self.question_set_id, concurrency=1)
+        self.assertEqual(judge.maximum, 1)
+        judge.maximum = 0
+        service.evaluate("L33-SM3E", self.question_set_id, concurrency=2)
+        self.assertEqual(judge.maximum, 2)
+        with self.assertRaisesRegex(ProjectError, "並行數必須介於 1 到 32"):
+            service.evaluate("L33-SM3E", self.question_set_id, concurrency=0)
 
     def test_manual_judgement_edit_clears_stale_reason_and_recalculates_count(self) -> None:
         service = AutomaticEvaluationService(
@@ -222,6 +269,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("自動評測 JSON", labels)
         self.assertIn("生成回答", button_values)
         self.assertIn("評測回答", button_values)
+        self.assertIn("評測請求並行數", labels)
 
 
 if __name__ == "__main__":

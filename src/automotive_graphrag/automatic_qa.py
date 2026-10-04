@@ -237,6 +237,7 @@ class AutomaticQATestService:
         judge_model: str,
         method: str,
         top_k: int = 5,
+        concurrency: int = 3,
     ) -> AutomaticQAReport:
         question_set = self.question_sets.get(project_id, question_set_id)
         if not any(item.status == "COMPLETED" and item.answer for item in question_set.questions):
@@ -244,7 +245,9 @@ class AutomaticQATestService:
         judge = None
         judge_error = None
         try:
-            judge = self.judging.evaluate(project_id, question_set_id, model=judge_model)
+            judge = self.judging.evaluate(
+                project_id, question_set_id, model=judge_model, concurrency=concurrency
+            )
         except ProjectError as exc:
             judge_error = str(exc)
         retrieval = None

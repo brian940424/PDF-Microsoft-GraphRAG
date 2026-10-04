@@ -9,6 +9,7 @@ import os
 import tempfile
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,7 +66,10 @@ class AutomaticEvaluationService:
         rerun_answers: bool = False,
         only_previous_failures: bool = False,
         model: str | None = None,
+        concurrency: int = 3,
     ) -> AutomaticEvaluationResult:
+        if concurrency < 1 or concurrency > 32:
+            raise ProjectError("評測並行數必須介於 1 到 32")
         previous = self.last_result(project_id, question_set_id)
         selected_ids: set[str] | None = None
         if only_previous_failures:
@@ -92,19 +96,35 @@ class AutomaticEvaluationService:
         if not eligible:
             raise ProjectError("沒有已完成回答且包含正確答案的題目可供評判")
 
-        prompt = self._build_prompt(eligible)
-        api_key = self.connections.apply_to_environment(project_id)
-        base_url = self.connections.get_api_base_url()
+        prompt = "\n\n---\n\n".join(self._build_prompt([item]) for item in eligible)
         model = model or self.connections.get_chat_model()
         if model not in ALLOWED_CHAT_MODELS:
             raise ProjectError(f"不支援的評判模型：{model}")
-        try:
-            response = self.client(base_url, api_key, model, prompt)
-        except ProjectError:
-            raise
-        except Exception as exc:
-            raise ProjectError(f"自動評測 API 呼叫失敗：{exc}") from exc
-        judged = self._parse_response(response, eligible)
+
+        judged_by_id: dict[str, AutomaticEvaluationItem] = {}
+        failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(
+                    self.evaluate_single_answer,
+                    project_id,
+                    item.question_id,
+                    item.question,
+                    item.reference_answer,
+                    item.answer,
+                    model,
+                ): item
+                for item in eligible
+            }
+            for future in as_completed(futures):
+                question = futures[future]
+                try:
+                    judged_by_id[question.question_id] = future.result()
+                except Exception as exc:
+                    failures.append(f"{question.question_id}: {exc}")
+        if failures:
+            raise ProjectError("自動評測部分請求失敗：" + "；".join(failures))
+        judged = [judged_by_id[item.question_id] for item in eligible]
         if selected_ids is not None and previous is not None:
             judged_by_id = {item.question_id: item for item in judged}
             items = tuple(judged_by_id.get(item.question_id, item) for item in previous.items)
