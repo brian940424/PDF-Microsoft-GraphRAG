@@ -204,8 +204,8 @@ class RetrievalExperimentTests(unittest.TestCase):
             if hasattr(component, "get_config")
         }
 
-        self.assertIn("實驗組", labels)
-        self.assertIn("GraphRAG 檢索策略", labels)
+        self.assertIn("回答模型", labels)
+        self.assertEqual(len(app.renderables), 1)
         self.assertIn("測試最大並行請求數", labels)
         self.assertIn("實驗組摘要", labels)
         self.assertIn("逐題實驗結果", labels)

@@ -739,37 +739,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             result_rows,
         )
 
-    def experiment_group_objects(project_id: str) -> list[ExperimentGroup]:
-        state = retrieval_experiments.load(project_id)
-        return [ExperimentGroup(**item) for item in state.get("groups", [])]
-
-    def experiment_group_rows(project_id: str) -> list[list[str]]:
-        return [
-            [item.group_id, item.name, item.answer_model, item.method]
-            for item in experiment_group_objects(project_id)
-        ]
-
-    def experiment_view(project_id: str | None, message: str = "", selected_group_id: str | None = None):
+    def experiment_view(project_id: str | None, message: str = ""):
         if not project_id:
             return (
-                message or "請先在「專案設定」開啟專案", [], gr.Dropdown(choices=[]),
-                gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
-                gr.Dropdown(choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")], value=None), "", [], [], [], 5,
+                message or "請先在「專案設定」開啟專案", "", [], [], [], 5,
                 gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
             )
         try:
             state = retrieval_experiments.load(project_id)
-            groups = state.get("groups", [])
-            group_choices = [(f"{item['group_id']}｜{item['name']}", item["group_id"]) for item in groups]
-            selected_group = selected_group_id if any(item[1] == selected_group_id for item in group_choices) else (group_choices[0][1] if group_choices else None)
-            selected_model = next(
-                (item.get("answer_model", connections.get_chat_model()) for item in groups if item.get("group_id") == selected_group),
-                connections.get_chat_model(),
-            )
-            selected_method = next(
-                (item.get("method", "") for item in groups if item.get("group_id") == selected_group),
-                "",
-            )
             question_set_id = str(state.get("question_set_id", ""))
             question_rows = []
             if question_set_id:
@@ -809,15 +786,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 f"最近實驗狀態：{run.get('status', '尚未執行')}｜題目集：{run.get('question_set_name', '尚未匯入')}"
             )
             return (
-                status, experiment_group_rows(project_id),
-                gr.Dropdown(choices=group_choices, value=selected_group),
-                gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=selected_model),
-                gr.Dropdown(choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")], value=selected_method or None),
-                question_set_id, question_rows, summaries, results, state.get("max_concurrency", 5),
+                status, question_set_id, question_rows, summaries, results, state.get("max_concurrency", 5),
                 gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=state.get("judge_model", connections.get_chat_model())),
             )
         except ProjectError as exc:
-            return (f"❌ {exc}", [], gr.Dropdown(choices=[]), gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()), gr.Dropdown(choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")], value=None), "", [], [], [], 5,
+            return (f"❌ {exc}", "", [], [], [], 5,
                     gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()))
 
     def import_experiment_questions(project_id: str | None, filepath: str | None):
@@ -829,82 +802,69 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return experiment_view(project_id, f"❌ 題目集匯入失敗：{exc}")
         return experiment_view(project_id, f"✅ 已匯入「{question_set.name}」共 {len(question_set.questions)} 題")
 
-    def save_experiment_groups(project_id: str | None, rows, question_set_id: str | None, concurrency, judge_model: str | None):
+    def save_experiment_globals(project_id: str | None, concurrency, judge_model: str | None):
         if not project_id:
             return "請先開啟專案"
         try:
-            state = retrieval_experiments.update_group_fields(project_id, rows)
+            state = retrieval_experiments.load(project_id)
             old_limit = int(state.get("max_concurrency", 5))
             try:
                 limit = int(concurrency) if concurrency not in (None, "") else old_limit
             except (TypeError, ValueError, OverflowError):
                 limit = old_limit
-            saved_qid = str(question_set_id or state.get("question_set_id", ""))
+            groups = [ExperimentGroup(**item) for item in state["groups"]]
             retrieval_experiments.save_configuration(
-                project_id, [ExperimentGroup(**item) for item in state["groups"]], saved_qid, limit,
+                project_id, groups, str(state.get("question_set_id", "")), limit,
                 judge_model=judge_model or str(state.get("judge_model", connections.get_chat_model())),
             )
         except (ProjectError, TypeError, ValueError) as exc:
             return f"❌ 設定尚未儲存：{exc}"
         return "✅ 實驗組設定已自動儲存"
 
-    def add_experiment_group(project_id: str | None):
+    def refresh_experiment_groups(revision: int | None):
+        return int(revision or 0) + 1
+
+    def add_experiment_group(project_id: str | None, revision: int | None):
         if not project_id:
-            return experiment_view(project_id, "❌ 請先開啟專案")
+            return "❌ 請先開啟專案", int(revision or 0)
         try:
-            state = retrieval_experiments.add_group(project_id)
+            retrieval_experiments.add_group(project_id)
         except ProjectError as exc:
-            return experiment_view(project_id, f"❌ {exc}")
-        selected_group = state["groups"][-1]["group_id"] if state.get("groups") else None
-        return experiment_view(project_id, "✅ 已新增並儲存實驗組", selected_group)
+            return f"❌ {exc}", int(revision or 0)
+        return "✅ 已新增實驗組並套用預設回答模型與 Local 策略", refresh_experiment_groups(revision)
 
-    def remove_experiment_group(project_id: str | None, group_id: str | None):
+    def remove_experiment_group(project_id: str | None, group_id: str | None, revision: int | None):
         if not project_id or not group_id:
-            return experiment_view(project_id, "❌ 請選取要移除的實驗組")
+            return "❌ 找不到要移除的實驗組", int(revision or 0)
         retrieval_experiments.remove_group(project_id, group_id)
-        return experiment_view(project_id, f"✅ 已明確移除實驗組 {group_id}")
-
-    def select_experiment_group(project_id: str | None, group_id: str | None):
-        if not project_id or not group_id:
-            return (
-                gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
-                gr.Dropdown(choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")], value=None),
-            )
-        state = retrieval_experiments.load(project_id)
-        group = next((g for g in state["groups"] if g.get("group_id") == group_id), {})
-        return (
-            gr.Dropdown(choices=list(ALLOWED_CHAT_MODELS), value=group.get("answer_model", connections.get_chat_model())),
-            gr.Dropdown(choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")], value=group.get("method") or None),
-        )
+        return f"✅ 已移除實驗組 {group_id}", refresh_experiment_groups(revision)
 
     def save_experiment_answer_model(project_id: str | None, group_id: str | None, answer_model: str | None):
         if not project_id or not group_id or not answer_model:
-            return "請先選取實驗組與回答模型", experiment_group_rows(project_id) if project_id else []
+            return "請先選取實驗組與回答模型"
         try:
             retrieval_experiments.set_group_answer_model(project_id, group_id, answer_model)
         except ProjectError as exc:
-            return f"❌ {exc}", experiment_group_rows(project_id)
-        return f"✅ {group_id} 回答模型已儲存", experiment_group_rows(project_id)
+            return f"❌ {exc}"
+        return f"✅ {group_id} 回答模型已儲存"
 
     def save_experiment_method(project_id: str | None, group_id: str | None, method: str):
         if not project_id or not group_id:
-            return "請先選取實驗組", experiment_group_rows(project_id) if project_id else []
+            return "請先選取實驗組"
         try:
             retrieval_experiments.set_group_method(project_id, group_id, method)
         except ProjectError as exc:
-            return f"❌ {exc}", experiment_group_rows(project_id)
-        return f"✅ {group_id} 檢索策略已儲存", experiment_group_rows(project_id)
+            return f"❌ {exc}"
+        return f"✅ {group_id} 檢索策略已儲存"
 
     def run_retrieval_experiment(
-        project_id: str | None, question_set_id: str | None, rows, concurrency,
-        judge_model: str | None, selected_group: str | None, selected_method: str,
+        project_id: str | None, question_set_id: str | None, concurrency,
+        judge_model: str | None,
     ):
         if not project_id or not question_set_id:
             return experiment_view(project_id, "❌ 請先匯入題目集並開啟專案")
         try:
-            state = retrieval_experiments.update_group_fields(project_id, rows)
-            if selected_group:
-                state = retrieval_experiments.set_group_method(project_id, selected_group, selected_method)
+            state = retrieval_experiments.load(project_id)
             groups = [ExperimentGroup(**item) for item in state["groups"]]
             limit = int(concurrency)
             judge_model = judge_model or str(state.get("judge_model", connections.get_chat_model()))
@@ -1681,30 +1641,54 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 wrap=True,
             )
             gr.Markdown("題目 JSON 使用 `schema_version: 1`，欄位為題號、題目、正確答案、來源頁碼與來源文件；跨文件或題目／答案來源不同時，也支援選填 `question_sources` / `answer_sources` 來源明細。範例見 `docs/檢索實驗格式範例.json`。")
-            gr.Markdown("### 實驗組清單（選取組別後，使用下拉選單調整回答模型與策略；只有「移除所選組別」會刪除組別）")
-            experiment_group_table = gr.Dataframe(
-                headers=["組別ID", "實驗組名稱", "回答模型", "GraphRAG 策略"],
-                value=[],
-                type="array",
-                datatype=["str", "str", "str", "str"],
-                interactive=False,
-                label="實驗組",
-                wrap=True,
-            )
-            with gr.Row():
-                experiment_add_group_button = gr.Button("新增實驗組")
-                experiment_selected_group = gr.Dropdown(label="編輯策略的實驗組")
-                experiment_answer_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
-                    label="回答模型",
-                )
-                experiment_method_editor = gr.Dropdown(
-                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                    value="local",
-                    label="GraphRAG 檢索策略",
-                )
-                experiment_remove_group_button = gr.Button("移除所選組別", variant="stop")
+            gr.Markdown("### 實驗組清單")
+            experiment_group_revision = gr.State(0)
+            experiment_add_group_button = gr.Button("新增實驗組")
             experiment_group_save_status = gr.Markdown()
+            @gr.render(inputs=[active_project_id, experiment_group_revision])
+            def render_experiment_group_cards(project_id: str | None, revision: int):
+                if not project_id:
+                    gr.Markdown("請先開啟專案")
+                    return
+                try:
+                    groups = retrieval_experiments.load(project_id).get("groups", [])
+                except ProjectError as exc:
+                    gr.Markdown(f"❌ {exc}")
+                    return
+                if not groups:
+                    gr.Markdown("尚未新增實驗組。")
+                    return
+                strategy_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
+                for group in groups:
+                    group_id_state = gr.State(group["group_id"])
+                    with gr.Group():
+                        with gr.Row():
+                            gr.Markdown(f"### {group['name']}")
+                            remove_button = gr.Button("移除此組", variant="stop", size="sm")
+                        with gr.Row():
+                            answer_model = gr.Dropdown(
+                                choices=list(ALLOWED_CHAT_MODELS), value=group.get("answer_model", connections.get_chat_model()),
+                                label="回答模型",
+                            )
+                            strategy = gr.Dropdown(
+                                choices=strategy_choices, value=group.get("method", "local"),
+                                label="GraphRAG 檢索策略",
+                            )
+                    answer_model.change(
+                        save_experiment_answer_model,
+                        inputs=[active_project_id, group_id_state, answer_model],
+                        outputs=experiment_group_save_status,
+                    )
+                    strategy.change(
+                        save_experiment_method,
+                        inputs=[active_project_id, group_id_state, strategy],
+                        outputs=experiment_group_save_status,
+                    )
+                    remove_button.click(
+                        remove_experiment_group,
+                        inputs=[active_project_id, group_id_state, experiment_group_revision],
+                        outputs=[experiment_group_save_status, experiment_group_revision],
+                    )
             with gr.Row():
                 experiment_judge_model = gr.Dropdown(
                     choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
@@ -1870,10 +1854,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             experiment_view,
             inputs=active_project_id,
-            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
-                     experiment_answer_model, experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+            outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
-        )
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         open_project_button.click(
             open_project,
             inputs=selected_project,
@@ -1889,10 +1872,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             experiment_view,
             inputs=active_project_id,
-            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
-                     experiment_answer_model, experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+            outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
-        )
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
             inputs=selected_project,
@@ -1941,10 +1923,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             experiment_view,
             inputs=active_project_id,
-            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
-                     experiment_answer_model, experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+            outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
-        )
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         upload_button.click(
             import_documents,
             inputs=[document_project, uploaded_files],
@@ -1969,62 +1950,30 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         experiment_import_button.click(
             import_experiment_questions,
             inputs=[active_project_id, experiment_question_file],
-            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
-                     experiment_answer_model, experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+            outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
-        )
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         experiment_add_group_button.click(
             add_experiment_group,
-            inputs=active_project_id,
-            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
-                     experiment_answer_model, experiment_method_editor, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
-        )
-        experiment_remove_group_button.click(
-            remove_experiment_group,
-            inputs=[active_project_id, experiment_selected_group],
-            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
-                     experiment_answer_model, experiment_method_editor, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
-        )
-        experiment_selected_group.change(
-            select_experiment_group,
-            inputs=[active_project_id, experiment_selected_group],
-            outputs=[experiment_answer_model, experiment_method_editor],
-        )
-        experiment_answer_model.change(
-            save_experiment_answer_model,
-            inputs=[active_project_id, experiment_selected_group, experiment_answer_model],
-            outputs=[experiment_group_save_status, experiment_group_table],
-        )
-        experiment_method_editor.change(
-            save_experiment_method,
-            inputs=[active_project_id, experiment_selected_group, experiment_method_editor],
-            outputs=[experiment_group_save_status, experiment_group_table],
-        )
-        experiment_group_table.change(
-            save_experiment_groups,
-            inputs=[active_project_id, experiment_group_table, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
-            outputs=experiment_group_save_status,
+            inputs=[active_project_id, experiment_group_revision],
+            outputs=[experiment_group_save_status, experiment_group_revision],
         )
         experiment_max_concurrency.change(
-            save_experiment_groups,
-            inputs=[active_project_id, experiment_group_table, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
+            save_experiment_globals,
+            inputs=[active_project_id, experiment_max_concurrency, experiment_judge_model],
             outputs=experiment_group_save_status,
         )
         experiment_judge_model.change(
-            save_experiment_groups,
-            inputs=[active_project_id, experiment_group_table, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
+            save_experiment_globals,
+            inputs=[active_project_id, experiment_max_concurrency, experiment_judge_model],
             outputs=experiment_group_save_status,
         )
         experiment_run_button.click(
             run_retrieval_experiment,
-            inputs=[active_project_id, experiment_question_set_state, experiment_group_table,
-                    experiment_max_concurrency, experiment_judge_model, experiment_selected_group, experiment_method_editor],
-            outputs=[experiment_status, experiment_group_table, experiment_selected_group,
-                     experiment_answer_model, experiment_method_editor, experiment_question_set_state, experiment_question_preview,
+            inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
+            outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model],
-        )
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         experiment_stop_button.click(
             stop_retrieval_experiment,
             inputs=active_project_id,
