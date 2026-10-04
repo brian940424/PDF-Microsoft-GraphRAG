@@ -1379,54 +1379,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 elem_id="indexing-log",
             )
 
-        with gr.Tab("自動問答測試"):
-            gr.Markdown(
-                "依已開啟專案中的每份 PDF 自動生成題目、執行 GraphRAG 問答及 LLM 評判。"
-                "系統會跨 PDF 去重；勾選平行生題時不同 PDF 可併行，同一 PDF 的請求仍會逐次執行。"
-            )
-            with gr.Row():
-                autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
-                autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
-                autoqa_generation_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
-                )
-            autoqa_generate_button = gr.Button("生成題目", variant="primary")
-            with gr.Row():
-                autoqa_answer_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
-                )
-                autoqa_judge_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評判模型"
-                )
-                autoqa_method = gr.Dropdown(
-                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                    value="local", label="檢索模式",
-                )
-                autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
-            autoqa_test_button = gr.Button("開始自動問答測試", variant="primary")
-            with gr.Row():
-                autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
-                autoqa_import_button = gr.Button("匯入題目集")
-                autoqa_export_button = gr.Button("匯出目前題目集")
-                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
-            autoqa_result = gr.Markdown()
-            autoqa_question_set_state = gr.State("")
-            autoqa_questions_table = gr.Dataframe(
-                headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
-                interactive=True,
-                datatype=["str", "str", "str", "str", "str"],
-                label="生成題目與來源（可直接編輯）",
-                wrap=True,
-            )
-            autoqa_summary = gr.Markdown()
-            autoqa_table = gr.Dataframe(
-                headers=["來源文件", "題目", "系統回答", "正確答案", "評判結果", "答案分數", "證據支持", "評判理由"],
-                interactive=False,
-                datatype=["str", "str", "str", "str", "str", "number", "number", "str"],
-                label="逐題自動問答測試結果",
-                wrap=True,
-            )
-
         with gr.Tab("問答測試"):
             with gr.Row():
                 with gr.Column():
@@ -1477,6 +1429,54 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_evidence_selector = gr.Dropdown(label="選取證據全文")
             query_evidence_detail = gr.Markdown()
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
+
+        with gr.Tab("自動問答測試"):
+            gr.Markdown(
+                "依已開啟專案中的每份 PDF 自動生成題目、執行 GraphRAG 問答及 LLM 評判。"
+                "系統會跨 PDF 去重；勾選平行生題時不同 PDF 可併行，同一 PDF 的請求仍會逐次執行。"
+            )
+            with gr.Row():
+                autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
+                autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                autoqa_generation_model = gr.Dropdown(
+                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
+                )
+            autoqa_generate_button = gr.Button("生成題目", variant="primary")
+            with gr.Row():
+                autoqa_answer_model = gr.Dropdown(
+                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
+                )
+                autoqa_judge_model = gr.Dropdown(
+                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評判模型"
+                )
+                autoqa_method = gr.Dropdown(
+                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+                    value="local", label="檢索模式",
+                )
+                autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
+            autoqa_test_button = gr.Button("開始自動問答測試", variant="primary")
+            with gr.Row():
+                autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
+                autoqa_import_button = gr.Button("匯入題目集")
+                autoqa_export_button = gr.Button("匯出目前題目集")
+                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
+            autoqa_result = gr.Markdown()
+            autoqa_question_set_state = gr.State("")
+            autoqa_questions_table = gr.Dataframe(
+                headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
+                interactive=True,
+                datatype=["str", "str", "str", "str", "str"],
+                label="生成題目與來源（可直接編輯）",
+                wrap=True,
+            )
+            autoqa_summary = gr.Markdown()
+            autoqa_table = gr.Dataframe(
+                headers=["來源文件", "題目", "系統回答", "正確答案", "評判結果", "答案分數", "證據支持", "評判理由"],
+                interactive=False,
+                datatype=["str", "str", "str", "str", "str", "number", "number", "str"],
+                label="逐題自動問答測試結果",
+                wrap=True,
+            )
 
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
