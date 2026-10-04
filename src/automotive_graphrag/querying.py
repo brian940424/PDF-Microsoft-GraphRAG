@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -17,7 +18,7 @@ from typing import Any, Callable
 import pandas as pd
 import yaml
 
-from .connections import ConnectionSettings
+from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 
@@ -64,8 +65,15 @@ class QueryService:
         self.runner = runner or self._run
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
         self.evidence_service = evidence_service or EvidenceService(projects)
+        self._history_lock = threading.Lock()
 
-    def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
+    def ask(
+        self,
+        project_id: str,
+        question: str,
+        method: str = "local",
+        chat_model: str | None = None,
+    ) -> QueryResult:
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
         prompt = question.strip()
@@ -76,6 +84,9 @@ class QueryService:
             raise ProjectError("問題為必填")
         if normalized_method not in QUERY_METHODS:
             raise ProjectError(f"不支援的查詢方法：{method}")
+        selected_model = chat_model or self.connection_settings.get_chat_model()
+        if selected_model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError(f"不支援的 Chat 模型：{selected_model}")
 
         graph_root = project_path / "graphrag"
         if not (graph_root / "output").is_dir():
@@ -84,7 +95,7 @@ class QueryService:
         self._configure_connection(
             graph_root / "settings.yaml",
             self.connection_settings.get_api_base_url(),
-            self.connection_settings.get_chat_model(),
+            selected_model,
             self.connection_settings.get_embedding_model(),
         )
         started = datetime.now(timezone.utc)
@@ -241,17 +252,9 @@ class QueryService:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
 
-    @staticmethod
-    def _append_record(path: Path, result: QueryResult) -> None:
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        content = existing + json.dumps(asdict(result), ensure_ascii=False) + "\n"
-        handle, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".queries-", suffix=".jsonl")
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as temporary:
-                temporary.write(content)
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_name, path)
-        finally:
-            if os.path.exists(temporary_name):
-                os.unlink(temporary_name)
+    def _append_record(self, path: Path, result: QueryResult) -> None:
+        line = json.dumps(asdict(result), ensure_ascii=False) + "\n"
+        with self._history_lock, path.open("a", encoding="utf-8") as output:
+            output.write(line)
+            output.flush()
+            os.fsync(output.fileno())

@@ -6,7 +6,7 @@ from pathlib import Path
 from automotive_graphrag.app import create_app
 from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
-from automotive_graphrag.question_generation import QuestionGenerationService
+from automotive_graphrag.question_generation import QuestionGenerationService, normalize_question
 from automotive_graphrag.source_sampling import SourceSamplingService
 
 
@@ -134,6 +134,28 @@ class QuestionGenerationServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ProjectError, "未使用繁體中文"):
             service.generate("L33-SM3E", self.sample_batch.sample_batch_id, 1)
+
+    def test_generate_for_document_uses_selected_model_and_only_its_samples(self) -> None:
+        document_sample = next(item for item in self.sample_batch.samples if item.document_id == "WW.pdf")
+        client = FakeGenerationClient({
+            "questions": [{
+                "question": "雨刷馬達不作動先檢查什麼？",
+                "reference_answer": "先檢查保險絲與電源供應。",
+                "source_sample_ids": [document_sample.sample_id],
+            }]
+        })
+        service = QuestionGenerationService(self.store, self.sampling, self.connections, client)
+
+        questions = service.generate_for_document(
+            "L33-SM3E", "WW.pdf", self.sample_batch.samples, 1, "gpt-4.1-mini"
+        )
+
+        self.assertEqual(client.calls[0][2], "gpt-4.1-mini")
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0].gold_evidence[0].document_id, "WW.pdf")
+
+    def test_duplicate_question_normalization_ignores_punctuation_and_width(self) -> None:
+        self.assertEqual(normalize_question("ＡＢＣ？ 雨刷！"), normalize_question("abc 雨刷"))
 
     def test_cross_section_requires_sources_from_two_sections(self) -> None:
         ww_batch = self.sampling.sample(

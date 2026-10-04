@@ -111,6 +111,20 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.error, "query failed")
         self.assertEqual(service.history("L33-SM3E")[0], result)
 
+    def test_query_can_override_chat_model(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+
+        service.ask("L33-SM3E", "測試模型", chat_model="gpt-4.1-mini")
+
+        settings = yaml.safe_load((self.graph_root / "settings.yaml").read_text())
+        self.assertEqual(settings["completion_models"]["default_completion_model"]["model"], "gpt-4.1-mini")
+
+    def test_query_rejects_unknown_chat_model(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+
+        with self.assertRaisesRegex(ProjectError, "不支援的 Chat 模型"):
+            service.ask("L33-SM3E", "測試模型", chat_model="not-a-model")
+
     def test_query_saves_context_and_resolved_evidence(self) -> None:
         service = QueryService(
             self.store,

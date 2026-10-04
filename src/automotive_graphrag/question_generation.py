@@ -6,15 +6,16 @@ import json
 import os
 import re
 import tempfile
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
-from .connections import ConnectionSettings
+from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings
 from .projects import ProjectError, ProjectStore
 from .question_sets import GoldEvidence
 from .source_sampling import SourceSample, SourceSampleBatch, SourceSamplingService
@@ -112,6 +113,71 @@ class QuestionGenerationService:
         )
         self._write(batch)
         return batch
+
+    def generate_for_document(
+        self,
+        project_id: str,
+        document_id: str,
+        samples: Sequence[SourceSample],
+        question_count: int,
+        model: str,
+        maximum_source_characters: int = 2500,
+        excluded_questions: Sequence[str] = (),
+    ) -> tuple[GeneratedQuestion, ...]:
+        if question_count < 1:
+            raise ProjectError("每份 PDF 生成題數必須是正整數")
+        if maximum_source_characters < 200:
+            raise ProjectError("每筆來源字數上限不可小於 200")
+        if model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError(f"不支援的題目生成模型：{model}")
+        document_samples = tuple(item for item in samples if item.document_id == document_id)
+        if not document_samples:
+            raise ProjectError(f"PDF {document_id} 沒有可用的前處理原文")
+
+        sample_batch = SourceSampleBatch(
+            sample_batch_id=uuid.uuid4().hex,
+            project_id=project_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            section_ids=tuple(sorted({item.section_id for item in document_samples})),
+            page_from=None,
+            page_to=None,
+            content_type="all",
+            minimum_characters=1,
+            seed=0,
+            requested_count=len(document_samples),
+            samples=document_samples,
+        )
+        prompt = self._build_prompt(
+            sample_batch,
+            question_count,
+            "simple",
+            maximum_source_characters,
+        )
+        if excluded_questions:
+            prompt += (
+                "\n以下既有題目禁止重複或只換同義詞，請生成不同考點的問題："
+                + json.dumps(list(excluded_questions), ensure_ascii=False)
+            )
+        api_key = self.connections.apply_to_environment(project_id)
+        try:
+            response = self.client(
+                self.connections.get_api_base_url(),
+                api_key,
+                model,
+                prompt,
+            )
+        except ProjectError:
+            raise
+        except Exception as exc:
+            raise ProjectError(f"{document_id} 題目生成 API 呼叫失敗：{exc}") from exc
+        questions = self._parse_response(response, sample_batch, question_count, "simple")
+        seen: set[str] = set()
+        for item in questions:
+            normalized = normalize_question(item.question)
+            if normalized in seen:
+                raise ProjectError(f"{document_id} 的生成結果有重複題目，請重新執行")
+            seen.add(normalized)
+        return tuple(questions)
 
     def get(self, project_id: str, generation_batch_id: str) -> GeneratedQuestionBatch:
         if not generation_batch_id.isalnum():
@@ -373,3 +439,12 @@ class QuestionGenerationService:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+
+def normalize_question(value: str) -> str:
+    """Normalize whitespace and punctuation for cross-PDF duplicate detection."""
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKC", value).casefold()
+        if character.isalnum()
+    )

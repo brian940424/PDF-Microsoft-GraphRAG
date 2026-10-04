@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .connections import ConnectionSettings
+from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings
 from .evidence import Evidence
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
@@ -74,6 +74,8 @@ class AutomaticEvaluationService:
         rerun_answers: bool = False,
         only_previous_failures: bool = False,
         maximum_evidence_characters: int = 1200,
+        model: str | None = None,
+        allow_missing_gold: bool = False,
     ) -> AutomaticEvaluationResult:
         if not isinstance(top_k, int) or top_k < 1:
             raise ProjectError("Top-K 必須是正整數")
@@ -92,22 +94,26 @@ class AutomaticEvaluationService:
         eligible = [
             item
             for item in question_set.questions
-            if item.reference_answer and item.gold_evidence and (selected_ids is None or item.question_id in selected_ids)
+            if item.reference_answer
+            and (allow_missing_gold or item.gold_evidence)
+            and (selected_ids is None or item.question_id in selected_ids)
         ]
         if not eligible:
-            raise ProjectError("題目集沒有同時包含 Reference Answer 與 Gold Evidence 的題目")
+            raise ProjectError("題目集沒有包含可評判參考答案（及所需 Gold Evidence）的題目")
         if rerun_answers:
             target_ids = [item.question_id for item in eligible]
             question_set = self.question_sets.run(project_id, question_set_id, selected_question_ids=target_ids)
             eligible = [item for item in question_set.questions if item.question_id in set(target_ids)]
-        incomplete = [item.question_id for item in eligible if item.status != "COMPLETED" or not item.answer]
-        if incomplete:
-            raise ProjectError(f"以下題目尚未完成系統回答：{', '.join(incomplete)}")
+        eligible = [item for item in eligible if item.status == "COMPLETED" and item.answer]
+        if not eligible:
+            raise ProjectError("沒有已完成回答且包含參考答案的題目可供評判")
 
         prompt = self._build_prompt(eligible, top_k, maximum_evidence_characters)
         api_key = self.connections.apply_to_environment(project_id)
         base_url = self.connections.get_api_base_url()
-        model = self.connections.get_chat_model()
+        model = model or self.connections.get_chat_model()
+        if model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError(f"不支援的評判模型：{model}")
         try:
             response = self.client(base_url, api_key, model, prompt)
         except ProjectError:

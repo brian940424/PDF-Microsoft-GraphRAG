@@ -12,6 +12,7 @@ from pathlib import Path
 import gradio as gr
 
 from .automatic_evaluation import AutomaticEvaluationService
+from .automatic_qa import AutomaticQATestService
 from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
 from .documents import DocumentInfo, DocumentService
 from .downloads import stage_downloads
@@ -67,6 +68,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     source_sampling = SourceSamplingService(store)
     question_generation = QuestionGenerationService(store, source_sampling, connections)
     automatic_evaluation = AutomaticEvaluationService(store, question_sets, connections)
+    automatic_qa = AutomaticQATestService(
+        store, source_sampling, question_generation, querying, question_sets,
+        automatic_evaluation, retrieval_evaluation,
+    )
 
     def connection_status(project_id: str | None = None) -> str:
         return (
@@ -527,6 +532,99 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", None, None
         return "✅ 已匯出自動評測 JSON 與 CSV", str(json_path), str(csv_path)
 
+    def automatic_qa_rows(report):
+        questions = {item.question_id: item for item in report.question_set.questions}
+        judges = {item.question_id: item for item in report.judge.items} if report.judge else {}
+        retrieval = {item.question_id: item for item in report.retrieval.items} if report.retrieval else {}
+        rows = []
+        for question_id, question in questions.items():
+            judged = judges.get(question_id)
+            retrieved = retrieval.get(question_id)
+            evidence_docs = ", ".join(dict.fromkeys(item.document_id for item in question.gold_evidence)) or "—"
+            rows.append([
+                evidence_docs, question.question, question.answer, question.reference_answer,
+                "答對" if judged and judged.answer_score >= 4 else ("未評判" if not judged else "答錯"),
+                judged.answer_score if judged else None,
+                judged.evidence_support_score if judged else None,
+                judged.judge_reason if judged else (question.error or "尚無評判結果"),
+                retrieved.recall_at_5 if retrieved else None,
+                (1 / retrieved.first_relevant_rank if retrieved and retrieved.first_relevant_rank else 0) if retrieved else None,
+            ])
+        return rows
+
+    def automatic_qa_summary(report):
+        total = len(report.question_set.questions)
+        judged = {item.question_id: item for item in report.judge.items} if report.judge else {}
+        correct = sum(item.answer_score >= 4 for item in judged.values())
+        lines = [
+            "**題目集：** " + report.question_set.name + " (" + report.question_set.question_set_id + ")｜"
+            + "**答對：** " + str(correct) + "/" + str(total) + "（" + format(correct / total, ".1%") + "）｜評判 "
+            + str(len(judged)) + "/" + str(total) + " 題",
+            "**模型：** 生題 " + report.generation_model + "｜回答 " + report.answer_model + "｜評判 " + report.judge_model,
+        ]
+        if report.retrieval:
+            result = report.retrieval
+            lines.append(
+                "**Retrieval：** Recall@1 " + format(result.recall_at_1, ".1%")
+                + "｜Recall@3 " + format(result.recall_at_3, ".1%")
+                + "｜Recall@5 " + format(result.recall_at_5, ".1%")
+                + "｜MRR " + format(result.mrr, ".3f")
+                + "｜Evidence 命中率 " + format(result.evidence_source_accuracy, ".1%")
+                + "｜平均延遲 " + format(result.average_latency_seconds or 0, ".2f") + "s"
+            )
+        elif report.retrieval_error:
+            lines.append("**Retrieval 指標：** " + report.retrieval_error)
+        if report.judge_error:
+            lines.append("**評判提醒：** " + report.judge_error)
+        if report.generation_errors:
+            lines.append("**部分 PDF 生題未完成：** " + "；".join(report.generation_errors))
+        return "\n\n".join(lines)
+
+    def run_automatic_qa(project_id, count, parallel_generation, generation_model, answer_model, judge_model, method, concurrency):
+        if not project_id:
+            return "❌ 請先開啟專案", "", [], gr.Dropdown(choices=[]), None, None
+        try:
+            report = automatic_qa.generate_and_run(
+                project_id, int(count), parallel_generation, generation_model,
+                answer_model, judge_model, method, int(concurrency),
+            )
+            json_path, csv_path = question_sets.export(project_id, report.question_set.question_set_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
+        except (ProjectError, ValueError) as exc:
+            return "❌ " + str(exc), "", [], gr.Dropdown(choices=question_set_choices(project_id)), None, None
+        return (
+            "✅ 自動問答測試完成", automatic_qa_summary(report), automatic_qa_rows(report),
+            gr.Dropdown(choices=question_set_choices(project_id), value=report.question_set.question_set_id),
+            str(json_path), str(csv_path),
+        )
+
+    def run_selected_automatic_qa(project_id, question_set_id, answer_model, judge_model, method, concurrency):
+        if not project_id or not question_set_id:
+            return "❌ 請選取題目集", "", [], None, None
+        try:
+            report = automatic_qa.run_existing(
+                project_id, question_set_id, answer_model, judge_model, method, int(concurrency)
+            )
+            json_path, csv_path = question_sets.export(project_id, question_set_id)
+            json_path, csv_path = stage_downloads((json_path, csv_path))
+        except (ProjectError, ValueError) as exc:
+            return "❌ " + str(exc), "", [], None, None
+        return "✅ 已完成所選題目集測試", automatic_qa_summary(report), automatic_qa_rows(report), str(json_path), str(csv_path)
+
+    def import_automatic_question_set(project_id, uploaded):
+        if not project_id or not uploaded:
+            return "❌ 請先開啟專案並選擇 JSON 題目集", gr.Dropdown(choices=question_set_choices(project_id))
+        source = uploaded if isinstance(uploaded, (str, Path)) else getattr(uploaded, "name", None)
+        if not source:
+            return "❌ 無法讀取上傳檔案", gr.Dropdown(choices=question_set_choices(project_id))
+        try:
+            question_set = question_sets.import_file(project_id, source)
+        except ProjectError as exc:
+            return "❌ " + str(exc), gr.Dropdown(choices=question_set_choices(project_id))
+        return "✅ 已匯入題目集「" + question_set.name + "」", gr.Dropdown(
+            choices=question_set_choices(project_id), value=question_set.question_set_id
+        )
+
     def sampling_section_choices(project_id: str | None):
         if not project_id:
             return gr.Dropdown(choices=[], value=None)
@@ -850,6 +948,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
             gr.Dropdown(choices=choices, value=None),
+            gr.Dropdown(choices=choices, value=None),
             sampling_section_choices(project_id),
             [],
             "請選取或建立題目集",
@@ -995,7 +1094,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             with gr.Row():
                 selected_project = gr.Dropdown(
                     choices=project_choices(),
-                    label="選取專案",
+                    label="專案",
                     allow_custom_value=True,
                 )
                 open_project_button = gr.Button("開啟專案", variant="primary")
@@ -1091,6 +1190,48 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoscroll=True,
                 elem_id="indexing-log",
             )
+
+        with gr.Tab("自動問答測試"):
+            gr.Markdown(
+                "依已開啟專案中的每份 PDF 自動生成題目、執行 GraphRAG 問答及 LLM 評判。"
+                "系統會跨 PDF 去重；勾選平行生題時不同 PDF 可併行，同一 PDF 的請求仍會逐次執行。"
+            )
+            with gr.Row():
+                autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=3, minimum=1, maximum=30, precision=0)
+                autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                autoqa_generation_model = gr.Dropdown(
+                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
+                )
+            with gr.Row():
+                autoqa_answer_model = gr.Dropdown(
+                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
+                )
+                autoqa_judge_model = gr.Dropdown(
+                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評判模型"
+                )
+                autoqa_method = gr.Dropdown(
+                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+                    value="local", label="檢索模式",
+                )
+                autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=2, minimum=1, maximum=32, precision=0)
+            autoqa_generate_button = gr.Button("生成題目並開始自動測試", variant="primary")
+            with gr.Row():
+                autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
+                autoqa_import_button = gr.Button("匯入題目集")
+                autoqa_question_set = gr.Dropdown(label="已載入／已匯入題目集")
+                autoqa_run_selected_button = gr.Button("執行所選題目集")
+            autoqa_result = gr.Markdown()
+            autoqa_summary = gr.Markdown()
+            autoqa_table = gr.Dataframe(
+                headers=["PDF", "問題", "系統回答", "正確答案", "評判結果", "答案分數", "證據支持", "評判理由", "Recall@5", "RR"],
+                interactive=False,
+                datatype=["str", "str", "str", "str", "str", "number", "number", "str", "number", "number"],
+                label="逐題自動問答測試結果",
+                wrap=True,
+            )
+            with gr.Row():
+                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
+                autoqa_csv_export = gr.File(label="題目集 CSV（匯出）")
 
         with gr.Tab("問答測試"):
             with gr.Row():
@@ -1226,7 +1367,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 retrieval_json_export = gr.File(label="Retrieval JSON")
                 retrieval_csv_export = gr.File(label="Retrieval CSV")
 
-        with gr.Tab("自動評測"):
+        with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
                 "## 回答與證據自動評測\n"
                 "每批 Judge 僅呼叫 API 一次，預設使用 `gpt-4o-mini`；低分、Retrieval 失敗或低信心結果會標記待人工審查。"
@@ -1268,7 +1409,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 automatic_json_export = gr.File(label="自動評測 JSON")
                 automatic_csv_export = gr.File(label="自動評測 CSV")
 
-        with gr.Tab("題目生成"):
+        with gr.Tab("題目生成（已整合）", visible=False):
             gr.Markdown("## 原文取樣器")
             with gr.Row():
                 sampling_project_refresh = gr.Button("重新整理章節")
@@ -1377,7 +1518,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, autoqa_question_set, sampling_sections, saved_questions_table, question_set_summary],
         )
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
@@ -1419,7 +1560,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
+            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, review_question_set, gold_question_set, retrieval_question_set, automatic_question_set, autoqa_question_set, sampling_sections, saved_questions_table, question_set_summary],
         )
         upload_button.click(
             import_documents,
@@ -1441,6 +1582,34 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             remove_document,
             inputs=[document_project, removable_pdf, remove_pdf_confirmation],
             outputs=[document_result, document_table, processing_options_table, removable_pdf, remove_pdf_confirmation],
+        )
+        autoqa_generate_button.click(
+            run_automatic_qa,
+            inputs=[
+                automatic_project, autoqa_questions_per_pdf, autoqa_parallel_generation,
+                autoqa_generation_model, autoqa_answer_model, autoqa_judge_model,
+                autoqa_method, autoqa_answer_concurrency,
+            ],
+            outputs=[
+                autoqa_result, autoqa_summary, autoqa_table, autoqa_question_set,
+                autoqa_json_export, autoqa_csv_export,
+            ],
+        )
+        autoqa_import_button.click(
+            import_automatic_question_set,
+            inputs=[automatic_project, autoqa_import_file],
+            outputs=[autoqa_result, autoqa_question_set],
+        )
+        autoqa_run_selected_button.click(
+            run_selected_automatic_qa,
+            inputs=[
+                automatic_project, autoqa_question_set, autoqa_answer_model,
+                autoqa_judge_model, autoqa_method, autoqa_answer_concurrency,
+            ],
+            outputs=[
+                autoqa_result, autoqa_summary, autoqa_table,
+                autoqa_json_export, autoqa_csv_export,
+            ],
         )
         ask_button.click(
             ask_question,

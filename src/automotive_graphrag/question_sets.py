@@ -11,7 +11,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Iterable, Mapping, Protocol, Sequence
 
 from .evidence import Evidence
 from .projects import ProjectError, ProjectStore
@@ -115,6 +115,73 @@ class QuestionSetService:
         )
         self._write(question_set)
         return question_set
+
+    def create_with_questions(
+        self,
+        project_id: str,
+        name: str,
+        questions: Sequence[BatchQuestion],
+        description: str = "",
+        method: str = "local",
+    ) -> QuestionSet:
+        self.projects.get(project_id)
+        if not name.strip() or not questions:
+            raise ProjectError("題目集名稱與題目不可空白")
+        question_ids: set[str] = set()
+        normalized_questions: set[str] = set()
+        for item in questions:
+            normalized = "".join(item.question.casefold().split())
+            if not item.question.strip() or not item.reference_answer.strip():
+                raise ProjectError("自動問答題目必須同時包含問題與正確答案")
+            if item.question_id in question_ids or normalized in normalized_questions:
+                raise ProjectError("題目集內含重複題號或重複問題")
+            question_ids.add(item.question_id)
+            normalized_questions.add(normalized)
+        now = datetime.now(timezone.utc).isoformat()
+        question_set = QuestionSet(
+            question_set_id=uuid.uuid4().hex,
+            project_id=project_id,
+            name=name.strip(),
+            description=description.strip(),
+            method=method,
+            imported_at=now,
+            updated_at=now,
+            questions=tuple(questions),
+        )
+        self._write(question_set)
+        return question_set
+
+    def update_answers(
+        self,
+        project_id: str,
+        question_set_id: str,
+        results: Mapping[str, QueryResult],
+        method: str,
+    ) -> QuestionSet:
+        question_set = self.get(project_id, question_set_id)
+        questions: list[BatchQuestion] = []
+        for item in question_set.questions:
+            result = results.get(item.question_id)
+            if result is None:
+                questions.append(item)
+                continue
+            questions.append(
+                BatchQuestion(
+                    question_id=item.question_id,
+                    question=item.question,
+                    reference_answer=item.reference_answer,
+                    status=result.status,
+                    answer=result.answer,
+                    error=result.error,
+                    duration_seconds=result.duration_seconds,
+                    completed_at=result.completed_at,
+                    gold_evidence=item.gold_evidence,
+                    retrieved_evidence=result.evidence,
+                )
+            )
+        updated = self._replace(question_set, questions, method)
+        self._write(updated)
+        return updated
 
     def append_answered_question(
         self,
@@ -342,6 +409,19 @@ class QuestionSetService:
             question_id = raw.get("question_id")
             question = raw.get("question")
             reference_answer = raw.get("reference_answer", "")
+            answer = raw.get("answer", "")
+            status = raw.get("status", "PENDING")
+            error = raw.get("error")
+            duration_seconds = raw.get("duration_seconds")
+            completed_at = raw.get("completed_at")
+            retrieved_raw = raw.get("retrieved_evidence", [])
+            try:
+                if not isinstance(retrieved_raw, list):
+                    raise ValueError("retrieved_evidence 必須是陣列")
+                retrieved_evidence = tuple(Evidence(**item) for item in retrieved_raw)
+            except (TypeError, ValueError) as exc:
+                errors.append(f"{location}.retrieved_evidence：格式錯誤（{exc}）")
+                retrieved_evidence = ()
             try:
                 gold_evidence = QuestionSetService.parse_gold_evidence(raw.get("gold_evidence", []), location)
             except ProjectError as exc:
@@ -357,6 +437,10 @@ class QuestionSetService:
                 errors.append(f"{location}.question：必須是非空白字串")
             if not isinstance(reference_answer, str):
                 errors.append(f"{location}.reference_answer：必須是字串")
+            if not isinstance(answer, str):
+                errors.append(f"{location}.answer：必須是字串")
+            if status not in QUESTION_STATUSES:
+                errors.append(f"{location}.status：不支援的狀態")
             if (
                 isinstance(question_id, str)
                 and question_id.strip()
@@ -369,7 +453,13 @@ class QuestionSetService:
                         question_id.strip(),
                         question.strip(),
                         reference_answer=reference_answer.strip(),
+                        status=status if status in QUESTION_STATUSES else "PENDING",
+                        answer=answer.strip() if isinstance(answer, str) else "",
+                        error=error if isinstance(error, str) else None,
+                        duration_seconds=duration_seconds if isinstance(duration_seconds, (int, float)) else None,
+                        completed_at=completed_at if isinstance(completed_at, str) else None,
                         gold_evidence=gold_evidence,
+                        retrieved_evidence=retrieved_evidence,
                     )
                 )
         if errors:

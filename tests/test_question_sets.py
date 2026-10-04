@@ -69,11 +69,16 @@ class QuestionSetServiceTests(unittest.TestCase):
         }
 
     def test_import_validates_and_persists_question_set(self) -> None:
-        question_set = self.service.import_file("L33-SM3E", self.write_question_set(self.valid_value()))
+        value = self.valid_value()
+        value["questions"][0]["answer"] = "已完成的系統答案"
+        value["questions"][0]["status"] = "COMPLETED"
+        question_set = self.service.import_file("L33-SM3E", self.write_question_set(value))
 
         self.assertEqual(question_set.name, "雨刷測試集")
-        self.assertEqual([item.status for item in question_set.questions], ["PENDING"] * 3)
+        self.assertEqual([item.status for item in question_set.questions], ["COMPLETED", "PENDING", "PENDING"])
         self.assertEqual(question_set.questions[0].reference_answer, "參考答案一")
+        self.assertEqual(question_set.questions[0].answer, "已完成的系統答案")
+        self.assertEqual(question_set.questions[0].status, "COMPLETED")
         self.assertEqual(self.service.get("L33-SM3E", question_set.question_set_id), question_set)
 
     def test_create_set_and_append_question_with_answer(self) -> None:
