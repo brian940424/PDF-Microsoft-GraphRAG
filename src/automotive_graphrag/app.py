@@ -839,23 +839,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         retrieval_experiments.remove_group(project_id, group_id)
         return f"✅ 已移除實驗組 {group_id}", refresh_experiment_groups(revision)
 
-    def save_experiment_answer_model(project_id: str | None, group_id: str | None, answer_model: str | None):
+    def save_experiment_answer_model(project_id: str | None, group_id: str | None, answer_model: str | None, revision: int | None):
         if not project_id or not group_id or not answer_model:
-            return "請先選取實驗組與回答模型"
+            return "請先選取實驗組與回答模型", int(revision or 0)
         try:
             retrieval_experiments.set_group_answer_model(project_id, group_id, answer_model)
         except ProjectError as exc:
-            return f"❌ {exc}"
-        return f"✅ {group_id} 回答模型已儲存"
+            return f"❌ {exc}", int(revision or 0)
+        return f"✅ {group_id} 回答模型已儲存", refresh_experiment_groups(revision)
 
-    def save_experiment_method(project_id: str | None, group_id: str | None, method: str):
+    def save_experiment_method(project_id: str | None, group_id: str | None, method: str, revision: int | None):
         if not project_id or not group_id:
-            return "請先選取實驗組"
+            return "請先選取實驗組", int(revision or 0)
         try:
             retrieval_experiments.set_group_method(project_id, group_id, method)
         except ProjectError as exc:
-            return f"❌ {exc}"
-        return f"✅ {group_id} 檢索策略已儲存"
+            return f"❌ {exc}", int(revision or 0)
+        return f"✅ {group_id} 檢索策略已儲存", refresh_experiment_groups(revision)
 
     def run_retrieval_experiment(
         project_id: str | None, question_set_id: str | None, concurrency,
@@ -1669,20 +1669,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             answer_model = gr.Dropdown(
                                 choices=list(ALLOWED_CHAT_MODELS), value=group.get("answer_model", connections.get_chat_model()),
                                 label="回答模型",
+                                key=f"experiment-answer-model-{group['group_id']}",
                             )
                             strategy = gr.Dropdown(
                                 choices=strategy_choices, value=group.get("method", "local"),
                                 label="GraphRAG 檢索策略",
+                                key=f"experiment-strategy-{group['group_id']}",
                             )
-                    answer_model.change(
+                    answer_model.input(
                         save_experiment_answer_model,
-                        inputs=[active_project_id, group_id_state, answer_model],
-                        outputs=experiment_group_save_status,
+                        inputs=[active_project_id, group_id_state, answer_model, experiment_group_revision],
+                        outputs=[experiment_group_save_status, experiment_group_revision],
                     )
-                    strategy.change(
+                    strategy.input(
                         save_experiment_method,
-                        inputs=[active_project_id, group_id_state, strategy],
-                        outputs=experiment_group_save_status,
+                        inputs=[active_project_id, group_id_state, strategy, experiment_group_revision],
+                        outputs=[experiment_group_save_status, experiment_group_revision],
                     )
                     remove_button.click(
                         remove_experiment_group,

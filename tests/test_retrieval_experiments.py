@@ -197,7 +197,21 @@ class RetrievalExperimentTests(unittest.TestCase):
             self.assertEqual(kwargs["completion_model"], "gpt-4.1-mini")
 
     def test_app_exposes_retrieval_experiment_page_and_controls(self):
-        app = create_app(self.root / "ui-projects")
+        from gradio.context import LocalContext
+
+        ui_root = self.root / "ui-projects"
+        ui_projects = ProjectStore(ui_root)
+        ui_projects.create(
+            project_id="ui-project", display_name="UI 測試", vehicle_name="測試", manual_version="v1"
+        )
+        ui_sets = QuestionSetService(ui_projects)
+        ui_connections = ConnectionSettings(ui_root)
+        ui_service = RetrievalExperimentService(
+            ui_projects, ui_sets, ui_connections,
+            AutomaticEvaluationService(ui_projects, ui_sets, ui_connections),
+        )
+        ui_service.add_group("ui-project")
+        app = create_app(ui_root)
         labels = {
             component.get_config().get("label")
             for component in app.blocks.values()
@@ -209,6 +223,23 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertIn("測試最大並行請求數", labels)
         self.assertIn("實驗組摘要", labels)
         self.assertIn("逐題實驗結果", labels)
+
+        renderer = app.renderables[0]
+        LocalContext.blocks_config.set(app.default_config)
+        LocalContext.blocks.set(app)
+        try:
+            renderer.apply("ui-project", 0)
+        finally:
+            LocalContext.blocks_config.set(None)
+            LocalContext.blocks.set(None)
+        dynamic_handlers = [
+            fn for fn in app.default_config.fns.values() if fn.rendered_in is renderer
+        ]
+        self.assertEqual(
+            {fn.fn.__name__ for fn in dynamic_handlers},
+            {"save_experiment_answer_model", "save_experiment_method", "remove_experiment_group"},
+        )
+        self.assertTrue(all(len(fn.inputs) == 4 for fn in dynamic_handlers if fn.fn.__name__.startswith("save_experiment_")))
 
 
 if __name__ == "__main__":
