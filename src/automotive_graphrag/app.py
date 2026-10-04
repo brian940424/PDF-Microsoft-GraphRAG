@@ -789,11 +789,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ]
             results = [
                 [
-                    item.get("group_name"), item.get("answer_model"), item.get("judge_model"),
-                    item.get("question_id"), item.get("question"), ", ".join(item.get("source_documents", [])),
-                    item.get("correct_answer"), item.get("actual_answer"), item.get("evaluation_result"),
-                    item.get("evaluation_reason"), item.get("answer_source_rank"),
-                    item.get("retrieval_metrics_status"), item.get("status"), item.get("error"),
+                    item.get("group_name"), item.get("question_id"),
+                    ", ".join(item.get("source_documents", [])), item.get("question"),
+                    item.get("actual_answer"), item.get("correct_answer"),
+                    item.get("evaluation_result") == "correct",
+                    item.get("evaluation_reason") or item.get("error") or "",
                 ]
                 for item in run.get("results", [])
             ]
@@ -1738,6 +1738,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 headers=["題號", "題目", "正確答案", "題目來源", "答案來源"],
                 interactive=False,
                 datatype=["str", "str", "str", "str", "str"],
+                column_widths=["8%", "22%", "18%", "26%", "26%"],
                 label="目前匯入題目集",
                 wrap=True,
             )
@@ -1802,8 +1803,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
                 experiment_run_button = gr.Button("執行實驗", variant="primary")
                 experiment_stop_button = gr.Button("停止實驗", variant="stop")
-                experiment_export_button = gr.Button("匯出實驗結果 JSON")
-                experiment_export_file = gr.File(label="實驗結果 JSON")
             experiment_status = gr.Markdown()
             experiment_summary_table = gr.Dataframe(
                 headers=["實驗組名稱", "回答模型", "評測模型（全域）", "策略", "題數", "已完成", "答對", "正確率", "Recall@5", "Recall@10", "MRR", "檢索指標狀態"],
@@ -1813,12 +1812,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 wrap=True,
             )
             experiment_result_table = gr.Dataframe(
-                headers=["實驗組名稱", "回答模型", "評測模型（全域）", "題號", "題目", "來源文件", "標準答案", "實際答案", "評測結果", "評測理由", "答案來源排名", "檢索指標狀態", "狀態", "錯誤"],
+                headers=["實驗組名稱", "題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
                 interactive=False,
-                datatype=["str"] * 14,
+                datatype=["str", "str", "str", "str", "str", "str", "bool", "str"],
+                column_widths=["8%", "6%", "10%", "14%", "21%", "18%", "8%", "15%"],
                 label="逐題實驗結果",
                 wrap=True,
             )
+            gr.Markdown("### 匯出實驗結果")
+            with gr.Row():
+                experiment_export_button = gr.Button("匯出實驗結果 JSON")
+                experiment_export_file = gr.File(label="實驗結果 JSON")
+            experiment_export_status = gr.Markdown()
 
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
@@ -2089,7 +2094,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         experiment_export_button.click(
             export_retrieval_experiment,
             inputs=active_project_id,
-            outputs=[experiment_status, experiment_export_file],
+            outputs=[experiment_export_status, experiment_export_file],
         )
         autoqa_generate_button.click(
             generate_automatic_qa,

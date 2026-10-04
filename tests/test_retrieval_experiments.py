@@ -224,6 +224,39 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertIn("測試最大並行請求數", labels)
         self.assertIn("實驗組摘要", labels)
         self.assertIn("逐題實驗結果", labels)
+        component_configs = [
+            component.get_config()
+            for component in app.blocks.values()
+            if hasattr(component, "get_config")
+        ]
+        question_preview = next(
+            config for config in component_configs if config.get("label") == "目前匯入題目集"
+        )
+        self.assertEqual(question_preview["column_widths"], ["8%", "22%", "18%", "26%", "26%"])
+        experiment_results = next(
+            config for config in component_configs if config.get("label") == "逐題實驗結果"
+        )
+        self.assertEqual(
+            experiment_results["headers"],
+            ["實驗組名稱", "題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
+        )
+        self.assertEqual(experiment_results["datatype"][6], "bool")
+        self.assertEqual(
+            experiment_results["column_widths"],
+            ["8%", "6%", "10%", "14%", "21%", "18%", "8%", "15%"],
+        )
+        block_values = list(app.blocks.values())
+        result_table_position = next(
+            index for index, component in enumerate(block_values)
+            if hasattr(component, "get_config")
+            and component.get_config().get("label") == "逐題實驗結果"
+        )
+        export_button_position = next(
+            index for index, component in enumerate(block_values)
+            if hasattr(component, "get_config")
+            and component.get_config().get("value") == "匯出實驗結果 JSON"
+        )
+        self.assertGreater(export_button_position, result_table_position)
 
         renderer = app.renderables[0]
         LocalContext.blocks_config.set(app.default_config)
