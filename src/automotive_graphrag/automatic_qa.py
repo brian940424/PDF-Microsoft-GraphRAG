@@ -57,10 +57,13 @@ class AutomaticQATestService:
         parallel_pdf_generation: bool,
         generation_model: str,
         method: str = "local",
+        initial_pages: int = 5,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> QuestionSet:
         if questions_per_pdf < 1:
             raise ProjectError("每份 PDF 題數必須是正整數")
+        if initial_pages < 1:
+            raise ProjectError("每題初始取樣頁數必須是正整數")
         if generation_model not in ALLOWED_CHAT_MODELS:
             raise ProjectError(f"不支援的生題模型：{generation_model}")
         project = self.projects.get(project_id)
@@ -96,6 +99,7 @@ class AutomaticQATestService:
                     needed,
                     generation_model,
                     excluded_questions=excluded,
+                    initial_pages=initial_pages,
                 )
             if parallel_pdf_generation:
                 with ThreadPoolExecutor(max_workers=min(3, len(pending))) as pool:

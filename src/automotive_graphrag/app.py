@@ -759,7 +759,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ 自動儲存失敗：{exc}"
         return "✅ 題目與來源已自動儲存至目前專案"
 
-    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method, progress=gr.Progress()):
+    def generate_automatic_qa(project_id, count, initial_pages, parallel_generation, generation_model, method, progress=gr.Progress()):
         if not project_id:
             return "❌ 請先開啟專案", [], "", "", []
         try:
@@ -769,6 +769,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 parallel_generation,
                 generation_model,
                 method,
+                initial_pages=int(initial_pages),
                 progress_callback=lambda fraction, description: progress(fraction, desc=description),
             )
         except (ProjectError, ValueError) as exc:
@@ -1438,10 +1439,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         with gr.Tab("自動問答測試"):
             gr.Markdown(
                 "依已開啟專案中的每份 PDF 自動生成題目、執行 GraphRAG 問答及 LLM 評判。"
+                "每題先隨機抽取指定頁數，並由 LLM 檢查內容邊界是否截斷；若不完整會自動向前／後擴頁。"
                 "系統會跨 PDF 去重；勾選平行生題時不同 PDF 可併行，同一 PDF 的請求仍會逐次執行。"
             )
             with gr.Row():
                 autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
+                autoqa_initial_pages = gr.Number(label="每題初始取樣頁數", value=5, minimum=1, maximum=30, precision=0)
                 autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
                 autoqa_generation_model = gr.Dropdown(
                     choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
@@ -1710,7 +1713,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         autoqa_generate_button.click(
             generate_automatic_qa,
             inputs=[
-                automatic_project, autoqa_questions_per_pdf, autoqa_parallel_generation,
+                automatic_project, autoqa_questions_per_pdf, autoqa_initial_pages, autoqa_parallel_generation,
                 autoqa_generation_model, autoqa_method,
             ],
             outputs=[

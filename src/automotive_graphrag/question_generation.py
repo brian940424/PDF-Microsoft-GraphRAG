@@ -124,13 +124,13 @@ class QuestionGenerationService:
         samples: Sequence[SourceSample],
         question_count: int,
         model: str,
-        maximum_source_characters: int = 1500,
         excluded_questions: Sequence[str] = (),
+        initial_pages: int = 5,
     ) -> tuple[GeneratedQuestion, ...]:
         if question_count < 1:
             raise ProjectError("每份 PDF 生成題數必須是正整數")
-        if maximum_source_characters < 200:
-            raise ProjectError("每筆來源字數上限不可小於 200")
+        if initial_pages < 1:
+            raise ProjectError("初始取樣頁數必須是正整數")
         if model not in ALLOWED_CHAT_MODELS:
             raise ProjectError(f"不支援的題目生成模型：{model}")
         document_samples = tuple(item for item in samples if item.document_id == document_id)
@@ -138,13 +138,18 @@ class QuestionGenerationService:
             raise ProjectError(f"PDF {document_id} 沒有可用的前處理原文")
         pdf_path = self.projects.path_for(project_id) / "source" / document_id
         try:
-            import fitz
+            import pymupdf
 
-            with fitz.open(pdf_path) as pdf:
+            with pymupdf.open(pdf_path) as pdf:
                 page_count = pdf.page_count
         except (ImportError, OSError, RuntimeError):
             page_count = max(sample.page for sample in document_samples)
-        windows = self._sample_page_windows(document_samples, question_count, page_count)
+        windows = self._sample_page_windows(document_samples, question_count, page_count, initial_pages)
+        api_key = self.connections.apply_to_environment(project_id)
+        api_base_url = self.connections.get_api_base_url()
+        windows = self._expand_incomplete_windows(
+            document_id, windows, document_samples, page_count, api_base_url, api_key, model
+        )
         source_by_id = {
             sample.sample_id: sample
             for _, _, window_samples in windows
@@ -169,15 +174,10 @@ class QuestionGenerationService:
             requested_count=len(selected_samples),
             samples=selected_samples,
         )
-        prompt = self._build_windowed_prompt(
-            windows,
-            maximum_source_characters,
-            excluded_questions,
-        )
-        api_key = self.connections.apply_to_environment(project_id)
+        prompt = self._build_windowed_prompt(windows, excluded_questions)
         try:
             response = self.client(
-                self.connections.get_api_base_url(),
+                api_base_url,
                 api_key,
                 model,
                 prompt,
@@ -203,13 +203,16 @@ class QuestionGenerationService:
 
     @staticmethod
     def _sample_page_windows(
-        samples: Sequence[SourceSample], question_count: int, page_count: int | None = None
+        samples: Sequence[SourceSample],
+        question_count: int,
+        page_count: int | None = None,
+        initial_pages: int = 5,
     ) -> list[tuple[int, int, tuple[SourceSample, ...]]]:
         samples_by_page: dict[int, list[SourceSample]] = {}
         for sample in samples:
             samples_by_page.setdefault(sample.page, []).append(sample)
         max_page = max(page_count or 0, max(samples_by_page))
-        window_size = min(5, max_page)
+        window_size = min(initial_pages, max_page)
         last_start = max(1, max_page - window_size + 1)
         candidates = []
         for start in range(1, last_start + 1):
@@ -231,9 +234,105 @@ class QuestionGenerationService:
         ]
 
     @staticmethod
+    def _build_completeness_prompt(
+        windows: Sequence[tuple[int, int, tuple[SourceSample, ...]]], page_count: int
+    ) -> str:
+        payload = []
+        for index, (start, end, samples) in enumerate(windows, start=1):
+            ordered = sorted(samples, key=lambda item: (item.page, item.block_id))
+            first = next((item for item in ordered if item.page == start), ordered[0])
+            last = next((item for item in reversed(ordered) if item.page == end), ordered[-1])
+            payload.append({
+                "window_id": f"W{index:04d}",
+                "pages": [start, end],
+                "document_page_count": page_count,
+                "beginning_boundary": {"page": first.page, "text": first.text[:1800]},
+                "ending_boundary": {"page": last.page, "text": last.text[-1800:]},
+            })
+        return (
+            "你是技術手冊內容完整性檢查器。檢查每個隨機頁面範圍的開頭和結尾，判斷是否切在同一段完整訊息、"
+            "操作步驟、條件說明或句子中間。不要因為內容不是整章就要求擴頁；只有邊界明顯承接到範圍外才算截斷。\n"
+            "若開頭承接前文，設 expand_before=true；若結尾承接後文，設 expand_after=true。"
+            "若兩端都完整，設 complete=true。頁面範圍已到文件邊界時，不可要求超出文件擴頁；若仍無法構成完整訊息，設 complete=false 並標註相應方向。\n"
+            "只輸出 JSON object："
+            '{"windows":[{"window_id":"W0001","complete":true,"expand_before":false,'
+            '"expand_after":false,"reason":"..."}]}\n'
+            f"待檢查範圍：{json.dumps(payload, ensure_ascii=False)}"
+        )
+
+    def _expand_incomplete_windows(
+        self,
+        document_id: str,
+        windows: list[tuple[int, int, tuple[SourceSample, ...]]],
+        document_samples: Sequence[SourceSample],
+        page_count: int,
+        api_base_url: str,
+        api_key: str,
+        model: str,
+    ) -> list[tuple[int, int, tuple[SourceSample, ...]]]:
+        samples_by_page: dict[int, list[SourceSample]] = {}
+        for sample in document_samples:
+            samples_by_page.setdefault(sample.page, []).append(sample)
+        for _ in range(max(page_count, 1)):
+            prompt = self._build_completeness_prompt(windows, page_count)
+            try:
+                response = self.client(api_base_url, api_key, model, prompt)
+            except ProjectError:
+                raise
+            except Exception as exc:
+                raise ProjectError(f"{document_id} 頁面完整性檢查 API 呼叫失敗：{exc}") from exc
+            decisions = self._parse_completeness_response(response, len(windows))
+            if all(item["complete"] for item in decisions):
+                return windows
+            expanded = []
+            for (start, end, _), decision in zip(windows, decisions):
+                if decision["complete"]:
+                    expanded.append((start, end, tuple(
+                        sample for page in range(start, end + 1) for sample in samples_by_page.get(page, ())
+                    )))
+                    continue
+                new_start = max(1, start - int(decision["expand_before"]))
+                new_end = min(page_count, end + int(decision["expand_after"]))
+                if (new_start, new_end) == (start, end):
+                    reason = decision["reason"] or "範圍已到文件邊界"
+                    raise ProjectError(f"{document_id} 第 {start}-{end} 頁仍有不完整內容，且無法再擴頁：{reason}")
+                expanded.append((new_start, new_end, tuple(
+                    sample for page in range(new_start, new_end + 1) for sample in samples_by_page.get(page, ())
+                )))
+            windows = expanded
+        raise ProjectError(f"{document_id} 頁面完整性檢查達到文件頁數上限仍未完成")
+
+    @staticmethod
+    def _parse_completeness_response(response: object, expected_count: int) -> list[dict[str, object]]:
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+            except json.JSONDecodeError as exc:
+                raise ProjectError("頁面完整性檢查結果不是有效 JSON") from exc
+        if not isinstance(response, dict) or not isinstance(response.get("windows"), list):
+            raise ProjectError("頁面完整性檢查結果缺少 windows 陣列")
+        records = response["windows"]
+        if len(records) != expected_count:
+            raise ProjectError(f"頁面完整性檢查回傳 {len(records)} 個範圍，預期 {expected_count} 個")
+        result = []
+        for index, record in enumerate(records, start=1):
+            if not isinstance(record, dict) or not isinstance(record.get("complete"), bool):
+                raise ProjectError(f"頁面完整性檢查第 {index} 筆格式錯誤")
+            if record.get("window_id") != f"W{index:04d}":
+                raise ProjectError(f"頁面完整性檢查第 {index} 筆範圍 ID 不符")
+            before = record.get("expand_before", False)
+            after = record.get("expand_after", False)
+            reason = record.get("reason", "")
+            if not isinstance(before, bool) or not isinstance(after, bool) or not isinstance(reason, str):
+                raise ProjectError(f"頁面完整性檢查第 {index} 筆擴頁方向格式錯誤")
+            if not record["complete"] and not before and not after:
+                raise ProjectError(f"頁面完整性檢查第 {index} 筆未完成但沒有指定擴頁方向")
+            result.append({"complete": record["complete"], "expand_before": before, "expand_after": after, "reason": reason})
+        return result
+
+    @staticmethod
     def _build_windowed_prompt(
         windows: Sequence[tuple[int, int, tuple[SourceSample, ...]]],
-        maximum_source_characters: int,
         excluded_questions: Sequence[str],
     ) -> str:
         window_payload = [
@@ -245,7 +344,7 @@ class QuestionGenerationService:
                         "sample_id": sample.sample_id,
                         "page": sample.page,
                         "section_id": sample.section_id,
-                        "text": sample.text[:maximum_source_characters],
+                        "text": sample.text,
                     }
                     for sample in samples
                 ],
@@ -254,7 +353,7 @@ class QuestionGenerationService:
         ]
         prompt = (
             "你是汽車維修手冊題目設計器。只能使用提供的原文，不可加入外部知識。\n"
-            "每個 window 是為一道題隨機抽取的連續五頁（文件不足五頁時使用該文件全部頁面）。"
+            "每個 window 是為一道題隨機抽取的連續頁面範圍，已先經 LLM 檢查；若邊界訊息不完整，範圍已向前或向後擴展。"
             "每個 window 必須且只能生成一道題，依照 window 順序輸出；不得跨 window 混用來源。\n"
             "問題與參考答案必須使用繁體中文；零件名稱、縮寫、DTC、單位與原廠術語可保留英文。"
             "不得因翻譯加入原文沒有的資訊。問題不可直接暴露答案。\n"
