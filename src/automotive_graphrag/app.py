@@ -759,12 +759,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ 自動儲存失敗：{exc}"
         return "✅ 題目與來源已自動儲存至目前專案"
 
-    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method):
+    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method, progress=gr.Progress()):
         if not project_id:
             return "❌ 請先開啟專案", [], "", "", []
         try:
             question_set = automatic_qa.generate_question_set(
-                project_id, int(count), parallel_generation, generation_model, method,
+                project_id,
+                int(count),
+                parallel_generation,
+                generation_model,
+                method,
+                progress_callback=lambda fraction, description: progress(fraction, desc=description),
             )
         except (ProjectError, ValueError) as exc:
             return "❌ " + str(exc), [], "", "", []

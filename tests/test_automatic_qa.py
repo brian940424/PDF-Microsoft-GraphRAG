@@ -127,7 +127,7 @@ class AutomaticQATests(unittest.TestCase):
             self.assertIn("test judge unavailable", report.judge_error)
 
     def test_parallel_generation_never_overlaps_for_the_same_pdf(self):
-        for parallel, expected_maximum in ((False, 1), (True, 2)):
+        for parallel, expected_maximum in ((False, 1), (True, 3)):
             with self.subTest(parallel=parallel), tempfile.TemporaryDirectory() as temporary:
                 store = ProjectStore(Path(temporary) / "projects")
                 project = store.create(
@@ -135,11 +135,11 @@ class AutomaticQATests(unittest.TestCase):
                 )
                 store.update_status("TEST", "INDEXED")
                 source = store.path_for(project.project_id) / "source"
-                (source / "one.pdf").write_bytes(b"")
-                (source / "two.pdf").write_bytes(b"")
+                for document in ("one.pdf", "two.pdf", "three.pdf", "four.pdf"):
+                    (source / document).write_bytes(b"")
                 generation = ConcurrentGeneration()
                 service = AutomaticQATestService(
-                    store, FakeSampling(["one.pdf", "two.pdf"]), generation, ConcurrentQuery(),
+                    store, FakeSampling(["one.pdf", "two.pdf", "three.pdf", "four.pdf"]), generation, ConcurrentQuery(),
                     QuestionSetService(store), NoJudge(), NoRetrieval(),
                 )
 
@@ -148,7 +148,7 @@ class AutomaticQATests(unittest.TestCase):
                     "gpt-4o-mini", "local", 1,
                 )
 
-                self.assertEqual(len(report.question_set.questions), 2)
+                self.assertEqual(len(report.question_set.questions), 4)
                 self.assertEqual(generation.maximum_active, expected_maximum)
                 self.assertEqual(set(generation.maximum_by_document.values()), {1})
 

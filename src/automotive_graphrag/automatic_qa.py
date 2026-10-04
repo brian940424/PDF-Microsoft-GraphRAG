@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Callable
 
 from .automatic_evaluation import AutomaticEvaluationResult, AutomaticEvaluationService
 from .connections import ALLOWED_CHAT_MODELS
@@ -56,6 +57,7 @@ class AutomaticQATestService:
         parallel_pdf_generation: bool,
         generation_model: str,
         method: str = "local",
+        progress_callback: Callable[[float, str], None] | None = None,
     ) -> QuestionSet:
         if questions_per_pdf < 1:
             raise ProjectError("每份 PDF 題數必須是正整數")
@@ -76,6 +78,8 @@ class AutomaticQATestService:
         accepted: dict[str, list] = {document_id: [] for document_id in pdf_ids}
         seen: set[str] = set()
         errors: list[str] = []
+        if progress_callback:
+            progress_callback(0, f"準備為 {len(pdf_ids)} 份 PDF 生成題目")
         # Each wave submits at most one request for any PDF. Waves only advance
         # after all previous requests finish, so retries can safely see all results.
         for _attempt in range(3):
@@ -94,22 +98,32 @@ class AutomaticQATestService:
                     excluded_questions=excluded,
                 )
             if parallel_pdf_generation:
-                with ThreadPoolExecutor(max_workers=len(pending)) as pool:
+                with ThreadPoolExecutor(max_workers=min(3, len(pending))) as pool:
                     futures = {pool.submit(generate_one, item): item for item in pending}
                     generated = {}
+                    finished = 0
                     for future in as_completed(futures):
                         doc = futures[future]
+                        finished += 1
                         try:
                             generated[doc] = future.result()
                         except Exception as exc:
                             errors.append(f"{doc}：{exc}")
+                        if progress_callback:
+                            fraction = min(0.95, ((_attempt * len(pdf_ids)) + finished) / (3 * len(pdf_ids)))
+                            progress_callback(fraction, f"第 {_attempt + 1} 輪：已完成 {finished}/{len(pending)} 份 PDF")
             else:
                 generated = {}
-                for doc in pending:
+                for position, doc in enumerate(pending, start=1):
+                    if progress_callback:
+                        progress_callback(0, f"第 {_attempt + 1} 輪：正在生成 {position}/{len(pending)} — {doc}")
                     try:
                         generated[doc] = generate_one(doc)
                     except Exception as exc:
                         errors.append(f"{doc}：{exc}")
+                    if progress_callback:
+                        fraction = min(0.95, ((_attempt * len(pdf_ids)) + position) / (3 * len(pdf_ids)))
+                        progress_callback(fraction, f"第 {_attempt + 1} 輪：已完成 {position}/{len(pending)} 份 PDF")
             for doc in pending:
                 for question in generated.get(doc, ()):
                     normalized = normalize_question(question.question)
@@ -117,6 +131,9 @@ class AutomaticQATestService:
                         continue
                     seen.add(normalized)
                     accepted[doc].append(question)
+
+        if progress_callback:
+            progress_callback(1, "題目生成完成，正在儲存題目集")
 
         batch_questions: list[BatchQuestion] = []
         for questions in accepted.values():

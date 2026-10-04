@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from automotive_graphrag.app import create_app
@@ -154,6 +155,20 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         self.assertEqual(client.calls[0][2], "gpt-4.1-mini")
         self.assertEqual(len(questions), 1)
         self.assertEqual(questions[0].gold_evidence[0].document_id, "WW.pdf")
+
+    def test_document_generation_limits_samples_and_spreads_them_across_the_document(self) -> None:
+        sample = self.sample_batch.samples[0]
+        samples = [
+            replace(sample, sample_id=f"sample-{index}", chunk_id=f"chunk-{index}", page=index + 1)
+            for index in range(60)
+        ]
+
+        selected = QuestionGenerationService._select_representative_samples(samples, question_count=10)
+
+        self.assertEqual(len(selected), 20)
+        self.assertEqual(selected[0].page, 1)
+        self.assertEqual(selected[-1].page, 60)
+        self.assertEqual(list(selected), sorted(selected, key=lambda item: item.page))
 
     def test_generated_question_tracks_question_and_answer_pages_separately(self) -> None:
         samples = [item for item in self.sample_batch.samples if item.document_id == "WW.pdf"]

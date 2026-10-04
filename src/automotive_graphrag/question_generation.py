@@ -123,7 +123,7 @@ class QuestionGenerationService:
         samples: Sequence[SourceSample],
         question_count: int,
         model: str,
-        maximum_source_characters: int = 2500,
+        maximum_source_characters: int = 1500,
         excluded_questions: Sequence[str] = (),
     ) -> tuple[GeneratedQuestion, ...]:
         if question_count < 1:
@@ -135,6 +135,7 @@ class QuestionGenerationService:
         document_samples = tuple(item for item in samples if item.document_id == document_id)
         if not document_samples:
             raise ProjectError(f"PDF {document_id} 沒有可用的前處理原文")
+        document_samples = self._select_representative_samples(document_samples, question_count)
 
         sample_batch = SourceSampleBatch(
             sample_batch_id=uuid.uuid4().hex,
@@ -180,6 +181,18 @@ class QuestionGenerationService:
                 raise ProjectError(f"{document_id} 的生成結果有重複題目，請重新執行")
             seen.add(normalized)
         return tuple(questions)
+
+    @staticmethod
+    def _select_representative_samples(samples: Sequence[SourceSample], question_count: int) -> tuple[SourceSample, ...]:
+        """Bound prompt size while spreading selected evidence across the document."""
+        limit = min(24, max(12, question_count * 2))
+        if len(samples) <= limit:
+            return tuple(samples)
+        indexes = {
+            round(index * (len(samples) - 1) / (limit - 1))
+            for index in range(limit)
+        }
+        return tuple(samples[index] for index in sorted(indexes))
 
     def get(self, project_id: str, generation_batch_id: str) -> GeneratedQuestionBatch:
         if not generation_batch_id.isalnum():
@@ -449,7 +462,12 @@ class QuestionGenerationService:
             with urllib.request.urlopen(request, timeout=120) as response:
                 value = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise ProjectError(f"題目生成 API 回應 HTTP {exc.code}") from exc
+            try:
+                detail = exc.read(1200).decode("utf-8", errors="replace").strip()
+            except OSError:
+                detail = ""
+            suffix = f"：{detail}" if detail else ""
+            raise ProjectError(f"題目生成 API 回應 HTTP {exc.code}{suffix}") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ProjectError("題目生成 API 無法連線或回應格式錯誤") from exc
         try:
