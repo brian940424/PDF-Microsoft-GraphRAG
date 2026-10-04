@@ -430,8 +430,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             return f"❌ {exc}", "", [], gr.Dropdown(choices=[]), []
         summary = (
-            f"Recall@1 `{result.recall_at_1:.3f}`｜Recall@3 `{result.recall_at_3:.3f}`｜"
-            f"Recall@5 `{result.recall_at_5:.3f}`｜MRR `{result.mrr:.3f}`｜"
+            f"Recall@5 `{result.recall_at_5:.3f}`｜Recall@10 `{result.recall_at_10:.3f}`｜"
+            f"MRR `{result.mrr:.3f}`｜"
             f"Avg First Rank `{result.average_first_relevant_rank if result.average_first_relevant_rank is not None else 'N/A'}`｜"
             f"Source Accuracy `{result.evidence_source_accuracy:.3f}`｜"
             f"Avg Latency `{result.average_latency_seconds if result.average_latency_seconds is not None else 'N/A'}` 秒"
@@ -662,9 +662,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if report.retrieval:
             result = report.retrieval
             lines.append(
-                "**Retrieval：** Recall@1 " + format(result.recall_at_1, ".1%")
-                + "｜Recall@3 " + format(result.recall_at_3, ".1%")
-                + "｜Recall@5 " + format(result.recall_at_5, ".1%")
+                "**Retrieval：** Recall@5 " + format(result.recall_at_5, ".1%")
+                + "｜Recall@10 " + format(result.recall_at_10, ".1%")
                 + "｜MRR " + format(result.mrr, ".3f")
                 + "｜Evidence 命中率 " + format(result.evidence_source_accuracy, ".1%")
                 + "｜平均延遲 " + format(result.average_latency_seconds or 0, ".2f") + "s"
@@ -721,8 +720,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             summary = f"**最近題目集：** {question_set.name}｜尚無已儲存的自動問答評判結果。"
         if retrieval:
             summary += (
-                f"\n\n**Retrieval：** Recall@1 {retrieval.recall_at_1:.1%}"
-                f"｜Recall@3 {retrieval.recall_at_3:.1%}｜Recall@5 {retrieval.recall_at_5:.1%}"
+                f"\n\n**Retrieval：** Recall@5 {retrieval.recall_at_5:.1%}"
+                f"｜Recall@10 {retrieval.recall_at_10:.1%}"
                 f"｜MRR {retrieval.mrr:.3f}｜Evidence 命中率 {retrieval.evidence_source_accuracy:.1%}"
             )
         return (

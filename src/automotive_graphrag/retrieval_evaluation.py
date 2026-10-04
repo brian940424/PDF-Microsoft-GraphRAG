@@ -23,9 +23,8 @@ class RetrievalEvaluationItem:
     gold_evidence: tuple[GoldEvidence, ...]
     retrieved_evidence: tuple[Evidence, ...]
     first_relevant_rank: int | None
-    recall_at_1: bool
-    recall_at_3: bool
     recall_at_5: bool
+    recall_at_10: bool
     passed_at_k: bool
     duration_seconds: float | None
 
@@ -37,9 +36,8 @@ class RetrievalEvaluationResult:
     evaluated_at: str
     top_k: int
     question_count: int
-    recall_at_1: float
-    recall_at_3: float
     recall_at_5: float
+    recall_at_10: float
     mrr: float
     average_first_relevant_rank: float | None
     evidence_source_accuracy: float
@@ -95,9 +93,8 @@ class RetrievalEvaluationService:
             evaluated_at=datetime.now(timezone.utc).isoformat(),
             top_k=top_k,
             question_count=count,
-            recall_at_1=sum(item.recall_at_1 for item in items) / count,
-            recall_at_3=sum(item.recall_at_3 for item in items) / count,
             recall_at_5=sum(item.recall_at_5 for item in items) / count,
+            recall_at_10=sum(item.recall_at_10 for item in items) / count,
             mrr=sum(1 / rank for rank in ranks) / count,
             average_first_relevant_rank=sum(ranks) / len(ranks) if ranks else None,
             evidence_source_accuracy=(relevant_evidence / len(considered_evidence) if considered_evidence else 0.0),
@@ -115,6 +112,12 @@ class RetrievalEvaluationService:
             return None
         items = []
         for item in value.pop("items"):
+            item.pop("recall_at_1", None)
+            item.pop("recall_at_3", None)
+            item.setdefault(
+                "recall_at_10",
+                item.get("first_relevant_rank") is not None and item["first_relevant_rank"] <= 10,
+            )
             item["gold_evidence"] = tuple(
                 GoldEvidence(
                     document_id=gold["document_id"],
@@ -125,6 +128,9 @@ class RetrievalEvaluationService:
             )
             item["retrieved_evidence"] = tuple(Evidence(**evidence) for evidence in item["retrieved_evidence"])
             items.append(RetrievalEvaluationItem(**item))
+        value.pop("recall_at_1", None)
+        value.pop("recall_at_3", None)
+        value.setdefault("recall_at_10", sum(item.recall_at_10 for item in items) / len(items))
         return RetrievalEvaluationResult(**value, items=tuple(items))
 
     def export(self, project_id: str, question_set_id: str) -> tuple[Path, Path]:
@@ -142,9 +148,8 @@ class RetrievalEvaluationService:
             "gold_evidence",
             "retrieved_evidence",
             "first_relevant_rank",
-            "recall_at_1",
-            "recall_at_3",
             "recall_at_5",
+            "recall_at_10",
             "passed_at_k",
             "duration_seconds",
         ]
@@ -174,9 +179,8 @@ class RetrievalEvaluationService:
             gold_evidence=item.gold_evidence,
             retrieved_evidence=item.retrieved_evidence,
             first_relevant_rank=first_rank,
-            recall_at_1=first_rank is not None and first_rank <= 1,
-            recall_at_3=first_rank is not None and first_rank <= 3,
             recall_at_5=first_rank is not None and first_rank <= 5,
+            recall_at_10=first_rank is not None and first_rank <= 10,
             passed_at_k=first_rank is not None and first_rank <= top_k,
             duration_seconds=item.duration_seconds,
         )

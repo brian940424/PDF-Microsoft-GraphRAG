@@ -2,6 +2,7 @@ import csv
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -101,9 +102,8 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
     def test_evaluate_computes_recall_mrr_rank_accuracy_and_latency(self) -> None:
         result = self.service.evaluate("L33-SM3E", self.question_set.question_set_id, top_k=3)
 
-        self.assertAlmostEqual(result.recall_at_1, 1 / 3)
-        self.assertAlmostEqual(result.recall_at_3, 2 / 3)
         self.assertAlmostEqual(result.recall_at_5, 2 / 3)
+        self.assertAlmostEqual(result.recall_at_10, 2 / 3)
         self.assertAlmostEqual(result.mrr, 0.5)
         self.assertEqual(result.average_first_relevant_rank, 1.5)
         self.assertEqual(result.evidence_source_accuracy, 0.5)
@@ -114,6 +114,18 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
             self.service.last_result("L33-SM3E", self.question_set.question_set_id),
             result,
         )
+
+    def test_recall_at_10_includes_a_relevant_result_at_rank_ten(self) -> None:
+        question = self.question_sets.get("L33-SM3E", self.question_set.question_set_id).questions[0]
+        retrieved = tuple(evidence(rank, f"irrelevant-{rank}", page=10) for rank in range(1, 10)) + (
+            evidence(10, "gold-q1"),
+        )
+
+        item = self.service._evaluate_question(replace(question, retrieved_evidence=retrieved), top_k=10)
+
+        self.assertFalse(item.recall_at_5)
+        self.assertTrue(item.recall_at_10)
+        self.assertEqual(item.first_relevant_rank, 10)
 
     def test_evaluate_can_rerun_only_questions_with_gold_evidence(self) -> None:
         result = self.service.evaluate(
