@@ -557,20 +557,54 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 item.question_id,
                 item.question,
                 item.reference_answer,
-                QuestionSetService._format_source_pages(question_sources),
-                QuestionSetService._format_source_pages(answer_sources),
+                format_autoqa_sources(question_sources),
+                format_autoqa_sources(answer_sources),
             ])
         return rows
+
+    def format_autoqa_sources(evidence):
+        return "；".join(
+            f"{item.document_name or item.document_id}: {', '.join(str(page) for page in item.pages)}"
+            for item in evidence
+        )
 
     def parse_autoqa_sources(value, existing):
         text = str(value or "").strip()
         if not text:
             return ()
-        try:
-            records = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ProjectError("來源欄位必須是 JSON 陣列，每筆包含文件 ID、文件名稱及頁碼") from exc
-        parsed = QuestionSetService._parse_source_pages(records, "source_records")
+        if text.startswith("["):
+            try:
+                records = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ProjectError("來源欄位 JSON 格式錯誤") from exc
+            parsed = QuestionSetService._parse_source_pages(records, "source_records")
+        else:
+            parsed = []
+            for record in text.replace("\n", "；").split("；"):
+                record = record.strip()
+                if not record:
+                    continue
+                if ":" not in record:
+                    raise ProjectError("來源格式請使用「文件名稱: 頁碼, 頁碼」")
+                document_name, page_text = record.rsplit(":", 1)
+                document_name = document_name.strip()
+                pages = []
+                try:
+                    pages = [int(page.strip()) for page in page_text.split(",") if page.strip()]
+                except ValueError as exc:
+                    raise ProjectError("來源頁碼請以逗號分隔正整數") from exc
+                if not document_name or not pages or any(page < 1 for page in pages):
+                    raise ProjectError("來源格式請使用「文件名稱: 頁碼, 頁碼」")
+                old = next(
+                    (source for source in existing if source.document_name == document_name or source.document_id == document_name),
+                    None,
+                )
+                parsed.append(GoldEvidence(
+                    old.document_id if old else document_name,
+                    tuple(dict.fromkeys(pages)),
+                    old.chunk_ids if old else (),
+                    document_name,
+                ))
         result = []
         for item in parsed:
             previous = next(
@@ -1280,7 +1314,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 "系統會跨 PDF 去重；勾選平行生題時不同 PDF 可併行，同一 PDF 的請求仍會逐次執行。"
             )
             with gr.Row():
-                autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=3, minimum=1, maximum=30, precision=0)
+                autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
                 autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
                 autoqa_generation_model = gr.Dropdown(
                     choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
@@ -1297,7 +1331,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
                     value="local", label="檢索模式",
                 )
-                autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=2, minimum=1, maximum=32, precision=0)
+                autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
             autoqa_test_button = gr.Button("開始自動問答測試", variant="primary")
             with gr.Row():
                 autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
@@ -1307,7 +1341,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             autoqa_result = gr.Markdown()
             autoqa_question_set_state = gr.State("")
             autoqa_questions_table = gr.Dataframe(
-                headers=["題號", "題目", "正確答案", "題目來源（文件 ID／名稱／頁碼 JSON 陣列）", "答案來源（文件 ID／名稱／頁碼 JSON 陣列）"],
+                headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
                 interactive=True,
                 datatype=["str", "str", "str", "str", "str"],
                 label="生成題目與來源（可直接編輯）",
