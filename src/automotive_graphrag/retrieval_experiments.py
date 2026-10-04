@@ -472,24 +472,83 @@ class RetrievalExperimentService:
             raise ProjectError("目前沒有可匯出的檢索實驗結果")
         path = self.projects.path_for(project_id) / "exports" / "retrieval-experiment.json"
         run = state["run"]
+        run_groups = run.get("groups", [])
+        run_results = run.get("results", [])
+        group_rows = []
+        evaluated_count = 0
+        correct_count = 0
+        for summary in run_groups:
+            group_results = [item for item in run_results if item.get("group_id") == summary.get("group_id")]
+            judged = [item for item in group_results if item.get("evaluation_result") in {"正確", "錯誤"}]
+            group_correct = sum(item.get("evaluation_result") == "正確" for item in judged)
+            group_evaluated = len(judged)
+            evaluated_count += group_evaluated
+            correct_count += group_correct
+            group_rows.append({
+                "group_id": summary.get("group_id"),
+                "name": summary.get("group_name"),
+                "parameters": {
+                    "answer_model": summary.get("answer_model"),
+                    "retrieval_mode": self._retrieval_mode_label(summary.get("method")),
+                },
+                "summary": {
+                    "answer_model": summary.get("answer_model"),
+                    "judge_model": summary.get("judge_model"),
+                    "question_count": summary.get("question_count", 0),
+                    "evaluated_count": group_evaluated,
+                    "correct_count": group_correct,
+                    "correct_total": f"{group_correct} / {group_evaluated}",
+                    "accuracy": group_correct / group_evaluated if group_evaluated else None,
+                    "recall_at_5": summary.get("recall_at_5"),
+                    "recall_at_10": summary.get("recall_at_10"),
+                    "mrr": summary.get("mrr"),
+                },
+            })
+        expected_count = sum(int(item.get("question_count", 0)) for item in run_groups)
         payload = {
-            "project": {"project_id": project_id, "project_name": self.projects.get(project_id).display_name},
+            "schema_version": 1,
+            "format": "manual-graphrag-experiment-summary",
+            "project": {"project_id": project_id, "name": self.projects.get(project_id).display_name},
+            "execution_status": run.get("status"),
             "question_set_id": state.get("question_set_id", ""),
             "question_set_name": run.get("question_set_name", ""),
-            "execution_status": run.get("status"),
-            "question_count": run.get("question_count", 0),
-            "max_concurrency": state.get("max_concurrency", 5),
-            "experiment_groups": [
-                {**group, "judge_model": state.get("judge_model", "")}
-                for group in state.get("groups", [])
-            ],
-            "judge_model": state.get("judge_model", ""),
-            "summary": run.get("groups", []),
-            "question_results": run.get("results", []),
-            "last_run": run,
+            "max_concurrent_requests": state.get("max_concurrency", 5),
+            "evaluation": {
+                "judge_model": state.get("judge_model", ""),
+                "judge_reasoning_effort": None,
+            },
+            "summary": {
+                "question_count": expected_count,
+                "evaluated_count": evaluated_count,
+                "correct_count": correct_count,
+                "correct_total": f"{correct_count} / {evaluated_count}",
+                "accuracy": correct_count / evaluated_count if evaluated_count else None,
+                "recall_at_5": self._average_metric(run_groups, "recall_at_5"),
+                "recall_at_10": self._average_metric(run_groups, "recall_at_10"),
+                "mrr": self._average_metric(run_groups, "mrr"),
+            },
+            "groups": group_rows,
+            "question_results": run_results,
         }
         self._atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         return path
+
+    @staticmethod
+    def _retrieval_mode_label(method: str | None) -> str | None:
+        return {
+            "local": "Microsoft GraphRAG Local",
+            "global": "Microsoft GraphRAG Global",
+            "drift": "Microsoft GraphRAG DRIFT",
+            "basic": "Microsoft GraphRAG Basic",
+        }.get(method)
+
+    @staticmethod
+    def _average_metric(groups: Sequence[dict[str, object]], field: str) -> float | None:
+        values = [
+            float(group[field]) for group in groups
+            if isinstance(group.get(field), (int, float)) and math.isfinite(float(group[field]))
+        ]
+        return sum(values) / len(values) if values else None
 
     def _run_case(
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str
