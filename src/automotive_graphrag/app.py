@@ -782,7 +782,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             expected_answers = len(group_by_id) * len(question_by_id)
             has_all_answers = expected_answers > 0 and len(raw_results) == expected_answers and all(
                 str(item.get("actual_answer", "") or "").strip()
-                and item.get("status") in {"answered", "completed", "evaluation_failed"}
                 for item in raw_results
             )
             answers_match_settings = has_all_answers and all(

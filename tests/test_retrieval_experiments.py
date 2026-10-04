@@ -162,6 +162,13 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(judge.calls, [])
         self.assertEqual(self.service.load("project")["run"]["status"], "answers_completed")
 
+        # Older combined runs could mark a generated answer failed when judging failed.
+        saved_state = self.service.load("project")
+        saved_state["run"]["results"][0].update(
+            status="failed", evaluation_result="評判失敗", evaluation_reason="舊版評判錯誤"
+        )
+        self.service._write("project", saved_state)
+
         evaluated = self.service.evaluate_answers(
             "project", question_set.question_set_id, judge_model="gpt-4o-mini", max_concurrency=1
         )
