@@ -139,6 +139,14 @@ class RetrievalExperimentService:
             {key: field for key, field in item.items() if key != "judge_model"}
             for item in legacy_groups if isinstance(item, dict)
         ]
+        # Repair configurations saved before GPT-6/DRIFT compatibility was enforced.
+        repaired = False
+        for group in value["groups"]:
+            if group.get("method") == "drift" and group.get("answer_model") == GPT6_LUNA_MODEL:
+                group["answer_model"] = next(model for model in ALLOWED_CHAT_MODELS if model != GPT6_LUNA_MODEL)
+                repaired = True
+        if repaired:
+            self._write(project_id, value)
         return value
 
     def save_configuration(
@@ -151,6 +159,7 @@ class RetrievalExperimentService:
     ) -> None:
         if not 1 <= max_concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
+        self._validate_groups(groups)
         current = self.load(project_id)
         current["groups"] = [asdict(group) for group in groups]
         if judge_model is not None:
@@ -222,6 +231,8 @@ class RetrievalExperimentService:
         matched = False
         for group in current["groups"]:
             if group.get("group_id") == group_id:
+                if method == "drift" and group.get("answer_model") == GPT6_LUNA_MODEL:
+                    raise ProjectError("DRIFT 不支援 GPT-6 Luna；請先選擇其他回答模型")
                 group["method"] = method
                 matched = True
         if matched:
@@ -235,6 +246,8 @@ class RetrievalExperimentService:
         matched = False
         for group in current["groups"]:
             if group.get("group_id") == group_id:
+                if group.get("method") == "drift" and answer_model == GPT6_LUNA_MODEL:
+                    raise ProjectError("DRIFT 不支援 GPT-6 Luna；請改選其他回答模型")
                 group["answer_model"] = answer_model
                 matched = True
         if matched:
@@ -805,6 +818,8 @@ class RetrievalExperimentService:
                 raise ProjectError(f"{group.group_id} 的回答模型不支援")
             if group.method not in EXPERIMENT_METHODS:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 策略不支援")
+            if group.method == "drift" and group.answer_model == GPT6_LUNA_MODEL:
+                raise ProjectError(f"{group.group_id} 的 DRIFT 策略不支援 GPT-6 Luna")
 
     def _path(self, project_id: str) -> Path:
         return self.projects.path_for(project_id) / "runs" / "retrieval-experiment-state.json"

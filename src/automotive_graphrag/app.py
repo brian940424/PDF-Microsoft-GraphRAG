@@ -904,9 +904,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id or not group_id:
             return "請先選取實驗組", int(revision or 0)
         try:
+            state = retrieval_experiments.load(project_id)
+            group = next((item for item in state["groups"] if item.get("group_id") == group_id), None)
+            model_was_adjusted = method == "drift" and group and group.get("answer_model") == "gpt-6-luna"
+            if model_was_adjusted:
+                compatible_model = next(model for model in ALLOWED_CHAT_MODELS if model != "gpt-6-luna")
+                retrieval_experiments.set_group_answer_model(project_id, group_id, compatible_model)
             retrieval_experiments.set_group_method(project_id, group_id, method)
         except ProjectError as exc:
             return f"❌ {exc}", int(revision or 0)
+        if model_was_adjusted:
+            return (
+                f"✅ {group_id} 已切換為 DRIFT；GPT-6 Luna 不相容，回答模型已改為 {compatible_model}。",
+                refresh_experiment_groups(revision),
+            )
         return f"✅ {group_id} 檢索策略已儲存", refresh_experiment_groups(revision)
 
     def generate_retrieval_experiment_answers(
@@ -1880,6 +1891,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     return
                 strategy_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
                 for group in groups:
+                    model_choices = [
+                        model for model in ALLOWED_CHAT_MODELS
+                        if group.get("method") != "drift" or model != "gpt-6-luna"
+                    ]
                     group_id_state = gr.State(group["group_id"])
                     with gr.Group():
                         with gr.Row():
@@ -1887,7 +1902,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             remove_button = gr.Button("移除此組", variant="stop", size="sm")
                         with gr.Row():
                             answer_model = gr.Dropdown(
-                                choices=list(ALLOWED_CHAT_MODELS), value=group.get("answer_model", connections.get_chat_model()),
+                                choices=model_choices, value=group.get("answer_model", connections.get_chat_model()),
                                 label="回答模型",
                                 interactive=True,
                                 key=f"experiment-answer-model-{group['group_id']}",

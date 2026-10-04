@@ -96,6 +96,21 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.service.remove_group("project", original[0]["group_id"])
         self.assertEqual(len(self.service.load("project")["groups"]), 1)
 
+    def test_drift_rejects_gpt6_luna_and_legacy_conflicts_are_repaired(self):
+        state = self.service.add_group("project")
+        group_id = state["groups"][0]["group_id"]
+        self.service.set_group_answer_model("project", group_id, "gpt-6-luna")
+        with self.assertRaisesRegex(ProjectError, "DRIFT 不支援 GPT-6 Luna"):
+            self.service.set_group_method("project", group_id, "drift")
+        self.assertEqual(self.service.load("project")["groups"][0]["method"], "local")
+
+        state = self.service.load("project")
+        state["groups"][0]["method"] = "drift"
+        self.service._write("project", state)
+        repaired = self.service.load("project")["groups"][0]
+        self.assertEqual(repaired["method"], "drift")
+        self.assertNotEqual(repaired["answer_model"], "gpt-6-luna")
+
     def test_legacy_per_group_judge_model_migrates_to_global_setting(self):
         path = self.service._path("project")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,6 +350,8 @@ class RetrievalExperimentTests(unittest.TestCase):
             AutomaticEvaluationService(ui_projects, ui_sets, ui_connections),
         )
         ui_service.add_group("ui-project")
+        ui_group_id = ui_service.load("ui-project")["groups"][0]["group_id"]
+        ui_service.set_group_method("ui-project", ui_group_id, "drift")
         app = create_app(ui_root)
         labels = {
             component.get_config().get("label")
@@ -408,6 +425,8 @@ class RetrievalExperimentTests(unittest.TestCase):
         ]
         self.assertEqual({component.label for component in dynamic_dropdowns}, {"回答模型", "GraphRAG 檢索策略"})
         self.assertTrue(all(component.interactive is True for component in dynamic_dropdowns))
+        answer_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答模型")
+        self.assertNotIn("gpt-6-luna", [value for _label, value in answer_dropdown.choices])
         self.assertEqual(
             {fn.fn.__name__ for fn in dynamic_handlers},
             {"save_experiment_answer_model", "save_experiment_method", "remove_experiment_group"},
