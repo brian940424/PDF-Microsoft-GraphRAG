@@ -65,8 +65,8 @@ class RetrievalExperimentTests(unittest.TestCase):
     def test_group_settings_autosave_reload_and_only_explicit_remove_deletes(self):
         state = self.service.add_group("project")
         self.assertEqual(state["groups"][0]["name"], "實驗組1")
-        self.assertEqual(state["groups"][0]["answer_model"], "")
-        self.assertEqual(state["groups"][0]["method"], "")
+        self.assertEqual(state["groups"][0]["answer_model"], self.connections.get_chat_model())
+        self.assertEqual(state["groups"][0]["method"], "local")
         state = self.service.add_group("project")
         self.assertEqual(state["groups"][1]["name"], "實驗組2")
         original = [dict(item) for item in state["groups"]]
@@ -74,6 +74,8 @@ class RetrievalExperimentTests(unittest.TestCase):
         state = self.service.update_group_fields("project", np.array(rows, dtype=object))
         self.assertEqual(state["groups"][0]["method"], "local")
         self.assertNotIn("judge_model", state["groups"][0])
+        state = self.service.set_group_answer_model("project", original[0]["group_id"], "gpt-4.1-mini")
+        self.assertEqual(state["groups"][0]["answer_model"], "gpt-4.1-mini")
         groups = [ExperimentGroup(**item) for item in state["groups"]]
         self.service.save_configuration("project", groups, "question-set-id", 5, "gpt-4.1-mini")
 

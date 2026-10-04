@@ -170,7 +170,8 @@ class RetrievalExperimentService:
                      if group_id.startswith("G") and group_id[1:].isdigit()), default=0) + 1
         while f"G{index:02d}" in used:
             index += 1
-        group = ExperimentGroup(f"G{index:02d}", f"實驗組{index}", "", "")
+        default_model = self.connections.get_chat_model()
+        group = ExperimentGroup(f"G{index:02d}", f"實驗組{index}", default_model, "local")
         current["groups"] = [*raw_groups, asdict(group)]
         self._write(project_id, current)
         return current
@@ -215,6 +216,19 @@ class RetrievalExperimentService:
         for group in current["groups"]:
             if group.get("group_id") == group_id:
                 group["method"] = method
+                matched = True
+        if matched:
+            self._write(project_id, current)
+        return current
+
+    def set_group_answer_model(self, project_id: str, group_id: str, answer_model: str) -> dict[str, object]:
+        if answer_model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError("不支援的回答模型")
+        current = self.load(project_id)
+        matched = False
+        for group in current["groups"]:
+            if group.get("group_id") == group_id:
+                group["answer_model"] = answer_model
                 matched = True
         if matched:
             self._write(project_id, current)
