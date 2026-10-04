@@ -267,9 +267,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("逐題自動評測結果", labels)
         self.assertIn("只重跑前次答錯題目", labels)
         self.assertIn("自動評測 JSON", labels)
-        self.assertIn("生成回答", button_values)
+        self.assertIn("檢索並生成回答", button_values)
         self.assertIn("評測回答", button_values)
         self.assertIn("評測請求並行數", labels)
+        self.assertIn("尚未生成回答。完成前不能評測。", [
+            component.get_config().get("value")
+            for component in app.blocks.values()
+            if hasattr(component, "get_config")
+        ])
+        tabs = {
+            component.get_config().get("label")
+            for component in app.blocks.values()
+            if hasattr(component, "get_config")
+        }
+        self.assertTrue({"0-0 專案設定", "0-1 連線設定", "0-2 文件與建圖", "0-3 問答測試", "0-4 自動問答測試", "0-5 檢索實驗"}.issubset(tabs))
 
 
 if __name__ == "__main__":

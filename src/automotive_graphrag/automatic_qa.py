@@ -240,8 +240,11 @@ class AutomaticQATestService:
         concurrency: int = 3,
     ) -> AutomaticQAReport:
         question_set = self.question_sets.get(project_id, question_set_id)
-        if not any(item.status == "COMPLETED" and item.answer for item in question_set.questions):
-            raise ProjectError("請先按「生成回答」完成系統回答")
+        if not question_set.questions or not all(
+            item.status == "COMPLETED" and item.answer.strip()
+            for item in question_set.questions
+        ):
+            raise ProjectError("請先按「檢索並生成回答」完成所有題目的系統回答")
         judge = None
         judge_error = None
         try:

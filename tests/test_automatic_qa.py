@@ -115,6 +115,12 @@ class AutomaticQATests(unittest.TestCase):
                 store, object(), object(), query, sets, NoJudge(), NoRetrieval()
             )
 
+            with self.assertRaisesRegex(ProjectError, "完成所有題目"):
+                service.evaluate_existing(
+                    "TEST", question_set.question_set_id,
+                    "gpt-4.1-mini", "gpt-4o-mini", "local",
+                )
+
             report = service.answer_existing(
                 "TEST", question_set.question_set_id, "gpt-4.1-mini", "local", 1
             )

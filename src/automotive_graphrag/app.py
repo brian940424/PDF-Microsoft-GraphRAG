@@ -541,9 +541,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question.question,
                 question.answer,
                 question.reference_answer,
-                "正確" if judged and judged.is_correct else (
-                    "錯誤" if judged else "尚未評判"
-                ),
+                bool(judged and judged.is_correct),
                 judged.judge_reason if judged else (
                     report.judge_error or question.error or "尚無評判結果"
                 ),
@@ -562,7 +560,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             rows.append([
                 question_id,
                 evidence_docs, question.question, question.answer, question.reference_answer,
-                "正確" if judged and judged.is_correct else ("尚未評判" if not judged else "錯誤"),
+                bool(judged and judged.is_correct),
                 judged.judge_reason if judged else "尚無評判結果",
             ])
         return rows
@@ -712,19 +710,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def automatic_qa_saved_view(project_id):
         if not project_id:
-            return "請先於「專案設定」開啟專案", [], "", "", []
+            return "請先於「專案設定」開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
         try:
             saved_sets = question_sets.list(project_id)
             if not saved_sets:
-                return "此專案尚無已儲存的自動問答題目集", [], "", "", []
+                return "此專案尚無已儲存的自動問答題目集", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
             question_set = saved_sets[0]
             judge = automatic_evaluation.last_result(project_id, question_set.question_set_id)
             retrieval = retrieval_evaluation.last_result(project_id, question_set.question_set_id)
         except ProjectError as exc:
-            return f"❌ 載入自動問答資料失敗：{exc}", [], "", "", []
+            return f"❌ 載入自動問答資料失敗：{exc}", [], "", "", [], "載入失敗。", gr.update(interactive=False)
 
         judge_by_id = {item.question_id: item for item in judge.items} if judge else {}
         result_rows = automatic_qa_result_rows(question_set, judge)
+        answers_ready = bool(question_set.questions) and all(
+            item.status == "COMPLETED" and item.answer.strip()
+            for item in question_set.questions
+        )
 
         total = len(question_set.questions)
         correct = sum(item.is_correct for item in judge_by_id.values())
@@ -748,6 +750,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             question_set.question_set_id,
             summary,
             result_rows,
+            "✅ 已載入完成的回答，可以開始評測。" if answers_ready else "尚未生成完成所有回答。",
+            gr.update(interactive=answers_ready),
         )
 
     def experiment_view(project_id: str | None, message: str = ""):
@@ -913,7 +917,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method, progress=gr.Progress()):
         if not project_id:
-            return "❌ 請先開啟專案", [], "", "", []
+            return "❌ 請先開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
         try:
             question_set = automatic_qa.generate_question_set(
                 project_id,
@@ -924,29 +928,47 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 progress_callback=lambda fraction, description: progress(fraction, desc=description),
             )
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), [], "", "", []
+            return "❌ " + str(exc), [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
         return (
             f"✅ 已生成 {len(question_set.questions)} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。\n\n{question_set.description}",
             autoqa_question_rows(question_set),
             question_set.question_set_id,
             "",
             [],
+            "尚未生成回答。完成前不能評測。",
+            gr.update(interactive=False),
         )
 
     def generate_automatic_answers(project_id, question_set_id, rows, answer_model, method, concurrency):
         if not project_id or not question_set_id:
-            return "❌ 請先生成或匯入題目集", "", []
+            yield "❌ 請先生成或匯入題目集", "", [], gr.update(interactive=False)
+            return
+        yield "⏳ 正在檢索並生成回答；完成前無法進行評測…", "", [], gr.update(interactive=False)
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
             report = automatic_qa.answer_existing(
                 project_id, question_set_id, answer_model, method, int(concurrency)
             )
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), "", []
-        return (
-            f"✅ 已為 {len(report.question_set.questions)} 題生成並儲存回答；回答內容會在按下「評測回答」後顯示。",
+            yield "❌ " + str(exc), "", [], gr.update(interactive=False)
+            return
+        ready = bool(report.question_set.questions) and all(
+            item.status == "COMPLETED" and item.answer.strip()
+            for item in report.question_set.questions
+        )
+        completed = sum(
+            item.status == "COMPLETED" and bool(item.answer.strip())
+            for item in report.question_set.questions
+        )
+        if ready:
+            status = f"✅ 檢索並生成回答完成：{completed}/{len(report.question_set.questions)} 題。現在可以評測。"
+        else:
+            status = f"⚠️ 回答生成尚未全部完成：{completed}/{len(report.question_set.questions)} 題；請確認失敗題目後重試。"
+        yield (
+            status,
             f"回答模型：{answer_model}｜檢索模式：{method}｜尚未評測。",
             [],
+            gr.update(interactive=ready),
         )
 
     def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency):
@@ -974,13 +996,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             else:
                 values = list(rows)
             known_ids = {question.question_id for question in question_set.questions}
-            decisions = {
-                str(row[0]).strip(): str(row[5]).strip()
-                for row in values
-                if len(row) >= 6
-                and str(row[0]).strip() in known_ids
-                and str(row[5]).strip() in {"正確", "錯誤"}
-            }
+            decisions = {}
+            for row in values:
+                if len(row) < 6 or str(row[0]).strip() not in known_ids:
+                    continue
+                checked = str(row[5]).strip().lower()
+                if checked in {"true", "false"}:
+                    decisions[str(row[0]).strip()] = "正確" if checked == "true" else "錯誤"
             result = automatic_evaluation.update_manual_results(
                 project_id, question_set_id, decisions
             )
@@ -1003,20 +1025,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def import_automatic_question_set(project_id, uploaded):
         if not project_id or not uploaded:
-            return "❌ 請先開啟專案並選擇 JSON 題目集", [], "", "", []
+            return "❌ 請先開啟專案並選擇 JSON 題目集", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
         source = uploaded if isinstance(uploaded, (str, Path)) else getattr(uploaded, "name", None)
         if not source:
-            return "❌ 無法讀取上傳檔案", [], "", "", []
+            return "❌ 無法讀取上傳檔案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
         try:
             question_set = question_sets.import_file(project_id, source)
         except ProjectError as exc:
-            return "❌ " + str(exc), [], "", "", []
+            return "❌ " + str(exc), [], "", "", [], "匯入失敗。", gr.update(interactive=False)
         return (
             "✅ 已匯入題目集「" + question_set.name + "」，可先編輯再測試。",
             autoqa_question_rows(question_set),
             question_set.question_set_id,
             "",
             [],
+            "尚未生成回答。",
+            gr.update(interactive=False),
         )
 
     def export_automatic_question_set(project_id, question_set_id, rows):
@@ -1491,7 +1515,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         retrieval_project = active_project_id
         automatic_project = active_project_id
         sampling_project = active_project_id
-        with gr.Tab("專案設定"):
+        with gr.Tab("0-0 專案設定"):
             with gr.Row():
                 selected_project = gr.Dropdown(
                     choices=project_choices(),
@@ -1526,7 +1550,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             delete_confirmation = gr.Checkbox(label="我確認要永久刪除選取的專案及其所有資料")
             delete_button = gr.Button("刪除選取專案", variant="stop")
 
-        with gr.Tab("連線設定"):
+        with gr.Tab("0-1 連線設定"):
             gr.Markdown("## GraphRAG 共用連線設定")
             gr.Markdown("API Base URL 與 API Key 由所有 Project 共用。")
             connection_state = gr.Markdown(value=connection_status)
@@ -1558,7 +1582,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 save_connection_button = gr.Button("儲存連線設定", variant="primary")
             connection_result = gr.Markdown()
 
-        with gr.Tab("文件與建圖"):
+        with gr.Tab("0-2 文件與建圖"):
             uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
             with gr.Row():
                 upload_button = gr.Button("上傳")
@@ -1592,7 +1616,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 elem_id="indexing-log",
             )
 
-        with gr.Tab("問答測試"):
+        with gr.Tab("0-3 問答測試"):
             with gr.Row():
                 with gr.Column():
                     question = gr.Textbox(label="問題", lines=5)
@@ -1643,11 +1667,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_evidence_detail = gr.Markdown()
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
 
-        with gr.Tab("自動問答測試"):
+        with gr.Tab("0-4 自動問答測試"):
             gr.Markdown(
-                "依 PDF 生成題目後，分別執行「生成回答」和「評測回答」。"
+                "匯入或生成題目後，執行「檢索並生成回答」，全部完成後才能評測。"
                 "回答會先保存但不顯示，評測完成後才顯示回答與判斷；系統會跨 PDF 去重。"
             )
+            with gr.Row():
+                autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
+                autoqa_import_button = gr.Button("匯入題目集")
+                autoqa_export_button = gr.Button("匯出目前題目集")
+                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
+            autoqa_result = gr.Markdown()
+            autoqa_question_set_state = gr.State("")
             with gr.Row():
                 autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
                 autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
@@ -1665,7 +1696,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     value="local", label="檢索模式",
                 )
                 autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
-            autoqa_answer_button = gr.Button("生成回答", variant="primary")
+            autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
+            autoqa_generation_status = gr.Markdown("尚未生成回答。完成前不能評測。")
             gr.Markdown("### 評測設定")
             with gr.Row():
                 autoqa_judge_model = gr.Dropdown(
@@ -1674,14 +1706,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_concurrency = gr.Number(
                     label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
                 )
-            autoqa_judge_button = gr.Button("評測回答", variant="primary")
-            with gr.Row():
-                autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
-                autoqa_import_button = gr.Button("匯入題目集")
-                autoqa_export_button = gr.Button("匯出目前題目集")
-                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
-            autoqa_result = gr.Markdown()
-            autoqa_question_set_state = gr.State("")
+            autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
             autoqa_questions_table = gr.Dataframe(
                 headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
                 interactive=True,
@@ -1693,12 +1718,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             autoqa_table = gr.Dataframe(
                 headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
                 interactive=True,
-                datatype=["str", "str", "str", "str", "str", "str", "str"],
-                label="評測結果（判斷欄可人工修改；修改後評判理由清空並自動重算正確率）",
+                datatype=["str", "str", "str", "str", "str", "bool", "str"],
+                column_widths=["64px", "100px", "140px", "170px", "140px", "62px", "130px"],
+                label="評測結果（勾選表示正確；修改後評判理由清空並自動重算正確率）",
                 wrap=True,
             )
 
-        with gr.Tab("檢索實驗"):
+        with gr.Tab("0-5 檢索實驗"):
             gr.Markdown(
                 "以同一份題目集比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略。"
                 "來源排名只有在 GraphRAG 明確提供可靠排序時才計算；目前 API context 不保證依檢索相關度排序，因此會如實標示不可計算。"
@@ -1946,7 +1972,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
-            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary, autoqa_table],
+            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
+                     autoqa_table, autoqa_generation_status, autoqa_judge_button],
         ).then(
             experiment_view,
             inputs=active_project_id,
@@ -1997,7 +2024,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
-            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary, autoqa_table],
+            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
+                     autoqa_table, autoqa_generation_status, autoqa_judge_button],
         ).then(
             experiment_view,
             inputs=active_project_id,
@@ -2070,7 +2098,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ],
             outputs=[
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,
-                autoqa_summary, autoqa_table,
+                autoqa_summary, autoqa_table, autoqa_generation_status, autoqa_judge_button,
             ],
         )
         autoqa_import_button.click(
@@ -2078,7 +2106,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[automatic_project, autoqa_import_file],
             outputs=[
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,
-                autoqa_summary, autoqa_table,
+                autoqa_summary, autoqa_table, autoqa_generation_status, autoqa_judge_button,
             ],
         )
         autoqa_questions_table.change(
@@ -2092,7 +2120,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
                 autoqa_answer_model, autoqa_method, autoqa_answer_concurrency,
             ],
-            outputs=[autoqa_result, autoqa_summary, autoqa_table],
+            outputs=[autoqa_generation_status, autoqa_summary, autoqa_table, autoqa_judge_button],
         )
         autoqa_judge_button.click(
             evaluate_automatic_answers,
