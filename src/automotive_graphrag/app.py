@@ -692,19 +692,88 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             lines.append("**部分 PDF 生題未完成：** " + "；".join(report.generation_errors))
         return "\n\n".join(lines)
 
+    def automatic_qa_saved_view(project_id):
+        if not project_id:
+            return "請先於「專案設定」開啟專案", [], "", "", []
+        try:
+            saved_sets = question_sets.list(project_id)
+            if not saved_sets:
+                return "此專案尚無已儲存的自動問答題目集", [], "", "", []
+            question_set = saved_sets[0]
+            judge = automatic_evaluation.last_result(project_id, question_set.question_set_id)
+            retrieval = retrieval_evaluation.last_result(project_id, question_set.question_set_id)
+        except ProjectError as exc:
+            return f"❌ 載入自動問答資料失敗：{exc}", [], "", "", []
+
+        judge_by_id = {item.question_id: item for item in judge.items} if judge else {}
+        result_rows = []
+        for item in question_set.questions:
+            judged = judge_by_id.get(item.question_id)
+            docs = item.answer_source_evidence or item.gold_evidence
+            source_names = ", ".join(dict.fromkeys(
+                source.document_name or source.document_id for source in docs
+            )) or "—"
+            result_rows.append([
+                source_names,
+                item.question,
+                item.answer,
+                item.reference_answer,
+                "答對" if judged and judged.answer_score >= 4 else (
+                    "答錯" if judged else ("尚未評判" if item.answer else "尚未測試")
+                ),
+                judged.answer_score if judged else None,
+                judged.evidence_support_score if judged else None,
+                judged.judge_reason if judged else (item.error or "尚無評判結果"),
+            ])
+
+        total = len(question_set.questions)
+        correct = sum(item.answer_score >= 4 for item in judge_by_id.values())
+        if judge:
+            summary = (
+                f"**最近題目集：** {question_set.name}｜**答對：** {correct}/{total} "
+                f"（{correct / total:.1%}）｜評判 {len(judge_by_id)}/{total} 題\n\n"
+                f"**檢索模式：** {question_set.method}｜**評判模型：** {judge.model}"
+            )
+        else:
+            summary = f"**最近題目集：** {question_set.name}｜尚無已儲存的自動問答評判結果。"
+        if retrieval:
+            summary += (
+                f"\n\n**Retrieval：** Recall@1 {retrieval.recall_at_1:.1%}"
+                f"｜Recall@3 {retrieval.recall_at_3:.1%}｜Recall@5 {retrieval.recall_at_5:.1%}"
+                f"｜MRR {retrieval.mrr:.3f}｜Evidence 命中率 {retrieval.evidence_source_accuracy:.1%}"
+            )
+        return (
+            f"✅ 已自動載入最近題目集「{question_set.name}」及已儲存的測試資料",
+            autoqa_question_rows(question_set),
+            question_set.question_set_id,
+            summary,
+            result_rows,
+        )
+
+    def autosave_automatic_questions(project_id, question_set_id, rows):
+        if not project_id or not question_set_id:
+            return "尚未建立題目集"
+        try:
+            save_autoqa_edits(project_id, question_set_id, rows)
+        except (ProjectError, TypeError, ValueError) as exc:
+            return f"❌ 自動儲存失敗：{exc}"
+        return "✅ 題目與來源已自動儲存至目前專案"
+
     def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method):
         if not project_id:
-            return "❌ 請先開啟專案", [], ""
+            return "❌ 請先開啟專案", [], "", "", []
         try:
             question_set = automatic_qa.generate_question_set(
                 project_id, int(count), parallel_generation, generation_model, method,
             )
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), [], ""
+            return "❌ " + str(exc), [], "", "", []
         return (
             f"✅ 已生成 {len(question_set.questions)} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。\n\n{question_set.description}",
             autoqa_question_rows(question_set),
             question_set.question_set_id,
+            "",
+            [],
         )
 
     def run_automatic_qa(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency):
@@ -721,18 +790,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def import_automatic_question_set(project_id, uploaded):
         if not project_id or not uploaded:
-            return "❌ 請先開啟專案並選擇 JSON 題目集", [], ""
+            return "❌ 請先開啟專案並選擇 JSON 題目集", [], "", "", []
         source = uploaded if isinstance(uploaded, (str, Path)) else getattr(uploaded, "name", None)
         if not source:
-            return "❌ 無法讀取上傳檔案", [], ""
+            return "❌ 無法讀取上傳檔案", [], "", "", []
         try:
             question_set = question_sets.import_file(project_id, source)
         except ProjectError as exc:
-            return "❌ " + str(exc), [], ""
+            return "❌ " + str(exc), [], "", "", []
         return (
             "✅ 已匯入題目集「" + question_set.name + "」，可先編輯再測試。",
             autoqa_question_rows(question_set),
             question_set.question_set_id,
+            "",
+            [],
         )
 
     def export_automatic_question_set(project_id, question_set_id, rows):
@@ -1559,6 +1630,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             active_project_views,
             inputs=active_project_id,
             outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
+        ).then(
+            automatic_qa_saved_view,
+            inputs=active_project_id,
+            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary, autoqa_table],
         )
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
@@ -1601,6 +1676,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             active_project_views,
             inputs=active_project_id,
             outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
+        ).then(
+            automatic_qa_saved_view,
+            inputs=active_project_id,
+            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary, autoqa_table],
         )
         upload_button.click(
             import_documents,
@@ -1631,12 +1710,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ],
             outputs=[
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,
+                autoqa_summary, autoqa_table,
             ],
         )
         autoqa_import_button.click(
             import_automatic_question_set,
             inputs=[automatic_project, autoqa_import_file],
-            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state],
+            outputs=[
+                autoqa_result, autoqa_questions_table, autoqa_question_set_state,
+                autoqa_summary, autoqa_table,
+            ],
+        )
+        autoqa_questions_table.change(
+            autosave_automatic_questions,
+            inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
+            outputs=autoqa_result,
         )
         autoqa_test_button.click(
             run_automatic_qa,
