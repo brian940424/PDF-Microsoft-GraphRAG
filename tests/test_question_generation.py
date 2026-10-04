@@ -99,6 +99,7 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         self.assertEqual(service.get("L33-SM3E", batch.generation_batch_id), batch)
         self.assertLess(len(client.calls[0][3]), 3000)
         self.assertIn("必須使用繁體中文", client.calls[0][3])
+        self.assertIn("參考答案要完整且具體", client.calls[0][3])
 
     def test_generate_rejects_unknown_source_id_from_model(self) -> None:
         client = FakeGenerationClient(
