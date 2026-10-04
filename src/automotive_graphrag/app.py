@@ -599,7 +599,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         current = question_sets.get(project_id, question_set_id)
         by_id = {item.question_id: item for item in current.questions}
         updated = []
-        for row in rows or []:
+        if rows is None:
+            editable_rows = []
+        elif hasattr(rows, "itertuples"):
+            editable_rows = rows.itertuples(index=False, name=None)
+        else:
+            editable_rows = list(rows)
+        for row in editable_rows:
             if len(row) < 6:
                 raise ProjectError("編輯表格欄位不完整")
             question_id = str(row[0])
@@ -1317,6 +1323,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     value="local", label="檢索模式",
                 )
                 autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=2, minimum=1, maximum=32, precision=0)
+                autoqa_test_button = gr.Button("開始自動問答測試", variant="primary")
             autoqa_generate_button = gr.Button("生成題目", variant="primary")
             with gr.Row():
                 autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
@@ -1333,7 +1340,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 label="生成題目與來源（可直接編輯）",
                 wrap=True,
             )
-            autoqa_test_button = gr.Button("開始自動問答測試", variant="primary")
             autoqa_summary = gr.Markdown()
             autoqa_table = gr.Dataframe(
                 headers=["來源文件", "題目", "系統回答", "正確答案", "評判結果", "答案分數", "證據支持", "評判理由"],
