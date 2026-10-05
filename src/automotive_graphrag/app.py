@@ -21,7 +21,7 @@ from .indexing import IndexingService
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_generation import GeneratedQuestion, QuestionGenerationService
-from .question_sets import BatchQuestion, GoldEvidence, QuestionSet, QuestionSetService
+from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
 from .retrieval_experiments import (
@@ -139,21 +139,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def ask_question(project_id: str | None, question: str, method: str):
-        yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, [], "", ""
+        yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, []
         if not project_id:
-            yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, [], "", ""
+            yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
             return
         try:
             query_result = querying.ask(project_id, question, method)
         except ProjectError as exc:
-            yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, [], "", ""
+            yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
             return
         summary = (
             f"狀態：{query_result.status}｜方法：{query_result.method}｜"
             f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
         )
         if query_result.status == "FAILED":
-            yield "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, [], "", ""
+            yield "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, []
             return
         evidence_values = [asdict(item) for item in query_result.evidence]
         evidence_rows = [
@@ -179,8 +179,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             detail,
             querying.context_summary(query_result.context),
             evidence_values,
-            question,
-            query_result.answer,
         )
 
     def evidence_markdown(evidence_id: str | None, evidence_values: list[dict[str, object]]) -> str:
@@ -201,79 +199,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return [(item.name, item.question_set_id) for item in question_sets.list(project_id)]
         except ProjectError:
             return []
-
-    def answered_question_rows(question_set: QuestionSet | None) -> list[list[str]]:
-        if question_set is None:
-            return []
-        return [
-            [item.question_id, item.question, item.reference_answer]
-            for item in question_set.questions
-        ]
-
-    def saved_question_set_view(project_id: str | None, question_set_id: str | None):
-        choices = question_set_choices(project_id)
-        if not project_id or not question_set_id:
-            return gr.Dropdown(choices=choices, value=None), [], "請選取或建立題目集"
-        try:
-            question_set = question_sets.get(project_id, question_set_id)
-        except ProjectError as exc:
-            return gr.Dropdown(choices=choices, value=None), [], f"❌ {exc}"
-        return (
-            gr.Dropdown(choices=choices, value=question_set.question_set_id),
-            answered_question_rows(question_set),
-            f"目前題目集：**{question_set.name}**｜共 {len(question_set.questions)} 題",
-        )
-
-    def load_saved_question_set(project_id: str | None, question_set_id: str | None):
-        selector, rows, summary = saved_question_set_view(project_id, question_set_id)
-        if not project_id or not question_set_id:
-            result = "❌ 請選擇題目集"
-        elif summary.startswith("❌"):
-            result = summary
-        else:
-            result = "✅ 已載入題目集"
-        return result, selector, rows, summary
-
-    def create_saved_question_set(project_id: str | None, name: str, description: str):
-        if not project_id:
-            return "❌ 請先開啟專案", gr.Dropdown(choices=[]), [], ""
-        try:
-            question_set = question_sets.create(project_id, name, description)
-        except ProjectError as exc:
-            return f"❌ {exc}", gr.Dropdown(choices=question_set_choices(project_id)), [], ""
-        selector, rows, status = saved_question_set_view(project_id, question_set.question_set_id)
-        return f"✅ 已建立題目集「{question_set.name}」", selector, rows, status
-
-    def add_current_answer_to_question_set(
-        project_id: str | None,
-        question_set_id: str | None,
-        current_question: str,
-        answered_question: str,
-        system_answer: str,
-        edited_answer: str,
-        method: str,
-    ):
-        if not project_id or not question_set_id:
-            return "❌ 請先選取題目集", gr.Dropdown(choices=question_set_choices(project_id)), [], ""
-        current_question_text = (current_question or "").strip()
-        if not current_question_text or current_question_text != (answered_question or "").strip():
-            return "❌ 請先對目前這個問題完成問答，再加入題目集", *saved_question_set_view(project_id, question_set_id)
-        if not (system_answer or "").strip():
-            return "❌ 請先完成問答，再修改及加入回答", *saved_question_set_view(project_id, question_set_id)
-        try:
-            question_set = question_sets.append_answered_question(
-                project_id,
-                question_set_id,
-                answered_question,
-                edited_answer,
-                method,
-            )
-        except ProjectError as exc:
-            return f"❌ {exc}", *saved_question_set_view(project_id, question_set_id)
-        return "✅ 已將問題與答案一併加入題目集", *saved_question_set_view(
-            project_id,
-            question_set.question_set_id,
-        )
 
     def review_view(project_id: str | None, question_set_id: str | None, index: int = 0):
         if not project_id or not question_set_id:
@@ -1502,10 +1427,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return (
             *documents_view,
             gr.Dropdown(choices=choices, value=None),
-            gr.Dropdown(choices=choices, value=None),
             sampling_section_choices(project_id),
-            [],
-            "請選取或建立題目集",
         )
 
     def import_documents(project_id: str | None, files: list[str] | None):
@@ -1759,33 +1681,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         clear_question_button = gr.Button("清除")
                 with gr.Column():
                     query_answer = gr.Textbox(
-                label="系統回答（可編輯，加入題目集時會保存修改後內容）",
+                        label="系統回答（可編輯）",
                         lines=10,
                         interactive=True,
                     )
                     query_summary = gr.Markdown(label="查詢資訊")
-            gr.Markdown("## 題目集")
-            with gr.Row():
-                question_set_name = gr.Textbox(label="新題目集名稱")
-                question_set_description = gr.Textbox(label="說明（選填）")
-                create_question_set_button = gr.Button("建立題目集", variant="primary")
-            question_set_selector = gr.Dropdown(label="題目集")
-            with gr.Row():
-                refresh_question_sets_button = gr.Button("重新整理")
-                load_question_set_button = gr.Button("載入題目集")
-                add_qa_to_question_set_button = gr.Button("將目前問題與編輯後答案加入題目集")
-            question_set_result = gr.Markdown()
-            question_set_summary = gr.Markdown("請建立或載入題目集")
-            saved_questions_table = gr.Dataframe(
-                headers=["題號", "問題", "答案"],
-                interactive=False,
-                datatype=["str", "str", "str"],
-                label="題目集內容（每題均包含問題與答案）",
-            )
             gr.Markdown("### Evidence 詳情")
             query_evidence_state = gr.State([])
-            query_question_state = gr.State("")
-            query_answer_state = gr.State("")
             query_evidence_table = gr.Dataframe(
                 headers=EVIDENCE_COLUMNS,
                 interactive=False,
@@ -2111,7 +2013,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
+            outputs=[document_table, processing_options_table, removable_pdf, automatic_question_set, sampling_sections],
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
@@ -2164,7 +2066,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, question_set_selector, automatic_question_set, sampling_sections, saved_questions_table, question_set_summary],
+            outputs=[document_table, processing_options_table, removable_pdf, automatic_question_set, sampling_sections],
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
@@ -2310,8 +2212,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail,
                 query_context,
                 query_evidence_state,
-                query_question_state,
-                query_answer_state,
             ],
         )
         query_evidence_selector.input(
@@ -2320,7 +2220,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=query_evidence_detail,
         )
         clear_question_button.click(
-            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, [], "", ""),
+            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, []),
             outputs=[
                 question,
                 query_answer,
@@ -2330,37 +2230,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail,
                 query_context,
                 query_evidence_state,
-                query_question_state,
-                query_answer_state,
             ],
-        )
-        create_question_set_button.click(
-            create_saved_question_set,
-            inputs=[query_project, question_set_name, question_set_description],
-            outputs=[question_set_result, question_set_selector, saved_questions_table, question_set_summary],
-        )
-        refresh_question_sets_button.click(
-            lambda project_id: saved_question_set_view(project_id, None),
-            inputs=query_project,
-            outputs=[question_set_selector, saved_questions_table, question_set_summary],
-        )
-        load_question_set_button.click(
-            load_saved_question_set,
-            inputs=[query_project, question_set_selector],
-            outputs=[question_set_result, question_set_selector, saved_questions_table, question_set_summary],
-        )
-        add_qa_to_question_set_button.click(
-            add_current_answer_to_question_set,
-            inputs=[
-                query_project,
-                question_set_selector,
-                question,
-                query_question_state,
-                query_answer_state,
-                query_answer,
-                query_method,
-            ],
-            outputs=[question_set_result, question_set_selector, saved_questions_table, question_set_summary],
         )
         automatic_project_refresh.click(
             lambda project_id: gr.Dropdown(choices=question_set_choices(project_id), value=None),
