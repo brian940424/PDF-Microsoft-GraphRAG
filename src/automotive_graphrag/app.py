@@ -138,13 +138,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             connection_status(project.project_id),
         )
 
-    def ask_question(project_id: str | None, question: str, method: str):
+    def ask_question(project_id: str | None, question: str, method: str, chat_model: str | None):
         yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, []
         if not project_id:
             yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
             return
         try:
-            query_result = querying.ask(project_id, question, method)
+            query_result = querying.ask(project_id, question, method, chat_model=chat_model)
         except ProjectError as exc:
             yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
             return
@@ -845,8 +845,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
         return f"✅ {group_id} 檢索策略已儲存", refresh_experiment_groups(revision)
 
-    def update_autoqa_compatibility(answer_model: str | None, method: str | None):
-        """Keep the 0-4 model and retrieval selections mutually compatible."""
+    def update_model_method_compatibility(answer_model: str | None, method: str | None):
+        """Keep model and retrieval selections mutually compatible on query pages."""
         answer_model = answer_model or connections.get_chat_model()
         method = method or "local"
         model_choices = list(ALLOWED_CHAT_MODELS)
@@ -1690,10 +1690,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             with gr.Row():
                 with gr.Column():
                     question = gr.Textbox(label="問題", lines=5)
+                    query_chat_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS),
+                        value=connections.get_chat_model(),
+                        label="本次回答模型",
+                    )
                     query_method = gr.Dropdown(
                         choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
                         value="local",
                         label="查詢方法",
+                    )
+                    query_chat_model.input(
+                        update_model_method_compatibility,
+                        inputs=[query_chat_model, query_method],
+                        outputs=[query_chat_model, query_method],
+                    )
+                    query_method.input(
+                        update_model_method_compatibility,
+                        inputs=[query_chat_model, query_method],
+                        outputs=[query_chat_model, query_method],
                     )
                     with gr.Row():
                         ask_button = gr.Button("送出問題", variant="primary")
@@ -1748,12 +1763,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
             autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
             autoqa_answer_model.input(
-                update_autoqa_compatibility,
+                update_model_method_compatibility,
                 inputs=[autoqa_answer_model, autoqa_method],
                 outputs=[autoqa_answer_model, autoqa_method],
             )
             autoqa_method.input(
-                update_autoqa_compatibility,
+                update_model_method_compatibility,
                 inputs=[autoqa_answer_model, autoqa_method],
                 outputs=[autoqa_answer_model, autoqa_method],
             )
@@ -2239,7 +2254,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         ask_button.click(
             ask_question,
-            inputs=[query_project, question, query_method],
+            inputs=[query_project, question, query_method, query_chat_model],
             outputs=[
                 query_answer,
                 query_summary,

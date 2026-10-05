@@ -270,9 +270,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("檢索並生成回答", button_values)
         self.assertIn("評測回答", button_values)
         self.assertIn("評測請求並行數", labels)
+        self.assertIn("本次回答模型", labels)
         compatibility_handler = next(
             fn.fn for fn in app.fns.values()
-            if getattr(fn.fn, "__name__", "") == "update_autoqa_compatibility"
+            if getattr(fn.fn, "__name__", "") == "update_model_method_compatibility"
         )
         model_update, method_update = compatibility_handler("gpt-6-luna", "local")
         self.assertNotIn("drift", [value for _label, value in method_update["choices"]])
@@ -285,6 +286,8 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             for component in app.blocks.values()
             if hasattr(component, "get_config")
         ])
+        ask_handler = next(fn for fn in app.fns.values() if fn.fn.__name__ == "ask_question")
+        self.assertEqual(len(ask_handler.inputs), 4)
         tabs = {
             component.get_config().get("label")
             for component in app.blocks.values()
