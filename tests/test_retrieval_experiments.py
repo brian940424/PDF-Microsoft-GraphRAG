@@ -427,6 +427,24 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertTrue(all(component.interactive is True for component in dynamic_dropdowns))
         answer_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答模型")
         self.assertNotIn("gpt-6-luna", [value for _label, value in answer_dropdown.choices])
+        # When Luna is selected, DRIFT must be removed from the strategy dropdown.
+        ui_service.set_group_method("ui-project", ui_group_id, "local")
+        ui_service.set_group_answer_model("ui-project", ui_group_id, "gpt-6-luna")
+        LocalContext.blocks_config.set(app.default_config)
+        LocalContext.blocks.set(app)
+        try:
+            renderer.apply("ui-project", 1)
+        finally:
+            LocalContext.blocks_config.set(None)
+            LocalContext.blocks.set(None)
+        dynamic_dropdowns = [
+            component for component in app.default_config.blocks.values()
+            if isinstance(component, gr.Dropdown) and component.rendered_in is renderer
+        ]
+        strategy_dropdown = next(component for component in dynamic_dropdowns if component.label == "GraphRAG 檢索策略")
+        answer_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答模型")
+        self.assertIn("gpt-6-luna", [value for _label, value in answer_dropdown.choices])
+        self.assertNotIn("drift", [value for _label, value in strategy_dropdown.choices])
         self.assertEqual(
             {fn.fn.__name__ for fn in dynamic_handlers},
             {"save_experiment_answer_model", "save_experiment_method", "remove_experiment_group"},

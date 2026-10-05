@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Callable
 
 from .automatic_evaluation import AutomaticEvaluationResult, AutomaticEvaluationService
-from .connections import ALLOWED_CHAT_MODELS
+from .connections import ALLOWED_CHAT_MODELS, GPT6_LUNA_MODEL
 from .projects import ProjectError, ProjectStore
 from .question_generation import QuestionGenerationService, normalize_question
 from .question_sets import BatchQuestion, QuestionSet, QuestionSetService
@@ -239,6 +239,7 @@ class AutomaticQATestService:
         top_k: int = 5,
         concurrency: int = 3,
     ) -> AutomaticQAReport:
+        self._validate_model_method(answer_model, method)
         question_set = self.question_sets.get(project_id, question_set_id)
         if not question_set.questions or not all(
             item.status == "COMPLETED" and item.answer.strip()
@@ -286,6 +287,7 @@ class AutomaticQATestService:
         generation_errors: tuple[str, ...],
         evaluate: bool = True,
     ) -> AutomaticQAReport:
+        self._validate_model_method(answer_model, method)
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("回答並行數必須介於 1 到 32")
         pending = [item for item in question_set.questions]
@@ -350,3 +352,8 @@ class AutomaticQATestService:
             retrieval=retrieval,
             retrieval_error=retrieval_error,
         )
+
+    @staticmethod
+    def _validate_model_method(answer_model: str, method: str) -> None:
+        if method.strip().lower() == "drift" and answer_model == GPT6_LUNA_MODEL:
+            raise ProjectError("DRIFT 不支援 GPT-6 Luna；請改用 Local、Global 或 Basic，或選擇其他回答模型")

@@ -270,6 +270,16 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("檢索並生成回答", button_values)
         self.assertIn("評測回答", button_values)
         self.assertIn("評測請求並行數", labels)
+        compatibility_handler = next(
+            fn.fn for fn in app.fns.values()
+            if getattr(fn.fn, "__name__", "") == "update_autoqa_compatibility"
+        )
+        model_update, method_update = compatibility_handler("gpt-6-luna", "local")
+        self.assertNotIn("drift", [value for _label, value in method_update["choices"]])
+        self.assertEqual(method_update["value"], "local")
+        drift_model_update, drift_update = compatibility_handler("gpt-4o-mini", "drift")
+        self.assertIn("drift", [value for _label, value in drift_update["choices"]])
+        self.assertNotIn("gpt-6-luna", drift_model_update["choices"])
         self.assertIn("尚未生成回答。完成前不能評測。", [
             component.get_config().get("value")
             for component in app.blocks.values()

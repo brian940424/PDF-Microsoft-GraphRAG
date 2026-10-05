@@ -13,7 +13,7 @@ import gradio as gr
 
 from .automatic_evaluation import AutomaticEvaluationService
 from .automatic_qa import AutomaticQATestService
-from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
+from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, GPT6_LUNA_MODEL, ConnectionSettings
 from .documents import DocumentInfo, DocumentService
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
@@ -831,9 +831,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         try:
             state = retrieval_experiments.load(project_id)
             group = next((item for item in state["groups"] if item.get("group_id") == group_id), None)
-            model_was_adjusted = method == "drift" and group and group.get("answer_model") == "gpt-6-luna"
+            model_was_adjusted = method == "drift" and group and group.get("answer_model") == GPT6_LUNA_MODEL
             if model_was_adjusted:
-                compatible_model = next(model for model in ALLOWED_CHAT_MODELS if model != "gpt-6-luna")
+                compatible_model = next(model for model in ALLOWED_CHAT_MODELS if model != GPT6_LUNA_MODEL)
                 retrieval_experiments.set_group_answer_model(project_id, group_id, compatible_model)
             retrieval_experiments.set_group_method(project_id, group_id, method)
         except ProjectError as exc:
@@ -844,6 +844,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 refresh_experiment_groups(revision),
             )
         return f"✅ {group_id} 檢索策略已儲存", refresh_experiment_groups(revision)
+
+    def update_autoqa_compatibility(answer_model: str | None, method: str | None):
+        """Keep the 0-4 model and retrieval selections mutually compatible."""
+        answer_model = answer_model or connections.get_chat_model()
+        method = method or "local"
+        model_choices = list(ALLOWED_CHAT_MODELS)
+        method_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
+        if method == "drift":
+            model_choices = [model for model in model_choices if model != GPT6_LUNA_MODEL]
+            if answer_model == GPT6_LUNA_MODEL:
+                answer_model = next(model for model in ALLOWED_CHAT_MODELS if model != GPT6_LUNA_MODEL)
+        if answer_model == GPT6_LUNA_MODEL:
+            method_choices = [choice for choice in method_choices if choice[1] != "drift"]
+            if method == "drift":
+                method = "local"
+        return (
+            gr.update(choices=model_choices, value=answer_model),
+            gr.update(choices=method_choices, value=method),
+        )
 
     def generate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
@@ -1728,6 +1747,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
                 autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
             autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
+            autoqa_answer_model.input(
+                update_autoqa_compatibility,
+                inputs=[autoqa_answer_model, autoqa_method],
+                outputs=[autoqa_answer_model, autoqa_method],
+            )
+            autoqa_method.input(
+                update_autoqa_compatibility,
+                inputs=[autoqa_answer_model, autoqa_method],
+                outputs=[autoqa_answer_model, autoqa_method],
+            )
             autoqa_generation_status = gr.Markdown("尚未生成回答。完成前不能評測。")
             gr.Markdown("### 評測設定")
             with gr.Row():
@@ -1793,9 +1822,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     return
                 strategy_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
                 for group in groups:
+                    answer_model_value = group.get("answer_model", connections.get_chat_model())
+                    method_value = group.get("method", "local")
                     model_choices = [
                         model for model in ALLOWED_CHAT_MODELS
-                        if group.get("method") != "drift" or model != "gpt-6-luna"
+                        if method_value != "drift" or model != GPT6_LUNA_MODEL
+                    ]
+                    group_strategy_choices = [
+                        choice for choice in strategy_choices
+                        if answer_model_value != GPT6_LUNA_MODEL or choice[1] != "drift"
                     ]
                     group_id_state = gr.State(group["group_id"])
                     with gr.Group():
@@ -1804,13 +1839,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             remove_button = gr.Button("移除此組", variant="stop", size="sm")
                         with gr.Row():
                             answer_model = gr.Dropdown(
-                                choices=model_choices, value=group.get("answer_model", connections.get_chat_model()),
+                                choices=model_choices, value=answer_model_value,
                                 label="回答模型",
                                 interactive=True,
                                 key=f"experiment-answer-model-{group['group_id']}",
                             )
                             strategy = gr.Dropdown(
-                                choices=strategy_choices, value=group.get("method", "local"),
+                                choices=group_strategy_choices, value=method_value,
                                 label="GraphRAG 檢索策略",
                                 interactive=True,
                                 key=f"experiment-strategy-{group['group_id']}",

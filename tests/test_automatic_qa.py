@@ -99,6 +99,31 @@ class ConcurrentGeneration:
 
 
 class AutomaticQATests(unittest.TestCase):
+    def test_luna_cannot_run_or_evaluate_with_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "projects")
+            store.create(
+                project_id="TEST", display_name="Test", vehicle_name="Vehicle", manual_version="Version"
+            )
+            store.update_status("TEST", "INDEXED")
+            sets = QuestionSetService(store)
+            question_set = sets.create_with_questions(
+                "TEST", "automatic", [BatchQuestion("Q0001", "問題", "正解")]
+            )
+            service = AutomaticQATestService(
+                store, object(), object(), ConcurrentQuery(), sets, NoJudge(), NoRetrieval()
+            )
+
+            with self.assertRaisesRegex(ProjectError, "DRIFT 不支援 GPT-6 Luna"):
+                service.answer_existing(
+                    "TEST", question_set.question_set_id, "gpt-6-luna", "drift", 1
+                )
+            with self.assertRaisesRegex(ProjectError, "DRIFT 不支援 GPT-6 Luna"):
+                service.evaluate_existing(
+                    "TEST", question_set.question_set_id,
+                    "gpt-6-luna", "gpt-4o-mini", "drift",
+                )
+
     def test_answer_existing_persists_answers_without_judging(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = ProjectStore(Path(temporary) / "projects")
