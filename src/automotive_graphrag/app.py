@@ -770,6 +770,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                     "載入實驗狀態失敗。", gr.update(interactive=False))
 
+    def resolve_experiment_question_set_id(project_id: str, question_set_id: str | None) -> str:
+        """Prefer the project's persisted question set over a stale/empty browser State."""
+        state = retrieval_experiments.load(project_id)
+        saved_id = str(state.get("question_set_id") or "").strip()
+        selected_id = str(question_set_id or "").strip()
+        resolved_id = saved_id or selected_id
+        if not resolved_id:
+            raise ProjectError("此專案尚未匯入題目集，請先匯入 JSON 題目集")
+        return resolved_id
+
     def import_experiment_questions(project_id: str | None, filepath: str | None):
         if not project_id or not filepath:
             return experiment_view(project_id, "❌ 請先開啟專案並選擇 JSON 題目集")
@@ -868,8 +878,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         project_id: str | None, question_set_id: str | None, concurrency,
         judge_model: str | None,
     ):
-        if not project_id or not question_set_id:
-            view = list(experiment_view(project_id, "❌ 請先匯入題目集並開啟專案"))
+        if not project_id:
+            view = list(experiment_view(None, "❌ 請先開啟專案"))
+            view[8] = gr.update(interactive=False)
+            yield tuple(view)
+            return
+        try:
+            question_set_id = resolve_experiment_question_set_id(project_id, question_set_id)
+        except ProjectError as exc:
+            view = list(experiment_view(project_id, f"❌ {exc}"))
             view[8] = gr.update(interactive=False)
             yield tuple(view)
             return
@@ -904,8 +921,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         project_id: str | None, question_set_id: str | None, concurrency,
         judge_model: str | None,
     ):
-        if not project_id or not question_set_id:
-            view = list(experiment_view(project_id, "❌ 請先匯入題目集並開啟專案"))
+        if not project_id:
+            view = list(experiment_view(None, "❌ 請先開啟專案"))
+            view[8] = gr.update(interactive=False)
+            yield tuple(view)
+            return
+        try:
+            question_set_id = resolve_experiment_question_set_id(project_id, question_set_id)
+        except ProjectError as exc:
+            view = list(experiment_view(project_id, f"❌ {exc}"))
             view[8] = gr.update(interactive=False)
             yield tuple(view)
             return
