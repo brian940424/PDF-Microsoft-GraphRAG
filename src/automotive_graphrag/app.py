@@ -1803,68 +1803,69 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 wrap=True,
             )
             gr.Markdown("題目 JSON 使用 `schema_version: 1`，欄位為題號、題目、正確答案、來源頁碼與來源文件；跨文件或題目／答案來源不同時，也支援選填 `question_sources` / `answer_sources` 來源明細。範例見 `docs/檢索實驗格式範例.json`。")
-            gr.Markdown("### 實驗組清單")
             experiment_group_revision = gr.State(0)
-            experiment_add_group_button = gr.Button("新增實驗組")
             experiment_group_save_status = gr.Markdown()
-            @gr.render(inputs=[active_project_id, experiment_group_revision])
-            def render_experiment_group_cards(project_id: str | None, revision: int):
-                if not project_id:
-                    gr.Markdown("請先開啟專案")
-                    return
-                try:
-                    groups = retrieval_experiments.load(project_id).get("groups", [])
-                except ProjectError as exc:
-                    gr.Markdown(f"❌ {exc}")
-                    return
-                if not groups:
-                    gr.Markdown("尚未新增實驗組。")
-                    return
-                strategy_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
-                for group in groups:
-                    answer_model_value = group.get("answer_model", connections.get_chat_model())
-                    method_value = group.get("method", "local")
-                    model_choices = [
-                        model for model in ALLOWED_CHAT_MODELS
-                        if method_value != "drift" or model != GPT6_LUNA_MODEL
-                    ]
-                    group_strategy_choices = [
-                        choice for choice in strategy_choices
-                        if answer_model_value != GPT6_LUNA_MODEL or choice[1] != "drift"
-                    ]
-                    group_id_state = gr.State(group["group_id"])
-                    with gr.Group():
-                        with gr.Row():
-                            gr.Markdown(f"### {group['name']}")
-                            remove_button = gr.Button("移除此組", variant="stop", size="sm")
-                        with gr.Row():
-                            answer_model = gr.Dropdown(
-                                choices=model_choices, value=answer_model_value,
-                                label="回答模型",
-                                interactive=True,
-                                key=f"experiment-answer-model-{group['group_id']}",
-                            )
-                            strategy = gr.Dropdown(
-                                choices=group_strategy_choices, value=method_value,
-                                label="GraphRAG 檢索策略",
-                                interactive=True,
-                                key=f"experiment-strategy-{group['group_id']}",
-                            )
-                    answer_model.input(
-                        save_experiment_answer_model,
-                        inputs=[active_project_id, group_id_state, answer_model, experiment_group_revision],
-                        outputs=[experiment_group_save_status, experiment_group_revision],
-                    )
-                    strategy.input(
-                        save_experiment_method,
-                        inputs=[active_project_id, group_id_state, strategy, experiment_group_revision],
-                        outputs=[experiment_group_save_status, experiment_group_revision],
-                    )
-                    remove_button.click(
-                        remove_experiment_group,
-                        inputs=[active_project_id, group_id_state, experiment_group_revision],
-                        outputs=[experiment_group_save_status, experiment_group_revision],
-                    )
+            with gr.Group():
+                gr.Markdown("### 實驗組清單")
+                @gr.render(inputs=[active_project_id, experiment_group_revision])
+                def render_experiment_group_cards(project_id: str | None, revision: int):
+                    if not project_id:
+                        gr.Markdown("請先開啟專案")
+                        return
+                    try:
+                        groups = retrieval_experiments.load(project_id).get("groups", [])
+                    except ProjectError as exc:
+                        gr.Markdown(f"❌ {exc}")
+                        return
+                    if not groups:
+                        gr.Markdown("尚未新增實驗組。")
+                        return
+                    strategy_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
+                    for group in groups:
+                        answer_model_value = group.get("answer_model", connections.get_chat_model())
+                        method_value = group.get("method", "local")
+                        model_choices = [
+                            model for model in ALLOWED_CHAT_MODELS
+                            if method_value != "drift" or model != GPT6_LUNA_MODEL
+                        ]
+                        group_strategy_choices = [
+                            choice for choice in strategy_choices
+                            if answer_model_value != GPT6_LUNA_MODEL or choice[1] != "drift"
+                        ]
+                        group_id_state = gr.State(group["group_id"])
+                        with gr.Group():
+                            with gr.Row():
+                                gr.Markdown(f"### {group['name']}")
+                                remove_button = gr.Button("移除此組", variant="stop", size="sm")
+                            with gr.Row():
+                                answer_model = gr.Dropdown(
+                                    choices=model_choices, value=answer_model_value,
+                                    label="回答模型",
+                                    interactive=True,
+                                    key=f"experiment-answer-model-{group['group_id']}",
+                                )
+                                strategy = gr.Dropdown(
+                                    choices=group_strategy_choices, value=method_value,
+                                    label="GraphRAG 檢索策略",
+                                    interactive=True,
+                                    key=f"experiment-strategy-{group['group_id']}",
+                                )
+                        answer_model.input(
+                            save_experiment_answer_model,
+                            inputs=[active_project_id, group_id_state, answer_model, experiment_group_revision],
+                            outputs=[experiment_group_save_status, experiment_group_revision],
+                        )
+                        strategy.input(
+                            save_experiment_method,
+                            inputs=[active_project_id, group_id_state, strategy, experiment_group_revision],
+                            outputs=[experiment_group_save_status, experiment_group_revision],
+                        )
+                        remove_button.click(
+                            remove_experiment_group,
+                            inputs=[active_project_id, group_id_state, experiment_group_revision],
+                            outputs=[experiment_group_save_status, experiment_group_revision],
+                        )
+            experiment_add_group_button = gr.Button("新增實驗組")
             with gr.Row():
                 experiment_judge_model = gr.Dropdown(
                     choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
