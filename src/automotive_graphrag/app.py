@@ -1525,7 +1525,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         rows, settings, selector = document_view(project_id)
         return f"✅ 已移除 {filename}；請重新執行前處理與建圖", rows, settings, selector, False
 
-    def build_index(project_id: str | None):
+    def build_index(project_id: str | None, chat_model: str | None):
         if not project_id:
             yield "❌ 請先到「專案設定」開啟專案", ""
             return
@@ -1535,27 +1535,32 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         def run_index() -> None:
             try:
-                result_holder.append(indexing.build(project_id, log_callback=chunks.put))
+                result_holder.append(
+                    indexing.build(project_id, log_callback=chunks.put, chat_model=chat_model)
+                )
             except Exception as exc:
                 error_holder.append(exc)
 
         worker = threading.Thread(target=run_index, daemon=True)
         worker.start()
         log = ""
-        yield "⏳ GraphRAG 建圖執行中…", log
+        yield f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）", log
         while worker.is_alive() or not chunks.empty():
             try:
                 log += chunks.get(timeout=0.25)
             except queue.Empty:
                 pass
-            yield "⏳ GraphRAG 建圖執行中…", log
+            yield f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）", log
         worker.join()
         if error_holder:
             yield f"❌ {error_holder[0]}", log
             return
         result = result_holder[0]
         icon = "✅" if result.status == "INDEXED" else "❌"
-        summary = f"{icon} {result.status}｜耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}"
+        summary = (
+            f"{icon} {result.status}｜建圖模型：{chat_model or connections.get_chat_model()}｜"
+            f"耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}"
+        )
         yield summary, log
 
     def create_project(
@@ -1684,6 +1689,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("0-2 文件與建圖"):
             uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
+            indexing_chat_model = gr.Dropdown(
+                choices=list(ALLOWED_CHAT_MODELS),
+                value=connections.get_chat_model,
+                label="建圖模型",
+                info="只套用於 GraphRAG 建圖；更換模型後按「建立 Graph」即可重新建圖。",
+            )
             with gr.Row():
                 upload_button = gr.Button("上傳")
                 preprocess_button = gr.Button("開始前處理", variant="primary")
@@ -2177,7 +2188,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[document_project, processing_options_table],
             outputs=[document_result, document_table, processing_options_table, removable_pdf],
         )
-        index_button.click(build_index, inputs=document_project, outputs=[document_result, indexing_log])
+        index_button.click(
+            build_index,
+            inputs=[document_project, indexing_chat_model],
+            outputs=[document_result, indexing_log],
+        )
         document_refresh_button.click(
             document_view,
             inputs=document_project,

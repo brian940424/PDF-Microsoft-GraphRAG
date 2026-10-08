@@ -113,13 +113,51 @@ class IndexingServiceTests(unittest.TestCase):
         self.assertEqual(self.metadata_projects, ["L33-SM3E"])
         self.assertFalse((self.store.path_for("L33-SM3E") / "graphrag" / ".indexing.lock").exists())
 
+    def test_build_uses_selected_gpt6_luna_model(self) -> None:
+        runner = FakeGraphRag()
+        service = IndexingService(
+            self.store,
+            runner,
+            connection_settings=self.connections,
+            metadata_builder=self.build_metadata,
+        )
+
+        result = service.build("L33-SM3E", chat_model="gpt-6-luna")
+
+        self.assertEqual(result.status, "INDEXED")
+        settings = yaml.safe_load(
+            (self.store.path_for("L33-SM3E") / "graphrag" / "settings.yaml").read_text()
+        )
+        completion_model = settings["completion_models"]["default_completion_model"]
+        self.assertEqual(completion_model["model"], "gpt-6-luna")
+        self.assertEqual(completion_model["call_args"]["reasoning_effort"], "medium")
+        self.assertNotIn("temperature", completion_model["call_args"])
+
+    def test_indexed_project_can_be_rebuilt_with_selected_model(self) -> None:
+        self.store.update_status("L33-SM3E", "INDEXED")
+        runner = FakeGraphRag()
+        service = IndexingService(
+            self.store,
+            runner,
+            connection_settings=self.connections,
+            metadata_builder=self.build_metadata,
+        )
+
+        result = service.build("L33-SM3E", chat_model="gpt-6-luna")
+
+        self.assertEqual(result.status, "INDEXED")
+        self.assertEqual(self.store.get("L33-SM3E").status, "INDEXED")
+        self.assertFalse(
+            (self.store.path_for("L33-SM3E") / "graphrag" / ".last-successful-output").exists()
+        )
+
     def test_failed_rebuild_restores_last_successful_output(self) -> None:
         graph_root = self.store.path_for("L33-SM3E") / "graphrag"
         (graph_root / "settings.yaml").write_text("input: {}\n")
         output = graph_root / "output"
         output.mkdir()
         (output / "previous.parquet").write_bytes(b"previous")
-        self.store.update_status("L33-SM3E", "STALE")
+        self.store.update_status("L33-SM3E", "INDEXED")
         service = IndexingService(
             self.store,
             FakeGraphRag(fail_index=True),
@@ -159,6 +197,15 @@ class IndexingServiceTests(unittest.TestCase):
                 connection_settings=self.connections,
                 metadata_builder=self.build_metadata,
             ).build("L33-SM3E")
+
+    def test_build_rejects_unsupported_model(self) -> None:
+        with self.assertRaisesRegex(ProjectError, "不支援的建圖模型"):
+            IndexingService(
+                self.store,
+                FakeGraphRag(),
+                connection_settings=self.connections,
+                metadata_builder=self.build_metadata,
+            ).build("L33-SM3E", chat_model="unsupported-model")
 
 
 if __name__ == "__main__":

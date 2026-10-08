@@ -16,7 +16,7 @@ from typing import Callable
 
 import yaml
 
-from .connections import ConnectionSettings, configure_completion_model
+from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, configure_completion_model
 from .projects import ProjectError, ProjectStore
 from .source_metadata import SourceMetadataService
 
@@ -57,8 +57,11 @@ class IndexingService:
         self._log_callback: Callable[[str], None] | None = None
 
     def initialize(self, project_id: str) -> Path:
+        return self._initialize(project_id, self.chat_model)
+
+    def _initialize(self, project_id: str, chat_model_override: str | None) -> Path:
         self.connection_settings.apply_to_environment(project_id)
-        chat_model = self.chat_model or self.connection_settings.get_chat_model()
+        chat_model = chat_model_override or self.chat_model or self.connection_settings.get_chat_model()
         embedding_model = self.embedding_model or self.connection_settings.get_embedding_model()
         project_path = self.projects.path_for(project_id)
         graph_root = project_path / "graphrag"
@@ -92,10 +95,13 @@ class IndexingService:
         self,
         project_id: str,
         log_callback: Callable[[str], None] | None = None,
+        chat_model: str | None = None,
     ) -> IndexingResult:
         project = self.projects.get(project_id)
-        if project.status not in {"READY", "STALE", "FAILED"}:
+        if project.status not in {"READY", "STALE", "FAILED", "INDEXED"}:
             raise ProjectError(f"專案狀態 {project.status} 不允許建圖")
+        if chat_model is not None and chat_model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError(f"不支援的建圖模型：{chat_model}")
         project_path = self.projects.path_for(project_id)
         graph_root = project_path / "graphrag"
         lock_path = graph_root / ".indexing.lock"
@@ -105,12 +111,12 @@ class IndexingService:
         log_path = graph_root / "indexing.log"
         output = graph_root / "output"
         backup = graph_root / ".last-successful-output"
-        previous_index = output.exists() and project.status in {"STALE", "FAILED"}
+        previous_index = output.exists() and project.status in {"STALE", "FAILED", "INDEXED"}
         try:
             self._active_log = log_path
             self._active_log.write_text("", encoding="utf-8")
             self._log_callback = log_callback
-            self.initialize(project_id)
+            self._initialize(project_id, chat_model)
             self.projects.update_status(project_id, "INDEXING")
             if backup.exists():
                 shutil.rmtree(backup)
