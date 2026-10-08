@@ -102,20 +102,21 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.service.remove_group("project", original[0]["group_id"])
         self.assertEqual(len(self.service.load("project")["groups"]), 1)
 
-    def test_drift_rejects_gpt6_luna_and_legacy_conflicts_are_repaired(self):
+    def test_drift_accepts_gpt6_luna_and_preserves_saved_configuration(self):
         state = self.service.add_group("project")
         group_id = state["groups"][0]["group_id"]
         self.service.set_group_answer_model("project", group_id, "gpt-6-luna")
-        with self.assertRaisesRegex(ProjectError, "DRIFT 不支援 GPT-6 Luna"):
-            self.service.set_group_method("project", group_id, "drift")
-        self.assertEqual(self.service.load("project")["groups"][0]["method"], "local")
+        self.service.set_group_method("project", group_id, "drift")
+        saved = self.service.load("project")["groups"][0]
+        self.assertEqual(saved["method"], "drift")
+        self.assertEqual(saved["answer_model"], "gpt-6-luna")
 
         state = self.service.load("project")
-        state["groups"][0]["method"] = "drift"
+        state["groups"][0]["method"] = "local"
         self.service._write("project", state)
-        repaired = self.service.load("project")["groups"][0]
-        self.assertEqual(repaired["method"], "drift")
-        self.assertNotEqual(repaired["answer_model"], "gpt-6-luna")
+        reloaded = self.service.load("project")["groups"][0]
+        self.assertEqual(reloaded["method"], "local")
+        self.assertEqual(reloaded["answer_model"], "gpt-6-luna")
 
     def test_legacy_per_group_judge_model_migrates_to_global_setting(self):
         path = self.service._path("project")
@@ -362,6 +363,38 @@ class RetrievalExperimentTests(unittest.TestCase):
             self.assertTrue(kwargs["output_is_symlink"])
             self.assertEqual(kwargs["completion_model"], "gpt-4.1-mini")
 
+    def test_luna_drift_uses_sampling_parameter_compatibility_adapter(self):
+        graph_root = self.projects.path_for("project") / "graphrag"
+        (graph_root / "output").mkdir(parents=True)
+        (graph_root / "settings.yaml").write_text(
+            "completion_models:\n  default:\n    model: old-model\n    call_args: {temperature: 0, top_p: 1}\n"
+            "embedding_models:\n  default:\n    model: old-embedding\n",
+            encoding="utf-8",
+        )
+        captured = {}
+
+        def run_compatible(**kwargs):
+            settings = yaml.safe_load((kwargs["root_dir"] / "settings.yaml").read_text(encoding="utf-8"))
+            captured["model"] = settings["completion_models"]["default"]["model"]
+            captured["args"] = settings["completion_models"]["default"]["call_args"]
+            captured["output_is_symlink"] = (kwargs["root_dir"] / "output").is_symlink()
+            return "Luna DRIFT answer", {"sources": []}
+
+        with patch(
+            "automotive_graphrag.retrieval_experiments.run_compatible_drift_search",
+            side_effect=run_compatible,
+        ) as adapter:
+            answer, _context = self.service._graphrag_query(
+                "project", "測試", "drift", "gpt-6-luna"
+            )
+
+        self.assertEqual(answer, "Luna DRIFT answer")
+        self.assertEqual(captured["model"], "gpt-6-luna")
+        self.assertNotIn("temperature", captured["args"])
+        self.assertNotIn("top_p", captured["args"])
+        self.assertTrue(captured["output_is_symlink"])
+        adapter.assert_called_once()
+
     def test_resolved_sources_reads_document_id_from_source_metadata(self):
         source = SourceMetadata(
             text_unit_id="unit-1", chunk_id="chunk-1", project_id="project",
@@ -489,8 +522,8 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual({component.label for component in dynamic_dropdowns}, {"回答模型", "GraphRAG 檢索策略"})
         self.assertTrue(all(component.interactive is True for component in dynamic_dropdowns))
         answer_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答模型")
-        self.assertNotIn("gpt-6-luna", [value for _label, value in answer_dropdown.choices])
-        # When Luna is selected, DRIFT must be removed from the strategy dropdown.
+        self.assertIn("gpt-6-luna", [value for _label, value in answer_dropdown.choices])
+        # Model and strategy choices remain independent; Luna + DRIFT is supported.
         ui_service.set_group_method("ui-project", ui_group_id, "local")
         ui_service.set_group_answer_model("ui-project", ui_group_id, "gpt-6-luna")
         LocalContext.blocks_config.set(app.default_config)
@@ -507,7 +540,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         strategy_dropdown = next(component for component in dynamic_dropdowns if component.label == "GraphRAG 檢索策略")
         answer_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答模型")
         self.assertIn("gpt-6-luna", [value for _label, value in answer_dropdown.choices])
-        self.assertNotIn("drift", [value for _label, value in strategy_dropdown.choices])
+        self.assertIn("drift", [value for _label, value in strategy_dropdown.choices])
         self.assertEqual(
             {fn.fn.__name__ for fn in dynamic_handlers},
             {"save_experiment_answer_model", "save_experiment_method", "remove_experiment_group"},

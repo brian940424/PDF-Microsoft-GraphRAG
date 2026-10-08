@@ -99,7 +99,7 @@ class ConcurrentGeneration:
 
 
 class AutomaticQATests(unittest.TestCase):
-    def test_luna_cannot_run_or_evaluate_with_drift(self):
+    def test_luna_can_run_and_evaluate_with_drift(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = ProjectStore(Path(temporary) / "projects")
             store.create(
@@ -110,19 +110,23 @@ class AutomaticQATests(unittest.TestCase):
             question_set = sets.create_with_questions(
                 "TEST", "automatic", [BatchQuestion("Q0001", "問題", "正解")]
             )
+            query = ConcurrentQuery()
             service = AutomaticQATestService(
-                store, object(), object(), ConcurrentQuery(), sets, NoJudge(), NoRetrieval()
+                store, object(), object(), query, sets, NoJudge(), NoRetrieval()
             )
 
-            with self.assertRaisesRegex(ProjectError, "DRIFT 不支援 GPT-6 Luna"):
-                service.answer_existing(
-                    "TEST", question_set.question_set_id, "gpt-6-luna", "drift", 1
-                )
-            with self.assertRaisesRegex(ProjectError, "DRIFT 不支援 GPT-6 Luna"):
-                service.evaluate_existing(
-                    "TEST", question_set.question_set_id,
-                    "gpt-6-luna", "gpt-4o-mini", "drift",
-                )
+            report = service.answer_existing(
+                "TEST", question_set.question_set_id, "gpt-6-luna", "drift", 1
+            )
+            self.assertEqual(report.answer_model, "gpt-6-luna")
+            self.assertEqual(report.question_set.questions[0].status, "COMPLETED")
+            self.assertEqual(query.models, ["gpt-6-luna"])
+
+            report = service.evaluate_existing(
+                "TEST", question_set.question_set_id,
+                "gpt-6-luna", "gpt-4o-mini", "drift",
+            )
+            self.assertEqual(report.answer_model, "gpt-6-luna")
 
     def test_answer_existing_persists_answers_without_judging(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -24,6 +24,7 @@ from .connections import (
     configure_completion_model,
 )
 from .evidence import EvidenceService
+from .drift_compat import run_drift_search as run_compatible_drift_search
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .querying import QueryService
@@ -142,14 +143,6 @@ class RetrievalExperimentService:
             {key: field for key, field in item.items() if key != "judge_model"}
             for item in legacy_groups if isinstance(item, dict)
         ]
-        # Repair configurations saved before GPT-6/DRIFT compatibility was enforced.
-        repaired = False
-        for group in value["groups"]:
-            if group.get("method") == "drift" and group.get("answer_model") == GPT6_LUNA_MODEL:
-                group["answer_model"] = next(model for model in ALLOWED_CHAT_MODELS if model != GPT6_LUNA_MODEL)
-                repaired = True
-        if repaired:
-            self._write(project_id, value)
         return value
 
     def save_configuration(
@@ -242,8 +235,6 @@ class RetrievalExperimentService:
         matched = False
         for group in current["groups"]:
             if group.get("group_id") == group_id:
-                if method == "drift" and group.get("answer_model") == GPT6_LUNA_MODEL:
-                    raise ProjectError("DRIFT 不支援 GPT-6 Luna；請先選擇其他回答模型")
                 group["method"] = method
                 matched = True
         if matched:
@@ -257,8 +248,6 @@ class RetrievalExperimentService:
         matched = False
         for group in current["groups"]:
             if group.get("group_id") == group_id:
-                if group.get("method") == "drift" and answer_model == GPT6_LUNA_MODEL:
-                    raise ProjectError("DRIFT 不支援 GPT-6 Luna；請改選其他回答模型")
                 group["answer_model"] = answer_model
                 matched = True
         if matched:
@@ -792,11 +781,6 @@ class RetrievalExperimentService:
     def _graphrag_query(self, project_id: str, question: str, method: str, model: str) -> tuple[str, dict[str, object]]:
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
-        if method == "drift" and model == GPT6_LUNA_MODEL:
-            raise ProjectError(
-                "GPT-6 Luna 的 medium 推理模式不接受 GraphRAG DRIFT 目前固定傳入的 temperature/top_p；"
-                "請改用 Local、Global 或 Basic，或為 DRIFT 選擇其他模型。"
-            )
         project_path = self.projects.path_for(project_id) / "graphrag"
         settings_path = project_path / "settings.yaml"
         try:
@@ -828,7 +812,15 @@ class RetrievalExperimentService:
                     community_level=2, dynamic_community_selection=False, **common
                 )
             elif method == "drift":
-                answer, context = run_drift_search(community_level=2, **common)
+                if model == GPT6_LUNA_MODEL:
+                    answer, context = run_compatible_drift_search(
+                        root_dir=root,
+                        query=question,
+                        community_level=2,
+                        response_type="Multiple Paragraphs",
+                    )
+                else:
+                    answer, context = run_drift_search(community_level=2, **common)
             else:
                 answer, context = run_basic_search(**common)
         serialized = QueryService._serialize_context(context)
@@ -846,8 +838,6 @@ class RetrievalExperimentService:
                 raise ProjectError(f"{group.group_id} 的回答模型不支援")
             if group.method not in EXPERIMENT_METHODS:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 策略不支援")
-            if group.method == "drift" and group.answer_model == GPT6_LUNA_MODEL:
-                raise ProjectError(f"{group.group_id} 的 DRIFT 策略不支援 GPT-6 Luna")
 
     def _path(self, project_id: str) -> Path:
         return self.projects.path_for(project_id) / "runs" / "retrieval-experiment-state.json"

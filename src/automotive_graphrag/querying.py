@@ -19,6 +19,7 @@ import pandas as pd
 import yaml
 
 from .connections import ALLOWED_CHAT_MODELS, GPT6_LUNA_MODEL, ConnectionSettings, configure_completion_model
+from .drift_compat import run_drift_search as run_compatible_drift_search
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 
@@ -87,12 +88,6 @@ class QueryService:
         selected_model = chat_model or self.connection_settings.get_chat_model()
         if selected_model not in ALLOWED_CHAT_MODELS:
             raise ProjectError(f"不支援的 Chat 模型：{selected_model}")
-        if normalized_method == "drift" and selected_model == GPT6_LUNA_MODEL:
-            raise ProjectError(
-                "GPT-6 Luna 的 medium 推理模式不接受 GraphRAG DRIFT 目前固定傳入的 temperature/top_p；"
-                "請改用 Local、Global 或 Basic，或為 DRIFT 選擇其他模型。"
-            )
-
         graph_root = project_path / "graphrag"
         if not (graph_root / "output").is_dir():
             raise ProjectError("找不到此專案的 GraphRAG 索引輸出")
@@ -105,19 +100,25 @@ class QueryService:
         )
         started = datetime.now(timezone.utc)
         started_clock = time.monotonic()
-        result = self.runner(
-            [
-                sys.executable,
-                "-m",
-                "graphrag",
-                "query",
-                "--root",
-                str(graph_root),
-                "--method",
-                normalized_method,
-                prompt,
-            ]
-        )
+        command = [
+            sys.executable,
+            "-m",
+            "graphrag",
+            "query",
+            "--root",
+            str(graph_root),
+            "--method",
+            normalized_method,
+            prompt,
+        ]
+        if normalized_method == "drift" and selected_model == GPT6_LUNA_MODEL:
+            try:
+                answer, context = run_compatible_drift_search(root_dir=graph_root, query=prompt)
+                result = QueryExecution(0, answer, "", self._serialize_context(context))
+            except Exception as exc:
+                result = QueryExecution(1, "", str(exc))
+        else:
+            result = self.runner(command)
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)

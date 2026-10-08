@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import yaml
+from unittest.mock import patch
 
 from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
@@ -131,11 +132,18 @@ class QueryServiceTests(unittest.TestCase):
         self.assertNotIn("temperature", model["call_args"])
         self.assertNotIn("top_p", model["call_args"])
 
-    def test_gpt6_drift_reports_sampling_parameter_incompatibility(self) -> None:
+    def test_gpt6_drift_uses_compatible_entrypoint(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)
 
-        with self.assertRaisesRegex(ProjectError, "DRIFT.*temperature/top_p"):
-            service.ask("L33-SM3E", "測試 GPT-6", method="drift", chat_model="gpt-6-luna")
+        with patch(
+            "automotive_graphrag.querying.run_compatible_drift_search",
+            return_value=("Luna DRIFT 回答", {"sources": []}),
+        ) as drift_search:
+            result = service.ask("L33-SM3E", "測試 GPT-6", method="drift", chat_model="gpt-6-luna")
+
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertEqual(result.answer, "Luna DRIFT 回答")
+        drift_search.assert_called_once_with(root_dir=self.graph_root, query="測試 GPT-6")
 
     def test_query_rejects_unknown_chat_model(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)

@@ -13,7 +13,7 @@ import gradio as gr
 
 from .automatic_evaluation import AutomaticEvaluationService
 from .automatic_qa import AutomaticQATestService
-from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, GPT6_LUNA_MODEL, ConnectionSettings
+from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
 from .documents import DocumentInfo, DocumentService
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
@@ -844,39 +844,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id or not group_id:
             return "請先選取實驗組", int(revision or 0)
         try:
-            state = retrieval_experiments.load(project_id)
-            group = next((item for item in state["groups"] if item.get("group_id") == group_id), None)
-            model_was_adjusted = method == "drift" and group and group.get("answer_model") == GPT6_LUNA_MODEL
-            if model_was_adjusted:
-                compatible_model = next(model for model in ALLOWED_CHAT_MODELS if model != GPT6_LUNA_MODEL)
-                retrieval_experiments.set_group_answer_model(project_id, group_id, compatible_model)
             retrieval_experiments.set_group_method(project_id, group_id, method)
         except ProjectError as exc:
             return f"❌ {exc}", int(revision or 0)
-        if model_was_adjusted:
-            return (
-                f"✅ {group_id} 已切換為 DRIFT；GPT-6 Luna 不相容，回答模型已改為 {compatible_model}。",
-                refresh_experiment_groups(revision),
-            )
         return f"✅ {group_id} 檢索策略已儲存", refresh_experiment_groups(revision)
 
     def update_model_method_compatibility(answer_model: str | None, method: str | None):
-        """Keep model and retrieval selections mutually compatible on query pages."""
+        """Keep all supported models and query strategies selectable together."""
         answer_model = answer_model or connections.get_chat_model()
         method = method or "local"
-        model_choices = list(ALLOWED_CHAT_MODELS)
-        method_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
-        if method == "drift":
-            model_choices = [model for model in model_choices if model != GPT6_LUNA_MODEL]
-            if answer_model == GPT6_LUNA_MODEL:
-                answer_model = next(model for model in ALLOWED_CHAT_MODELS if model != GPT6_LUNA_MODEL)
-        if answer_model == GPT6_LUNA_MODEL:
-            method_choices = [choice for choice in method_choices if choice[1] != "drift"]
-            if method == "drift":
-                method = "local"
         return (
-            gr.update(choices=model_choices, value=answer_model),
-            gr.update(choices=method_choices, value=method),
+            gr.update(choices=list(ALLOWED_CHAT_MODELS), value=answer_model),
+            gr.update(
+                choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+                value=method,
+            ),
         )
 
     def generate_retrieval_experiment_answers(
@@ -1880,14 +1862,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     for group in groups:
                         answer_model_value = group.get("answer_model", connections.get_chat_model())
                         method_value = group.get("method", "local")
-                        model_choices = [
-                            model for model in ALLOWED_CHAT_MODELS
-                            if method_value != "drift" or model != GPT6_LUNA_MODEL
-                        ]
-                        group_strategy_choices = [
-                            choice for choice in strategy_choices
-                            if answer_model_value != GPT6_LUNA_MODEL or choice[1] != "drift"
-                        ]
+                        model_choices = list(ALLOWED_CHAT_MODELS)
+                        group_strategy_choices = strategy_choices
                         group_id_state = gr.State(group["group_id"])
                         with gr.Group():
                             with gr.Row():
