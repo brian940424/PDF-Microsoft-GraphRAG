@@ -234,6 +234,41 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1, "evaluation must not repeat GraphRAG retrieval")
         self.assertEqual(self.service.load("project")["run"]["status"], "completed")
 
+    def test_lenient_evaluation_accepts_complete_answer_containment_and_persists_mode(self):
+        judge = FakeJudge()
+        self.service.judging = judge
+        question_set = self.question_sets.create_with_questions(
+            "project", "lenient", [
+                BatchQuestion("Q1", "問題", "先確認設備已關閉，\n準備指定工具")
+            ],
+        )
+        group = ExperimentGroup("G01", "Basic", "gpt-4o-mini", "basic")
+        self.service.save_configuration(
+            "project", [group], question_set.question_set_id, 1, "gpt-4o-mini"
+        )
+        self.service.generate_answers(
+            "project", question_set.question_set_id, [group], max_concurrency=1
+        )
+
+        run = self.service.evaluate_answers(
+            "project", question_set.question_set_id, judge_model="gpt-4o-mini",
+            max_concurrency=1, evaluation_mode="lenient",
+        )
+
+        self.assertEqual(run.results[0].evaluation_result, "正確")
+        self.assertIn("寬鬆評分", run.results[0].evaluation_reason)
+        self.assertEqual(judge.calls, [], "lenient containment mode should not call the LLM judge")
+        self.assertEqual(self.service.load("project")["evaluation_mode"], "lenient")
+        self.service.set_evaluation_mode("project", "strict")
+        summary_path, details_path = self.service.export("project")
+        self.assertEqual(json.loads(summary_path.read_text())["evaluation"]["mode"], "lenient")
+        self.assertEqual(json.loads(details_path.read_text())["evaluation_mode"], "lenient")
+
+    def test_evaluation_mode_defaults_to_strict_and_rejects_unknown_values(self):
+        self.assertEqual(self.service.load("project")["evaluation_mode"], "strict")
+        with self.assertRaisesRegex(ProjectError, "不支援的評分方式"):
+            self.service.set_evaluation_mode("project", "guess")
+
     def test_evaluation_is_rejected_before_answers_exist(self):
         question_set = self.service.import_question_set("project", self.question_file)
         self.service.add_group("project")
@@ -371,6 +406,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         }
 
         self.assertIn("回答模型", labels)
+        self.assertIn("答案評分方式", labels)
         self.assertEqual(len(app.renderables), 1)
         self.assertIn("測試最大並行請求數", labels)
         self.assertIn("實驗組摘要", labels)
@@ -418,6 +454,15 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertGreater(export_button_position, result_table_position)
         self.assertIn("精簡摘要 JSON", labels)
         self.assertIn("逐題結果 JSON", labels)
+        evaluation_mode_dropdown = next(
+            component for component in app.blocks.values()
+            if isinstance(component, gr.Dropdown) and component.label == "答案評分方式"
+        )
+        self.assertEqual(evaluation_mode_dropdown.value, "strict")
+        self.assertEqual(
+            [value for _label, value in evaluation_mode_dropdown.choices],
+            ["strict", "lenient"],
+        )
 
         renderer = app.renderables[0]
         LocalContext.blocks_config.set(app.default_config)

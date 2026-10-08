@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import threading
+import unicodedata
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -122,12 +123,15 @@ class RetrievalExperimentService:
             value = json.loads(self._path(project_id).read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {"groups": [], "question_set_id": "", "max_concurrency": 5,
-                    "judge_model": self.connections.get_chat_model(), "run": None}
+                    "judge_model": self.connections.get_chat_model(), "evaluation_mode": "strict", "run": None}
         except (OSError, json.JSONDecodeError) as exc:
             raise ProjectError("檢索實驗保存資料無法讀取") from exc
         value.setdefault("groups", [])
         value.setdefault("question_set_id", "")
         value.setdefault("max_concurrency", 5)
+        value.setdefault("evaluation_mode", "strict")
+        if value["evaluation_mode"] not in {"strict", "lenient"}:
+            value["evaluation_mode"] = "strict"
         value.setdefault("run", None)
         legacy_groups = value.get("groups", [])
         legacy_judge = next((
@@ -169,6 +173,14 @@ class RetrievalExperimentService:
         current["question_set_id"] = question_set_id
         current["max_concurrency"] = max_concurrency
         self._write(project_id, current)
+
+    def set_evaluation_mode(self, project_id: str, evaluation_mode: str) -> dict[str, object]:
+        if evaluation_mode not in {"strict", "lenient"}:
+            raise ProjectError("不支援的評分方式")
+        current = self.load(project_id)
+        current["evaluation_mode"] = evaluation_mode
+        self._write(project_id, current)
+        return current
 
     def import_question_set(self, project_id: str, filepath: str | Path) -> object:
         question_set = self.question_sets.import_file(project_id, filepath)
@@ -383,9 +395,13 @@ class RetrievalExperimentService:
         judge_model: str | None = None,
         max_concurrency: int | None = None,
         update_callback: UpdateFunction | None = None,
+        evaluation_mode: str | None = None,
     ) -> RetrievalExperimentRun:
         """Evaluate previously saved answers without repeating GraphRAG retrieval."""
         state = self.load(project_id)
+        evaluation_mode = evaluation_mode or str(state.get("evaluation_mode", "strict"))
+        if evaluation_mode not in {"strict", "lenient"}:
+            raise ProjectError("不支援的評分方式")
         run_state = state.get("run")
         if not isinstance(run_state, dict) or run_state.get("question_set_id") != question_set_id:
             raise ProjectError("請先執行「檢索並生成答案」")
@@ -398,6 +414,8 @@ class RetrievalExperimentService:
         concurrency = int(max_concurrency or state.get("max_concurrency", 5))
         if not 1 <= concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
+        state["evaluation_mode"] = evaluation_mode
+        self._write(project_id, state)
         question_set = self.question_sets.get(project_id, question_set_id)
         question_by_id = {item.question_id: item for item in question_set.questions}
         results: dict[tuple[str, str], ExperimentQuestionResult] = {}
@@ -424,7 +442,7 @@ class RetrievalExperimentService:
         started_at = str(run_state.get("started_at") or datetime.now(timezone.utc).isoformat())
         self._persist_run(
             project_id, question_set_id, groups, judge_model, concurrency,
-            started_at, "evaluating", results,
+            started_at, "evaluating", results, evaluation_mode=evaluation_mode,
         )
         futures: dict[Future[ExperimentQuestionResult], tuple[ExperimentGroup, BatchQuestion]] = {}
         work_iter = iter(work)
@@ -436,7 +454,9 @@ class RetrievalExperimentService:
                     group, question, result = next(work_iter)
                 except StopIteration:
                     return
-                future = executor.submit(self._evaluate_case, project_id, group, question, judge_model, result)
+                future = executor.submit(
+                    self._evaluate_case, project_id, group, question, judge_model, result, evaluation_mode
+                )
                 futures[future] = (group, question)
 
         fill_available_workers()
@@ -453,7 +473,7 @@ class RetrievalExperimentService:
                     status = "stopping" if stop_event.is_set() else "evaluating"
                     updated = self._persist_run(
                         project_id, question_set_id, groups, judge_model, concurrency,
-                        started_at, status, results,
+                        started_at, status, results, evaluation_mode=evaluation_mode,
                     )
                     if update_callback:
                         update_callback(updated)
@@ -464,7 +484,7 @@ class RetrievalExperimentService:
             executor.shutdown(wait=True, cancel_futures=True)
             self._persist_run(
                 project_id, question_set_id, groups, judge_model, concurrency,
-                started_at, "stopped", results,
+                started_at, "stopped", results, evaluation_mode=evaluation_mode,
             )
             raise
         finally:
@@ -475,6 +495,7 @@ class RetrievalExperimentService:
         return self._persist_run(
             project_id, question_set_id, groups, judge_model, concurrency,
             started_at, run_status, results, datetime.now(timezone.utc).isoformat(),
+            evaluation_mode=evaluation_mode,
         )
 
     def stop(self, project_id: str) -> bool:
@@ -569,6 +590,7 @@ class RetrievalExperimentService:
             "max_concurrent_requests": state.get("max_concurrency", 5),
             "evaluation": {
                 "judge_model": state.get("judge_model", ""),
+                "mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
                 "judge_reasoning_effort": (
                     DEFAULT_REASONING_EFFORT
                     if state.get("judge_model") == GPT6_LUNA_MODEL
@@ -591,6 +613,7 @@ class RetrievalExperimentService:
             "format": "manual-graphrag-experiment-question-results",
             "project": payload["project"],
             "execution_status": run.get("status"),
+            "evaluation_mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
             "question_set_id": state.get("question_set_id", ""),
             "question_set_name": run.get("question_set_name", ""),
             "question_count": expected_count,
@@ -671,17 +694,30 @@ class RetrievalExperimentService:
         question: BatchQuestion,
         judge_model: str,
         generated: ExperimentQuestionResult,
+        evaluation_mode: str = "strict",
     ) -> ExperimentQuestionResult:
         try:
-            judged = self.judging.evaluate_single_answer(
-                project_id, question.question_id, question.question,
-                question.reference_answer, generated.actual_answer, judge_model,
-            )
+            if evaluation_mode == "lenient":
+                expected = self._normalize_for_containment(question.reference_answer)
+                actual = self._normalize_for_containment(generated.actual_answer)
+                is_correct = bool(expected) and expected in actual
+                reason = (
+                    "寬鬆評分：系統回答包含完整正確答案（忽略空白與全／半形差異）。"
+                    if is_correct
+                    else "寬鬆評分：系統回答未完整包含正確答案。"
+                )
+            else:
+                judged = self.judging.evaluate_single_answer(
+                    project_id, question.question_id, question.question,
+                    question.reference_answer, generated.actual_answer, judge_model,
+                )
+                is_correct = judged.is_correct
+                reason = judged.judge_reason
             return replace(
                 generated,
                 judge_model=judge_model,
-                evaluation_result="正確" if judged.is_correct else "錯誤",
-                evaluation_reason=judged.judge_reason,
+                evaluation_result="正確" if is_correct else "錯誤",
+                evaluation_reason=reason,
                 status="completed",
                 error=None,
             )
@@ -694,6 +730,11 @@ class RetrievalExperimentService:
                 status="evaluation_failed",
                 error=str(exc),
             )
+
+    @staticmethod
+    def _normalize_for_containment(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value or "").casefold()
+        return "".join(normalized.split())
 
     def _failed_result(
         self, group: ExperimentGroup, question: BatchQuestion, judge_model: str, error: str
@@ -723,6 +764,7 @@ class RetrievalExperimentService:
         status: str,
         results: dict[tuple[str, str], ExperimentQuestionResult],
         completed_at: str | None = None,
+        evaluation_mode: str | None = None,
     ) -> RetrievalExperimentRun:
         question_set = self.question_sets.get(project_id, question_set_id)
         project = self.projects.get(project_id)
@@ -746,7 +788,10 @@ class RetrievalExperimentService:
         )
         state = self.load(project_id)
         state["judge_model"] = judge_model
-        state["run"] = asdict(run)
+        run_value = asdict(run)
+        if evaluation_mode is not None:
+            run_value["evaluation_mode"] = evaluation_mode
+        state["run"] = run_value
         self._write(project_id, state)
         return run
 
