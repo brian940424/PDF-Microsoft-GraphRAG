@@ -515,10 +515,18 @@ class RetrievalExperimentTests(unittest.TestCase):
         dynamic_handlers = [
             fn for fn in app.default_config.fns.values() if fn.rendered_in is renderer
         ]
+        dynamic_handler_ids = {fn.key: fn._id for fn in dynamic_handlers}
         dynamic_dropdowns = [
             component for component in app.default_config.blocks.values()
             if isinstance(component, gr.Dropdown) and component.rendered_in is renderer
         ]
+        dynamic_handlers_after_rerender = [
+            fn for fn in app.default_config.fns.values() if fn.rendered_in is renderer
+        ]
+        self.assertEqual(
+            {fn.key: fn._id for fn in dynamic_handlers_after_rerender},
+            dynamic_handler_ids,
+        )
         self.assertEqual({component.label for component in dynamic_dropdowns}, {"回答模型", "GraphRAG 檢索策略"})
         self.assertTrue(all(component.interactive is True for component in dynamic_dropdowns))
         answer_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答模型")

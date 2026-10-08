@@ -1864,12 +1864,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         method_value = group.get("method", "local")
                         model_choices = list(ALLOWED_CHAT_MODELS)
                         group_strategy_choices = strategy_choices
-                        group_id_state = gr.State(group["group_id"])
-                        with gr.Group():
-                            with gr.Row():
-                                gr.Markdown(f"### {group['name']}")
-                                remove_button = gr.Button("移除此組", variant="stop", size="sm")
-                            with gr.Row():
+                        group_id = group["group_id"]
+                        group_id_state = gr.State(group_id)
+                        with gr.Group(key=f"experiment-group-{group_id}"):
+                            with gr.Row(key=f"experiment-group-title-{group_id}"):
+                                gr.Markdown(f"### {group['name']}", key=f"experiment-group-name-{group_id}")
+                                remove_button = gr.Button(
+                                    "移除此組",
+                                    variant="stop",
+                                    size="sm",
+                                    key=f"experiment-group-remove-{group_id}",
+                                )
+                            with gr.Row(key=f"experiment-group-settings-{group_id}"):
                                 answer_model = gr.Dropdown(
                                     choices=model_choices, value=answer_model_value,
                                     label="回答模型",
@@ -1886,16 +1892,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             save_experiment_answer_model,
                             inputs=[active_project_id, group_id_state, answer_model, experiment_group_revision],
                             outputs=[experiment_group_save_status, experiment_group_revision],
+                            key=f"experiment-answer-model-save-{group_id}",
                         )
                         strategy.input(
                             save_experiment_method,
                             inputs=[active_project_id, group_id_state, strategy, experiment_group_revision],
                             outputs=[experiment_group_save_status, experiment_group_revision],
+                            key=f"experiment-strategy-save-{group_id}",
                         )
                         remove_button.click(
                             remove_experiment_group,
                             inputs=[active_project_id, group_id_state, experiment_group_revision],
                             outputs=[experiment_group_save_status, experiment_group_revision],
+                            key=f"experiment-group-remove-action-{group_id}",
                         )
             experiment_add_group_button = gr.Button("新增實驗組")
             with gr.Row():
