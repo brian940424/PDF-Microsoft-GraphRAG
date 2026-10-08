@@ -7,7 +7,6 @@ import math
 import os
 import tempfile
 import threading
-import unicodedata
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -697,27 +696,16 @@ class RetrievalExperimentService:
         evaluation_mode: str = "strict",
     ) -> ExperimentQuestionResult:
         try:
-            if evaluation_mode == "lenient":
-                expected = self._normalize_for_containment(question.reference_answer)
-                actual = self._normalize_for_containment(generated.actual_answer)
-                is_correct = bool(expected) and expected in actual
-                reason = (
-                    "寬鬆評分：系統回答包含完整正確答案（忽略空白與全／半形差異）。"
-                    if is_correct
-                    else "寬鬆評分：系統回答未完整包含正確答案。"
-                )
-            else:
-                judged = self.judging.evaluate_single_answer(
-                    project_id, question.question_id, question.question,
-                    question.reference_answer, generated.actual_answer, judge_model,
-                )
-                is_correct = judged.is_correct
-                reason = judged.judge_reason
+            judged = self.judging.evaluate_single_answer(
+                project_id, question.question_id, question.question,
+                question.reference_answer, generated.actual_answer, judge_model,
+                evaluation_mode=evaluation_mode,
+            )
             return replace(
                 generated,
                 judge_model=judge_model,
-                evaluation_result="正確" if is_correct else "錯誤",
-                evaluation_reason=reason,
+                evaluation_result="正確" if judged.is_correct else "錯誤",
+                evaluation_reason=judged.judge_reason,
                 status="completed",
                 error=None,
             )
@@ -730,11 +718,6 @@ class RetrievalExperimentService:
                 status="evaluation_failed",
                 error=str(exc),
             )
-
-    @staticmethod
-    def _normalize_for_containment(value: str) -> str:
-        normalized = unicodedata.normalize("NFKC", value or "").casefold()
-        return "".join(normalized.split())
 
     def _failed_result(
         self, group: ExperimentGroup, question: BatchQuestion, judge_model: str, error: str

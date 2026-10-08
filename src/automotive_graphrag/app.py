@@ -1925,7 +1925,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     value="strict",
                     label="答案評分方式",
                 )
-                gr.Markdown("寬鬆模式只檢查正確答案是否完整出現在回答中；忽略空白與全形／半形差異，不呼叫評測模型。")
+                gr.Markdown("寬鬆模式會使用評測模型做語意比對：涵蓋正解核心資訊即可；接受同義改寫與合理補充，不因答案較詳細而扣錯。")
             experiment_generation_status = gr.Markdown("尚未生成答案。完成前不能評測。")
             experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
             experiment_status = gr.Markdown()

@@ -19,12 +19,18 @@ from automotive_graphrag.source_metadata import SourceMetadata
 
 
 class FakeJudge:
-    def __init__(self):
+    def __init__(self, lenient_result: bool | None = None):
         self.calls = []
+        self.lenient_result = lenient_result
 
-    def evaluate_single_answer(self, project_id, question_id, question, correct, actual, model):
-        self.calls.append((project_id, question_id, question, correct, actual, model))
-        return AutomaticEvaluationItem(question_id, actual == correct, f"model={model}")
+    def evaluate_single_answer(self, project_id, question_id, question, correct, actual, model, evaluation_mode="strict"):
+        self.calls.append((project_id, question_id, question, correct, actual, model, evaluation_mode))
+        is_correct = (
+            self.lenient_result if evaluation_mode == "lenient" and self.lenient_result is not None
+            else actual == correct
+        )
+        reason = f"寬鬆評分 model={model}" if evaluation_mode == "lenient" else f"model={model}"
+        return AutomaticEvaluationItem(question_id, is_correct, reason)
 
 
 class RetrievalExperimentTests(unittest.TestCase):
@@ -234,8 +240,8 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1, "evaluation must not repeat GraphRAG retrieval")
         self.assertEqual(self.service.load("project")["run"]["status"], "completed")
 
-    def test_lenient_evaluation_accepts_complete_answer_containment_and_persists_mode(self):
-        judge = FakeJudge()
+    def test_lenient_evaluation_uses_lenient_judge_prompt_and_persists_mode(self):
+        judge = FakeJudge(lenient_result=True)
         self.service.judging = judge
         question_set = self.question_sets.create_with_questions(
             "project", "lenient", [
@@ -257,7 +263,8 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         self.assertEqual(run.results[0].evaluation_result, "正確")
         self.assertIn("寬鬆評分", run.results[0].evaluation_reason)
-        self.assertEqual(judge.calls, [], "lenient containment mode should not call the LLM judge")
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(judge.calls[0][-1], "lenient")
         self.assertEqual(self.service.load("project")["evaluation_mode"], "lenient")
         self.service.set_evaluation_mode("project", "strict")
         summary_path, details_path = self.service.export("project")

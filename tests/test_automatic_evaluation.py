@@ -13,7 +13,7 @@ from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
-from automotive_graphrag.question_sets import QuestionSetService
+from automotive_graphrag.question_sets import BatchQuestion, QuestionSetService
 from automotive_graphrag.reviews import ReviewService
 
 
@@ -172,6 +172,33 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             rows = list(csv.DictReader(source))
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["reviewer_note"], "人工抽查")
+
+    def test_lenient_single_answer_uses_prompt_that_accepts_paraphrases_and_extras(self) -> None:
+        judge = FakeJudge([self.judged(5)])
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+
+        result = service.evaluate_single_answer(
+            "L33-SM3E", "Q001", "問題一", "核心正確答案", "改寫後的回答與額外補充", "gpt-4o-mini",
+            evaluation_mode="lenient",
+        )
+
+        self.assertTrue(result.is_correct)
+        prompt = judge.calls[0][3]
+        self.assertIn("使用寬鬆的語意比對", prompt)
+        self.assertIn("必須接受同義詞", prompt)
+        self.assertIn("不要只因回答比正確答案更詳細", prompt)
+        self.assertNotIn("額外步驟／實質資訊，判為 incorrect", prompt)
+        self.assertNotIn('"retrieved_evidence"', prompt)
+
+    def test_strict_and_lenient_prompts_have_distinct_criteria(self) -> None:
+        question = BatchQuestion("Q1", "問題", "標準答案", answer="回答")
+        strict = AutomaticEvaluationService._build_prompt([question])
+        lenient = AutomaticEvaluationService._build_prompt([question], "lenient")
+
+        self.assertIn("加入正確答案未支持的額外步驟／實質資訊", strict)
+        self.assertIn("合理補充", lenient)
+        self.assertIn("只有在回答漏掉核心資訊", lenient)
+        self.assertNotIn("額外步驟／實質資訊，判為 incorrect", lenient)
 
     def test_only_previous_failures_rejudges_subset_and_merges_result(self) -> None:
         second_response = {"items": [self.judged(5)["items"][0]]}

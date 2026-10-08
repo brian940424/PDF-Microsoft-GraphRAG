@@ -152,17 +152,20 @@ class AutomaticEvaluationService:
         correct_answer: str,
         system_answer: str,
         model: str,
+        evaluation_mode: str = "strict",
     ) -> AutomaticEvaluationItem:
         """Judge one answer without retrieval evidence or shared question-set mutation."""
         if model not in ALLOWED_CHAT_MODELS:
             raise ProjectError(f"不支援的評判模型：{model}")
+        if evaluation_mode not in {"strict", "lenient"}:
+            raise ProjectError("不支援的評分方式")
         case = BatchQuestion(
             question_id=question_id,
             question=question,
             reference_answer=correct_answer,
             answer=system_answer,
         )
-        prompt = self._build_prompt([case])
+        prompt = self._build_prompt([case], evaluation_mode)
         api_key = self.connections.apply_to_environment(project_id)
         try:
             response = self.client(
@@ -279,7 +282,7 @@ class AutomaticEvaluationService:
         return json_path, csv_path
 
     @staticmethod
-    def _build_prompt(questions: list[BatchQuestion]) -> str:
+    def _build_prompt(questions: list[BatchQuestion], evaluation_mode: str = "strict") -> str:
         cases = [
             {
                 "question_id": item.question_id,
@@ -289,14 +292,26 @@ class AutomaticEvaluationService:
             }
             for item in questions
         ]
+        if evaluation_mode == "lenient":
+            criteria = (
+                "使用寬鬆的語意比對：若系統回答已表達正確答案的全部核心資訊與必要步驟，判為 correct。"
+                "必須接受同義詞、語序或格式差異、簡潔改寫，以及不改變正解含義的合理補充。\n"
+                "不要要求逐字包含正確答案，也不要只因回答比正確答案更詳細、包含正確答案未提到的背景或補充資訊，就判為 incorrect。"
+                "只有在回答漏掉核心資訊／必要步驟、與正確答案的核心內容矛盾，或額外內容明確使答案變成錯誤時，才判為 incorrect。\n"
+                "流程題仍須涵蓋所有必要步驟；只有當順序會影響結果時才要求相同順序。非流程題以是否傳達正確答案的核心意思為準。\n"
+            )
+        else:
+            criteria = (
+                "若系統回答與正確答案表達的內容一致，且完整包含所有必要步驟、條件、順序與要求，判為 correct。\n"
+                "只要缺少必要內容／步驟、步驟順序錯誤、與正確答案矛盾，或加入正確答案未支持的額外步驟／實質資訊，判為 incorrect。"
+                "不要求字面完全相同；同義改寫可接受，但不能因此省略或新增實質內容。非流程型答案也不得缺漏或添加實質主張。\n"
+            )
         return (
             "你是答案比對員。只根據每筆資料中的題目、正確答案和系統回答判斷，不得使用外部知識或任何檢索證據。\n"
-            "若系統回答與正確答案表達的內容一致，且完整包含所有必要步驟、條件、順序與要求，判為 correct。\n"
-            "只要缺少必要內容／步驟、步驟順序錯誤、與正確答案矛盾，或加入正確答案未支持的額外步驟／實質資訊，判為 incorrect。"
-            "不要求字面完全相同；同義改寫可接受，但不能因此省略或新增實質內容。非流程型答案也不得缺漏或添加實質主張。\n"
+            f"{criteria}"
             "只輸出 JSON object，格式為 "
             '{"items":[{"question_id":"...","result":"correct或incorrect","reason":"..."}]}。'
-            "每個輸入題號必須恰好出現一次。reason 簡短指出符合之處，或具體缺漏、錯誤、額外內容。\n"
+            "每個輸入題號必須恰好出現一次。reason 簡短指出符合之處，或具體缺漏、矛盾、錯誤。\n"
             f"評測案例：{json.dumps(cases, ensure_ascii=False)}"
         )
 
