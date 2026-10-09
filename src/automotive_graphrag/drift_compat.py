@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -89,4 +90,16 @@ def run_drift_search(
     # The GraphRAG API resolves its factory through a module global. Serialize
     # DRIFT calls while that reference is temporarily wrapped to prevent races.
     with _DRIFT_PATCH_LOCK:
-        return execute()
+        try:
+            original_cwd = os.getcwd()
+        except OSError:
+            # Recover cleanly if an earlier GraphRAG call left the app in a
+            # temporary directory that has since been removed.
+            original_cwd = str(Path(__file__).resolve().parents[2])
+        try:
+            return execute()
+        finally:
+            try:
+                os.chdir(original_cwd)
+            except FileNotFoundError:
+                os.chdir(Path(__file__).resolve().parents[2])

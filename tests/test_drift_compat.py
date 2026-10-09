@@ -1,4 +1,6 @@
 import asyncio
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -113,6 +115,23 @@ class DriftCompatibilityTests(unittest.TestCase):
             completion.calls,
             [{"messages": "prompt", "max_completion_tokens": 50}],
         )
+        self.assertIs(query_api.get_drift_search_engine, original_factory)
+
+    def test_drift_entrypoint_restores_process_working_directory(self):
+        from graphrag.api import query as query_api
+        from graphrag.cli import query as cli_query
+
+        original_cwd = os.getcwd()
+        original_factory = query_api.get_drift_search_engine
+
+        def fake_cli_run(**_kwargs):
+            os.chdir(temporary_path)
+            return "answer", {}
+
+        with tempfile.TemporaryDirectory() as temporary_path:
+            with patch.object(cli_query, "run_drift_search", fake_cli_run):
+                run_drift_search(root_dir=temporary_path, query="question")
+            self.assertEqual(os.getcwd(), original_cwd)
         self.assertIs(query_api.get_drift_search_engine, original_factory)
 
 

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -330,38 +331,37 @@ class RetrievalExperimentTests(unittest.TestCase):
             encoding="utf-8",
         )
         calls = {}
-        def capture(name):
-            def run(**kwargs):
-                root = kwargs["root_dir"]
-                settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
-                calls[name] = {
-                    **kwargs,
-                    "output_is_symlink": (root / "output").is_symlink(),
-                    "completion_model": settings["completion_models"]["default"]["model"],
-                }
-                return "answer", {}
-            return run
 
-        with (
-            patch("graphrag.cli.query.run_local_search", side_effect=capture("local")) as local,
-            patch("graphrag.cli.query.run_global_search", side_effect=capture("global")) as global_search,
-            patch("graphrag.cli.query.run_drift_search", side_effect=capture("drift")) as drift,
-            patch("graphrag.cli.query.run_basic_search", side_effect=capture("basic")) as basic,
-        ):
+        def run_worker(command, **kwargs):
+            payload = json.loads(kwargs["input"])
+            root = Path(payload["root_dir"])
+            settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
+            calls[payload["method"]] = {
+                **payload,
+                "output_is_symlink": (root / "output").is_symlink(),
+                "completion_model": settings["completion_models"]["default"]["model"],
+                "cwd": str(kwargs["cwd"]),
+            }
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps({"answer": "answer", "context": {}}),
+                "",
+            )
+
+        with patch(
+            "automotive_graphrag.retrieval_experiments.subprocess.run",
+            side_effect=run_worker,
+        ) as worker:
             for method in ("local", "global", "drift", "basic"):
                 answer, _ = self.service._graphrag_query("project", "查詢", method, "gpt-4.1-mini")
                 self.assertEqual(answer, "answer")
 
-        self.assertTrue(all(call.call_count == 1 for call in (local, global_search, drift, basic)))
-        self.assertEqual(calls["local"]["community_level"], 2)
-        self.assertFalse(calls["global"]["dynamic_community_selection"])
-        self.assertEqual(calls["drift"]["community_level"], 2)
-        self.assertNotIn("community_level", calls["basic"])
-        for kwargs in calls.values():
-            self.assertEqual(kwargs["response_type"], "Multiple Paragraphs")
-            self.assertFalse(kwargs["streaming"])
-            self.assertTrue(kwargs["output_is_symlink"])
-            self.assertEqual(kwargs["completion_model"], "gpt-4.1-mini")
+        self.assertEqual(worker.call_count, 4)
+        self.assertEqual(set(calls), {"local", "global", "drift", "basic"})
+        self.assertTrue(all(call["output_is_symlink"] for call in calls.values()))
+        self.assertTrue(all(call["cwd"] == str(Path(__file__).parents[1]) for call in calls.values()))
+        self.assertTrue(all(call["completion_model"] == "gpt-4.1-mini" for call in calls.values()))
 
     def test_luna_drift_uses_sampling_parameter_compatibility_adapter(self):
         graph_root = self.projects.path_for("project") / "graphrag"
@@ -373,16 +373,23 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         captured = {}
 
-        def run_compatible(**kwargs):
-            settings = yaml.safe_load((kwargs["root_dir"] / "settings.yaml").read_text(encoding="utf-8"))
+        def run_worker(command, **kwargs):
+            payload = json.loads(kwargs["input"])
+            root = Path(payload["root_dir"])
+            settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             captured["model"] = settings["completion_models"]["default"]["model"]
             captured["args"] = settings["completion_models"]["default"]["call_args"]
-            captured["output_is_symlink"] = (kwargs["root_dir"] / "output").is_symlink()
-            return "Luna DRIFT answer", {"sources": []}
+            captured["output_is_symlink"] = (root / "output").is_symlink()
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps({"answer": "Luna DRIFT answer", "context": {"sources": []}}),
+                "",
+            )
 
         with patch(
-            "automotive_graphrag.retrieval_experiments.run_compatible_drift_search",
-            side_effect=run_compatible,
+            "automotive_graphrag.retrieval_experiments.subprocess.run",
+            side_effect=run_worker,
         ) as adapter:
             answer, _context = self.service._graphrag_query(
                 "project", "測試", "drift", "gpt-6-luna"

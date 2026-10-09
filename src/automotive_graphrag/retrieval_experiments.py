@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -24,10 +26,8 @@ from .connections import (
     configure_completion_model,
 )
 from .evidence import EvidenceService
-from .drift_compat import run_drift_search as run_compatible_drift_search
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
-from .querying import QueryService
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
@@ -795,36 +795,45 @@ class RetrievalExperimentService:
         api_key = self.connections.apply_to_environment(project_id)
         del api_key  # GraphRAG reads the standard API key environment variable.
 
-        from graphrag.cli.query import (
-            run_basic_search, run_drift_search, run_global_search, run_local_search,
-        )
-
         with tempfile.TemporaryDirectory(prefix="graphrag-experiment-") as temporary:
             root = Path(temporary)
             (root / "settings.yaml").write_text(yaml.safe_dump(settings, allow_unicode=True, sort_keys=False), encoding="utf-8")
             (root / "output").symlink_to(project_path / "output", target_is_directory=True)
-            common = dict(data_dir=None, root_dir=root, response_type="Multiple Paragraphs", streaming=False,
-                          query=question, verbose=False)
-            if method == "local":
-                answer, context = run_local_search(community_level=2, **common)
-            elif method == "global":
-                answer, context = run_global_search(
-                    community_level=2, dynamic_community_selection=False, **common
-                )
-            elif method == "drift":
-                if model == GPT6_LUNA_MODEL:
-                    answer, context = run_compatible_drift_search(
-                        root_dir=root,
-                        query=question,
-                        community_level=2,
-                        response_type="Multiple Paragraphs",
-                    )
-                else:
-                    answer, context = run_drift_search(community_level=2, **common)
-            else:
-                answer, context = run_basic_search(**common)
-        serialized = QueryService._serialize_context(context)
-        return str(answer), serialized
+            worker_payload = json.dumps(
+                {
+                    "root_dir": str(root),
+                    "question": question,
+                    "method": method,
+                    "model": model,
+                },
+                ensure_ascii=False,
+            )
+            package_root = Path(__file__).resolve().parents[2]
+            environment = os.environ.copy()
+            source_path = str(package_root / "src")
+            environment["PYTHONPATH"] = os.pathsep.join(
+                part for part in (source_path, environment.get("PYTHONPATH", "")) if part
+            )
+            result = subprocess.run(
+                [sys.executable, "-m", "automotive_graphrag.graph_query_worker"],
+                cwd=package_root,
+                env=environment,
+                input=worker_payload,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            raise ProjectError(
+                f"GraphRAG 查詢工作程序未回傳有效結果：{detail[-1] if detail else result.returncode}"
+            ) from exc
+        if result.returncode or "error" in response:
+            raise ProjectError(str(response.get("error") or result.stderr or "GraphRAG 查詢失敗"))
+        context = response.get("context", {})
+        return str(response.get("answer", "")), context if isinstance(context, dict) else {}
 
     def _validate_groups(self, groups: Sequence[ExperimentGroup]) -> None:
         seen: set[str] = set()
