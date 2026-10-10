@@ -30,6 +30,7 @@ class GraphQueryWorkerTests(unittest.TestCase):
                     "question": "問題",
                     "method": method,
                     "model": "gpt-4.1-mini",
+                    "response_type": "List of 3-7 Points",
                 })
                 self.assertEqual(result["answer"], "answer")
                 self.assertEqual(result["context"], {"sources": []})
@@ -39,6 +40,7 @@ class GraphQueryWorkerTests(unittest.TestCase):
         self.assertFalse(calls["global"]["dynamic_community_selection"])
         self.assertEqual(calls["drift"]["community_level"], 2)
         self.assertEqual(calls["basic"]["root_dir"], Path("/tmp/project"))
+        self.assertTrue(all(call["response_type"] == "List of 3-7 Points" for call in calls.values()))
 
     def test_luna_drift_uses_compatibility_adapter(self):
         with patch(
@@ -50,6 +52,7 @@ class GraphQueryWorkerTests(unittest.TestCase):
                 "question": "問題",
                 "method": "drift",
                 "model": "gpt-6-luna",
+                "response_type": "Single Sentence",
             })
 
         self.assertEqual(result["answer"], "luna answer")
@@ -57,7 +60,7 @@ class GraphQueryWorkerTests(unittest.TestCase):
             root_dir=Path("/tmp/project"),
             query="問題",
             community_level=2,
-            response_type="Multiple Paragraphs",
+            response_type="Single Sentence",
         )
 
 

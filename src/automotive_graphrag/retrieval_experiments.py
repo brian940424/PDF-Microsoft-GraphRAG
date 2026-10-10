@@ -31,6 +31,17 @@ from .question_sets import BatchQuestion, QuestionSetService
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
+DEFAULT_EXPERIMENT_RESPONSE_TYPE = "Single Paragraph"
+EXPERIMENT_RESPONSE_TYPE_OPTIONS = (
+    ("單句", "Single Sentence"),
+    ("3–7 點條列", "List of 3-7 Points"),
+    ("單段回答", "Single Paragraph"),
+    ("多頁報告", "Multi-Page Report"),
+    ("2–3 句精簡回答", "2-3 concise sentences"),
+    ("精簡段落；流程題以編號列必要步驟", "A concise paragraph; use numbered steps only for procedures"),
+    ("簡短回答，不要前言", "A short answer with no preamble"),
+)
+EXPERIMENT_RESPONSE_TYPES = tuple(value for _, value in EXPERIMENT_RESPONSE_TYPE_OPTIONS)
 UNRANKED_REASON = (
     "不可計算：GraphRAG API context 未提供可驗證的來源排序分數；context 列表順序不保證是檢索排名。"
 )
@@ -42,6 +53,7 @@ class ExperimentGroup:
     name: str
     answer_model: str
     method: str
+    response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +74,7 @@ class ExperimentQuestionResult:
     retrieval_metrics_status: str
     status: str
     error: str | None = None
+    response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +92,7 @@ class ExperimentGroupSummary:
     recall_at_10: float | None
     mrr: float | None
     retrieval_metrics_status: str
+    response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +110,7 @@ class RetrievalExperimentRun:
     results: tuple[ExperimentQuestionResult, ...]
 
 
-QueryFunction = Callable[[str, str, str, str], tuple[str, dict[str, object]]]
+QueryFunction = Callable[[str, str, str, str, str], tuple[str, dict[str, object]]]
 UpdateFunction = Callable[[RetrievalExperimentRun], None]
 
 
@@ -249,6 +263,19 @@ class RetrievalExperimentService:
         for group in current["groups"]:
             if group.get("group_id") == group_id:
                 group["answer_model"] = answer_model
+                matched = True
+        if matched:
+            self._write(project_id, current)
+        return current
+
+    def set_group_response_type(self, project_id: str, group_id: str, response_type: str) -> dict[str, object]:
+        if response_type not in EXPERIMENT_RESPONSE_TYPES:
+            raise ProjectError("不支援的 GraphRAG 回答格式")
+        current = self.load(project_id)
+        matched = False
+        for group in current["groups"]:
+            if group.get("group_id") == group_id:
+                group["response_type"] = response_type
                 matched = True
         if matched:
             self._write(project_id, current)
@@ -418,8 +445,12 @@ class RetrievalExperimentService:
                     raise ProjectError(
                         f"{group.name} 的題目 {question.question_id} 尚未完成回答；請先生成所有答案"
                     )
-                if result.answer_model != group.answer_model or result.method != group.method:
-                    raise ProjectError(f"{group.name} 的模型或檢索策略已變更；請重新生成答案")
+                if (
+                    result.answer_model != group.answer_model
+                    or result.method != group.method
+                    or result.response_type != group.response_type
+                ):
+                    raise ProjectError(f"{group.name} 的模型、檢索策略或回答格式已變更；請重新生成答案")
                 if result.question != question.question or result.correct_answer != question.reference_answer:
                     raise ProjectError(f"題目 {question.question_id} 已變更；請重新生成答案")
                 work.append((group, question_by_id[question.question_id], result))
@@ -552,6 +583,7 @@ class RetrievalExperimentService:
                 "parameters": {
                     "answer_model": summary.get("answer_model"),
                     "retrieval_mode": self._retrieval_mode_label(summary.get("method")),
+                    "response_type": summary.get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE),
                     "answer_reasoning_effort": (
                         DEFAULT_REASONING_EFFORT
                         if summary.get("answer_model") == GPT6_LUNA_MODEL
@@ -610,6 +642,7 @@ class RetrievalExperimentService:
                     "name": group.get("name"),
                     "answer_model": group.get("parameters", {}).get("answer_model"),
                     "retrieval_mode": group.get("parameters", {}).get("retrieval_mode"),
+                    "response_type": group.get("parameters", {}).get("response_type"),
                     "judge_model": group.get("summary", {}).get("judge_model"),
                 }
                 for group in group_rows
@@ -649,7 +682,9 @@ class RetrievalExperimentService:
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str
     ) -> ExperimentQuestionResult:
         try:
-            answer, context = self.query_function(project_id, question.question, group.method, group.answer_model)
+            answer, context = self.query_function(
+                project_id, question.question, group.method, group.answer_model, group.response_type
+            )
         except Exception as exc:
             return self._failed_result(group, question, judge_model, str(exc))
         try:
@@ -671,6 +706,7 @@ class RetrievalExperimentService:
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 question.question_id, question.question, source_docs, question.reference_answer,
                 answer, "待評測", "", None, UNRANKED_REASON, "answered",
+                response_type=group.response_type,
             )
         except Exception as exc:
             return self._failed_result(group, question, judge_model, str(exc))
@@ -723,6 +759,7 @@ class RetrievalExperimentService:
             group.group_id, group.name, group.answer_model, judge_model, group.method,
             question.question_id, question.question, source_docs, question.reference_answer,
             "", "未評判", error, None, UNRANKED_REASON, "failed", error,
+            response_type=group.response_type,
         )
 
     def _persist_run(
@@ -751,7 +788,7 @@ class RetrievalExperimentService:
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 len(question_set.questions), answered, correct,
                 correct / len(judged) if judged else None,
-                None, None, None, UNRANKED_REASON,
+                None, None, None, UNRANKED_REASON, group.response_type,
             ))
         run = RetrievalExperimentRun(
             project_id, project.display_name, question_set_id, question_set.name, status,
@@ -778,9 +815,18 @@ class RetrievalExperimentService:
         }
         return tuple(dict.fromkeys(metadata.get(item.text_unit_id, item.document_id) for item in evidence))
 
-    def _graphrag_query(self, project_id: str, question: str, method: str, model: str) -> tuple[str, dict[str, object]]:
+    def _graphrag_query(
+        self,
+        project_id: str,
+        question: str,
+        method: str,
+        model: str,
+        response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+    ) -> tuple[str, dict[str, object]]:
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
+        if response_type not in EXPERIMENT_RESPONSE_TYPES:
+            raise ProjectError("不支援的 GraphRAG 回答格式")
         project_path = self.projects.path_for(project_id) / "graphrag"
         settings_path = project_path / "settings.yaml"
         try:
@@ -805,6 +851,7 @@ class RetrievalExperimentService:
                     "question": question,
                     "method": method,
                     "model": model,
+                    "response_type": response_type,
                 },
                 ensure_ascii=False,
             )
@@ -847,6 +894,8 @@ class RetrievalExperimentService:
                 raise ProjectError(f"{group.group_id} 的回答模型不支援")
             if group.method not in EXPERIMENT_METHODS:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 策略不支援")
+            if group.response_type not in EXPERIMENT_RESPONSE_TYPES:
+                raise ProjectError(f"{group.group_id} 的 GraphRAG 回答格式不支援")
 
     def _path(self, project_id: str) -> Path:
         return self.projects.path_for(project_id) / "runs" / "retrieval-experiment-state.json"

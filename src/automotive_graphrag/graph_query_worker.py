@@ -19,6 +19,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     root_dir = Path(str(payload["root_dir"]))
     question = str(payload["question"])
     model = str(payload.get("model", ""))
+    response_type = str(payload.get("response_type") or "Single Paragraph")
     if method not in {"local", "global", "drift", "basic"}:
         raise ValueError(f"不支援的 GraphRAG 檢索策略：{method}")
 
@@ -27,7 +28,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     common = {
         "data_dir": None,
         "root_dir": root_dir,
-        "response_type": "Multiple Paragraphs",
+        "response_type": response_type,
         "streaming": False,
         "query": question,
         "verbose": False,
@@ -47,7 +48,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
             root_dir=root_dir,
             query=question,
             community_level=2,
-            response_type="Multiple Paragraphs",
+            response_type=response_type,
         )
     elif method == "drift":
         answer, context = cli_query.run_drift_search(community_level=2, **common)
@@ -55,7 +56,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
         answer, context = cli_query.run_basic_search(
             data_dir=None,
             root_dir=root_dir,
-            response_type="Multiple Paragraphs",
+            response_type=response_type,
             streaming=False,
             query=question,
             verbose=False,

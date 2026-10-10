@@ -82,7 +82,7 @@ class QueryServiceTests(unittest.TestCase):
         runner = FakeQueryRunner()
         service = QueryService(self.store, runner, self.connections)
 
-        result = service.ask("L33-SM3E", " 雨刷不會動，如何檢修？ ")
+        result = service.ask("L33-SM3E", " 雨刷不會動，如何檢修？ ", response_type="List of 3-7 Points")
 
         self.assertEqual(result.status, "COMPLETED")
         self.assertEqual(result.answer, "先檢查保險絲，再檢查馬達。")
@@ -90,6 +90,8 @@ class QueryServiceTests(unittest.TestCase):
         command = runner.commands[0]
         self.assertEqual(command[command.index("--root") + 1], str(self.graph_root))
         self.assertEqual(command[command.index("--method") + 1], "local")
+        self.assertEqual(command[command.index("--response-type") + 1], "List of 3-7 Points")
+        self.assertEqual(result.response_type, "List of 3-7 Points")
         self.assertEqual(command[-1], "雨刷不會動，如何檢修？")
         self.assertEqual(service.history("L33-SM3E"), [result])
         settings = yaml.safe_load((self.graph_root / "settings.yaml").read_text())
@@ -97,7 +99,7 @@ class QueryServiceTests(unittest.TestCase):
             settings["completion_models"]["default_completion_model"]["api_base"],
             "https://api.openai.com/v1",
         )
-        self.assertEqual(settings["completion_models"]["default_completion_model"]["model"], "gpt-4o-mini")
+        self.assertEqual(settings["completion_models"]["default_completion_model"]["model"], "gpt-6-luna")
         self.assertEqual(
             settings["embedding_models"]["default_embedding_model"]["model"],
             "text-embedding-3-small",
@@ -143,7 +145,9 @@ class QueryServiceTests(unittest.TestCase):
 
         self.assertEqual(result.status, "COMPLETED")
         self.assertEqual(result.answer, "Luna DRIFT 回答")
-        drift_search.assert_called_once_with(root_dir=self.graph_root, query="測試 GPT-6")
+        drift_search.assert_called_once_with(
+            root_dir=self.graph_root, query="測試 GPT-6", response_type="Single Paragraph"
+        )
 
     def test_query_rejects_unknown_chat_model(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)

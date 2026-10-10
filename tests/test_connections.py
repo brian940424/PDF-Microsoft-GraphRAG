@@ -93,11 +93,11 @@ class ConnectionSettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "HTTP"):
             ConnectionSettings(self.project_root).save("gateway.example", "shared-key")
 
-    def test_low_cost_models_are_defaults(self) -> None:
+    def test_luna_is_default_chat_model(self) -> None:
         settings = ConnectionSettings(self.project_root)
         settings.save("https://api.openai.com/v1", "shared-key")
 
-        self.assertEqual(settings.get_chat_model(), "gpt-4o-mini")
+        self.assertEqual(settings.get_chat_model(), "gpt-6-luna")
         self.assertEqual(settings.get_embedding_model(), "text-embedding-3-small")
 
     def test_models_are_restricted_to_allowed_options(self) -> None:

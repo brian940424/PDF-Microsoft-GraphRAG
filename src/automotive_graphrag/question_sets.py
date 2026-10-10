@@ -58,6 +58,7 @@ class QuestionSet:
     imported_at: str
     updated_at: str
     questions: tuple[BatchQuestion, ...]
+    response_type: str = "Single Paragraph"
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +162,7 @@ class QuestionSetService:
         question_set_id: str,
         results: Mapping[str, QueryResult],
         method: str,
+        response_type: str | None = None,
     ) -> QuestionSet:
         question_set = self.get(project_id, question_set_id)
         questions: list[BatchQuestion] = []
@@ -186,7 +188,7 @@ class QuestionSetService:
                     source_documents=item.source_documents,
                 )
             )
-        updated = self._replace(question_set, questions, method)
+        updated = self._replace(question_set, questions, method, response_type=response_type)
         self._write(updated)
         return updated
 
@@ -749,7 +751,12 @@ class QuestionSetService:
         return value
 
     @staticmethod
-    def _replace(question_set: QuestionSet, questions: list[BatchQuestion], method: str) -> QuestionSet:
+    def _replace(
+        question_set: QuestionSet,
+        questions: list[BatchQuestion],
+        method: str,
+        response_type: str | None = None,
+    ) -> QuestionSet:
         return QuestionSet(
             question_set_id=question_set.question_set_id,
             project_id=question_set.project_id,
@@ -759,6 +766,7 @@ class QuestionSetService:
             imported_at=question_set.imported_at,
             updated_at=datetime.now(timezone.utc).isoformat(),
             questions=tuple(questions),
+            response_type=response_type or question_set.response_type,
         )
 
     @staticmethod

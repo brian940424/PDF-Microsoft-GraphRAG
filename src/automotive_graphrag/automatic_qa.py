@@ -212,6 +212,7 @@ class AutomaticQATestService:
         answer_model: str,
         method: str,
         answer_concurrency: int,
+        response_type: str = "Single Paragraph",
     ) -> AutomaticQAReport:
         """Generate and persist answers only; judging is a separate user action."""
         report = self._run_existing(
@@ -224,6 +225,7 @@ class AutomaticQATestService:
             5,
             (),
             evaluate=False,
+            response_type=response_type,
         )
         self.judging.clear_result(project_id, question_set_id)
         return report
@@ -237,8 +239,11 @@ class AutomaticQATestService:
         method: str,
         top_k: int = 5,
         concurrency: int = 3,
+        response_type: str = "Single Paragraph",
     ) -> AutomaticQAReport:
         question_set = self.question_sets.get(project_id, question_set_id)
+        if question_set.response_type != response_type:
+            raise ProjectError("回答格式與已生成答案不同；請先使用目前格式重新生成回答")
         if not question_set.questions or not all(
             item.status == "COMPLETED" and item.answer.strip()
             for item in question_set.questions
@@ -284,13 +289,17 @@ class AutomaticQATestService:
         top_k: int,
         generation_errors: tuple[str, ...],
         evaluate: bool = True,
+        response_type: str = "Single Paragraph",
     ) -> AutomaticQAReport:
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("回答並行數必須介於 1 到 32")
         pending = [item for item in question_set.questions]
         results: dict[str, QueryResult] = {}
         def answer(item: BatchQuestion) -> QueryResult:
-            return self.querying.ask(question_set.project_id, item.question, method, chat_model=answer_model)
+            return self.querying.ask(
+                question_set.project_id, item.question, method,
+                chat_model=answer_model, response_type=response_type,
+            )
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {pool.submit(answer, item): item for item in pending}
             for future in as_completed(futures):
@@ -306,7 +315,8 @@ class AutomaticQATestService:
                         completed_at="", duration_seconds=0,
                     )
         updated = self.question_sets.update_answers(
-            question_set.project_id, question_set.question_set_id, results, method
+            question_set.project_id, question_set.question_set_id, results, method,
+            response_type=response_type,
         )
         if not evaluate:
             return AutomaticQAReport(

@@ -38,10 +38,10 @@
 
 | 用途 | 模型 |
 |---|---|
-| Chat | `gpt-4o-mini`、`gpt-4.1-mini` |
+| Chat | `gpt-6-luna`（預設）、`gpt-4o-mini`、`gpt-4.1-mini` |
 | Embedding | `text-embedding-3-small`、`text-embedding-3-large` |
 
-開發及測試建議使用 `gpt-4o-mini` 與 `text-embedding-3-small` 以降低成本。
+Chat 模型預設為 `gpt-6-luna`，Embedding 模型預設為 `text-embedding-3-small`。
 
 ## 實作原理
 
@@ -170,7 +170,7 @@ docker volume create automotive-graphrag-data
 ```dotenv
 GRAPHRAG_API_KEY=your-api-key
 GRAPHRAG_API_BASE=https://api.openai.com/v1
-GRAPHRAG_CHAT_MODEL=gpt-4o-mini
+GRAPHRAG_CHAT_MODEL=gpt-6-luna
 GRAPHRAG_EMBEDDING_MODEL=text-embedding-3-small
 ```
 
@@ -261,7 +261,7 @@ docker run --rm --name automotive-graphrag-portal --env-file .env -p 7860:7860 -
 
 ### 如何降低開發測試成本
 
-- Chat 使用 `gpt-4o-mini`。
+- Chat 預設使用 `gpt-6-luna`；也可在連線設定中選擇其他允許的模型。
 - Embedding 使用 `text-embedding-3-small`。
 - 題目生成先縮小頁碼、章節及取樣數量。
 - 自動評測使用既有回答，不要勾選重新執行系統回答。
@@ -296,14 +296,14 @@ Linux／macOS：
 export PROJECTS_ROOT="$PWD/projects"
 export GRAPHRAG_API_KEY="your-api-key"
 export GRAPHRAG_API_BASE="https://api.openai.com/v1"
-export GRAPHRAG_CHAT_MODEL="gpt-4o-mini"
+export GRAPHRAG_CHAT_MODEL="gpt-6-luna"
 export GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"
 ```
 
 Windows PowerShell（單行）：
 
 ```powershell
-$env:PROJECTS_ROOT=(Join-Path $PWD "projects"); $env:GRAPHRAG_API_KEY="your-api-key"; $env:GRAPHRAG_API_BASE="https://api.openai.com/v1"; $env:GRAPHRAG_CHAT_MODEL="gpt-4o-mini"; $env:GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"
+$env:PROJECTS_ROOT=(Join-Path $PWD "projects"); $env:GRAPHRAG_API_KEY="your-api-key"; $env:GRAPHRAG_API_BASE="https://api.openai.com/v1"; $env:GRAPHRAG_CHAT_MODEL="gpt-6-luna"; $env:GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"
 ```
 
 啟動一般入口：

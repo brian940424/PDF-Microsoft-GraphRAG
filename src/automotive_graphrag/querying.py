@@ -52,6 +52,7 @@ class QueryResult:
     duration_seconds: float
     evidence: tuple[Evidence, ...] = ()
     context: dict[str, Any] = field(default_factory=dict)
+    response_type: str = "Single Paragraph"
 
 
 class QueryService:
@@ -74,6 +75,7 @@ class QueryService:
         question: str,
         method: str = "local",
         chat_model: str | None = None,
+        response_type: str = "Single Paragraph",
     ) -> QueryResult:
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
@@ -109,11 +111,15 @@ class QueryService:
             str(graph_root),
             "--method",
             normalized_method,
+            "--response-type",
+            response_type,
             prompt,
         ]
         if normalized_method == "drift" and selected_model == GPT6_LUNA_MODEL:
             try:
-                answer, context = run_compatible_drift_search(root_dir=graph_root, query=prompt)
+                answer, context = run_compatible_drift_search(
+                    root_dir=graph_root, query=prompt, response_type=response_type
+                )
                 result = QueryExecution(0, answer, "", self._serialize_context(context))
             except Exception as exc:
                 result = QueryExecution(1, "", str(exc))
@@ -145,6 +151,7 @@ class QueryService:
             duration_seconds=round(time.monotonic() - started_clock, 3),
             evidence=evidence,
             context=context,
+            response_type=response_type,
         )
         try:
             self._append_record(project_path / "runs" / "queries.jsonl", query_result)
@@ -192,6 +199,11 @@ class QueryService:
             return subprocess.run(command, text=True, capture_output=True, check=False)
         root = Path(command[command.index("--root") + 1])
         question = command[-1]
+        response_type = (
+            command[command.index("--response-type") + 1]
+            if "--response-type" in command
+            else "Single Paragraph"
+        )
         try:
             from graphrag.cli.query import run_local_search
 
@@ -199,7 +211,7 @@ class QueryService:
                 data_dir=None,
                 root_dir=root,
                 community_level=2,
-                response_type="Multiple Paragraphs",
+                response_type=response_type,
                 streaming=False,
                 query=question,
                 verbose=False,

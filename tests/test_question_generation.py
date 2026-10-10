@@ -70,7 +70,7 @@ class QuestionGenerationServiceTests(unittest.TestCase):
             "text": text,
         }
 
-    def test_generate_uses_one_low_cost_call_and_builds_grounded_questions(self) -> None:
+    def test_generate_uses_default_model_once_and_builds_grounded_questions(self) -> None:
         sample_ids = [item.sample_id for item in self.sample_batch.samples]
         client = FakeGenerationClient(
             {
@@ -93,7 +93,7 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         batch = service.generate("L33-SM3E", self.sample_batch.sample_batch_id, 2, "simple", 300)
 
         self.assertEqual(len(client.calls), 1)
-        self.assertEqual(client.calls[0][2], "gpt-4o-mini")
+        self.assertEqual(client.calls[0][2], "gpt-6-luna")
         self.assertEqual(len(batch.questions), 2)
         self.assertTrue(all(item.generation_status == "pending_review" for item in batch.questions))
         self.assertEqual(batch.questions[0].gold_evidence[0].chunk_ids, (sample_ids[0],))

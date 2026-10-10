@@ -147,7 +147,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         result = service.evaluate("L33-SM3E", self.question_set_id)
 
         self.assertEqual(len(judge.calls), 2)
-        self.assertEqual(judge.calls[0][2], "gpt-4o-mini")
+        self.assertEqual(judge.calls[0][2], "gpt-6-luna")
         self.assertFalse(result.items[0].is_correct)
         self.assertTrue(result.items[1].is_correct)
         self.assertEqual(result.correct_count, 1)
@@ -166,7 +166,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         )
         json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
         payload = json.loads(json_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["model"], "gpt-4o-mini")
+        self.assertEqual(payload["model"], "gpt-6-luna")
         self.assertEqual(payload["human_reviews"][0]["human_label"], "partially_correct")
         with csv_path.open(encoding="utf-8", newline="") as source:
             rows = list(csv.DictReader(source))
@@ -298,6 +298,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("評測回答", button_values)
         self.assertIn("評測請求並行數", labels)
         self.assertIn("本次回答模型", labels)
+        self.assertEqual(sum(label == "回答格式" for label in labels), 1)
         compatibility_handler = next(
             fn.fn for fn in app.fns.values()
             if getattr(fn.fn, "__name__", "") == "update_model_method_compatibility"
@@ -314,7 +315,15 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             if hasattr(component, "get_config")
         ])
         ask_handler = next(fn for fn in app.fns.values() if fn.fn.__name__ == "ask_question")
-        self.assertEqual(len(ask_handler.inputs), 4)
+        self.assertEqual(len(ask_handler.inputs), 5)
+        response_type_dropdowns = [
+            component for component in app.blocks.values()
+            if hasattr(component, "get_config")
+            and component.get_config().get("label") == "回答格式"
+        ]
+        self.assertEqual(len(response_type_dropdowns), 2)
+        self.assertTrue(all(component.get_config()["value"] == "Single Paragraph"
+                            for component in response_type_dropdowns))
         tabs = {
             component.get_config().get("label")
             for component in app.blocks.values()

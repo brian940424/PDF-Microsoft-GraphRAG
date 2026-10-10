@@ -52,7 +52,7 @@ def run_drift_search(
     root_dir: str | Path,
     query: str,
     community_level: int = 2,
-    response_type: str = "Multiple Paragraphs",
+    response_type: str = "Single Paragraph",
 ) -> tuple[str, dict[str, Any]]:
     """Run the official GraphRAG DRIFT entry point with a scoped Luna adapter.
 

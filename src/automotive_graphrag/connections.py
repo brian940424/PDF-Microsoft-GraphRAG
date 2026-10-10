@@ -24,7 +24,7 @@ GPT6_LUNA_MODEL = "gpt-6-luna"
 DEFAULT_REASONING_EFFORT = "medium"
 ALLOWED_CHAT_MODELS = ("gpt-4o-mini", "gpt-4.1-mini", GPT6_LUNA_MODEL)
 ALLOWED_EMBEDDING_MODELS = ("text-embedding-3-small", "text-embedding-3-large")
-DEFAULT_CHAT_MODEL = "gpt-4o-mini"
+DEFAULT_CHAT_MODEL = GPT6_LUNA_MODEL
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 
 

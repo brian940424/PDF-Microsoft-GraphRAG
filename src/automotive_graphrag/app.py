@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
 from .retrieval_experiments import (
+    DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+    EXPERIMENT_RESPONSE_TYPE_OPTIONS,
     ExperimentGroup,
     RetrievalExperimentService,
 )
@@ -53,6 +56,27 @@ INDEXING_LOG_AUTOSCROLL_JS = """() => {
         log.scrollTop = log.scrollHeight;
     }, 100);
 }"""
+
+
+def _sort_experiment_results(raw_results, groups, questions):
+    """Order result rows by configured group order and imported question order."""
+    group_order = {
+        str(group.get("group_id", "")): index
+        for index, group in enumerate(groups)
+        if isinstance(group, dict)
+    }
+    question_order = {
+        question.question_id: index
+        for index, question in enumerate(questions)
+    }
+    return sorted(
+        raw_results,
+        key=lambda item: (
+            group_order.get(str(item.get("group_id", "")), len(group_order)),
+            question_order.get(str(item.get("question_id", "")), len(question_order)),
+            str(item.get("question_id", "")),
+        ),
+    )
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -138,13 +162,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             connection_status(project.project_id),
         )
 
-    def ask_question(project_id: str | None, question: str, method: str, chat_model: str | None):
+    def ask_question(project_id: str | None, question: str, method: str, chat_model: str | None, response_type: str):
         yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, []
         if not project_id:
             yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
             return
         try:
-            query_result = querying.ask(project_id, question, method, chat_model=chat_model)
+            query_result = querying.ask(
+                project_id, question, method, chat_model=chat_model, response_type=response_type
+            )
         except ProjectError as exc:
             yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
             return
@@ -635,16 +661,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def automatic_qa_saved_view(project_id):
         if not project_id:
-            return "請先於「專案設定」開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+            return "請先於「專案設定」開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
         try:
             saved_sets = question_sets.list(project_id)
             if not saved_sets:
-                return "此專案尚無已儲存的自動問答題目集", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+                return "此專案尚無已儲存的自動問答題目集", [], "", "", [], "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
             question_set = saved_sets[0]
             judge = automatic_evaluation.last_result(project_id, question_set.question_set_id)
             retrieval = retrieval_evaluation.last_result(project_id, question_set.question_set_id)
         except ProjectError as exc:
-            return f"❌ 載入自動問答資料失敗：{exc}", [], "", "", [], "載入失敗。", gr.update(interactive=False)
+            return f"❌ 載入自動問答資料失敗：{exc}", [], "", "", [], "載入失敗。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
 
         judge_by_id = {item.question_id: item for item in judge.items} if judge else {}
         result_rows = automatic_qa_result_rows(question_set, judge)
@@ -677,6 +703,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             result_rows,
             "✅ 已載入完成的回答，可以開始評測。" if answers_ready else "尚未生成完成所有回答。",
             gr.update(interactive=answers_ready),
+            question_set.response_type,
         )
 
     def experiment_view(project_id: str | None, message: str = ""):
@@ -703,7 +730,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     ])
             run = state.get("run") or {}
             raw_results = run.get("results", [])
-            group_by_id = {item.get("group_id"): item for item in state.get("groups", [])}
+            configured_groups = state.get("groups", [])
+            group_by_id = {item.get("group_id"): item for item in configured_groups}
             expected_answers = len(group_by_id) * len(question_by_id)
             has_all_answers = expected_answers > 0 and len(raw_results) == expected_answers and all(
                 str(item.get("actual_answer", "") or "").strip()
@@ -713,6 +741,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 item.get("group_id") in group_by_id
                 and item.get("answer_model") == group_by_id[item.get("group_id")].get("answer_model")
                 and item.get("method") == group_by_id[item.get("group_id")].get("method")
+                and item.get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE)
+                == group_by_id[item.get("group_id")].get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE)
                 and item.get("question_id") in question_by_id
                 and item.get("question") == question_by_id[item.get("question_id")].question
                 and item.get("correct_answer") == question_by_id[item.get("question_id")].reference_answer
@@ -746,6 +776,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 ]
                 for item in run.get("groups", [])
             ]
+            ordered_raw_results = _sort_experiment_results(
+                raw_results, configured_groups, question_by_id.values()
+            )
             results = [
                 [
                     item.get("group_name"), item.get("question_id"),
@@ -754,7 +787,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("evaluation_result") == "正確",
                     item.get("evaluation_reason") or item.get("error") or "",
                 ]
-                for item in raw_results
+                for item in ordered_raw_results
                 if item.get("evaluation_result") in {"正確", "錯誤", "評判失敗"}
             ]
             status = message or (
@@ -769,6 +802,48 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return (f"❌ {exc}", "", [], [], [], 5,
                     gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                     "載入實驗狀態失敗。", gr.update(interactive=False), "strict")
+
+    def experiment_progress_markup(completed: int, total: int, status: str) -> str:
+        total = max(int(total), 0)
+        completed = min(max(int(completed), 0), total) if total else 0
+        percent = round(completed * 100 / total) if total else 0
+        maximum = max(total, 1)
+        return (
+            '<div style="width:100%;padding:0.25rem 0">'
+            f'<progress value="{completed}" max="{maximum}" '
+            'style="width:100%;height:1rem;accent-color:var(--color-accent)"></progress>'
+            '<div style="display:flex;justify-content:space-between;gap:1rem">'
+            f'<span>已處理 {completed} / {total} 題</span><span>{percent}%｜{status}</span></div></div>'
+        )
+
+    def experiment_progress_for_project(project_id: str | None) -> str:
+        if not project_id:
+            return experiment_progress_markup(0, 0, "請先開啟專案")
+        try:
+            state = retrieval_experiments.load(project_id)
+            run = state.get("run")
+            if not isinstance(run, dict):
+                question_set_id = str(state.get("question_set_id") or "")
+                question_count = (
+                    len(question_sets.get(project_id, question_set_id).questions)
+                    if question_set_id else 0
+                )
+                return experiment_progress_markup(
+                    0, len(state.get("groups", [])) * question_count, "尚未開始"
+                )
+            status = {
+                "generating_answers": "答案生成中",
+                "answers_completed": "答案生成完成",
+                "answers_partial": "部分完成",
+                "stopped": "已停止",
+                "completed": "實驗完成",
+                "evaluating": "評測中",
+                "running": "執行中",
+            }.get(str(run.get("status", "")), "準備中")
+            total = len(run.get("groups", [])) * int(run.get("question_count", 0))
+            return experiment_progress_markup(len(run.get("results", [])), total, status)
+        except (ProjectError, TypeError, ValueError):
+            return experiment_progress_markup(0, 0, "尚未開始")
 
     def resolve_experiment_question_set_id(project_id: str, question_set_id: str | None) -> str:
         """Prefer the project's persisted question set over a stale/empty browser State."""
@@ -828,8 +903,44 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def remove_experiment_group(project_id: str | None, group_id: str | None, revision: int | None):
         if not project_id or not group_id:
             return "❌ 找不到要移除的實驗組", int(revision or 0)
-        retrieval_experiments.remove_group(project_id, group_id)
+        try:
+            retrieval_experiments.remove_group(project_id, group_id)
+        except ProjectError as exc:
+            return f"❌ {exc}", int(revision or 0)
         return f"✅ 已移除實驗組 {group_id}", refresh_experiment_groups(revision)
+
+    def make_remove_experiment_group_handler(group_id: str):
+        def remove_group_from_card(project_id: str | None, revision: int | None):
+            return remove_experiment_group(project_id, group_id, revision)
+
+        # Keep a recognizable handler name for diagnostics and tests.
+        remove_group_from_card.__name__ = "remove_experiment_group"
+        return remove_group_from_card
+
+    def make_save_experiment_answer_model_handler(group_id: str):
+        def save_answer_model_from_card(
+            project_id: str | None, answer_model: str | None, revision: int | None
+        ):
+            return save_experiment_answer_model(project_id, group_id, answer_model, revision)
+
+        save_answer_model_from_card.__name__ = "save_experiment_answer_model"
+        return save_answer_model_from_card
+
+    def make_save_experiment_method_handler(group_id: str):
+        def save_method_from_card(project_id: str | None, method: str, revision: int | None):
+            return save_experiment_method(project_id, group_id, method, revision)
+
+        save_method_from_card.__name__ = "save_experiment_method"
+        return save_method_from_card
+
+    def make_save_experiment_response_type_handler(group_id: str):
+        def save_response_type_from_card(
+            project_id: str | None, response_type: str, revision: int | None
+        ):
+            return save_experiment_response_type(project_id, group_id, response_type, revision)
+
+        save_response_type_from_card.__name__ = "save_experiment_response_type"
+        return save_response_type_from_card
 
     def save_experiment_answer_model(project_id: str | None, group_id: str | None, answer_model: str | None, revision: int | None):
         if not project_id or not group_id or not answer_model:
@@ -848,6 +959,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             return f"❌ {exc}", int(revision or 0)
         return f"✅ {group_id} 檢索策略已儲存", refresh_experiment_groups(revision)
+
+    def save_experiment_response_type(
+        project_id: str | None, group_id: str | None, response_type: str, revision: int | None
+    ):
+        if not project_id or not group_id:
+            return "請先選取實驗組", int(revision or 0)
+        try:
+            retrieval_experiments.set_group_response_type(project_id, group_id, response_type)
+        except ProjectError as exc:
+            return f"❌ {exc}", int(revision or 0)
+        return f"✅ {group_id} 回答格式已儲存", refresh_experiment_groups(revision)
 
     def update_model_method_compatibility(answer_model: str | None, method: str | None):
         """Keep all supported models and query strategies selectable together."""
@@ -868,33 +990,74 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
             view[8] = gr.update(interactive=False)
-            yield tuple(view)
+            yield (*view, experiment_progress_markup(0, 0, "請先開啟專案"))
             return
         try:
             question_set_id = resolve_experiment_question_set_id(project_id, question_set_id)
         except ProjectError as exc:
             view = list(experiment_view(project_id, f"❌ {exc}"))
             view[8] = gr.update(interactive=False)
-            yield tuple(view)
+            yield (*view, experiment_progress_for_project(project_id))
             return
         pending = list(experiment_view(project_id))
         pending[0] = "⏳ 正在依各實驗組策略檢索並生成答案…"
         pending[7] = "⏳ 答案生成中；完成前無法評測。"
         pending[8] = gr.update(interactive=False)
-        yield tuple(pending)
+        yield (*pending, experiment_progress_markup(0, 0, "準備開始"))
         try:
             state = retrieval_experiments.load(project_id)
             groups = [ExperimentGroup(**item) for item in state["groups"]]
             limit = int(concurrency)
             judge_model = judge_model or str(state.get("judge_model", connections.get_chat_model()))
             retrieval_experiments.save_configuration(project_id, groups, question_set_id, limit, judge_model)
-            run = retrieval_experiments.generate_answers(
-                project_id, question_set_id, groups, limit, judge_model=judge_model
-            )
+            question_count = len(question_sets.get(project_id, question_set_id).questions)
+            total = len(groups) * question_count
+            pending[0] = f"⏳ 正在依各實驗組策略檢索並生成答案：0/{total} 題"
+            yield (*pending, experiment_progress_markup(0, total, "答案生成中"))
+            progress_updates: queue.Queue = queue.Queue(maxsize=1)
+
+            def publish_progress(run_update):
+                if progress_updates.full():
+                    try:
+                        progress_updates.get_nowait()
+                    except queue.Empty:
+                        pass
+                try:
+                    progress_updates.put_nowait(run_update)
+                except queue.Full:
+                    pass
+
+            with ThreadPoolExecutor(max_workers=1) as runner:
+                future = runner.submit(
+                    retrieval_experiments.generate_answers,
+                    project_id,
+                    question_set_id,
+                    groups,
+                    limit,
+                    update_callback=publish_progress,
+                    judge_model=judge_model,
+                )
+                while True:
+                    try:
+                        progress_run = progress_updates.get(timeout=0.5)
+                    except queue.Empty:
+                        if future.done():
+                            break
+                        continue
+                    completed = len(progress_run.results)
+                    progress_view = list(experiment_view(project_id))
+                    progress_view[0] = f"⏳ 檢索並生成回答中：{completed}/{total} 題"
+                    progress_view[7] = f"⏳ 已處理 {completed}/{total} 題；完成前無法評測。"
+                    progress_view[8] = gr.update(interactive=False)
+                    yield (
+                        *progress_view,
+                        experiment_progress_markup(completed, total, "答案生成中"),
+                    )
+                run = future.result()
         except (ProjectError, TypeError, ValueError, OSError) as exc:
             view = list(experiment_view(project_id, f"❌ 答案生成失敗：{exc}"))
             view[8] = gr.update(interactive=False)
-            yield tuple(view)
+            yield (*view, experiment_progress_for_project(project_id))
             return
         if run.status == "answers_completed":
             message = f"✅ 檢索並生成答案完成：{len(run.results)}/{len(groups) * run.question_count} 筆。"
@@ -902,7 +1065,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             message = f"🛑 已停止並保存部分答案：{len(run.results)}/{len(groups) * run.question_count} 筆。"
         else:
             message = f"⚠️ 答案生成部分完成：{len(run.results)}/{len(groups) * run.question_count} 筆；請檢查失敗項目並重試。"
-        yield experiment_view(project_id, message)
+        progress_status = {
+            "answers_completed": "答案生成完成",
+            "stopped": "已停止",
+            "answers_partial": "部分完成",
+        }.get(run.status, "完成")
+        yield (*experiment_view(project_id, message),
+               experiment_progress_markup(len(run.results), total, progress_status))
 
     def evaluate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
@@ -1024,7 +1193,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.update(interactive=False),
         )
 
-    def generate_automatic_answers(project_id, question_set_id, rows, answer_model, method, concurrency):
+    def generate_automatic_answers(project_id, question_set_id, rows, answer_model, method, concurrency, response_type):
         if not project_id or not question_set_id:
             yield "❌ 請先生成或匯入題目集", "", [], gr.update(interactive=False)
             return
@@ -1032,7 +1201,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
             report = automatic_qa.answer_existing(
-                project_id, question_set_id, answer_model, method, int(concurrency)
+                project_id, question_set_id, answer_model, method, int(concurrency), response_type
             )
         except (ProjectError, ValueError) as exc:
             yield "❌ " + str(exc), "", [], gr.update(interactive=False)
@@ -1051,12 +1220,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             status = f"⚠️ 回答生成尚未全部完成：{completed}/{len(report.question_set.questions)} 題；請確認失敗題目後重試。"
         yield (
             status,
-            f"回答模型：{answer_model}｜檢索模式：{method}｜尚未評測。",
+            f"回答模型：{answer_model}｜檢索模式：{method}｜回答格式：{response_type}｜尚未評測。",
             [],
             gr.update(interactive=ready),
         )
 
-    def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency):
+    def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency, response_type):
         if not project_id or not question_set_id:
             return "❌ 請先生成或匯入題目集", "", []
         try:
@@ -1064,10 +1233,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             report = automatic_qa.evaluate_existing(
                 project_id, question_set_id, answer_model, judge_model, method,
                 concurrency=int(concurrency),
+                response_type=response_type,
             )
         except (ProjectError, ValueError) as exc:
             return "❌ " + str(exc), "", []
-        return "✅ 評測完成；可直接修改「判斷」欄位，正確率會自動更新。", automatic_qa_summary(report), automatic_qa_rows(report)
+        status = "✅ 評測完成；可直接修改「判斷」欄位，正確率會自動更新。"
+        return status, automatic_qa_summary(report), automatic_qa_rows(report)
 
     def autosave_automatic_qa_judgements(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
@@ -1663,7 +1834,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     value=connections.get_embedding_model,
                     label="Embedding 模型",
                 )
-            gr.Markdown("開發測試建議使用 `gpt-4o-mini` 與 `text-embedding-3-small` 以降低成本。")
+            gr.Markdown("Chat 模型預設為 `gpt-6-luna`；Embedding 模型預設為 `text-embedding-3-small`。")
             with gr.Row():
                 test_connection_button = gr.Button("測試連線")
                 save_connection_button = gr.Button("儲存連線設定", variant="primary")
@@ -1722,6 +1893,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
                         value="local",
                         label="查詢方法",
+                    )
+                    query_response_type = gr.Dropdown(
+                        choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                        value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+                        label="回答格式",
                     )
                     query_chat_model.input(
                         update_model_method_compatibility,
@@ -1784,6 +1960,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     value="local", label="檢索模式",
                 )
                 autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
+                autoqa_response_type = gr.Dropdown(
+                    choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                    value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+                    label="回答格式",
+                )
             autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
             autoqa_answer_model.input(
                 update_model_method_compatibility,
@@ -1862,10 +2043,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     for group in groups:
                         answer_model_value = group.get("answer_model", connections.get_chat_model())
                         method_value = group.get("method", "local")
+                        response_type_value = group.get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE)
                         model_choices = list(ALLOWED_CHAT_MODELS)
                         group_strategy_choices = strategy_choices
                         group_id = group["group_id"]
-                        group_id_state = gr.State(group_id)
                         with gr.Group(key=f"experiment-group-{group_id}"):
                             with gr.Row(key=f"experiment-group-title-{group_id}"):
                                 gr.Markdown(f"### {group['name']}", key=f"experiment-group-name-{group_id}")
@@ -1888,21 +2069,34 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                                     interactive=True,
                                     key=f"experiment-strategy-{group['group_id']}",
                                 )
+                                response_type = gr.Dropdown(
+                                    choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                                    value=response_type_value,
+                                    label="回答格式",
+                                    interactive=True,
+                                    key=f"experiment-response-type-{group_id}",
+                                )
                         answer_model.input(
-                            save_experiment_answer_model,
-                            inputs=[active_project_id, group_id_state, answer_model, experiment_group_revision],
+                            make_save_experiment_answer_model_handler(group_id),
+                            inputs=[active_project_id, answer_model, experiment_group_revision],
                             outputs=[experiment_group_save_status, experiment_group_revision],
                             key=f"experiment-answer-model-save-{group_id}",
                         )
                         strategy.input(
-                            save_experiment_method,
-                            inputs=[active_project_id, group_id_state, strategy, experiment_group_revision],
+                            make_save_experiment_method_handler(group_id),
+                            inputs=[active_project_id, strategy, experiment_group_revision],
                             outputs=[experiment_group_save_status, experiment_group_revision],
                             key=f"experiment-strategy-save-{group_id}",
                         )
+                        response_type.input(
+                            make_save_experiment_response_type_handler(group_id),
+                            inputs=[active_project_id, response_type, experiment_group_revision],
+                            outputs=[experiment_group_save_status, experiment_group_revision],
+                            key=f"experiment-response-type-save-{group_id}",
+                        )
                         remove_button.click(
-                            remove_experiment_group,
-                            inputs=[active_project_id, group_id_state, experiment_group_revision],
+                            make_remove_experiment_group_handler(group_id),
+                            inputs=[active_project_id, experiment_group_revision],
                             outputs=[experiment_group_save_status, experiment_group_revision],
                             key=f"experiment-group-remove-action-{group_id}",
                         )
@@ -1923,6 +2117,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
                 gr.Markdown("寬鬆模式會使用評測模型做語意比對：涵蓋正解核心資訊即可；接受同義改寫與合理補充，不因答案較詳細而扣錯。")
             experiment_generation_status = gr.Markdown("尚未生成答案。完成前不能評測。")
+            experiment_progress_bar = gr.HTML(
+                value=experiment_progress_markup(0, 0, "尚未開始"),
+                label="回答生成進度",
+            )
             experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
             experiment_status = gr.Markdown()
             experiment_summary_table = gr.Dataframe(
@@ -2030,7 +2228,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
             gr.Markdown("## AI 題目生成與人工審核")
             gr.Markdown(
-                "每個批次只呼叫 API 一次，使用連線設定中的 Chat Model（預設 `gpt-4o-mini`）。"
+                "每個批次只呼叫 API 一次，使用連線設定中的 Chat Model（預設 `gpt-6-luna`）。"
                 "問題與參考答案固定使用繁體中文，技術代號可保留英文。"
                 "生成結果只會引用上述取樣原文，且匯出前必須人工核准。"
             )
@@ -2089,7 +2287,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
-        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
+            experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
+        )
         open_project_button.click(
             open_project,
             inputs=selected_project,
@@ -2102,14 +2302,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             automatic_qa_saved_view,
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
-                     autoqa_table, autoqa_generation_status, autoqa_judge_button],
+                     autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
         ).then(
             experiment_view,
             inputs=active_project_id,
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
-        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
+            experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
+        )
         selected_project.change(
             lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
             inputs=selected_project,
@@ -2155,7 +2357,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             automatic_qa_saved_view,
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
-                     autoqa_table, autoqa_generation_status, autoqa_judge_button],
+                     autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
         ).then(
             experiment_view,
             inputs=active_project_id,
@@ -2194,7 +2396,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
-        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
+            experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
+        )
         experiment_add_group_button.click(
             add_experiment_group,
             inputs=[active_project_id, experiment_group_revision],
@@ -2220,7 +2424,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
-                     experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
+                     experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode,
+                     experiment_progress_bar],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         experiment_evaluate_button.click(
             evaluate_retrieval_experiment_answers,
@@ -2274,6 +2479,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
                 autoqa_answer_model, autoqa_method, autoqa_answer_concurrency,
+                autoqa_response_type,
             ],
             outputs=[autoqa_generation_status, autoqa_summary, autoqa_table, autoqa_judge_button],
         )
@@ -2282,6 +2488,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
                 autoqa_answer_model, autoqa_judge_model, autoqa_method, autoqa_judge_concurrency,
+                autoqa_response_type,
             ],
             outputs=[autoqa_result, autoqa_summary, autoqa_table],
         )
@@ -2297,7 +2504,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         ask_button.click(
             ask_question,
-            inputs=[query_project, question, query_method, query_chat_model],
+            inputs=[query_project, question, query_method, query_chat_model, query_response_type],
             outputs=[
                 query_answer,
                 query_summary,

@@ -10,12 +10,17 @@ import yaml
 import numpy as np
 import gradio as gr
 
-from automotive_graphrag.app import create_app
+from automotive_graphrag.app import _sort_experiment_results, create_app
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationItem, AutomaticEvaluationService
 from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.question_sets import BatchQuestion, QuestionSetService
-from automotive_graphrag.retrieval_experiments import ExperimentGroup, RetrievalExperimentService
+from automotive_graphrag.retrieval_experiments import (
+    DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+    EXPERIMENT_RESPONSE_TYPE_OPTIONS,
+    ExperimentGroup,
+    RetrievalExperimentService,
+)
 from automotive_graphrag.source_metadata import SourceMetadata
 
 
@@ -48,8 +53,8 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.connections.save("https://api.openai.com/v1", "test-key")
         self.calls = []
 
-        def query(project_id, question, method, model):
-            self.calls.append((project_id, question, method, model))
+        def query(project_id, question, method, model, response_type):
+            self.calls.append((project_id, question, method, model, response_type))
             return "先確認設備已關閉，準備指定工具，並依序完成安全檢查。", {}
 
         self.service = RetrievalExperimentService(
@@ -62,6 +67,26 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.question_file = self.root / "questions.json"
         example = Path(__file__).parents[1] / "docs" / "檢索實驗格式範例.json"
         self.question_file.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def test_experiment_results_sort_by_group_then_question_set_order(self):
+        groups = [{"group_id": "G01"}, {"group_id": "G02"}]
+        questions = [
+            SimpleNamespace(question_id="Q1"),
+            SimpleNamespace(question_id="Q2"),
+        ]
+        completed_out_of_order = [
+            {"group_id": "G02", "question_id": "Q2"},
+            {"group_id": "G01", "question_id": "Q2"},
+            {"group_id": "G02", "question_id": "Q1"},
+            {"group_id": "G01", "question_id": "Q1"},
+        ]
+
+        ordered = _sort_experiment_results(completed_out_of_order, groups, questions)
+
+        self.assertEqual(
+            [(item["group_id"], item["question_id"]) for item in ordered],
+            [("G01", "Q1"), ("G01", "Q2"), ("G02", "Q1"), ("G02", "Q2")],
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -81,6 +106,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(state["groups"][0]["name"], "實驗組1")
         self.assertEqual(state["groups"][0]["answer_model"], self.connections.get_chat_model())
         self.assertEqual(state["groups"][0]["method"], "local")
+        self.assertEqual(state["groups"][0]["response_type"], DEFAULT_EXPERIMENT_RESPONSE_TYPE)
         state = self.service.add_group("project")
         self.assertEqual(state["groups"][1]["name"], "實驗組2")
         original = [dict(item) for item in state["groups"]]
@@ -90,6 +116,10 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertNotIn("judge_model", state["groups"][0])
         state = self.service.set_group_answer_model("project", original[0]["group_id"], "gpt-4.1-mini")
         self.assertEqual(state["groups"][0]["answer_model"], "gpt-4.1-mini")
+        state = self.service.set_group_response_type(
+            "project", original[0]["group_id"], "List of 3-7 Points"
+        )
+        self.assertEqual(state["groups"][0]["response_type"], "List of 3-7 Points")
         groups = [ExperimentGroup(**item) for item in state["groups"]]
         self.service.save_configuration("project", groups, "question-set-id", 5, "gpt-4.1-mini")
 
@@ -98,6 +128,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         ).load("project")
         self.assertEqual(len(reloaded["groups"]), 2)
         self.assertEqual(reloaded["groups"][0]["name"], original[0]["name"])
+        self.assertEqual(reloaded["groups"][0]["response_type"], "List of 3-7 Points")
         self.assertEqual(reloaded["question_set_id"], "question-set-id")
         self.assertEqual(reloaded["judge_model"], "gpt-4.1-mini")
         self.service.remove_group("project", original[0]["group_id"])
@@ -149,6 +180,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(len(run.results), 4)
         self.assertEqual({call[2] for call in self.calls}, {"local", "basic"})
         self.assertEqual({call[3] for call in self.calls}, {"gpt-4o-mini", "gpt-4.1-mini"})
+        self.assertEqual({call[4] for call in self.calls}, {"Single Paragraph"})
         self.assertTrue(all(result.evaluation_result == "正確" for result in run.results))
         self.assertTrue(all(result.judge_model == "gpt-4.1-mini" for result in run.results))
         self.assertTrue(all(result.answer_source_rank is None for result in run.results))
@@ -298,7 +330,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.service.set_group_method("project", group.group_id, "basic")
 
-        with self.assertRaisesRegex(ProjectError, "檢索策略已變更"):
+        with self.assertRaisesRegex(ProjectError, "檢索策略或回答格式已變更"):
             self.service.evaluate_answers("project", question_set.question_set_id)
 
     def test_stop_keeps_completed_results_and_saves_partial_summary(self):
@@ -354,7 +386,9 @@ class RetrievalExperimentTests(unittest.TestCase):
             side_effect=run_worker,
         ) as worker:
             for method in ("local", "global", "drift", "basic"):
-                answer, _ = self.service._graphrag_query("project", "查詢", method, "gpt-4.1-mini")
+                answer, _ = self.service._graphrag_query(
+                    "project", "查詢", method, "gpt-4.1-mini", "List of 3-7 Points"
+                )
                 self.assertEqual(answer, "answer")
 
         self.assertEqual(worker.call_count, 4)
@@ -362,6 +396,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertTrue(all(call["output_is_symlink"] for call in calls.values()))
         self.assertTrue(all(call["cwd"] == str(Path(__file__).parents[1]) for call in calls.values()))
         self.assertTrue(all(call["completion_model"] == "gpt-4.1-mini" for call in calls.values()))
+        self.assertTrue(all(call["response_type"] == "List of 3-7 Points" for call in calls.values()))
 
     def test_luna_drift_uses_sampling_parameter_compatibility_adapter(self):
         graph_root = self.projects.path_for("project") / "graphrag"
@@ -456,6 +491,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertIn("答案評分方式", labels)
         self.assertEqual(len(app.renderables), 1)
         self.assertIn("測試最大並行請求數", labels)
+        self.assertIn("回答生成進度", labels)
         self.assertIn("實驗組摘要", labels)
         self.assertIn("逐題實驗結果", labels)
         button_values = [
@@ -465,6 +501,16 @@ class RetrievalExperimentTests(unittest.TestCase):
         ]
         self.assertIn("檢索並生成答案", button_values)
         self.assertIn("評測答案", button_values)
+        progress_bar = next(
+            component for component in app.blocks.values()
+            if hasattr(component, "get_config")
+            and component.get_config().get("label") == "回答生成進度"
+        )
+        generation_event = next(
+            fn for fn in app.fns.values()
+            if getattr(fn.fn, "__name__", "") == "generate_retrieval_experiment_answers"
+        )
+        self.assertIn(progress_bar, generation_event.outputs)
         component_configs = [
             component.get_config()
             for component in app.blocks.values()
@@ -523,10 +569,17 @@ class RetrievalExperimentTests(unittest.TestCase):
             fn for fn in app.default_config.fns.values() if fn.rendered_in is renderer
         ]
         dynamic_handler_ids = {fn.key: fn._id for fn in dynamic_handlers}
+        dynamic_handler_inputs = {fn.key: list(fn.inputs) for fn in dynamic_handlers}
         dynamic_dropdowns = [
             component for component in app.default_config.blocks.values()
             if isinstance(component, gr.Dropdown) and component.rendered_in is renderer
         ]
+        self.assertTrue(any(
+            component.get_config().get("value") == "移除此組"
+            for component in app.default_config.blocks.values()
+            if getattr(component, "rendered_in", None) is renderer
+            and hasattr(component, "get_config")
+        ))
         dynamic_handlers_after_rerender = [
             fn for fn in app.default_config.fns.values() if fn.rendered_in is renderer
         ]
@@ -534,7 +587,14 @@ class RetrievalExperimentTests(unittest.TestCase):
             {fn.key: fn._id for fn in dynamic_handlers_after_rerender},
             dynamic_handler_ids,
         )
-        self.assertEqual({component.label for component in dynamic_dropdowns}, {"回答模型", "GraphRAG 檢索策略"})
+        self.assertEqual(
+            {fn.key: list(fn.inputs) for fn in dynamic_handlers_after_rerender},
+            dynamic_handler_inputs,
+        )
+        self.assertEqual(
+            {component.label for component in dynamic_dropdowns},
+            {"回答模型", "GraphRAG 檢索策略", "回答格式"},
+        )
         self.assertTrue(all(component.interactive is True for component in dynamic_dropdowns))
         answer_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答模型")
         self.assertIn("gpt-6-luna", [value for _label, value in answer_dropdown.choices])
@@ -554,13 +614,22 @@ class RetrievalExperimentTests(unittest.TestCase):
         ]
         strategy_dropdown = next(component for component in dynamic_dropdowns if component.label == "GraphRAG 檢索策略")
         answer_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答模型")
+        response_type_dropdown = next(component for component in dynamic_dropdowns if component.label == "回答格式")
         self.assertIn("gpt-6-luna", [value for _label, value in answer_dropdown.choices])
+        self.assertEqual(response_type_dropdown.value, DEFAULT_EXPERIMENT_RESPONSE_TYPE)
+        self.assertEqual(response_type_dropdown.choices, list(EXPERIMENT_RESPONSE_TYPE_OPTIONS))
         self.assertIn("drift", [value for _label, value in strategy_dropdown.choices])
+        self.assertEqual(response_type_dropdown.value, DEFAULT_EXPERIMENT_RESPONSE_TYPE)
         self.assertEqual(
             {fn.fn.__name__ for fn in dynamic_handlers},
-            {"save_experiment_answer_model", "save_experiment_method", "remove_experiment_group"},
+            {"save_experiment_answer_model", "save_experiment_method", "save_experiment_response_type", "remove_experiment_group"},
         )
-        self.assertTrue(all(len(fn.inputs) == 4 for fn in dynamic_handlers if fn.fn.__name__.startswith("save_experiment_")))
+        self.assertTrue(all(len(fn.inputs) == 3 for fn in dynamic_handlers if fn.fn.__name__.startswith("save_experiment_")))
+        remove_handler = next(fn for fn in dynamic_handlers if fn.fn.__name__ == "remove_experiment_group")
+        self.assertEqual(len(remove_handler.inputs), 2)
+        removal_status, _revision = remove_handler.fn("ui-project", 0)
+        self.assertIn(ui_group_id, removal_status)
+        self.assertEqual(ui_service.load("ui-project")["groups"], [])
 
 
 if __name__ == "__main__":
