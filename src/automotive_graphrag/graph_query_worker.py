@@ -20,6 +20,8 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     question = str(payload["question"])
     model = str(payload.get("model", ""))
     response_type = str(payload.get("response_type") or "Single Paragraph")
+    community_level = int(payload.get("community_level", 2))
+    dynamic_community_selection = bool(payload.get("dynamic_community_selection", False))
     if method not in {"local", "global", "drift", "basic"}:
         raise ValueError(f"不支援的 GraphRAG 檢索策略：{method}")
 
@@ -34,11 +36,11 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
         "verbose": False,
     }
     if method == "local":
-        answer, context = cli_query.run_local_search(community_level=2, **common)
+        answer, context = cli_query.run_local_search(community_level=community_level, **common)
     elif method == "global":
         answer, context = cli_query.run_global_search(
-            community_level=2,
-            dynamic_community_selection=False,
+            community_level=community_level,
+            dynamic_community_selection=dynamic_community_selection,
             **common,
         )
     elif method == "drift" and model == GPT6_LUNA_MODEL:
@@ -47,11 +49,11 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
         answer, context = run_drift_search(
             root_dir=root_dir,
             query=question,
-            community_level=2,
+            community_level=community_level,
             response_type=response_type,
         )
     elif method == "drift":
-        answer, context = cli_query.run_drift_search(community_level=2, **common)
+        answer, context = cli_query.run_drift_search(community_level=community_level, **common)
     else:
         answer, context = cli_query.run_basic_search(
             data_dir=None,

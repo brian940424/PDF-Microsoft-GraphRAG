@@ -36,6 +36,7 @@ from .retrieval_experiments import (
     DEFAULT_EXPERIMENT_RESPONSE_TYPE,
     EXPERIMENT_REASONING_EFFORT_OPTIONS,
     EXPERIMENT_RESPONSE_TYPE_OPTIONS,
+    EXPERIMENT_STRATEGY_PARAMETER_SPECS,
     ExperimentGroup,
     RetrievalExperimentService,
 )
@@ -1106,6 +1107,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         save_reasoning_effort_from_card.__name__ = "save_experiment_reasoning_effort"
         return save_reasoning_effort_from_card
+
+    def make_save_experiment_strategy_parameter_handler(group_id: str, method: str, name: str):
+        def save_strategy_parameter_from_card(project_id: str | None, value, revision: int | None):
+            if not project_id:
+                return "請先開啟專案", int(revision or 0)
+            try:
+                retrieval_experiments.set_group_strategy_parameter(project_id, group_id, method, name, value)
+            except ProjectError as exc:
+                return f"❌ {exc}", int(revision or 0)
+            return f"✅ {group_id} 策略參數已儲存", refresh_experiment_groups(revision)
+
+        save_strategy_parameter_from_card.__name__ = "save_experiment_strategy_parameter"
+        return save_strategy_parameter_from_card
 
     def save_experiment_answer_model(project_id: str | None, group_id: str | None, answer_model: str | None, revision: int | None):
         if not project_id or not group_id or not answer_model:
@@ -2245,6 +2259,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         reasoning_effort_value = group.get(
                             "answer_reasoning_effort", DEFAULT_REASONING_EFFORT
                         )
+                        strategy_parameter_values = group.get("strategy_parameters", {}).get(
+                            method_value, {}
+                        )
                         model_choices = list(ALLOWED_CHAT_MODELS)
                         group_strategy_choices = strategy_choices
                         group_id = group["group_id"]
@@ -2287,6 +2304,28 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                                     )
                                 else:
                                     reasoning_effort = None
+                            gr.Markdown("#### 此策略可調參數")
+                            visible_specs = [
+                                item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS[method_value]
+                                if not (
+                                    method_value == "global"
+                                    and item[0].startswith("dynamic_search_")
+                                    and not strategy_parameter_values.get("dynamic_community_selection", False)
+                                )
+                            ]
+                            parameter_controls = []
+                            for row_index in range(0, len(visible_specs), 3):
+                                with gr.Row(key=f"experiment-params-{group_id}-{method_value}-{row_index}"):
+                                    for param_name, label, kind, default, minimum, maximum in visible_specs[row_index:row_index + 3]:
+                                        value = strategy_parameter_values.get(param_name, default)
+                                        key = f"experiment-param-{group_id}-{method_value}-{param_name}"
+                                        if kind == "bool":
+                                            control = gr.Checkbox(value=bool(value), label=label, interactive=True, key=key)
+                                        elif kind == "float":
+                                            control = gr.Slider(minimum=minimum, maximum=maximum, value=float(value), step=0.05, label=label, interactive=True, key=key)
+                                        else:
+                                            control = gr.Number(value=value, precision=0, minimum=minimum, maximum=maximum, label=label, interactive=True, key=key)
+                                        parameter_controls.append((control, param_name))
                         answer_model.input(
                             make_save_experiment_answer_model_handler(group_id),
                             inputs=[active_project_id, answer_model, experiment_group_revision],
@@ -2299,6 +2338,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             outputs=[experiment_group_save_status, experiment_group_revision],
                             key=f"experiment-strategy-save-{group_id}",
                         )
+                        for control, param_name in parameter_controls:
+                            control.input(
+                                make_save_experiment_strategy_parameter_handler(group_id, method_value, param_name),
+                                inputs=[active_project_id, control, experiment_group_revision],
+                                outputs=[experiment_group_save_status, experiment_group_revision],
+                                key=f"experiment-param-save-{group_id}-{method_value}-{param_name}",
+                            )
                         response_type.input(
                             make_save_experiment_response_type_handler(group_id),
                             inputs=[active_project_id, response_type, experiment_group_revision],

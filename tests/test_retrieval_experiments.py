@@ -549,6 +549,40 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertTrue(all(call["completion_model"] == "gpt-4.1-mini" for call in calls.values()))
         self.assertTrue(all(call["response_type"] == "List of 3-7 Points" for call in calls.values()))
 
+    def test_strategy_parameters_are_saved_per_group_and_applied_to_settings(self):
+        self.service.add_group("project")
+        self.service.add_group("project")
+        first, second = self.service.load("project")["groups"]
+        self.service.set_group_strategy_parameter("project", first["group_id"], "basic", "k", 17)
+        self.service.set_group_strategy_parameter("project", first["group_id"], "local", "top_k_entities", 22)
+        saved = self.service.load("project")["groups"]
+        first = next(item for item in saved if item["group_id"] == first["group_id"])
+        second = next(item for item in saved if item["group_id"] == second["group_id"])
+        self.assertEqual(first["strategy_parameters"]["basic"]["k"], 17)
+        self.assertEqual(first["strategy_parameters"]["local"]["top_k_entities"], 22)
+        self.assertEqual(second["strategy_parameters"]["basic"]["k"], 10)
+        with self.assertRaisesRegex(ProjectError, "沒有該設定參數"):
+            self.service.set_group_strategy_parameter("project", first["group_id"], "basic", "n_depth", 3)
+
+        graph_root = self.projects.path_for("project") / "graphrag"
+        (graph_root / "output").mkdir(parents=True)
+        (graph_root / "settings.yaml").write_text("completion_models: {default: {model: old}}\n", encoding="utf-8")
+        captured = {}
+
+        def run_worker(command, **kwargs):
+            payload = json.loads(kwargs["input"])
+            root = Path(payload["root_dir"])
+            captured["settings"] = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
+            return subprocess.CompletedProcess(command, 0, json.dumps({"answer": "ok", "context": {}}), "")
+
+        with patch("automotive_graphrag.retrieval_experiments.subprocess.run", side_effect=run_worker):
+            self.service._graphrag_query(
+                "project", "q", "basic", "gpt-4.1-mini",
+                strategy_parameters={"k": 17, "max_context_tokens": 8000},
+            )
+        self.assertEqual(captured["settings"]["basic_search"]["k"], 17)
+        self.assertEqual(captured["settings"]["basic_search"]["max_context_tokens"], 8000)
+
     def test_luna_drift_uses_sampling_parameter_compatibility_adapter(self):
         graph_root = self.projects.path_for("project") / "graphrag"
         (graph_root / "output").mkdir(parents=True)
@@ -786,10 +820,18 @@ class RetrievalExperimentTests(unittest.TestCase):
             {
                 "save_experiment_answer_model", "save_experiment_method",
                 "save_experiment_response_type", "save_experiment_reasoning_effort",
-                "remove_experiment_group",
+                "save_experiment_strategy_parameter", "remove_experiment_group",
             },
         )
         self.assertTrue(all(len(fn.inputs) == 3 for fn in dynamic_handlers if fn.fn.__name__.startswith("save_experiment_")))
+        drift_parameter_controls = [
+            component for component in app.default_config.blocks.values()
+            if getattr(component, "rendered_in", None) is renderer
+            and hasattr(component, "get_config")
+            and str(component.get_config().get("key", "")).startswith(f"experiment-param-{ui_group_id}-drift-")
+        ]
+        self.assertTrue(drift_parameter_controls)
+        self.assertTrue(all(component.get_config().get("interactive") for component in drift_parameter_controls))
         remove_handler = next(fn for fn in dynamic_handlers if fn.fn.__name__ == "remove_experiment_group")
         self.assertEqual(len(remove_handler.inputs), 2)
         effort_handler = next(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import math
 import os
 import subprocess
@@ -10,7 +11,7 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
@@ -45,7 +46,74 @@ EXPERIMENT_RESPONSE_TYPE_OPTIONS = (
 )
 EXPERIMENT_RESPONSE_TYPES = tuple(value for _, value in EXPERIMENT_RESPONSE_TYPE_OPTIONS)
 EXPERIMENT_REASONING_EFFORT_OPTIONS = (("低", "low"), ("中", "medium"), ("高", "high"))
+EXPERIMENT_STRATEGY_PARAMETER_SPECS = {
+    "local": (
+        ("community_level", "Community 層級", "int", 2, 0, 10),
+        ("text_unit_prop", "原文片段比例", "float", 0.5, 0, 1),
+        ("community_prop", "社群報告比例", "float", 0.15, 0, 1),
+        ("conversation_history_max_turns", "對話歷史輪數", "int", 5, 0, 50),
+        ("top_k_entities", "相關實體數", "int", 10, 1, 100),
+        ("top_k_relationships", "相關關係數", "int", 10, 1, 100),
+        ("max_context_tokens", "最大上下文 Token", "int", 12000, 100, 100000),
+    ),
+    "global": (
+        ("community_level", "Community 層級", "int", 2, 0, 10),
+        ("dynamic_community_selection", "啟用動態社群選擇", "bool", False, None, None),
+        ("max_context_tokens", "最大上下文 Token", "int", 12000, 100, 100000),
+        ("data_max_tokens", "Map 階段資料 Token 上限", "int", 12000, 100, 100000),
+        ("map_max_length", "Map 回答長度上限（字）", "int", 1000, 100, 10000),
+        ("reduce_max_length", "Reduce 回答長度上限（字）", "int", 2000, 100, 10000),
+        ("dynamic_search_threshold", "動態選擇相關門檻", "int", 1, 0, 100),
+        ("dynamic_search_keep_parent", "保留父層社群", "bool", False, None, None),
+        ("dynamic_search_num_repeats", "社群評估重複次數", "int", 1, 1, 10),
+        ("dynamic_search_use_summary", "使用社群摘要", "bool", False, None, None),
+        ("dynamic_search_max_level", "動態搜尋最高層級", "int", 2, 0, 10),
+    ),
+    "drift": (
+        ("community_level", "Community 層級", "int", 2, 0, 10),
+        ("n_depth", "探索深度（輪數）", "int", 3, 1, 10),
+        ("drift_k_followups", "每輪 Follow-up 上限", "int", 20, 1, 100),
+        ("primer_folds", "Primer 報告分組數", "int", 5, 1, 50),
+        ("local_search_text_unit_prop", "原文片段比例", "float", 0.9, 0, 1),
+        ("local_search_community_prop", "社群報告比例", "float", 0.1, 0, 1),
+        ("local_search_top_k_mapped_entities", "局部搜尋實體數", "int", 10, 1, 100),
+        ("local_search_top_k_relationships", "局部搜尋關係數", "int", 10, 1, 100),
+        ("local_search_max_data_tokens", "每輪最大上下文 Token", "int", 12000, 100, 100000),
+        ("local_search_temperature", "每輪回答 Temperature", "float", 0.0, 0, 2),
+        ("local_search_top_p", "每輪回答 Top P", "float", 1.0, 0, 1),
+        ("local_search_n", "每輪候選回答數", "int", 1, 1, 10),
+    ),
+    "basic": (
+        ("k", "取回文字片段數（k）", "int", 10, 1, 100),
+        ("max_context_tokens", "最大上下文 Token", "int", 12000, 100, 100000),
+    ),
+}
+EXPERIMENT_STRATEGY_CONFIG_KEYS = {
+    "local": {
+        "text_unit_prop", "community_prop", "conversation_history_max_turns",
+        "top_k_entities", "top_k_relationships", "max_context_tokens",
+    },
+    "global": {
+        "max_context_tokens", "data_max_tokens", "map_max_length", "reduce_max_length",
+        "dynamic_search_threshold", "dynamic_search_keep_parent", "dynamic_search_num_repeats",
+        "dynamic_search_use_summary", "dynamic_search_max_level",
+    },
+    "drift": {
+        "n_depth", "drift_k_followups", "primer_folds", "local_search_text_unit_prop",
+        "local_search_community_prop", "local_search_top_k_mapped_entities",
+        "local_search_top_k_relationships", "local_search_max_data_tokens", "local_search_n",
+        "local_search_temperature", "local_search_top_p",
+    },
+    "basic": {"k", "max_context_tokens"},
+}
 UNSUPPORTED_RETRIEVAL_METRICS = "暫不可計算：Global 社群報告尚未可靠映射至原始文件"
+
+
+def default_strategy_parameters() -> dict[str, dict[str, object]]:
+    return {
+        method: {name: default for name, _label, _kind, default, _minimum, _maximum in specs}
+        for method, specs in EXPERIMENT_STRATEGY_PARAMETER_SPECS.items()
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +124,7 @@ class ExperimentGroup:
     method: str
     response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
     answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    strategy_parameters: dict[str, dict[str, object]] = field(default_factory=default_strategy_parameters)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +173,7 @@ class ExperimentGroupSummary:
     retrieval_metrics_status: str
     response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
     answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    strategy_parameters: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +193,7 @@ class RetrievalExperimentRun:
     question_set_names: tuple[str, ...] = ()
 
 
-QueryFunction = Callable[[str, str, str, str, str, str], tuple[str, dict[str, object]]]
+QueryFunction = Callable[..., tuple[str, dict[str, object]]]
 UpdateFunction = Callable[[RetrievalExperimentRun], None]
 
 
@@ -173,8 +243,24 @@ class RetrievalExperimentService:
             {key: field for key, field in item.items() if key != "judge_model"}
             for item in legacy_groups if isinstance(item, dict)
         ]
-        run = value.get("run")
         migrated = False
+        for group in value["groups"]:
+            saved = group.get("strategy_parameters")
+            if not isinstance(saved, dict):
+                saved = {}
+                migrated = True
+            defaults = default_strategy_parameters()
+            normalized = {}
+            for method, params in defaults.items():
+                current_params = saved.get(method)
+                if not isinstance(current_params, dict):
+                    current_params = {}
+                    migrated = migrated or method not in saved
+                normalized[method] = {**params, **current_params}
+            if normalized != saved:
+                migrated = True
+            group["strategy_parameters"] = normalized
+        run = value.get("run")
         if isinstance(run, dict):
             for item in run.get("results", []):
                 old = item.get("evaluation_result")
@@ -197,8 +283,8 @@ class RetrievalExperimentService:
                 if any(group.get(key) != field for key, field in updated.items()):
                     group.update(updated)
                     migrated = True
-            if migrated:
-                self._write(project_id, value)
+        if migrated:
+            self._write(project_id, value)
         return value
 
     def save_configuration(
@@ -362,6 +448,40 @@ class RetrievalExperimentService:
             if group.get("group_id") == group_id:
                 group["method"] = method
                 matched = True
+        if matched:
+            self._write(project_id, current)
+        return current
+
+    def set_group_strategy_parameter(
+        self, project_id: str, group_id: str, method: str, name: str, value: object
+    ) -> dict[str, object]:
+        specs = {item[0]: item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS.get(method, ())}
+        spec = specs.get(name)
+        if spec is None:
+            raise ProjectError("此策略沒有該設定參數")
+        _name, label, kind, _default, minimum, maximum = spec
+        if kind == "bool":
+            if not isinstance(value, bool):
+                raise ProjectError(f"{label}必須為開啟或關閉")
+            normalized: object = value
+        elif kind == "int":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or int(value) != float(value):
+                raise ProjectError(f"{label}必須是整數")
+            normalized = int(value)
+        else:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ProjectError(f"{label}必須是有限數值")
+            normalized = float(value)
+        if minimum is not None and normalized < minimum or maximum is not None and normalized > maximum:
+            raise ProjectError(f"{label}必須介於 {minimum} 與 {maximum} 之間")
+        current = self.load(project_id)
+        matched = False
+        for group in current["groups"]:
+            if group.get("group_id") != group_id:
+                continue
+            params = group.setdefault("strategy_parameters", default_strategy_parameters())
+            params.setdefault(method, {})[name] = normalized
+            matched = True
         if matched:
             self._write(project_id, current)
         return current
@@ -764,6 +884,7 @@ class RetrievalExperimentService:
                         if summary.get("answer_model") == GPT6_LUNA_MODEL
                         else None
                     ),
+                    "strategy_parameters": summary.get("strategy_parameters", {}),
                 },
                 "summary": {
                     "answer_model": summary.get("answer_model"),
@@ -838,6 +959,7 @@ class RetrievalExperimentService:
                     "answer_model": group.get("parameters", {}).get("answer_model"),
                     "retrieval_mode": group.get("parameters", {}).get("retrieval_mode"),
                     "response_type": group.get("parameters", {}).get("response_type"),
+                    "strategy_parameters": group.get("parameters", {}).get("strategy_parameters", {}),
                     "judge_model": group.get("summary", {}).get("judge_model"),
                 }
                 for group in group_rows
@@ -896,10 +1018,20 @@ class RetrievalExperimentService:
         dataset_id: str = "", dataset_name: str = "",
     ) -> ExperimentQuestionResult:
         try:
-            answer, context = self.query_function(
+            query_arguments = (
                 project_id, question.question, group.method, group.answer_model, group.response_type,
                 group.answer_reasoning_effort,
             )
+            parameters = inspect.signature(self.query_function).parameters.values()
+            accepts_strategy_parameters = any(
+                item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
+            ) or len(inspect.signature(self.query_function).parameters) >= 7
+            if accepts_strategy_parameters:
+                answer, context = self.query_function(
+                    *query_arguments, group.strategy_parameters.get(group.method, {})
+                )
+            else:
+                answer, context = self.query_function(*query_arguments)
         except Exception as exc:
             return self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name)
         try:
@@ -1057,6 +1189,7 @@ class RetrievalExperimentService:
                 (2 * correct + partial) / (2 * total) if total else None,
                 evidence_hit_rate, evidence_precision, document_hit_rate,
                 no_evidence_count, metrics_status, group.response_type, group.answer_reasoning_effort,
+                dict(group.strategy_parameters.get(group.method, {})),
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
@@ -1119,6 +1252,7 @@ class RetrievalExperimentService:
         model: str,
         response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        strategy_parameters: dict[str, object] | None = None,
     ) -> tuple[str, dict[str, object]]:
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
@@ -1126,6 +1260,11 @@ class RetrievalExperimentService:
             raise ProjectError("不支援的 GraphRAG 回答格式")
         if reasoning_effort not in REASONING_EFFORT_OPTIONS:
             raise ProjectError("不支援的 Luna 推理深度")
+        defaults = default_strategy_parameters()[method]
+        selected_parameters = {**defaults, **(strategy_parameters or {})}
+        allowed_names = {item[0] for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS[method]}
+        if set(selected_parameters) - allowed_names:
+            raise ProjectError("策略參數包含不支援的欄位")
         project_path = self.projects.path_for(project_id) / "graphrag"
         settings_path = project_path / "settings.yaml"
         try:
@@ -1137,6 +1276,11 @@ class RetrievalExperimentService:
                 config["api_base"] = self.connections.get_api_base_url()
         for config in settings.get("completion_models", {}).values():
             configure_completion_model(config, model, reasoning_effort)
+        settings_section = {"local": "local_search", "global": "global_search", "drift": "drift_search", "basic": "basic_search"}[method]
+        section = settings.setdefault(settings_section, {})
+        for key in EXPERIMENT_STRATEGY_CONFIG_KEYS[method]:
+            if key in selected_parameters:
+                section[key] = selected_parameters[key]
         api_key = self.connections.apply_to_environment(project_id)
         del api_key  # GraphRAG reads the standard API key environment variable.
 
@@ -1151,6 +1295,8 @@ class RetrievalExperimentService:
                     "method": method,
                     "model": model,
                     "response_type": response_type,
+                    "community_level": selected_parameters.get("community_level", 2),
+                    "dynamic_community_selection": selected_parameters.get("dynamic_community_selection", False),
                 },
                 ensure_ascii=False,
             )
@@ -1197,6 +1343,11 @@ class RetrievalExperimentService:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 回答格式不支援")
             if group.answer_reasoning_effort not in REASONING_EFFORT_OPTIONS:
                 raise ProjectError(f"{group.group_id} 的 Luna 推理深度不支援")
+            strategy_parameters = group.strategy_parameters or default_strategy_parameters()
+            for method, parameters in strategy_parameters.items():
+                specs = {item[0]: item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS.get(method, ())}
+                if method not in EXPERIMENT_METHODS or not isinstance(parameters, dict) or set(parameters) - set(specs):
+                    raise ProjectError(f"{group.group_id} 的策略參數不支援")
 
     def _path(self, project_id: str) -> Path:
         return self.projects.path_for(project_id) / "runs" / "retrieval-experiment-state.json"
