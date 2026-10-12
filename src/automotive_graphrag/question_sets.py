@@ -84,9 +84,9 @@ class QuestionSetService:
             raise ProjectError("找不到題目集檔案") from exc
         except json.JSONDecodeError as exc:
             raise ProjectError(f"JSON 格式錯誤：第 {exc.lineno} 行第 {exc.colno} 欄，{exc.msg}") from exc
-        if isinstance(value, dict) and "name" not in value:
-            value["name"] = path.stem
         name, description, questions = self._validate(value)
+        if name == "匯入題目集":
+            name = path.stem
         now = datetime.now(timezone.utc).isoformat()
         question_set = QuestionSet(
             question_set_id=uuid.uuid4().hex,
@@ -263,6 +263,12 @@ class QuestionSetService:
         except FileNotFoundError as exc:
             raise ProjectError(f"找不到題目集：{question_set_id}") from exc
 
+    def delete(self, project_id: str, question_set_id: str) -> None:
+        """Delete one project-owned question set after validating its ID and ownership."""
+        self.get(project_id, question_set_id)
+        path = self.projects.path_for(project_id) / "question_sets" / f"{question_set_id}.json"
+        path.unlink()
+
     def run(
         self,
         project_id: str,
@@ -360,7 +366,7 @@ class QuestionSetService:
         question_set = self.get(project_id, question_set_id)
         export_directory = self.projects.path_for(project_id) / "exports"
         json_path = export_directory / f"{question_set_id}.json"
-        payload = self.to_schema_v1(question_set.questions)
+        payload = self.to_question_set_json(question_set.questions)
         self._atomic_text(json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         return json_path
 
@@ -369,39 +375,25 @@ class QuestionSetService:
         json_path = self.projects.path_for(project_id) / "exports" / f"{question_set_id}.json"
         self._atomic_text(
             json_path,
-            json.dumps(self.to_schema_v1(question_set.questions), ensure_ascii=False, indent=2) + "\n",
+            json.dumps(self.to_question_set_json(question_set.questions), ensure_ascii=False, indent=2) + "\n",
         )
         return json_path
 
     @staticmethod
-    def to_schema_v1(questions: Sequence[BatchQuestion]) -> dict[str, object]:
-        """Serialize portable question sets using schema v1, preserving richer source data when needed."""
+    def to_question_set_json(questions: Sequence[BatchQuestion]) -> dict[str, object]:
+        """Serialize question sets using the portable number/expected_answer/source format."""
         rows: list[dict[str, object]] = []
         for number, item in enumerate(questions, start=1):
             question_sources = item.question_source_evidence or item.gold_evidence
             answer_sources = item.answer_source_evidence or item.gold_evidence
-            all_sources = tuple(dict.fromkeys((*question_sources, *answer_sources)))
-            document_ids = tuple(dict.fromkeys(source.document_id for source in all_sources))
-            primary = next((source for source in answer_sources if source.document_id), None)
-            if primary is None and all_sources:
-                primary = all_sources[0]
-            primary_pages = tuple(dict.fromkeys(
-                page for source in all_sources
-                if primary is not None and source.document_id == primary.document_id
-                for page in source.pages
-            ))
-            row: dict[str, object] = {
+            rows.append({
                 "number": number,
                 "question": item.question,
                 "expected_answer": item.reference_answer,
-                "source_pages": list(primary_pages),
-                "document": (primary.document_name or primary.document_id) if primary else "",
-            }
-            if question_sources != answer_sources or len(document_ids) > 1:
-                row["question_sources"] = QuestionSetService._sources_payload(question_sources)
-                row["answer_sources"] = QuestionSetService._sources_payload(answer_sources)
-            rows.append(row)
-        return {"schema_version": 1, "questions": rows}
+                "question_sources": QuestionSetService._portable_sources_payload(question_sources),
+                "answer_sources": QuestionSetService._portable_sources_payload(answer_sources),
+            })
+        return {"questions": rows}
 
     def update_gold_evidence(
         self,
@@ -433,149 +425,105 @@ class QuestionSetService:
         if not isinstance(value, dict):
             raise ProjectError("題目集根節點必須是 JSON object")
         errors: list[str] = []
-        schema_version = value.get("schema_version")
-        is_schema_v1 = schema_version is not None
-        if is_schema_v1 and (type(schema_version) is not int or schema_version != 1):
-            raise ProjectError(f"不支援的題目集 schema_version：{schema_version}")
-        name = value.get("name", "匯入題目集")
-        description = value.get("description", "")
+        unsupported_root_fields = set(value) - {"questions"}
+        if unsupported_root_fields:
+            errors.append("不支援的題目集欄位：" + ", ".join(sorted(unsupported_root_fields)))
+        name = "匯入題目集"
+        description = ""
         raw_questions = value.get("questions")
-        if not isinstance(name, str) or not name.strip():
-            errors.append("name：必須是非空白字串")
-        if not isinstance(description, str):
-            errors.append("description：必須是字串")
         if not isinstance(raw_questions, list) or not raw_questions:
             errors.append("questions：必須是至少包含一題的陣列")
             raw_questions = []
 
         questions: list[BatchQuestion] = []
         seen: set[str] = set()
+        allowed_question_fields = {
+            "number", "question", "expected_answer", "question_sources", "answer_sources"
+        }
         for index, raw in enumerate(raw_questions):
             location = f"questions[{index}]"
             if not isinstance(raw, dict):
                 errors.append(f"{location}：必須是 object")
                 continue
-            number = raw.get("number") if is_schema_v1 else None
-            question_id = raw.get("question_id")
-            if is_schema_v1:
-                if type(number) is not int or number < 1:
-                    errors.append(f"{location}.number：必須是正整數")
-                else:
-                    question_id = f"Q{number:04d}"
-            question = raw.get("question")
-            reference_answer = raw.get(
-                "expected_answer", raw.get("correct_answer", raw.get("reference_answer", ""))
-            )
-            answer = raw.get("answer", "")
-            status = raw.get("status", "PENDING")
-            error = raw.get("error")
-            duration_seconds = raw.get("duration_seconds")
-            completed_at = raw.get("completed_at")
-            source_documents_raw = raw.get("source_documents", [])
-            retrieved_raw = raw.get("retrieved_evidence", [])
-            try:
-                if not isinstance(retrieved_raw, list):
-                    raise ValueError("retrieved_evidence 必須是陣列")
-                retrieved_evidence = tuple(Evidence(**item) for item in retrieved_raw)
-            except (TypeError, ValueError) as exc:
-                errors.append(f"{location}.retrieved_evidence：格式錯誤（{exc}）")
-                retrieved_evidence = ()
-            try:
-                gold_evidence = QuestionSetService.parse_gold_evidence(raw.get("gold_evidence", []), location)
-            except ProjectError as exc:
-                errors.extend(str(exc).splitlines())
-                gold_evidence = ()
-            question_sources_raw = raw.get(
-                "question_sources",
-                raw.get("question_source_evidence", raw.get("question_source_pages")),
-            )
-            answer_sources_raw = raw.get(
-                "answer_sources",
-                raw.get("answer_source_evidence", raw.get("answer_source_pages")),
-            )
-            if is_schema_v1 and question_sources_raw is None and answer_sources_raw is None:
-                document = raw.get("document", "")
-                pages = raw.get("source_pages", [])
-                if not isinstance(document, str) or not isinstance(pages, list) or any(
-                    type(page) is not int or page < 1 for page in pages
-                ):
-                    errors.append(f"{location}.document/source_pages：文件必須是字串，頁碼必須是正整數陣列")
-                elif bool(document.strip()) != bool(pages):
-                    errors.append(f"{location}.document/source_pages：文件與頁碼必須同時提供或同時留白")
-                elif document.strip():
-                    base_sources = [{
-                        "document_id": document.strip(),
-                        "document_name": document.strip(),
-                        "pages": pages,
-                    }]
-                    question_sources_raw = base_sources
-                    answer_sources_raw = base_sources
-            try:
-                question_sources = (
-                    QuestionSetService._parse_source_pages(
-                        question_sources_raw, location + ".question_sources"
-                    )
-                    if question_sources_raw is not None
-                    else gold_evidence
-                )
-                answer_sources = (
-                    QuestionSetService._parse_source_pages(
-                        answer_sources_raw, location + ".answer_sources"
-                    )
-                    if answer_sources_raw is not None
-                    else gold_evidence
-                )
-            except ProjectError as exc:
-                errors.extend(str(exc).splitlines())
-                question_sources = answer_sources = gold_evidence
-            if not gold_evidence:
-                gold_evidence = answer_sources
-            if not isinstance(question_id, str) or not question_id.strip():
-                errors.append(f"{location}.question_id：必須是非空白字串")
-            elif question_id.strip() in seen:
-                errors.append(f"{location}.question_id：重複題號 {question_id.strip()}")
+            unsupported_fields = set(raw) - allowed_question_fields
+            if unsupported_fields:
+                errors.append(f"{location}：不支援的欄位 " + ", ".join(sorted(unsupported_fields)))
+            number = raw.get("number")
+            if type(number) is not int or number < 1:
+                errors.append(f"{location}.number：必須是正整數")
+                question_id = ""
             else:
-                seen.add(question_id.strip())
+                question_id = f"Q{number:04d}"
+            question = raw.get("question")
+            try:
+                question_sources = QuestionSetService._parse_portable_sources(
+                    raw.get("question_sources"), location + ".question_sources"
+                )
+                answer_sources = QuestionSetService._parse_portable_sources(
+                    raw.get("answer_sources"), location + ".answer_sources"
+                )
+            except ProjectError as exc:
+                errors.extend(str(exc).splitlines())
+                question_sources = answer_sources = ()
+            if question_id in seen:
+                errors.append(f"{location}.number：重複題號 {number}")
+            else:
+                seen.add(question_id)
             if not isinstance(question, str) or not question.strip():
                 errors.append(f"{location}.question：必須是非空白字串")
-            if not isinstance(reference_answer, str):
-                errors.append(f"{location}.reference_answer：必須是字串")
-            if not isinstance(answer, str):
-                errors.append(f"{location}.answer：必須是字串")
-            if not isinstance(source_documents_raw, list) or any(
-                not isinstance(document, str) or not document.strip() for document in source_documents_raw
-            ):
-                errors.append(f"{location}.source_documents：必須是非空白文件名稱陣列")
-                source_documents_raw = []
-            if status not in QUESTION_STATUSES:
-                errors.append(f"{location}.status：不支援的狀態")
+            reference_answer = raw.get("expected_answer")
+            if not isinstance(reference_answer, str) or not reference_answer.strip():
+                errors.append(f"{location}.expected_answer：必須是非空白字串")
             if (
-                isinstance(question_id, str)
-                and question_id.strip()
+                isinstance(number, int)
+                and number > 0
                 and isinstance(question, str)
                 and question.strip()
                 and isinstance(reference_answer, str)
+                and reference_answer.strip()
             ):
                 questions.append(
                     BatchQuestion(
-                        question_id.strip(),
+                        question_id,
                         question.strip(),
                         reference_answer=reference_answer.strip(),
-                        status=status if status in QUESTION_STATUSES else "PENDING",
-                        answer=answer.strip() if isinstance(answer, str) else "",
-                        error=error if isinstance(error, str) else None,
-                        duration_seconds=duration_seconds if isinstance(duration_seconds, (int, float)) else None,
-                        completed_at=completed_at if isinstance(completed_at, str) else None,
-                        gold_evidence=gold_evidence,
-                        retrieved_evidence=retrieved_evidence,
+                        gold_evidence=answer_sources,
                         question_source_evidence=question_sources,
                         answer_source_evidence=answer_sources,
-                        source_documents=tuple(dict.fromkeys(item.strip() for item in source_documents_raw)),
+                        source_documents=tuple(dict.fromkeys(
+                            item.document_id for item in (*question_sources, *answer_sources)
+                        )),
                     )
                 )
         if errors:
             raise ProjectError("題目集格式錯誤：\n- " + "\n- ".join(errors))
-        return name.strip(), description.strip(), questions
+        return name, description, questions
+
+    @staticmethod
+    def _parse_portable_sources(value: object, location: str) -> tuple[GoldEvidence, ...]:
+        if not isinstance(value, list):
+            raise ProjectError(f"{location}：必須是 document_name/pages 來源陣列")
+        parsed: list[GoldEvidence] = []
+        for index, item in enumerate(value):
+            item_location = f"{location}[{index}]"
+            if not isinstance(item, dict):
+                raise ProjectError(f"{item_location}：必須是 object")
+            unsupported = set(item) - {"document_name", "pages"}
+            if unsupported:
+                raise ProjectError(f"{item_location}：不支援的欄位 " + ", ".join(sorted(unsupported)))
+            document_name = item.get("document_name")
+            pages = item.get("pages")
+            if not isinstance(document_name, str) or not document_name.strip():
+                raise ProjectError(f"{item_location}.document_name：必須是非空白字串")
+            if not isinstance(pages, list) or not pages or any(type(page) is not int or page < 1 for page in pages):
+                raise ProjectError(f"{item_location}.pages：必須是非空的正整數陣列")
+            parsed.append(GoldEvidence(
+                document_id=document_name.strip(),
+                pages=tuple(dict.fromkeys(pages)),
+                chunk_ids=(),
+                document_name=document_name.strip(),
+            ))
+        return tuple(parsed)
 
     @staticmethod
     def _parse_source_pages(value: object, location: str) -> tuple[GoldEvidence, ...]:
@@ -585,8 +533,8 @@ class QuestionSetService:
         for index, item in enumerate(value):
             if not isinstance(item, dict):
                 raise ProjectError(f"{location}[{index}]：必須是 object")
-            document_id = item.get("document_id")
-            document_name = item.get("document_name", document_id)
+            document_name = item.get("document_name", item.get("document_id"))
+            document_id = item.get("document_id", document_name)
             pages = item.get("pages", [])
             chunk_ids = item.get("chunk_ids", [])
             if (
@@ -623,6 +571,17 @@ class QuestionSetService:
                 "pages": list(item.pages),
             }
             for item in evidence
+        ]
+
+    @staticmethod
+    def _portable_sources_payload(evidence: Sequence[GoldEvidence]) -> list[dict[str, object]]:
+        return [
+            {
+                "document_name": item.document_name or item.document_id,
+                "pages": list(item.pages),
+            }
+            for item in evidence
+            if item.pages
         ]
 
     @staticmethod

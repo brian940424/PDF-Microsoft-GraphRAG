@@ -18,8 +18,7 @@ from typing import Any, Callable
 import pandas as pd
 import yaml
 
-from .connections import ALLOWED_CHAT_MODELS, GPT6_LUNA_MODEL, ConnectionSettings, configure_completion_model
-from .drift_compat import run_drift_search as run_compatible_drift_search
+from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, configure_completion_model
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 
@@ -115,16 +114,7 @@ class QueryService:
             response_type,
             prompt,
         ]
-        if normalized_method == "drift" and selected_model == GPT6_LUNA_MODEL:
-            try:
-                answer, context = run_compatible_drift_search(
-                    root_dir=graph_root, query=prompt, response_type=response_type
-                )
-                result = QueryExecution(0, answer, "", self._serialize_context(context))
-            except Exception as exc:
-                result = QueryExecution(1, "", str(exc))
-        else:
-            result = self.runner(command)
+        result = self.runner(command)
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -195,30 +185,64 @@ class QueryService:
     @staticmethod
     def _run(command: list[str]) -> subprocess.CompletedProcess[str] | QueryExecution:
         method = command[command.index("--method") + 1]
-        if method != "local":
-            return subprocess.run(command, text=True, capture_output=True, check=False)
         root = Path(command[command.index("--root") + 1])
         question = command[-1]
+        model = ""
+        settings_path = root / "settings.yaml"
+        try:
+            settings = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
+            completion_models = settings.get("completion_models", {})
+            model = str(next(iter(completion_models.values())).get("model", ""))
+        except (OSError, StopIteration, AttributeError, TypeError, yaml.YAMLError):
+            pass
         response_type = (
             command[command.index("--response-type") + 1]
             if "--response-type" in command
             else "Single Paragraph"
         )
+        package_root = Path(__file__).resolve().parents[2]
+        environment = os.environ.copy()
+        source_path = str(package_root / "src")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            part for part in (source_path, environment.get("PYTHONPATH", "")) if part
+        )
+        worker_payload = json.dumps(
+            {
+                "root_dir": str(root),
+                "question": question,
+                "method": method,
+                "model": model,
+                "response_type": response_type,
+            },
+            ensure_ascii=False,
+        )
         try:
-            from graphrag.cli.query import run_local_search
-
-            response, context = run_local_search(
-                data_dir=None,
-                root_dir=root,
-                community_level=2,
-                response_type=response_type,
-                streaming=False,
-                query=question,
-                verbose=False,
+            completed = subprocess.run(
+                [sys.executable, "-m", "automotive_graphrag.graph_query_worker"],
+                cwd=package_root,
+                env=environment,
+                input=worker_payload,
+                text=True,
+                capture_output=True,
+                check=False,
             )
-            return QueryExecution(0, str(response), "", QueryService._serialize_context(context))
-        except Exception as exc:
-            return QueryExecution(1, "", str(exc))
+            response = json.loads(completed.stdout)
+            if not isinstance(response, dict):
+                raise ValueError("工作程序結果不是 JSON 物件")
+            if completed.returncode or "error" in response:
+                error = str(response.get("error") or completed.stderr or "GraphRAG 查詢失敗")
+                return QueryExecution(completed.returncode or 1, "", error)
+            context = response.get("context", {})
+            return QueryExecution(
+                0,
+                str(response.get("answer", "")),
+                completed.stderr or "",
+                context if isinstance(context, dict) else {},
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            detail = (completed.stderr or completed.stdout).strip().splitlines() if "completed" in locals() else []
+            error = detail[-1] if detail else str(exc)
+            return QueryExecution(1, "", error)
 
     @staticmethod
     def _last_error(result: subprocess.CompletedProcess[str] | QueryExecution) -> str:
@@ -229,17 +253,20 @@ class QueryService:
     def _serialize_context(context: Any) -> dict[str, Any]:
         if not isinstance(context, dict):
             return {"raw": str(context)}
-        serialized: dict[str, Any] = {}
-        for key, value in context.items():
+        def serialize(value: Any) -> Any:
             if isinstance(value, pd.DataFrame):
-                serialized[str(key)] = json.loads(value.to_json(orient="records", force_ascii=False))
-            else:
-                try:
-                    json.dumps(value)
-                    serialized[str(key)] = value
-                except TypeError:
-                    serialized[str(key)] = str(value)
-        return serialized
+                return json.loads(value.to_json(orient="records", force_ascii=False))
+            if isinstance(value, dict):
+                return {str(key): serialize(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [serialize(item) for item in value]
+            try:
+                json.dumps(value)
+                return value
+            except (TypeError, ValueError):
+                return str(value)
+
+        return serialize(context)
 
     @staticmethod
     def _configure_connection(

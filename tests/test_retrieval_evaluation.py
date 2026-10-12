@@ -9,8 +9,8 @@ from pathlib import Path
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
-from automotive_graphrag.question_sets import GoldEvidence, QuestionSetService
-from automotive_graphrag.retrieval_evaluation import RetrievalEvaluationService
+from automotive_graphrag.question_sets import BatchQuestion, GoldEvidence, QuestionSetService
+from automotive_graphrag.retrieval_evaluation import RetrievalEvaluationService, compute_source_metrics
 
 
 def evidence(rank: int, chunk_id: str, document_id: str = "WW.pdf", page: int = 25) -> Evidence:
@@ -71,11 +71,10 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
         source.write_text(
             json.dumps(
                 {
-                    "name": "Retrieval 評估集",
                     "questions": [
-                        {"question_id": "Q001", "question": "問題一"},
-                        {"question_id": "Q002", "question": "問題二"},
-                        {"question_id": "Q003", "question": "問題三"},
+                        {"number": 1, "question": "問題一", "expected_answer": "答案一", "question_sources": [], "answer_sources": []},
+                        {"number": 2, "question": "問題二", "expected_answer": "答案二", "question_sources": [], "answer_sources": []},
+                        {"number": 3, "question": "問題三", "expected_answer": "答案三", "question_sources": [], "answer_sources": []},
                     ],
                 },
                 ensure_ascii=False,
@@ -85,9 +84,9 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
         self.question_sets = QuestionSetService(self.store, EvaluationQueryRunner())
         self.question_set = self.question_sets.import_file("L33-SM3E", source)
         gold_by_question = {
-            "Q001": (GoldEvidence("WW.pdf", (25,), ("gold-q1",)),),
-            "Q002": (GoldEvidence("PG.pdf", (42,), ("gold-q2",)),),
-            "Q003": (GoldEvidence("WW.pdf", (99,), ("missing-q3",)),),
+            "Q0001": (GoldEvidence("WW.pdf", (25,), ("gold-q1",)),),
+            "Q0002": (GoldEvidence("PG.pdf", (42,), ("gold-q2",)),),
+            "Q0003": (GoldEvidence("WW.pdf", (99,), ("missing-q3",)),),
         }
         for question_id, gold in gold_by_question.items():
             self.question_sets.update_gold_evidence(
@@ -99,33 +98,70 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def test_evaluate_computes_recall_mrr_rank_accuracy_and_latency(self) -> None:
+    def test_evaluate_computes_unranked_evidence_metrics_and_latency(self) -> None:
         result = self.service.evaluate("L33-SM3E", self.question_set.question_set_id, top_k=3)
 
-        self.assertAlmostEqual(result.recall_at_5, 2 / 3)
-        self.assertAlmostEqual(result.recall_at_10, 2 / 3)
-        self.assertAlmostEqual(result.mrr, 0.5)
-        self.assertEqual(result.average_first_relevant_rank, 1.5)
-        self.assertEqual(result.evidence_source_accuracy, 0.5)
+        self.assertAlmostEqual(result.evidence_hit_rate, 2 / 3)
+        self.assertAlmostEqual(result.evidence_precision, 0.5)
+        self.assertAlmostEqual(result.document_hit_rate, 1.0)
+        self.assertEqual(result.no_evidence_question_count, 0)
         self.assertAlmostEqual(result.average_latency_seconds or 0, 0.2)
-        self.assertEqual([item.first_relevant_rank for item in result.items], [2, 1, None])
-        self.assertEqual([item.passed_at_k for item in result.items], [True, True, False])
+        self.assertEqual([item.evidence_hit for item in result.items], [True, True, False])
+        self.assertEqual([item.relevant_evidence_count for item in result.items], [1, 1, 0])
         self.assertEqual(
             self.service.last_result("L33-SM3E", self.question_set.question_set_id),
             result,
         )
 
-    def test_recall_at_10_includes_a_relevant_result_at_rank_ten(self) -> None:
+    def test_metrics_do_not_depend_on_context_order(self) -> None:
         question = self.question_sets.get("L33-SM3E", self.question_set.question_set_id).questions[0]
         retrieved = tuple(evidence(rank, f"irrelevant-{rank}", page=10) for rank in range(1, 10)) + (
             evidence(10, "gold-q1"),
         )
 
-        item = self.service._evaluate_question(replace(question, retrieved_evidence=retrieved), top_k=10)
+        first = self.service._evaluate_question(replace(question, retrieved_evidence=retrieved))
+        second = self.service._evaluate_question(replace(question, retrieved_evidence=tuple(reversed(retrieved))))
 
-        self.assertFalse(item.recall_at_5)
-        self.assertTrue(item.recall_at_10)
-        self.assertEqual(item.first_relevant_rank, 10)
+        self.assertEqual(first.evidence_hit, second.evidence_hit)
+        self.assertEqual(first.evidence_precision, second.evidence_precision)
+        self.assertEqual(first.document_hit, second.document_hit)
+
+    def test_precision_is_macro_averaged_page_precision_and_empty_retrieval_is_zero(self) -> None:
+        gold = (GoldEvidence("WW.pdf", (25,), ("gold-chunk",)),)
+        samples = (
+            # Different chunk IDs on the same document/page are one relevant page.
+            ((evidence(1, "other-chunk", page=25), evidence(2, "another-chunk", page=25)), gold),
+            ((evidence(1, "gold-chunk", page=25), evidence(2, "noise", page=10)), gold),
+            ((), gold),
+        )
+
+        hit_rate, precision, document_hit_rate, no_evidence = compute_source_metrics(samples)
+
+        self.assertAlmostEqual(hit_rate, 2 / 3)
+        self.assertAlmostEqual(precision, 0.5)  # mean(1.0, 0.5, 0.0), not pooled 2/3
+        self.assertAlmostEqual(document_hit_rate, 2 / 3)
+        self.assertEqual(no_evidence, 1)
+        empty_result = RetrievalEvaluationService._evaluate_question(
+            BatchQuestion("Q", "問題", "答案", gold_evidence=gold, retrieved_evidence=())
+        )
+        self.assertEqual(empty_result.evidence_precision, 0.0)
+        self.assertEqual(empty_result.retrieved_evidence_count, 0)
+
+    def test_gold_without_pages_is_excluded_from_precision_average(self) -> None:
+        with_pages = (GoldEvidence("WW.pdf", (25,), ()),)
+        without_pages = (GoldEvidence("WW.pdf", (), ("old-chunk-only",)),)
+
+        _, precision, _, _ = compute_source_metrics((
+            ((evidence(1, "matching-page", page=25),), with_pages),
+            ((evidence(1, "unmatchable", page=25),), without_pages),
+        ))
+
+        self.assertEqual(precision, 1.0)
+        unscorable = RetrievalEvaluationService._evaluate_question(
+            BatchQuestion("Q", "問題", "答案", gold_evidence=without_pages,
+                          retrieved_evidence=(evidence(1, "unmatchable", page=25),))
+        )
+        self.assertIsNone(unscorable.evidence_precision)
 
     def test_evaluate_can_rerun_only_questions_with_gold_evidence(self) -> None:
         result = self.service.evaluate(
@@ -146,13 +182,33 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(payload["question_count"], 3)
         with csv_path.open(encoding="utf-8", newline="") as source:
             rows = list(csv.DictReader(source))
-        self.assertEqual(rows[0]["question_id"], "Q001")
-        self.assertEqual(rows[0]["first_relevant_rank"], "2")
+        self.assertEqual(rows[0]["question_id"], "Q0001")
+        self.assertEqual(rows[0]["evidence_hit"], "True")
+
+    def test_drift_metrics_are_calculated_after_rerunning_and_mapping_its_sources(self) -> None:
+        result = self.service.evaluate(
+            "L33-SM3E", self.question_set.question_set_id, method="drift", rerun_queries=True
+        )
+
+        self.assertAlmostEqual(result.evidence_hit_rate or 0, 2 / 3)
+        self.assertAlmostEqual(result.evidence_precision or 0, 0.5)
+        self.assertEqual(result.document_hit_rate, 1.0)
+        self.assertIn("不使用檢索排名", result.retrieval_metrics_status)
+
+    def test_global_metrics_remain_unavailable_for_unmapped_community_reports(self) -> None:
+        result = self.service.evaluate(
+            "L33-SM3E", self.question_set.question_set_id, method="global", rerun_queries=True
+        )
+
+        self.assertIsNone(result.evidence_hit_rate)
+        self.assertIsNone(result.evidence_precision)
+        self.assertIsNone(result.document_hit_rate)
+        self.assertIn("GLOBAL", result.retrieval_metrics_status)
 
     def test_evaluate_requires_gold_evidence(self) -> None:
         source = self.root / "no-gold.json"
         source.write_text(
-            json.dumps({"name": "No Gold", "questions": [{"question_id": "Q1", "question": "問題"}]}),
+            json.dumps({"questions": [{"number": 1, "question": "問題", "expected_answer": "答案", "question_sources": [], "answer_sources": []}]}),
             encoding="utf-8",
         )
         question_set = self.question_sets.import_file("L33-SM3E", source)

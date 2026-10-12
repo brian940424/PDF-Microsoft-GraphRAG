@@ -5,12 +5,14 @@ import unittest
 from pathlib import Path
 
 import yaml
+import pandas as pd
 from unittest.mock import patch
 
 from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
-from automotive_graphrag.evidence import Evidence
+from automotive_graphrag.evidence import Evidence, EvidenceService
 from automotive_graphrag.querying import QueryExecution, QueryService
+from automotive_graphrag.source_metadata import SourceMetadata
 
 
 class FakeQueryRunner:
@@ -135,19 +137,22 @@ class QueryServiceTests(unittest.TestCase):
         self.assertNotIn("top_p", model["call_args"])
 
     def test_gpt6_drift_uses_compatible_entrypoint(self) -> None:
-        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+        service = QueryService(self.store, connection_settings=self.connections)
 
-        with patch(
-            "automotive_graphrag.querying.run_compatible_drift_search",
-            return_value=("Luna DRIFT 回答", {"sources": []}),
-        ) as drift_search:
+        def run_worker(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            payload = json.loads(str(kwargs["input"]))
+            self.assertEqual(payload["method"], "drift")
+            self.assertEqual(payload["model"], "gpt-6-luna")
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps({"answer": "Luna DRIFT 回答", "context": {"sources": []}}), ""
+            )
+
+        with patch("automotive_graphrag.querying.subprocess.run", side_effect=run_worker):
             result = service.ask("L33-SM3E", "測試 GPT-6", method="drift", chat_model="gpt-6-luna")
 
         self.assertEqual(result.status, "COMPLETED")
         self.assertEqual(result.answer, "Luna DRIFT 回答")
-        drift_search.assert_called_once_with(
-            root_dir=self.graph_root, query="測試 GPT-6", response_type="Single Paragraph"
-        )
+        self.assertEqual(result.context["sources"], [])
 
     def test_query_rejects_unknown_chat_model(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)
@@ -168,6 +173,90 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.evidence[0].evidence_id, "E1")
         self.assertEqual(result.context["sources"][0]["id"], "7")
         self.assertEqual(service.history("L33-SM3E")[0], result)
+
+    def test_all_retrieval_methods_save_returned_evidence(self) -> None:
+        service = QueryService(
+            self.store,
+            connection_settings=self.connections,
+            evidence_service=FakeEvidenceService(),
+        )
+        calls: list[dict[str, object]] = []
+
+        def run_worker(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            payload = json.loads(str(kwargs["input"]))
+            calls.append(payload)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps({
+                    "answer": f"{payload['method']} answer",
+                    "context": {"sources": [{"id": "7", "text": "來源"}]},
+                }),
+                "",
+            )
+
+        with patch("automotive_graphrag.querying.subprocess.run", side_effect=run_worker):
+            results = [
+                service.ask("L33-SM3E", "測試證據", method=method)
+                for method in ("local", "global", "drift", "basic")
+            ]
+
+        self.assertEqual([call["method"] for call in calls], ["local", "global", "drift", "basic"])
+        self.assertTrue(all(result.evidence and result.evidence[0].page == 25 for result in results))
+        self.assertEqual([len(item.evidence) for item in service.history("L33-SM3E")], [1, 1, 1, 1])
+
+    def test_global_community_reports_are_saved_as_report_level_evidence(self) -> None:
+        evidence = EvidenceService(self.store).from_context(
+            "L33-SM3E",
+            {
+                "reports": [{
+                    "id": "report-1",
+                    "community": "community-3",
+                    "title": "冷卻系統",
+                    "summary": "檢查冷卻液液位及管路狀況。",
+                }]
+            },
+        )
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].document_id, "GraphRAG Community Report")
+        self.assertIsNone(evidence[0].page)
+        self.assertEqual(evidence[0].text, "檢查冷卻液液位及管路狀況。")
+
+    def test_drift_nested_context_is_serialized_and_mapped_to_source_metadata(self) -> None:
+        nested_context = {
+            "查詢 A": {"sources": pd.DataFrame([{"id": "7", "text": "來源 A"}])},
+            "查詢 B": {"sources": pd.DataFrame([{"id": "8", "text": "來源 B"}])},
+        }
+        serialized = QueryService._serialize_context(nested_context)
+        self.assertEqual(serialized["查詢 A"]["sources"][0]["id"], "7")
+        self.assertEqual(serialized["查詢 B"]["sources"][0]["text"], "來源 B")
+
+        output = self.graph_root / "output"
+        (output / "text_units.parquet").touch()
+        metadata = [
+            SourceMetadata("full-7", "chunk-7", "L33-SM3E", "WW", "雨刷", "WW.pdf", 25, "b01", "原文 A"),
+            SourceMetadata("full-8", "chunk-8", "L33-SM3E", "PG", "電源", "PG.pdf", 42, "b02", "原文 B"),
+        ]
+
+        class MetadataService:
+            def load(self, project_id):
+                self_project_id = project_id
+                return metadata if self_project_id == "L33-SM3E" else []
+
+        with patch(
+            "automotive_graphrag.evidence.pd.read_parquet",
+            return_value=pd.DataFrame([
+                {"id": "full-7", "human_readable_id": "7"},
+                {"id": "full-8", "human_readable_id": "8"},
+            ]),
+        ):
+            evidence = EvidenceService(self.store, MetadataService()).from_context("L33-SM3E", serialized)
+
+        self.assertEqual([(item.document_id, item.page, item.chunk_id) for item in evidence], [
+            ("WW.pdf", 25, "chunk-7"),
+            ("PG.pdf", 42, "chunk-8"),
+        ])
 
     def test_context_summary_is_bounded_for_large_query_context(self) -> None:
         context = {"sources": [{"text": "x" * 10_000} for _ in range(100)], "metadata": {"a": 1}}

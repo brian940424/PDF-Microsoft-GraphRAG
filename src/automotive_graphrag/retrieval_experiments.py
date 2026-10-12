@@ -22,12 +22,14 @@ from .connections import (
     ALLOWED_CHAT_MODELS,
     DEFAULT_REASONING_EFFORT,
     GPT6_LUNA_MODEL,
+    REASONING_EFFORT_OPTIONS,
     ConnectionSettings,
     configure_completion_model,
 )
-from .evidence import EvidenceService
+from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
+from .retrieval_evaluation import compute_source_metrics
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
@@ -42,9 +44,8 @@ EXPERIMENT_RESPONSE_TYPE_OPTIONS = (
     ("簡短回答，不要前言", "A short answer with no preamble"),
 )
 EXPERIMENT_RESPONSE_TYPES = tuple(value for _, value in EXPERIMENT_RESPONSE_TYPE_OPTIONS)
-UNRANKED_REASON = (
-    "不可計算：GraphRAG API context 未提供可驗證的來源排序分數；context 列表順序不保證是檢索排名。"
-)
+EXPERIMENT_REASONING_EFFORT_OPTIONS = (("低", "low"), ("中", "medium"), ("高", "high"))
+UNSUPPORTED_RETRIEVAL_METRICS = "暫不可計算：Global 社群報告尚未可靠映射至原始文件"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,7 @@ class ExperimentGroup:
     answer_model: str
     method: str
     response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
+    answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,13 +70,17 @@ class ExperimentQuestionResult:
     source_documents: tuple[str, ...]
     correct_answer: str
     actual_answer: str
-    evaluation_result: str
+    evaluation_result: int | str
     evaluation_reason: str
     answer_source_rank: int | None
     retrieval_metrics_status: str
     status: str
     error: str | None = None
     response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
+    retrieved_evidence: tuple[Evidence, ...] = ()
+    dataset_id: str = ""
+    dataset_name: str = ""
+    answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,12 +93,17 @@ class ExperimentGroupSummary:
     question_count: int
     completed_count: int
     correct_count: int
+    partial_correct_count: int
+    incorrect_count: int
     accuracy: float | None
-    recall_at_5: float | None
-    recall_at_10: float | None
-    mrr: float | None
+    score_accuracy: float | None
+    evidence_hit_rate: float | None
+    evidence_precision: float | None
+    document_hit_rate: float | None
+    no_evidence_question_count: int
     retrieval_metrics_status: str
     response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
+    answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,9 +119,11 @@ class RetrievalExperimentRun:
     completed_at: str | None
     groups: tuple[ExperimentGroupSummary, ...]
     results: tuple[ExperimentQuestionResult, ...]
+    question_set_ids: tuple[str, ...] = ()
+    question_set_names: tuple[str, ...] = ()
 
 
-QueryFunction = Callable[[str, str, str, str, str], tuple[str, dict[str, object]]]
+QueryFunction = Callable[[str, str, str, str, str, str], tuple[str, dict[str, object]]]
 UpdateFunction = Callable[[RetrievalExperimentRun], None]
 
 
@@ -136,12 +149,15 @@ class RetrievalExperimentService:
         try:
             value = json.loads(self._path(project_id).read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return {"groups": [], "question_set_id": "", "max_concurrency": 5,
+            return {"groups": [], "question_set_id": "", "question_set_ids": [], "max_concurrency": 5,
                     "judge_model": self.connections.get_chat_model(), "evaluation_mode": "strict", "run": None}
         except (OSError, json.JSONDecodeError) as exc:
             raise ProjectError("檢索實驗保存資料無法讀取") from exc
         value.setdefault("groups", [])
         value.setdefault("question_set_id", "")
+        value["question_set_ids"] = self._normalize_question_set_ids(
+            value.get("question_set_ids") or value.get("question_set_id")
+        )
         value.setdefault("max_concurrency", 5)
         value.setdefault("evaluation_mode", "strict")
         if value["evaluation_mode"] not in {"strict", "lenient"}:
@@ -157,13 +173,39 @@ class RetrievalExperimentService:
             {key: field for key, field in item.items() if key != "judge_model"}
             for item in legacy_groups if isinstance(item, dict)
         ]
+        run = value.get("run")
+        migrated = False
+        if isinstance(run, dict):
+            for item in run.get("results", []):
+                old = item.get("evaluation_result")
+                grade = self._parse_grade(old)
+                if grade is not None and old != grade:
+                    item["evaluation_result"] = grade
+                    migrated = True
+            for group in run.get("groups", []):
+                group_results = [item for item in run.get("results", []) if item.get("group_id") == group.get("group_id")]
+                judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
+                full = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
+                partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
+                incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
+                total = int(group.get("question_count", len(group_results)))
+                updated = {
+                    "correct_count": full, "partial_correct_count": partial,
+                    "incorrect_count": incorrect, "accuracy": full / total if total else None,
+                    "score_accuracy": (2 * full + partial) / (2 * total) if total else None,
+                }
+                if any(group.get(key) != field for key, field in updated.items()):
+                    group.update(updated)
+                    migrated = True
+            if migrated:
+                self._write(project_id, value)
         return value
 
     def save_configuration(
         self,
         project_id: str,
         groups: Sequence[ExperimentGroup],
-        question_set_id: str,
+        question_set_id: str | Sequence[str],
         max_concurrency: int,
         judge_model: str | None = None,
     ) -> None:
@@ -176,7 +218,9 @@ class RetrievalExperimentService:
             if judge_model not in ALLOWED_CHAT_MODELS:
                 raise ProjectError("全域評測模型不支援")
             current["judge_model"] = judge_model
-        current["question_set_id"] = question_set_id
+        question_set_ids = self._normalize_question_set_ids(question_set_id)
+        current["question_set_ids"] = question_set_ids
+        current["question_set_id"] = question_set_ids[0] if question_set_ids else ""
         current["max_concurrency"] = max_concurrency
         self._write(project_id, current)
 
@@ -189,12 +233,79 @@ class RetrievalExperimentService:
         return current
 
     def import_question_set(self, project_id: str, filepath: str | Path) -> object:
-        question_set = self.question_sets.import_file(project_id, filepath)
+        return self.import_question_sets(project_id, [filepath])[0]
+
+    def import_question_sets(self, project_id: str, filepaths: Sequence[str | Path]) -> list[object]:
+        imported, errors = self.import_question_sets_with_errors(project_id, filepaths)
+        if errors:
+            raise ProjectError("題目集未取代，舊資料已保留：\n- " + "\n- ".join(errors))
+        return imported
+
+    def import_question_sets_with_errors(
+        self, project_id: str, filepaths: Sequence[str | Path]
+    ) -> tuple[list[object], list[str]]:
+        if not filepaths:
+            raise ProjectError("請至少選擇一份 JSON 題目集")
         current = self.load(project_id)
-        current["question_set_id"] = question_set.question_set_id
+        old_ids = self._normalize_question_set_ids(
+            current.get("question_set_ids") or current.get("question_set_id")
+        )
+        imported = []
+        errors = []
+        for filepath in filepaths:
+            try:
+                imported.append(self.question_sets.import_file(project_id, filepath))
+            except (ProjectError, OSError, ValueError) as exc:
+                errors.append(f"{Path(filepath).name}：{exc}")
+        if errors or not imported:
+            # Treat multi-file replacement atomically: a malformed file must not
+            # replace or partially erase the currently loaded datasets.
+            for item in imported:
+                try:
+                    self.question_sets.delete(project_id, item.question_set_id)
+                except (ProjectError, OSError):
+                    pass
+            return [], errors or ["沒有可匯入的題目集"]
+
+        ids = [item.question_set_id for item in imported]
+        current["question_set_ids"] = ids
+        current["question_set_id"] = ids[0]
         current["run"] = None
         self._write(project_id, current)
-        return question_set
+        for old_id in old_ids:
+            if old_id not in ids:
+                try:
+                    self.question_sets.delete(project_id, old_id)
+                except ProjectError:
+                    # A stale ID may already have been removed; the replacement
+                    # state is authoritative and remains usable.
+                    pass
+        return imported, errors
+
+    def remove_question_set(self, project_id: str, question_set_id: str) -> dict[str, object]:
+        current = self.load(project_id)
+        ids = [item for item in self._normalize_question_set_ids(current.get("question_set_ids"))
+               if item != question_set_id]
+        if len(ids) == len(self._normalize_question_set_ids(current.get("question_set_ids"))):
+            raise ProjectError(f"題目集不在檢索實驗清單中：{question_set_id}")
+        current["question_set_ids"] = ids
+        current["question_set_id"] = ids[0] if ids else ""
+        current["run"] = None
+        self._write(project_id, current)
+        try:
+            self.question_sets.delete(project_id, question_set_id)
+        except ProjectError:
+            # The active list is already updated; tolerate a stale missing file.
+            pass
+        return current
+
+    @staticmethod
+    def _normalize_question_set_ids(value: str | Sequence[str] | object) -> list[str]:
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+        return []
 
     def add_group(self, project_id: str) -> dict[str, object]:
         current = self.load(project_id)
@@ -281,6 +392,23 @@ class RetrievalExperimentService:
             self._write(project_id, current)
         return current
 
+    def set_group_reasoning_effort(
+        self, project_id: str, group_id: str, reasoning_effort: str
+    ) -> dict[str, object]:
+        if reasoning_effort not in REASONING_EFFORT_OPTIONS:
+            raise ProjectError("不支援的 Luna 推理深度")
+        current = self.load(project_id)
+        matched = False
+        for group in current["groups"]:
+            if group.get("group_id") == group_id:
+                if group.get("answer_model") != GPT6_LUNA_MODEL:
+                    raise ProjectError("只有回答模型為 gpt-6-luna 時可以設定推理深度")
+                group["answer_reasoning_effort"] = reasoning_effort
+                matched = True
+        if matched:
+            self._write(project_id, current)
+        return current
+
     def remove_group(self, project_id: str, group_id: str) -> dict[str, object]:
         current = self.load(project_id)
         current["groups"] = [g for g in current["groups"] if g.get("group_id") != group_id]
@@ -290,7 +418,7 @@ class RetrievalExperimentService:
     def run(
         self,
         project_id: str,
-        question_set_id: str,
+        question_set_id: str | Sequence[str],
         groups: Sequence[ExperimentGroup],
         max_concurrency: int = 5,
         update_callback: UpdateFunction | None = None,
@@ -307,53 +435,69 @@ class RetrievalExperimentService:
         if judge_model not in ALLOWED_CHAT_MODELS:
             raise ProjectError("全域評測模型不支援")
         project = self.projects.get(project_id)
-        question_set = self.question_sets.get(project_id, question_set_id)
+        question_set_ids = self._normalize_question_set_ids(question_set_id)
+        if not question_set_ids:
+            raise ProjectError("此專案尚未匯入題目集，請先匯入 JSON 題目集")
+        question_sets = [self.question_sets.get(project_id, item) for item in question_set_ids]
         if project.status != "INDEXED":
             raise ProjectError("專案尚未完成 GraphRAG 建圖")
-        if not question_set.questions:
+        if not any(question_set.questions for question_set in question_sets):
             raise ProjectError("匯入題目集沒有題目")
-        missing_answers = [item.question_id for item in question_set.questions if not item.reference_answer.strip()]
+        missing_answers = [
+            f"{question_set.name}/{item.question_id}"
+            for question_set in question_sets for item in question_set.questions
+            if not item.reference_answer.strip()
+        ]
         if missing_answers:
             raise ProjectError("以下題目缺少正確答案，無法評測：" + ", ".join(missing_answers))
+        question_count = sum(len(item.questions) for item in question_sets)
         stop_event = threading.Event()
         with self._lock:
             self._stop_events[project_id] = stop_event
 
         start = datetime.now(timezone.utc).isoformat()
-        results: dict[tuple[str, str], ExperimentQuestionResult] = {}
+        results: dict[tuple[str, str, str], ExperimentQuestionResult] = {}
         run_status = "running"
         initial_status = "generating_answers" if not evaluate else run_status
-        self._persist_run(project_id, question_set_id, groups, judge_model, max_concurrency, start, initial_status, results)
-        work = [(group, question) for group in groups for question in question_set.questions]
+        self._persist_run(project_id, question_set_ids, groups, judge_model, max_concurrency, start, initial_status, results)
+        work = [
+            (group, question_set, question)
+            for group in groups for question_set in question_sets for question in question_set.questions
+        ]
         executor = ThreadPoolExecutor(max_workers=max_concurrency)
         work_iter = iter(work)
-        futures: dict[Future[ExperimentQuestionResult], tuple[ExperimentGroup, BatchQuestion]] = {}
+        futures: dict[Future[ExperimentQuestionResult], tuple[ExperimentGroup, object, BatchQuestion]] = {}
 
         def fill_available_workers() -> None:
             while not stop_event.is_set() and len(futures) < max_concurrency:
                 try:
-                    group, question = next(work_iter)
+                    group, question_set, question = next(work_iter)
                 except StopIteration:
                     return
                 worker = self._run_case if evaluate else self._generate_case
-                futures[executor.submit(worker, project_id, group, question, judge_model)] = (group, question)
+                futures[executor.submit(
+                    worker, project_id, group, question, judge_model,
+                    question_set.question_set_id, question_set.name,
+                )] = (group, question_set, question)
 
         fill_available_workers()
         try:
             while futures:
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
-                    group, question = futures.pop(future)
+                    group, question_set, question = futures.pop(future)
                     try:
                         result = future.result()
                     except Exception as exc:  # Preserve an individual failure instead of losing the run.
-                        result = self._failed_result(group, question, judge_model, str(exc))
-                    results[(group.group_id, question.question_id)] = result
+                        result = self._failed_result(
+                            group, question, judge_model, str(exc), question_set.question_set_id, question_set.name
+                        )
+                    results[(group.group_id, question_set.question_set_id, question.question_id)] = result
                     run_status = "stopping" if stop_event.is_set() else (
                         "evaluating" if evaluate else "generating_answers"
                     )
                     run = self._persist_run(
-                        project_id, question_set_id, groups, judge_model, max_concurrency, start, run_status, results
+                        project_id, question_set_ids, groups, judge_model, max_concurrency, start, run_status, results
                     )
                     if update_callback:
                         update_callback(run)
@@ -362,7 +506,7 @@ class RetrievalExperimentService:
         except BaseException:
             stop_event.set()
             executor.shutdown(wait=True, cancel_futures=True)
-            self._persist_run(project_id, question_set_id, groups, judge_model, max_concurrency, start, "stopped", results)
+            self._persist_run(project_id, question_set_ids, groups, judge_model, max_concurrency, start, "stopped", results)
             raise
         finally:
             with self._lock:
@@ -373,20 +517,20 @@ class RetrievalExperimentService:
         elif evaluate:
             run_status = "completed"
         else:
-            expected_count = len(groups) * len(question_set.questions)
+            expected_count = len(groups) * question_count
             run_status = "answers_completed" if len(results) == expected_count and all(
                 item.status == "answered" and item.actual_answer.strip()
                 for item in results.values()
             ) else "answers_partial"
         completed_at = datetime.now(timezone.utc).isoformat()
         return self._persist_run(
-            project_id, question_set_id, groups, judge_model, max_concurrency, start, run_status, results, completed_at
+            project_id, question_set_ids, groups, judge_model, max_concurrency, start, run_status, results, completed_at
         )
 
     def generate_answers(
         self,
         project_id: str,
-        question_set_id: str,
+        question_set_id: str | Sequence[str],
         groups: Sequence[ExperimentGroup],
         max_concurrency: int = 5,
         update_callback: UpdateFunction | None = None,
@@ -406,7 +550,7 @@ class RetrievalExperimentService:
     def evaluate_answers(
         self,
         project_id: str,
-        question_set_id: str,
+        question_set_id: str | Sequence[str],
         judge_model: str | None = None,
         max_concurrency: int | None = None,
         update_callback: UpdateFunction | None = None,
@@ -418,7 +562,12 @@ class RetrievalExperimentService:
         if evaluation_mode not in {"strict", "lenient"}:
             raise ProjectError("不支援的評分方式")
         run_state = state.get("run")
-        if not isinstance(run_state, dict) or run_state.get("question_set_id") != question_set_id:
+        question_set_ids = self._normalize_question_set_ids(question_set_id)
+        run_question_set_ids = self._normalize_question_set_ids(
+            run_state.get("question_set_ids", run_state.get("question_set_id", ""))
+            if isinstance(run_state, dict) else ""
+        )
+        if not isinstance(run_state, dict) or run_question_set_ids != question_set_ids:
             raise ProjectError("請先執行「檢索並生成答案」")
         groups = [ExperimentGroup(**item) for item in state.get("groups", [])]
         if not groups:
@@ -431,67 +580,72 @@ class RetrievalExperimentService:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
         state["evaluation_mode"] = evaluation_mode
         self._write(project_id, state)
-        question_set = self.question_sets.get(project_id, question_set_id)
-        question_by_id = {item.question_id: item for item in question_set.questions}
-        results: dict[tuple[str, str], ExperimentQuestionResult] = {}
+        question_sets = [self.question_sets.get(project_id, item) for item in question_set_ids]
+        dataset_by_id = {item.question_set_id: item for item in question_sets}
+        results: dict[tuple[str, str, str], ExperimentQuestionResult] = {}
         for item in run_state.get("results", []):
-            result = ExperimentQuestionResult(**item)
-            results[(result.group_id, result.question_id)] = result
-        work: list[tuple[ExperimentGroup, BatchQuestion, ExperimentQuestionResult]] = []
+            result = self._result_from_dict(item)
+            dataset_id = result.dataset_id or question_set_ids[0]
+            results[(result.group_id, dataset_id, result.question_id)] = result
+        work: list[tuple[ExperimentGroup, object, BatchQuestion, ExperimentQuestionResult]] = []
         for group in groups:
-            for question in question_set.questions:
-                result = results.get((group.group_id, question.question_id))
-                if result is None or not result.actual_answer.strip():
-                    raise ProjectError(
-                        f"{group.name} 的題目 {question.question_id} 尚未完成回答；請先生成所有答案"
-                    )
-                if (
-                    result.answer_model != group.answer_model
-                    or result.method != group.method
-                    or result.response_type != group.response_type
-                ):
-                    raise ProjectError(f"{group.name} 的模型、檢索策略或回答格式已變更；請重新生成答案")
-                if result.question != question.question or result.correct_answer != question.reference_answer:
-                    raise ProjectError(f"題目 {question.question_id} 已變更；請重新生成答案")
-                work.append((group, question_by_id[question.question_id], result))
+            for question_set in question_sets:
+                for question in question_set.questions:
+                    result = results.get((group.group_id, question_set.question_set_id, question.question_id))
+                    if result is None or not result.actual_answer.strip():
+                        raise ProjectError(
+                            f"{group.name}／{question_set.name} 的題目 {question.question_id} 尚未完成回答；請先生成所有答案"
+                        )
+                    if (
+                        result.answer_model != group.answer_model
+                        or result.method != group.method
+                        or result.response_type != group.response_type
+                        or result.answer_reasoning_effort != group.answer_reasoning_effort
+                    ):
+                        raise ProjectError(f"{group.name} 的模型、推理深度、檢索策略或回答格式已變更；請重新生成答案")
+                    if result.question != question.question or result.correct_answer != question.reference_answer:
+                        raise ProjectError(f"{question_set.name} 的題目 {question.question_id} 已變更；請重新生成答案")
+                    work.append((group, question_set, question, result))
 
         stop_event = threading.Event()
         with self._lock:
             self._stop_events[project_id] = stop_event
         started_at = str(run_state.get("started_at") or datetime.now(timezone.utc).isoformat())
         self._persist_run(
-            project_id, question_set_id, groups, judge_model, concurrency,
+            project_id, question_set_ids, groups, judge_model, concurrency,
             started_at, "evaluating", results, evaluation_mode=evaluation_mode,
         )
-        futures: dict[Future[ExperimentQuestionResult], tuple[ExperimentGroup, BatchQuestion]] = {}
+        futures: dict[Future[ExperimentQuestionResult], tuple[ExperimentGroup, object, BatchQuestion]] = {}
         work_iter = iter(work)
         executor = ThreadPoolExecutor(max_workers=concurrency)
 
         def fill_available_workers() -> None:
             while not stop_event.is_set() and len(futures) < concurrency:
                 try:
-                    group, question, result = next(work_iter)
+                    group, question_set, question, result = next(work_iter)
                 except StopIteration:
                     return
                 future = executor.submit(
                     self._evaluate_case, project_id, group, question, judge_model, result, evaluation_mode
                 )
-                futures[future] = (group, question)
+                futures[future] = (group, question_set, question)
 
         fill_available_workers()
         try:
             while futures:
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
-                    group, question = futures.pop(future)
+                    group, question_set, question = futures.pop(future)
                     try:
                         result = future.result()
                     except Exception as exc:
-                        result = self._failed_result(group, question, judge_model, str(exc))
-                    results[(group.group_id, question.question_id)] = result
+                        result = self._failed_result(
+                            group, question, judge_model, str(exc), question_set.question_set_id, question_set.name
+                        )
+                    results[(group.group_id, question_set.question_set_id, question.question_id)] = result
                     status = "stopping" if stop_event.is_set() else "evaluating"
                     updated = self._persist_run(
-                        project_id, question_set_id, groups, judge_model, concurrency,
+                        project_id, question_set_ids, groups, judge_model, concurrency,
                         started_at, status, results, evaluation_mode=evaluation_mode,
                     )
                     if update_callback:
@@ -502,7 +656,7 @@ class RetrievalExperimentService:
             stop_event.set()
             executor.shutdown(wait=True, cancel_futures=True)
             self._persist_run(
-                project_id, question_set_id, groups, judge_model, concurrency,
+                project_id, question_set_ids, groups, judge_model, concurrency,
                 started_at, "stopped", results, evaluation_mode=evaluation_mode,
             )
             raise
@@ -512,7 +666,7 @@ class RetrievalExperimentService:
 
         run_status = "stopped" if stop_event.is_set() else "completed"
         return self._persist_run(
-            project_id, question_set_id, groups, judge_model, concurrency,
+            project_id, question_set_ids, groups, judge_model, concurrency,
             started_at, run_status, results, datetime.now(timezone.utc).isoformat(),
             evaluation_mode=evaluation_mode,
         )
@@ -526,21 +680,34 @@ class RetrievalExperimentService:
         return True
 
     def update_manual_judgments(
-        self, project_id: str, judgments: Sequence[tuple[str, str, bool]]
+        self, project_id: str, judgments: Sequence[tuple[str, ...]]
     ) -> dict[str, object]:
-        """Persist user-edited correctness flags and refresh per-group accuracy."""
+        """Persist user-edited 0/1/2 grades and refresh per-group statistics."""
         state = self.load(project_id)
         run = state.get("run")
         if not isinstance(run, dict):
             raise ProjectError("目前沒有可修改的檢索實驗結果")
         results = run.get("results", [])
         changed = False
-        for group_name, question_id, is_correct in judgments:
+        for judgment in judgments:
+            if len(judgment) == 4:
+                group_name, dataset_id, question_id, raw_correct = judgment
+            elif len(judgment) == 3:
+                group_name, question_id, raw_correct = judgment
+                dataset_id = ""
+            else:
+                continue
+            score = self._parse_grade(raw_correct)
+            if score is None:
+                continue
             for item in results:
-                if item.get("group_name") != group_name or item.get("question_id") != question_id:
+                if (
+                    item.get("group_name") != group_name or item.get("question_id") != question_id
+                    or (dataset_id and item.get("dataset_id") != dataset_id)
+                ):
                     continue
-                next_result = "正確" if is_correct else "錯誤"
-                if item.get("evaluation_result") == "評判失敗" and not is_correct:
+                next_result = score
+                if item.get("evaluation_result") == "評判失敗":
                     continue
                 if item.get("evaluation_result") != next_result:
                     item["evaluation_result"] = next_result
@@ -551,10 +718,14 @@ class RetrievalExperimentService:
         if changed:
             for group in run.get("groups", []):
                 group_results = [item for item in results if item.get("group_id") == group.get("group_id")]
-                judged = [item for item in group_results if item.get("evaluation_result") in {"正確", "錯誤"}]
-                correct = sum(item.get("evaluation_result") == "正確" for item in judged)
-                group["correct_count"] = correct
-                group["accuracy"] = correct / len(judged) if judged else None
+                judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
+                full = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
+                partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
+                incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
+                total = int(group.get("question_count", len(group_results)))
+                group.update(correct_count=full, partial_correct_count=partial, incorrect_count=incorrect,
+                             accuracy=full / total if total else None,
+                             score_accuracy=(2 * full + partial) / (2 * total) if total else None)
             self._write(project_id, state)
         return run
 
@@ -569,15 +740,19 @@ class RetrievalExperimentService:
         run_groups = run.get("groups", [])
         run_results = run.get("results", [])
         group_rows = []
-        evaluated_count = 0
-        correct_count = 0
+        evaluated_count = full_count = partial_count = incorrect_count = 0
         for summary in run_groups:
             group_results = [item for item in run_results if item.get("group_id") == summary.get("group_id")]
-            judged = [item for item in group_results if item.get("evaluation_result") in {"正確", "錯誤"}]
-            group_correct = sum(item.get("evaluation_result") == "正確" for item in judged)
+            judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
+            group_correct = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
+            group_partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
+            group_incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
             group_evaluated = len(judged)
             evaluated_count += group_evaluated
-            correct_count += group_correct
+            full_count += group_correct
+            partial_count += group_partial
+            incorrect_count += group_incorrect
+            group_total = int(summary.get("question_count", len(group_results)))
             group_rows.append({
                 "name": summary.get("group_name"),
                 "parameters": {
@@ -585,7 +760,7 @@ class RetrievalExperimentService:
                     "retrieval_mode": self._retrieval_mode_label(summary.get("method")),
                     "response_type": summary.get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE),
                     "answer_reasoning_effort": (
-                        DEFAULT_REASONING_EFFORT
+                        summary.get("answer_reasoning_effort", DEFAULT_REASONING_EFFORT)
                         if summary.get("answer_model") == GPT6_LUNA_MODEL
                         else None
                     ),
@@ -594,12 +769,17 @@ class RetrievalExperimentService:
                     "answer_model": summary.get("answer_model"),
                     "judge_model": summary.get("judge_model"),
                     "question_count": summary.get("question_count", 0),
+                    "fully_correct_count": group_correct,
                     "correct_count": group_correct,
-                    "correct_total": f"{group_correct} / {group_evaluated}",
-                    "accuracy": group_correct / group_evaluated if group_evaluated else None,
-                    "recall_at_5": summary.get("recall_at_5"),
-                    "recall_at_10": summary.get("recall_at_10"),
-                    "mrr": summary.get("mrr"),
+                    "partial_correct_count": group_partial,
+                    "incorrect_count": group_incorrect,
+                    "fully_correct_total": f"{group_correct} / {group_total}",
+                    "accuracy": group_correct / group_total if group_total else None,
+                    "score_accuracy": (2 * group_correct + group_partial) / (2 * group_total) if group_total else None,
+                    "evidence_hit_rate": summary.get("evidence_hit_rate"),
+                    "evidence_precision": summary.get("evidence_precision"),
+                    "document_hit_rate": summary.get("document_hit_rate"),
+                    "no_evidence_question_count": summary.get("no_evidence_question_count", 0),
                 },
             })
         expected_count = sum(int(item.get("question_count", 0)) for item in run_groups)
@@ -619,14 +799,26 @@ class RetrievalExperimentService:
             },
             "summary": {
                 "question_count": expected_count,
-                "correct_count": correct_count,
-                "correct_total": f"{correct_count} / {evaluated_count}",
-                "accuracy": correct_count / evaluated_count if evaluated_count else None,
-                "recall_at_5": self._average_metric(run_groups, "recall_at_5"),
-                "recall_at_10": self._average_metric(run_groups, "recall_at_10"),
-                "mrr": self._average_metric(run_groups, "mrr"),
+                "evaluated_count": evaluated_count,
+                "fully_correct_count": full_count,
+                "correct_count": full_count,
+                "partial_correct_count": partial_count,
+                "incorrect_count": incorrect_count,
+                "fully_correct_total": f"{full_count} / {expected_count}",
+                "accuracy": full_count / expected_count if expected_count else None,
+                "score_accuracy": (2 * full_count + partial_count) / (2 * expected_count) if expected_count else None,
+                "evidence_hit_rate": self._average_metric(run_groups, "evidence_hit_rate"),
+                "evidence_precision": self._average_metric(run_groups, "evidence_precision"),
+                "document_hit_rate": self._average_metric(run_groups, "document_hit_rate"),
             },
             "groups": group_rows,
+            "datasets": [
+                {"question_set_id": item, "name": name}
+                for item, name in zip(
+                    run.get("question_set_ids", [run.get("question_set_id", "")]),
+                    run.get("question_set_names", [run.get("question_set_name", "")]),
+                )
+            ],
         }
         details_payload = {
             "schema_version": 1,
@@ -635,6 +827,9 @@ class RetrievalExperimentService:
             "execution_status": run.get("status"),
             "evaluation_mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
             "question_set_id": state.get("question_set_id", ""),
+            "question_set_ids": run.get("question_set_ids", [run.get("question_set_id", "")]),
+            "datasets": payload["datasets"],
+            "summary": payload["summary"],
             "question_set_name": run.get("question_set_name", ""),
             "question_count": expected_count,
             "groups": [
@@ -670,28 +865,54 @@ class RetrievalExperimentService:
         ]
         return sum(values) / len(values) if values else None
 
+    @staticmethod
+    def _parse_grade(value: object) -> int | None:
+        if isinstance(value, bool):
+            return 2 if value else 0
+        if isinstance(value, int) and value in {0, 1, 2}:
+            return value
+        text = str(value or "").strip()
+        legacy = {"正確": 2, "全對": 2, "錯誤": 0, "部分對": 1}
+        if text in legacy:
+            return legacy[text]
+        if text in {"0", "1", "2"}:
+            return int(text)
+        for prefix, score in (("0 ", 0), ("1 ", 1), ("2 ", 2)):
+            if text.startswith(prefix):
+                return score
+        return None
+
     def _run_case(
-        self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str
+        self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
+        dataset_id: str = "", dataset_name: str = "",
     ) -> ExperimentQuestionResult:
-        generated = self._generate_case(project_id, group, question, judge_model)
+        generated = self._generate_case(project_id, group, question, judge_model, dataset_id, dataset_name)
         if generated.status != "answered":
             return generated
         return self._evaluate_case(project_id, group, question, judge_model, generated)
 
     def _generate_case(
-        self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str
+        self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
+        dataset_id: str = "", dataset_name: str = "",
     ) -> ExperimentQuestionResult:
         try:
             answer, context = self.query_function(
-                project_id, question.question, group.method, group.answer_model, group.response_type
+                project_id, question.question, group.method, group.answer_model, group.response_type,
+                group.answer_reasoning_effort,
             )
         except Exception as exc:
-            return self._failed_result(group, question, judge_model, str(exc))
+            return self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name)
         try:
-            try:
-                retrieved = self._resolved_sources(project_id, context)
-            except (ProjectError, OSError, ValueError, TypeError):
-                retrieved = ()
+            retrieved_evidence: tuple[Evidence, ...] = ()
+            mapping_error = None
+            if group.method in {"local", "basic", "drift"}:
+                try:
+                    retrieved_evidence = self._resolved_evidence(project_id, context)
+                    raw_sources = EvidenceService.source_records(context)
+                    if raw_sources and not retrieved_evidence:
+                        mapping_error = "GraphRAG 回傳了來源，但無法映射至原始文件"
+                except (ProjectError, OSError, ValueError, TypeError) as exc:
+                    mapping_error = f"來源映射失敗：{exc}"
             source_evidence = tuple(dict.fromkeys((
                 *question.question_source_evidence,
                 *question.answer_source_evidence,
@@ -699,17 +920,26 @@ class RetrievalExperimentService:
             )))
             source_docs = tuple(dict.fromkeys(
                 [item.document_name or item.document_id for item in source_evidence]
-                + [item for item in retrieved]
+                + [item.document_id for item in retrieved_evidence]
                 + list(question.source_documents)
             ))
+            retrieval_status = (
+                f"不可計算：{mapping_error}" if mapping_error else
+                "已映射至原始文件／頁碼；不使用 context 順序作排名"
+                if group.method in {"local", "basic", "drift"} else UNSUPPORTED_RETRIEVAL_METRICS
+            )
             return ExperimentQuestionResult(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 question.question_id, question.question, source_docs, question.reference_answer,
-                answer, "待評測", "", None, UNRANKED_REASON, "answered",
+                answer, "待評測", "", None, retrieval_status, "answered",
                 response_type=group.response_type,
+                answer_reasoning_effort=group.answer_reasoning_effort,
+                retrieved_evidence=tuple(retrieved_evidence),
+                dataset_id=dataset_id,
+                dataset_name=dataset_name,
             )
         except Exception as exc:
-            return self._failed_result(group, question, judge_model, str(exc))
+            return self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name)
 
     def _evaluate_case(
         self,
@@ -721,7 +951,7 @@ class RetrievalExperimentService:
         evaluation_mode: str = "strict",
     ) -> ExperimentQuestionResult:
         try:
-            judged = self.judging.evaluate_single_answer(
+            judged = self.judging.evaluate_single_answer_grade(
                 project_id, question.question_id, question.question,
                 question.reference_answer, generated.actual_answer, judge_model,
                 evaluation_mode=evaluation_mode,
@@ -729,7 +959,7 @@ class RetrievalExperimentService:
             return replace(
                 generated,
                 judge_model=judge_model,
-                evaluation_result="正確" if judged.is_correct else "錯誤",
+                evaluation_result=judged.score,
                 evaluation_reason=judged.judge_reason,
                 status="completed",
                 error=None,
@@ -745,7 +975,8 @@ class RetrievalExperimentService:
             )
 
     def _failed_result(
-        self, group: ExperimentGroup, question: BatchQuestion, judge_model: str, error: str
+        self, group: ExperimentGroup, question: BatchQuestion, judge_model: str, error: str,
+        dataset_id: str = "", dataset_name: str = "",
     ) -> ExperimentQuestionResult:
         source_docs = tuple(dict.fromkeys(
             item.document_name or item.document_id
@@ -758,44 +989,86 @@ class RetrievalExperimentService:
         return ExperimentQuestionResult(
             group.group_id, group.name, group.answer_model, judge_model, group.method,
             question.question_id, question.question, source_docs, question.reference_answer,
-            "", "未評判", error, None, UNRANKED_REASON, "failed", error,
+            "", "未評判", error, None,
+            (
+                UNSUPPORTED_RETRIEVAL_METRICS if group.method == "global"
+                else "不可計算：查詢失敗，未取得檢索證據"
+            ),
+            "failed", error,
             response_type=group.response_type,
+            answer_reasoning_effort=group.answer_reasoning_effort,
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
         )
 
     def _persist_run(
         self,
         project_id: str,
-        question_set_id: str,
+        question_set_id: str | Sequence[str],
         groups: Sequence[ExperimentGroup],
         judge_model: str,
         max_concurrency: int,
         started_at: str,
         status: str,
-        results: dict[tuple[str, str], ExperimentQuestionResult],
+        results: dict[tuple[str, ...], ExperimentQuestionResult],
         completed_at: str | None = None,
         evaluation_mode: str | None = None,
     ) -> RetrievalExperimentRun:
-        question_set = self.question_sets.get(project_id, question_set_id)
+        question_set_ids = self._normalize_question_set_ids(question_set_id)
+        question_sets = [self.question_sets.get(project_id, item) for item in question_set_ids]
+        dataset_by_id = {item.question_set_id: item for item in question_sets}
         project = self.projects.get(project_id)
         summaries = []
         result_items = tuple(results.values())
         for group in groups:
             group_items = [item for item in result_items if item.group_id == group.group_id]
-            judged = [item for item in group_items if item.evaluation_result in {"正確", "錯誤"}]
-            correct = sum(item.evaluation_result == "正確" for item in judged)
+            judged = [item for item in group_items if self._parse_grade(item.evaluation_result) is not None]
+            correct = sum(self._parse_grade(item.evaluation_result) == 2 for item in judged)
+            partial = sum(self._parse_grade(item.evaluation_result) == 1 for item in judged)
+            incorrect = sum(self._parse_grade(item.evaluation_result) == 0 for item in judged)
+            total = sum(len(question_set.questions) for question_set in question_sets)
             answered = sum(bool(item.actual_answer.strip()) for item in group_items)
+            if group.method in {"local", "basic", "drift"}:
+                metric_results = [
+                    item for item in group_items
+                    if item.status != "failed" and not item.retrieval_metrics_status.startswith("不可計算：")
+                ]
+                metric_samples = []
+                for item in metric_results:
+                    dataset = dataset_by_id.get(item.dataset_id) or (question_sets[0] if question_sets else None)
+                    if dataset is not None:
+                        metric_samples.append((
+                            item.retrieved_evidence, self._gold_evidence_for(dataset, item.question_id)
+                        ))
+                metric_values = compute_source_metrics(tuple(metric_samples))
+                evidence_hit_rate, evidence_precision, document_hit_rate, no_evidence_count = metric_values
+                metrics_status = (
+                    "尚無成功完成來源解析的題目"
+                    if not metric_results else "已計算：依文件 ID／頁碼比對 Gold Evidence；逐題 precision 平均（無標註頁碼者排除），不使用排名"
+                )
+            else:
+                evidence_hit_rate = evidence_precision = document_hit_rate = None
+                no_evidence_count = 0
+                metrics_status = UNSUPPORTED_RETRIEVAL_METRICS
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
-                len(question_set.questions), answered, correct,
-                correct / len(judged) if judged else None,
-                None, None, None, UNRANKED_REASON, group.response_type,
+                total, answered, correct, partial, incorrect,
+                correct / total if total else None,
+                (2 * correct + partial) / (2 * total) if total else None,
+                evidence_hit_rate, evidence_precision, document_hit_rate,
+                no_evidence_count, metrics_status, group.response_type, group.answer_reasoning_effort,
             ))
+        question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
-            project_id, project.display_name, question_set_id, question_set.name, status,
-            max_concurrency, len(question_set.questions), started_at, completed_at,
-            tuple(summaries), result_items,
+            project_id, project.display_name,
+            question_set_ids[0] if question_set_ids else "", question_set_name, status,
+            max_concurrency, sum(len(item.questions) for item in question_sets), started_at, completed_at,
+            tuple(summaries), result_items, tuple(question_set_ids),
+            tuple(item.name for item in question_sets),
         )
         state = self.load(project_id)
+        state["question_set_ids"] = question_set_ids
+        state["question_set_id"] = question_set_ids[0] if question_set_ids else ""
         state["judge_model"] = judge_model
         run_value = asdict(run)
         if evaluation_mode is not None:
@@ -804,16 +1077,39 @@ class RetrievalExperimentService:
         self._write(project_id, state)
         return run
 
-    def _resolved_sources(self, project_id: str, context: dict[str, object]) -> tuple[str, ...]:
+    def _resolved_evidence(self, project_id: str, context: dict[str, object]) -> tuple[Evidence, ...]:
         raw = context.get("sources")
         if not isinstance(raw, list) or not raw:
             return ()
         evidence = EvidenceService(self.projects).from_context(project_id, context)
-        metadata = {
-            item.text_unit_id: getattr(item, "document_name", None) or item.document_id
-            for item in EvidenceService(self.projects).metadata.load(project_id)
+        return tuple(evidence)
+
+    def _resolved_sources(self, project_id: str, context: dict[str, object]) -> tuple[str, ...]:
+        service = EvidenceService(self.projects)
+        evidence = service.from_context(project_id, context)
+        document_by_unit = {
+            item.text_unit_id: item.document_id for item in service.metadata.load(project_id)
         }
-        return tuple(dict.fromkeys(metadata.get(item.text_unit_id, item.document_id) for item in evidence))
+        return tuple(dict.fromkeys(
+            document_by_unit.get(item.text_unit_id, item.document_id) for item in evidence
+        ))
+
+    @staticmethod
+    def _gold_evidence_for(question_set: object, question_id: str):
+        question = next((item for item in question_set.questions if item.question_id == question_id), None)
+        if question is None:
+            return ()
+        return question.gold_evidence or question.answer_source_evidence
+
+    @staticmethod
+    def _result_from_dict(value: dict[str, object]) -> ExperimentQuestionResult:
+        data = dict(value)
+        data.setdefault("retrieved_evidence", [])
+        data["retrieved_evidence"] = tuple(
+            item if isinstance(item, Evidence) else Evidence(**item)
+            for item in data["retrieved_evidence"]
+        )
+        return ExperimentQuestionResult(**data)
 
     def _graphrag_query(
         self,
@@ -822,11 +1118,14 @@ class RetrievalExperimentService:
         method: str,
         model: str,
         response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ) -> tuple[str, dict[str, object]]:
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
         if response_type not in EXPERIMENT_RESPONSE_TYPES:
             raise ProjectError("不支援的 GraphRAG 回答格式")
+        if reasoning_effort not in REASONING_EFFORT_OPTIONS:
+            raise ProjectError("不支援的 Luna 推理深度")
         project_path = self.projects.path_for(project_id) / "graphrag"
         settings_path = project_path / "settings.yaml"
         try:
@@ -837,7 +1136,7 @@ class RetrievalExperimentService:
             for config in settings.get(section, {}).values():
                 config["api_base"] = self.connections.get_api_base_url()
         for config in settings.get("completion_models", {}).values():
-            configure_completion_model(config, model)
+            configure_completion_model(config, model, reasoning_effort)
         api_key = self.connections.apply_to_environment(project_id)
         del api_key  # GraphRAG reads the standard API key environment variable.
 
@@ -896,6 +1195,8 @@ class RetrievalExperimentService:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 策略不支援")
             if group.response_type not in EXPERIMENT_RESPONSE_TYPES:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 回答格式不支援")
+            if group.answer_reasoning_effort not in REASONING_EFFORT_OPTIONS:
+                raise ProjectError(f"{group.group_id} 的 Luna 推理深度不支援")
 
     def _path(self, project_id: str) -> Path:
         return self.projects.path_for(project_id) / "runs" / "retrieval-experiment-state.json"

@@ -1,24 +1,38 @@
 {
-  "schema_version": 1,
   "questions": [
     {
       "number": 1,
       "question": "如何透過 Printer Setting Utility 進行色彩基準線調整？",
       "expected_answer": "先確認設備已關閉，準備指定工具，並依序完成安全檢查。",
-      "source_pages": [
-        330
+      "question_sources": [
+        {
+          "document_name": "ALCX17_UsersGuide_TC_VersionUp.pdf",
+          "pages": [330]
+        }
       ],
-      "document": "ALCX17_UsersGuide_TC_VersionUp.pdf"
+      "answer_sources": [
+        {
+          "document_name": "ALCX17_UsersGuide_TC_VersionUp.pdf",
+          "pages": [330]
+        }
+      ]
     },
     {
       "number": 2,
       "question": "如何從操作面板將文件掃描至連接 USB 的電腦？",
       "expected_answer": "先確認設備已關閉，準備指定工具，並依序完成安全檢查。",
-      "source_pages": [
-        173,
-        174
+      "question_sources": [
+        {
+          "document_name": "ALCX17_UsersGuide_TC_VersionUp.pdf",
+          "pages": [173, 174]
+        }
       ],
-      "document": "ALCX17_UsersGuide_TC_VersionUp.pdf"
+      "answer_sources": [
+        {
+          "document_name": "ALCX17_UsersGuide_TC_VersionUp.pdf",
+          "pages": [173, 174]
+        }
+      ]
     }
   ]
 }

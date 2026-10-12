@@ -22,6 +22,7 @@ API_BASE_ENVIRONMENT_VARIABLE = "GRAPHRAG_API_BASE"
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
 GPT6_LUNA_MODEL = "gpt-6-luna"
 DEFAULT_REASONING_EFFORT = "medium"
+REASONING_EFFORT_OPTIONS = ("low", "medium", "high")
 ALLOWED_CHAT_MODELS = ("gpt-4o-mini", "gpt-4.1-mini", GPT6_LUNA_MODEL)
 ALLOWED_EMBEDDING_MODELS = ("text-embedding-3-small", "text-embedding-3-large")
 DEFAULT_CHAT_MODEL = GPT6_LUNA_MODEL
@@ -40,8 +41,13 @@ def chat_completion_api_params(model: str, max_tokens: int) -> dict[str, object]
     return {"temperature": 0, "max_tokens": max_tokens}
 
 
-def configure_completion_model(model_config: dict[str, object], model: str) -> None:
+def configure_completion_model(
+    model_config: dict[str, object], model: str,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+) -> None:
     """Set a GraphRAG model and its model-specific Chat Completions arguments."""
+    if reasoning_effort not in REASONING_EFFORT_OPTIONS:
+        raise ProjectError("不支援的 Luna 推理深度")
     model_config["model"] = model
     raw_call_args = model_config.get("call_args")
     call_args = dict(raw_call_args) if isinstance(raw_call_args, dict) else {}
@@ -59,7 +65,7 @@ def configure_completion_model(model_config: dict[str, object], model: str) -> N
     legacy_max_tokens = call_args.pop("max_tokens", None)
     if legacy_max_tokens is not None:
         call_args.setdefault("max_completion_tokens", legacy_max_tokens)
-    call_args["reasoning_effort"] = DEFAULT_REASONING_EFFORT
+    call_args["reasoning_effort"] = reasoning_effort
     model_config["call_args"] = call_args
 
 

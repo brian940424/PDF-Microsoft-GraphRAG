@@ -15,7 +15,7 @@ from .projects import Project, ProjectError, ProjectStore
 from .querying import QueryResult, QueryService
 
 
-EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
+EVIDENCE_COLUMNS = ["Context 順序", "Evidence ID", "來源／文件", "頁碼", "Chunk ID", "Score"]
 
 
 class UserPortalService:
@@ -55,10 +55,21 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
     def evidence_detail(evidence_id: str | None, values: list[dict[str, object]]) -> str:
         for item in values or []:
             if item.get("evidence_id") == evidence_id:
+                location = (
+                    f"第 {item['page']} 頁"
+                    if item.get("page") is not None
+                    else "GraphRAG 社群報告（無單一 PDF 頁碼）"
+                )
+                identifiers = []
+                if item.get("chunk_id"):
+                    identifiers.append(f"Chunk：`{item['chunk_id']}`")
+                if item.get("text_unit_id"):
+                    identifiers.append(f"Text Unit：`{item['text_unit_id']}`")
+                identifier_text = ("  \n".join(identifiers) + "\n\n") if identifiers else "\n\n"
                 return (
-                    f"### [{item['evidence_id']}] {item['document_id']} — 第 {item['page']} 頁\n\n"
+                    f"### [{item['evidence_id']}] {item['document_id']} — {location}\n\n"
                     f"章節：{item['section_name']} (`{item['section_id']}`)  \n"
-                    f"Chunk：`{item['chunk_id']}`\n\n{item['text']}"
+                    f"{identifier_text}{item['text']}"
                 )
         return ""
 
@@ -92,7 +103,7 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
             return
         values = [asdict(item) for item in result.evidence]
         rows = [
-            [item.rank, item.evidence_id, item.document_id, item.page, item.chunk_id, item.score]
+            [item.rank, item.evidence_id, item.document_id, item.page or "—", item.chunk_id or "—", item.score]
             for item in result.evidence
         ]
         selected = result.evidence[0].evidence_id if result.evidence else None

@@ -258,7 +258,7 @@ class QuestionGenerationService:
         approved = [item for item in batch.questions if item.generation_status == "approved"]
         if not approved:
             raise ProjectError("沒有已核准的生成題目可匯出")
-        payload = QuestionSetService.to_schema_v1([
+        payload = QuestionSetService.to_question_set_json([
             BatchQuestion(
                 question_id=item.question_id,
                 question=item.question,

@@ -14,7 +14,13 @@ import gradio as gr
 
 from .automatic_evaluation import AutomaticEvaluationService
 from .automatic_qa import AutomaticQATestService
-from .connections import ALLOWED_CHAT_MODELS, ALLOWED_EMBEDDING_MODELS, ConnectionSettings
+from .connections import (
+    ALLOWED_CHAT_MODELS,
+    ALLOWED_EMBEDDING_MODELS,
+    DEFAULT_REASONING_EFFORT,
+    GPT6_LUNA_MODEL,
+    ConnectionSettings,
+)
 from .documents import DocumentInfo, DocumentService
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
@@ -25,8 +31,10 @@ from .question_generation import GeneratedQuestion, QuestionGenerationService
 from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
+from .retrieval_evaluation import compute_source_metrics
 from .retrieval_experiments import (
     DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+    EXPERIMENT_REASONING_EFFORT_OPTIONS,
     EXPERIMENT_RESPONSE_TYPE_OPTIONS,
     ExperimentGroup,
     RetrievalExperimentService,
@@ -37,9 +45,9 @@ from .source_sampling import SourceSample, SourceSamplingService
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
-EVIDENCE_COLUMNS = ["Rank", "Evidence", "PDF", "Page", "Chunk ID", "Score"]
+EVIDENCE_COLUMNS = ["Context 順序", "Evidence ID", "來源／文件", "頁碼", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
-RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "Retrieved", "First Relevant Rank", "Pass@K"]
+RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "檢索證據", "Evidence Hit", "Evidence Precision", "Document Hit"]
 SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk ID"]
 GENERATED_QUESTION_COLUMNS = ["Question ID", "Question", "Difficulty", "Status", "Sources"]
 AUTOMATIC_EVALUATION_COLUMNS = [
@@ -58,25 +66,102 @@ INDEXING_LOG_AUTOSCROLL_JS = """() => {
 }"""
 
 
-def _sort_experiment_results(raw_results, groups, questions):
-    """Order result rows by configured group order and imported question order."""
+def _sort_experiment_results(raw_results, groups, questions, dataset_ids=()):
+    """Order rows by group, dataset, then source question order."""
     group_order = {
         str(group.get("group_id", "")): index
         for index, group in enumerate(groups)
         if isinstance(group, dict)
     }
-    question_order = {
-        question.question_id: index
-        for index, question in enumerate(questions)
-    }
+    question_order = {}
+    for index, entry in enumerate(questions):
+        if isinstance(entry, tuple) and len(entry) == 2:
+            dataset_id, question = entry
+            question_order[(str(dataset_id), question.question_id)] = index
+        else:
+            question_order[("", entry.question_id)] = index
+    dataset_order = {str(dataset_id): index for index, dataset_id in enumerate(dataset_ids)}
     return sorted(
         raw_results,
         key=lambda item: (
             group_order.get(str(item.get("group_id", "")), len(group_order)),
-            question_order.get(str(item.get("question_id", "")), len(question_order)),
+            dataset_order.get(str(item.get("dataset_id", "")), len(dataset_order)),
+            question_order.get(
+                (str(item.get("dataset_id", "")), str(item.get("question_id", ""))),
+                question_order.get(("", str(item.get("question_id", ""))), len(question_order)),
+            ),
             str(item.get("question_id", "")),
         ),
     )
+
+
+def _experiment_dataset_summary_rows(run, groups, question_sets):
+    """Build one persisted-run summary row for each experiment-group/dataset pair."""
+    strategy_labels = {
+        "local": "Microsoft GraphRAG Local",
+        "global": "Microsoft GraphRAG Global",
+        "drift": "Microsoft GraphRAG DRIFT",
+        "basic": "Microsoft GraphRAG Basic",
+    }
+    raw_results = (run or {}).get("results", [])
+    run_ids = list((run or {}).get("question_set_ids", []))
+    rows = []
+    for group in groups:
+        group_id = group.get("group_id", "")
+        method = group.get("method", "")
+        for question_set in question_sets:
+            selected = [
+                item for item in raw_results
+                if item.get("group_id") == group_id
+                and (item.get("dataset_id") or (run_ids[0] if len(run_ids) == 1 else ""))
+                    == question_set.question_set_id
+            ]
+            answered = sum(bool(str(item.get("actual_answer", "") or "").strip()) for item in selected)
+            judged = [item for item in selected if RetrievalExperimentService._parse_grade(item.get("evaluation_result")) is not None]
+            correct = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
+            partial = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
+            incorrect = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
+            metric_samples = []
+            if method in {"local", "basic", "drift"}:
+                for item in selected:
+                    if item.get("status") == "failed":
+                        continue
+                    question = next((q for q in question_set.questions if q.question_id == item.get("question_id")), None)
+                    if question is None:
+                        continue
+                    gold = question.gold_evidence or question.answer_source_evidence
+                    if not gold:
+                        continue
+                    try:
+                        result = RetrievalExperimentService._result_from_dict(item)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    metric_samples.append((result.retrieved_evidence, gold))
+            metrics = compute_source_metrics(tuple(metric_samples)) if metric_samples else (None, None, None, 0)
+            metric_status = (
+                "已計算（文件 ID／頁碼比對；逐題 precision 平均，無頁碼 Gold 排除）" if metric_samples else
+                "不可計算：Global 社群報告無法可靠映射" if method == "global" else
+                "不可計算：尚無可用來源證據"
+            )
+            rows.append([
+                group.get("name", group_id),
+                f"{question_set.name} ({question_set.question_set_id[:8]})",
+                strategy_labels.get(method, method or "未設定"),
+                group.get("answer_model", ""),
+                len(question_set.questions), answered, len(judged), correct, partial, incorrect,
+                f"{correct / len(question_set.questions):.1%}" if question_set.questions else "—",
+                f"{(2 * correct + partial) / (2 * len(question_set.questions)):.1%}" if question_set.questions else "—",
+                f"{metrics[0]:.1%}" if metrics[0] is not None else "不可計算",
+                f"{metrics[1]:.1%}" if metrics[1] is not None else "不可計算",
+                f"{metrics[2]:.1%}" if metrics[2] is not None else "不可計算",
+                metric_status,
+            ])
+    return rows
+
+
+def _experiment_grade_label(value):
+    score = RetrievalExperimentService._parse_grade(value)
+    return {0: "0 錯誤", 1: "1 部分對", 2: "2 全對"}.get(score, value or "")
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -183,7 +268,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return
         evidence_values = [asdict(item) for item in query_result.evidence]
         evidence_rows = [
-            [item.rank, item.evidence_id, item.document_id, item.page, item.chunk_id, item.score]
+            [item.rank, item.evidence_id, item.document_id, item.page or "—", item.chunk_id or "—", item.score]
             for item in query_result.evidence
         ]
         answer = query_result.answer
@@ -210,11 +295,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def evidence_markdown(evidence_id: str | None, evidence_values: list[dict[str, object]]) -> str:
         for item in evidence_values or []:
             if item.get("evidence_id") == evidence_id:
+                location = (
+                    f"第 {item['page']} 頁"
+                    if item.get("page") is not None
+                    else "GraphRAG 社群報告（無單一 PDF 頁碼）"
+                )
+                identifiers = []
+                if item.get("chunk_id"):
+                    identifiers.append(f"Chunk：`{item['chunk_id']}`")
+                if item.get("text_unit_id"):
+                    identifiers.append(f"Text Unit：`{item['text_unit_id']}`")
+                identifier_text = ("  \n".join(identifiers) + "\n\n") if identifiers else "\n\n"
                 return (
-                    f"### [{item['evidence_id']}] {item['document_id']} — 第 {item['page']} 頁\n\n"
+                    f"### [{item['evidence_id']}] {item['document_id']} — {location}\n\n"
                     f"章節：{item['section_name']} (`{item['section_id']}`)  \n"
-                    f"Chunk：`{item['chunk_id']}`  \n"
-                    f"Text Unit：`{item['text_unit_id']}`\n\n{item['text']}"
+                    f"{identifier_text}{item['text']}"
                 )
         return ""
 
@@ -387,12 +482,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
         except ProjectError as exc:
             return f"❌ {exc}", "", [], gr.Dropdown(choices=[]), []
+        display_metric = lambda value: f"{value:.1%}" if value is not None else "不可計算"
         summary = (
-            f"Recall@5 `{result.recall_at_5:.3f}`｜Recall@10 `{result.recall_at_10:.3f}`｜"
-            f"MRR `{result.mrr:.3f}`｜"
-            f"Avg First Rank `{result.average_first_relevant_rank if result.average_first_relevant_rank is not None else 'N/A'}`｜"
-            f"Source Accuracy `{result.evidence_source_accuracy:.3f}`｜"
-            f"Avg Latency `{result.average_latency_seconds if result.average_latency_seconds is not None else 'N/A'}` 秒"
+            f"Evidence Hit Rate `{display_metric(result.evidence_hit_rate)}`｜"
+            f"Evidence Precision `{display_metric(result.evidence_precision)}`｜"
+            f"Document Hit Rate `{display_metric(result.document_hit_rate)}`｜"
+            f"無檢索證據題數 `{result.no_evidence_question_count}`｜{result.retrieval_metrics_status}｜"
+            f"平均延遲 `{result.average_latency_seconds if result.average_latency_seconds is not None else 'N/A'}` 秒"
         )
         item_values = [asdict(item) for item in result.items]
         rows = [
@@ -400,8 +496,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 item.question_id,
                 sum(len(gold.chunk_ids) or len(gold.pages) for gold in item.gold_evidence),
                 len(item.retrieved_evidence),
-                item.first_relevant_rank,
-                item.passed_at_k,
+                "是" if item.evidence_hit else ("否" if item.evidence_hit is False else "不可計算"),
+                f"{item.evidence_precision:.1%}" if item.evidence_precision is not None else "不可計算",
+                "是" if item.document_hit else ("否" if item.document_hit is False else "不可計算"),
             ]
             for item in result.items
         ]
@@ -645,10 +742,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if report.retrieval:
             result = report.retrieval
             lines.append(
-                "**Retrieval：** Recall@5 " + format(result.recall_at_5, ".1%")
-                + "｜Recall@10 " + format(result.recall_at_10, ".1%")
-                + "｜MRR " + format(result.mrr, ".3f")
-                + "｜Evidence 命中率 " + format(result.evidence_source_accuracy, ".1%")
+                "**Retrieval：** Evidence Hit Rate " + (format(result.evidence_hit_rate, ".1%") if result.evidence_hit_rate is not None else "不可計算")
+                + "｜Evidence Precision " + (format(result.evidence_precision, ".1%") if result.evidence_precision is not None else "不可計算")
+                + "｜Document Hit Rate " + (format(result.document_hit_rate, ".1%") if result.document_hit_rate is not None else "不可計算")
+                + "｜" + result.retrieval_metrics_status
                 + "｜平均延遲 " + format(result.average_latency_seconds or 0, ".2f") + "s"
             )
         elif report.retrieval_error:
@@ -691,10 +788,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             summary = f"**最近題目集：** {question_set.name}｜尚無已儲存的自動問答評判結果。"
         if retrieval:
             summary += (
-                f"\n\n**Retrieval：** Recall@5 {retrieval.recall_at_5:.1%}"
-                f"｜Recall@10 {retrieval.recall_at_10:.1%}"
-                f"｜MRR {retrieval.mrr:.3f}｜Evidence 命中率 {retrieval.evidence_source_accuracy:.1%}"
+                f"\n\n**Retrieval：** Evidence Hit Rate {retrieval.evidence_hit_rate:.1%}"
+                if retrieval.evidence_hit_rate is not None else "\n\n**Retrieval：** 指標不可計算"
             )
+            if retrieval.evidence_hit_rate is not None:
+                summary += (
+                    f"｜Evidence Precision {retrieval.evidence_precision:.1%}" if retrieval.evidence_precision is not None else "｜Evidence Precision 不可計算"
+                )
+                summary += (
+                    f"｜Document Hit Rate {retrieval.document_hit_rate:.1%}"
+                    if retrieval.document_hit_rate is not None else "｜Document Hit Rate 不可計算"
+                )
+            summary += f"｜{retrieval.retrieval_metrics_status}"
         return (
             f"✅ 已自動載入最近題目集「{question_set.name}」及已儲存的測試資料",
             autoqa_question_rows(question_set),
@@ -709,22 +814,27 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def experiment_view(project_id: str | None, message: str = ""):
         if not project_id:
             return (
-                message or "請先在「專案設定」開啟專案", "", [], [], [], 5,
+                message or "請先在「專案設定」開啟專案", [], [], [], [], [], 5,
                 gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                 "尚未生成答案。", gr.update(interactive=False), "strict",
             )
         try:
             state = retrieval_experiments.load(project_id)
-            question_set_id = str(state.get("question_set_id", ""))
+            question_set_ids = retrieval_experiments._normalize_question_set_ids(
+                state.get("question_set_ids", state.get("question_set_id", ""))
+            )
+            datasets = [question_sets.get(project_id, item) for item in question_set_ids]
             question_rows = []
-            question_by_id = {}
-            if question_set_id:
-                question_set = question_sets.get(project_id, question_set_id)
-                question_by_id = {item.question_id: item for item in question_set.questions}
+            question_by_key = {}
+            question_entries = []
+            for question_set in datasets:
                 for item in question_set.questions:
+                    question_by_key[(question_set.question_set_id, item.question_id)] = item
+                    question_entries.append((question_set.question_set_id, item))
                     question_sources = item.question_source_evidence or item.gold_evidence
                     answer_sources = item.answer_source_evidence or item.gold_evidence
                     question_rows.append([
+                        f"{question_set.name} ({question_set.question_set_id[:8]})",
                         item.question_id, item.question, item.reference_answer,
                         format_autoqa_sources(question_sources), format_autoqa_sources(answer_sources),
                     ])
@@ -732,10 +842,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             raw_results = run.get("results", [])
             configured_groups = state.get("groups", [])
             group_by_id = {item.get("group_id"): item for item in configured_groups}
-            expected_answers = len(group_by_id) * len(question_by_id)
+            expected_answers = len(group_by_id) * len(question_entries)
             has_all_answers = expected_answers > 0 and len(raw_results) == expected_answers and all(
                 str(item.get("actual_answer", "") or "").strip()
                 for item in raw_results
+            )
+            run_dataset_ids = retrieval_experiments._normalize_question_set_ids(
+                run.get("question_set_ids", run.get("question_set_id", ""))
             )
             answers_match_settings = has_all_answers and all(
                 item.get("group_id") in group_by_id
@@ -743,13 +856,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 and item.get("method") == group_by_id[item.get("group_id")].get("method")
                 and item.get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE)
                 == group_by_id[item.get("group_id")].get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE)
-                and item.get("question_id") in question_by_id
-                and item.get("question") == question_by_id[item.get("question_id")].question
-                and item.get("correct_answer") == question_by_id[item.get("question_id")].reference_answer
+                and item.get("answer_reasoning_effort", DEFAULT_REASONING_EFFORT)
+                == group_by_id[item.get("group_id")].get("answer_reasoning_effort", DEFAULT_REASONING_EFFORT)
+                and (item.get("dataset_id") or (run_dataset_ids[0] if len(run_dataset_ids) == 1 else ""),
+                     item.get("question_id")) in question_by_key
+                and item.get("question") == question_by_key[(
+                    item.get("dataset_id") or (run_dataset_ids[0] if len(run_dataset_ids) == 1 else ""),
+                    item.get("question_id"),
+                )].question
+                and item.get("correct_answer") == question_by_key[(
+                    item.get("dataset_id") or (run_dataset_ids[0] if len(run_dataset_ids) == 1 else ""),
+                    item.get("question_id"),
+                )].reference_answer
                 for item in raw_results
             )
             answers_ready = (
-                run.get("question_set_id") == question_set_id
+                run_dataset_ids == question_set_ids
                 and has_all_answers
                 and answers_match_settings
             )
@@ -763,43 +885,62 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 generation_status = "⏳ 答案生成尚在執行中。"
             else:
                 generation_status = "尚未完成檢索並生成所有答案。"
+            strategy_labels = {
+                "local": "Microsoft GraphRAG Local",
+                "global": "Microsoft GraphRAG Global",
+                "drift": "Microsoft GraphRAG DRIFT",
+                "basic": "Microsoft GraphRAG Basic",
+            }
             summaries = [
                 [
-                    item.get("group_name"), item.get("answer_model"), item.get("judge_model"),
-                    item.get("method"), item.get("question_count"), item.get("completed_count"),
-                    item.get("correct_count"),
+                    item.get("group_name"),
+                    strategy_labels.get(
+                        item.get("method") or item.get("retrieval_mode") or item.get("strategy"),
+                        item.get("method") or item.get("retrieval_mode") or item.get("strategy") or "未設定",
+                    ),
+                    item.get("answer_model"), item.get("judge_model"),
+                    item.get("question_count"), item.get("completed_count"),
+                    item.get("correct_count"), item.get("partial_correct_count"), item.get("incorrect_count"),
                     f"{item['accuracy']:.1%}" if item.get("accuracy") is not None else "—",
-                    f"{item['recall_at_5']:.1%}" if item.get("recall_at_5") is not None else "不可計算",
-                    f"{item['recall_at_10']:.1%}" if item.get("recall_at_10") is not None else "不可計算",
-                    f"{item['mrr']:.3f}" if item.get("mrr") is not None else "不可計算",
+                    f"{item['score_accuracy']:.1%}" if item.get("score_accuracy") is not None else "—",
+                    f"{item['evidence_hit_rate']:.1%}" if item.get("evidence_hit_rate") is not None else "不可計算",
+                    f"{item['evidence_precision']:.1%}" if item.get("evidence_precision") is not None else "不可計算",
+                    f"{item['document_hit_rate']:.1%}" if item.get("document_hit_rate") is not None else "不可計算",
+                    item.get("no_evidence_question_count", 0),
                     item.get("retrieval_metrics_status", ""),
                 ]
                 for item in run.get("groups", [])
             ]
+            dataset_summaries = _experiment_dataset_summary_rows(
+                run, configured_groups, datasets
+            )
             ordered_raw_results = _sort_experiment_results(
-                raw_results, configured_groups, question_by_id.values()
+                raw_results, configured_groups, question_entries, question_set_ids
             )
             results = [
                 [
-                    item.get("group_name"), item.get("question_id"),
+                    item.get("group_name"),
+                    f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})",
+                    item.get("question_id"),
                     ", ".join(item.get("source_documents", [])), item.get("question"),
                     item.get("actual_answer"), item.get("correct_answer"),
-                    item.get("evaluation_result") == "正確",
+                    _experiment_grade_label(item.get("evaluation_result")) if item.get("evaluation_result") not in (None, "待評測") else "",
                     item.get("evaluation_reason") or item.get("error") or "",
                 ]
                 for item in ordered_raw_results
-                if item.get("evaluation_result") in {"正確", "錯誤", "評判失敗"}
+                if item.get("evaluation_result") not in (None, "待評測")
             ]
             status = message or (
-                f"最近實驗狀態：{run.get('status', '尚未執行')}｜題目集：{run.get('question_set_name', '尚未匯入')}"
+                f"最近實驗狀態：{run.get('status', '尚未執行')}｜資料集：{run.get('question_set_name', '尚未匯入')}"
             )
             return (
-                status, question_set_id, question_rows, summaries, results, state.get("max_concurrency", 5),
+                status, question_set_ids, question_rows, summaries, dataset_summaries,
+                results, state.get("max_concurrency", 5),
                 gr.update(choices=list(ALLOWED_CHAT_MODELS), value=state.get("judge_model", connections.get_chat_model())),
                 generation_status, gr.update(interactive=answers_ready), state.get("evaluation_mode", "strict"),
             )
         except ProjectError as exc:
-            return (f"❌ {exc}", "", [], [], [], 5,
+            return (f"❌ {exc}", [], [], [], [], [], 5,
                     gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                     "載入實驗狀態失敗。", gr.update(interactive=False), "strict")
 
@@ -823,10 +964,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             state = retrieval_experiments.load(project_id)
             run = state.get("run")
             if not isinstance(run, dict):
-                question_set_id = str(state.get("question_set_id") or "")
-                question_count = (
-                    len(question_sets.get(project_id, question_set_id).questions)
-                    if question_set_id else 0
+                question_set_ids = retrieval_experiments._normalize_question_set_ids(
+                    state.get("question_set_ids", state.get("question_set_id", ""))
+                )
+                question_count = sum(
+                    len(question_sets.get(project_id, item).questions) for item in question_set_ids
                 )
                 return experiment_progress_markup(
                     0, len(state.get("groups", [])) * question_count, "尚未開始"
@@ -845,24 +987,36 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except (ProjectError, TypeError, ValueError):
             return experiment_progress_markup(0, 0, "尚未開始")
 
-    def resolve_experiment_question_set_id(project_id: str, question_set_id: str | None) -> str:
-        """Prefer the project's persisted question set over a stale/empty browser State."""
+    def resolve_experiment_question_set_id(project_id: str, question_set_id: str | list[str] | None) -> list[str]:
+        """Prefer the project's persisted datasets over stale/empty browser State."""
         state = retrieval_experiments.load(project_id)
-        saved_id = str(state.get("question_set_id") or "").strip()
-        selected_id = str(question_set_id or "").strip()
-        resolved_id = saved_id or selected_id
-        if not resolved_id:
+        saved_ids = retrieval_experiments._normalize_question_set_ids(
+            state.get("question_set_ids", state.get("question_set_id", ""))
+        )
+        selected_ids = retrieval_experiments._normalize_question_set_ids(question_set_id)
+        resolved_ids = saved_ids or selected_ids
+        if not resolved_ids:
             raise ProjectError("此專案尚未匯入題目集，請先匯入 JSON 題目集")
-        return resolved_id
+        return resolved_ids
 
-    def import_experiment_questions(project_id: str | None, filepath: str | None):
-        if not project_id or not filepath:
+    def import_experiment_questions(project_id: str | None, filepaths: str | list[str] | None):
+        if not project_id or not filepaths:
             return experiment_view(project_id, "❌ 請先開啟專案並選擇 JSON 題目集")
         try:
-            question_set = retrieval_experiments.import_question_set(project_id, filepath)
+            selected_files = filepaths if isinstance(filepaths, list) else [filepaths]
+            imported, import_errors = retrieval_experiments.import_question_sets_with_errors(
+                project_id, selected_files
+            )
         except (ProjectError, OSError) as exc:
             return experiment_view(project_id, f"❌ 題目集匯入失敗：{exc}")
-        return experiment_view(project_id, f"✅ 已匯入「{question_set.name}」共 {len(question_set.questions)} 題")
+        if not imported:
+            details = "\n- ".join(import_errors) or "沒有可匯入的題目集"
+            return experiment_view(project_id, f"❌ 題目集匯入失敗：\n- {details}")
+        details = "、".join(f"{item.name}（{len(item.questions)} 題）" for item in imported)
+        message = f"✅ 已取代舊題目集；目前資料集：{details}"
+        if import_errors:
+            message += "\n⚠️ 以下檔案未匯入：\n- " + "\n- ".join(import_errors)
+        return experiment_view(project_id, message)
 
     def save_experiment_globals(
         project_id: str | None, concurrency, judge_model: str | None, evaluation_mode: str | None,
@@ -878,7 +1032,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 limit = old_limit
             groups = [ExperimentGroup(**item) for item in state["groups"]]
             retrieval_experiments.save_configuration(
-                project_id, groups, str(state.get("question_set_id", "")), limit,
+                project_id, groups, retrieval_experiments._normalize_question_set_ids(
+                    state.get("question_set_ids", state.get("question_set_id", ""))
+                ), limit,
                 judge_model=judge_model or str(state.get("judge_model", connections.get_chat_model())),
             )
             retrieval_experiments.set_evaluation_mode(
@@ -942,6 +1098,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         save_response_type_from_card.__name__ = "save_experiment_response_type"
         return save_response_type_from_card
 
+    def make_save_experiment_reasoning_effort_handler(group_id: str):
+        def save_reasoning_effort_from_card(
+            project_id: str | None, reasoning_effort: str, revision: int | None
+        ):
+            return save_experiment_reasoning_effort(project_id, group_id, reasoning_effort, revision)
+
+        save_reasoning_effort_from_card.__name__ = "save_experiment_reasoning_effort"
+        return save_reasoning_effort_from_card
+
     def save_experiment_answer_model(project_id: str | None, group_id: str | None, answer_model: str | None, revision: int | None):
         if not project_id or not group_id or not answer_model:
             return "請先選取實驗組與回答模型", int(revision or 0)
@@ -971,6 +1136,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", int(revision or 0)
         return f"✅ {group_id} 回答格式已儲存", refresh_experiment_groups(revision)
 
+    def save_experiment_reasoning_effort(
+        project_id: str | None, group_id: str | None, reasoning_effort: str, revision: int | None
+    ):
+        if not project_id or not group_id:
+            return "請先選取實驗組", int(revision or 0)
+        try:
+            retrieval_experiments.set_group_reasoning_effort(
+                project_id, group_id, reasoning_effort
+            )
+        except ProjectError as exc:
+            return f"❌ {exc}", int(revision or 0)
+        return f"✅ {group_id} Luna 推理深度已儲存", refresh_experiment_groups(revision)
+
     def update_model_method_compatibility(answer_model: str | None, method: str | None):
         """Keep all supported models and query strategies selectable together."""
         answer_model = answer_model or connections.get_chat_model()
@@ -989,20 +1167,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     ):
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
-            view[8] = gr.update(interactive=False)
+            view[9] = gr.update(interactive=False)
             yield (*view, experiment_progress_markup(0, 0, "請先開啟專案"))
             return
         try:
             question_set_id = resolve_experiment_question_set_id(project_id, question_set_id)
         except ProjectError as exc:
             view = list(experiment_view(project_id, f"❌ {exc}"))
-            view[8] = gr.update(interactive=False)
+            view[9] = gr.update(interactive=False)
             yield (*view, experiment_progress_for_project(project_id))
             return
         pending = list(experiment_view(project_id))
         pending[0] = "⏳ 正在依各實驗組策略檢索並生成答案…"
-        pending[7] = "⏳ 答案生成中；完成前無法評測。"
-        pending[8] = gr.update(interactive=False)
+        pending[8] = "⏳ 答案生成中；完成前無法評測。"
+        pending[9] = gr.update(interactive=False)
         yield (*pending, experiment_progress_markup(0, 0, "準備開始"))
         try:
             state = retrieval_experiments.load(project_id)
@@ -1010,7 +1188,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             limit = int(concurrency)
             judge_model = judge_model or str(state.get("judge_model", connections.get_chat_model()))
             retrieval_experiments.save_configuration(project_id, groups, question_set_id, limit, judge_model)
-            question_count = len(question_sets.get(project_id, question_set_id).questions)
+            question_count = sum(len(question_sets.get(project_id, item).questions) for item in question_set_id)
             total = len(groups) * question_count
             pending[0] = f"⏳ 正在依各實驗組策略檢索並生成答案：0/{total} 題"
             yield (*pending, experiment_progress_markup(0, total, "答案生成中"))
@@ -1047,8 +1225,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     completed = len(progress_run.results)
                     progress_view = list(experiment_view(project_id))
                     progress_view[0] = f"⏳ 檢索並生成回答中：{completed}/{total} 題"
-                    progress_view[7] = f"⏳ 已處理 {completed}/{total} 題；完成前無法評測。"
-                    progress_view[8] = gr.update(interactive=False)
+                    progress_view[8] = f"⏳ 已處理 {completed}/{total} 題；完成前無法評測。"
+                    progress_view[9] = gr.update(interactive=False)
                     yield (
                         *progress_view,
                         experiment_progress_markup(completed, total, "答案生成中"),
@@ -1056,7 +1234,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 run = future.result()
         except (ProjectError, TypeError, ValueError, OSError) as exc:
             view = list(experiment_view(project_id, f"❌ 答案生成失敗：{exc}"))
-            view[8] = gr.update(interactive=False)
+            view[9] = gr.update(interactive=False)
             yield (*view, experiment_progress_for_project(project_id))
             return
         if run.status == "answers_completed":
@@ -1079,19 +1257,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     ):
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
-            view[8] = gr.update(interactive=False)
+            view[9] = gr.update(interactive=False)
             yield tuple(view)
             return
         try:
             question_set_id = resolve_experiment_question_set_id(project_id, question_set_id)
         except ProjectError as exc:
             view = list(experiment_view(project_id, f"❌ {exc}"))
-            view[8] = gr.update(interactive=False)
+            view[9] = gr.update(interactive=False)
             yield tuple(view)
             return
         pending = list(experiment_view(project_id))
         pending[0] = "⏳ 正在評測已保存的答案…"
-        pending[8] = gr.update(interactive=False)
+        pending[9] = gr.update(interactive=False)
         yield tuple(pending)
         try:
             state = retrieval_experiments.load(project_id)
@@ -1115,7 +1293,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             view = list(experiment_view(project_id, f"❌ 評測失敗：{exc}"))
             yield tuple(view)
             return
-        evaluated = sum(item.evaluation_result in {"正確", "錯誤"} for item in run.results)
+        evaluated = sum(RetrievalExperimentService._parse_grade(item.evaluation_result) is not None for item in run.results)
         yield experiment_view(project_id, f"✅ 評測完成：{evaluated}/{len(run.results)} 筆答案已評判。")
 
     def stop_retrieval_experiment(project_id: str | None):
@@ -1136,7 +1314,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def update_retrieval_experiment_judgments(project_id: str | None, table_data):
         if not project_id:
-            return "❌ 請先開啟專案", [], []
+            return "❌ 請先開啟專案", [], [], []
         if hasattr(table_data, "to_numpy"):
             table_rows = table_data.to_numpy().tolist()
         elif isinstance(table_data, dict):
@@ -1144,21 +1322,27 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         else:
             table_rows = table_data or []
         judgments = []
+        run = retrieval_experiments.load(project_id).get("run") or {}
+        dataset_display_to_id = {
+            f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})": item.get("dataset_id", "")
+            for item in run.get("results", [])
+        }
         for row in table_rows:
             if not isinstance(row, (list, tuple)) or len(row) < 7:
                 continue
-            flag = row[6]
-            if isinstance(flag, str):
-                is_correct = flag.strip().lower() in {"true", "1", "yes", "是", "正確"}
+            is_multidataset_row = len(row) >= 9
+            grade = row[7] if is_multidataset_row else row[6]
+            if is_multidataset_row:
+                display = str(row[1])
+                judgments.append((str(row[0]), str(dataset_display_to_id.get(display, "")), str(row[2]), grade))
             else:
-                is_correct = bool(flag)
-            judgments.append((str(row[0]), str(row[1]), is_correct))
+                judgments.append((str(row[0]), str(row[1]), grade))
         try:
             retrieval_experiments.update_manual_judgments(project_id, judgments)
         except ProjectError as exc:
-            return f"❌ 儲存人工判斷失敗：{exc}", [], []
+            return f"❌ 儲存人工判斷失敗：{exc}", [], [], []
         view = experiment_view(project_id, "✅ 人工判斷已儲存，實驗組摘要已更新。")
-        return view[0], view[3], view[4]
+        return view[0], view[3], view[4], view[5]
 
     def autosave_automatic_questions(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
@@ -1237,7 +1421,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
         except (ProjectError, ValueError) as exc:
             return "❌ " + str(exc), "", []
-        status = "✅ 評測完成；可直接修改「判斷」欄位，正確率會自動更新。"
+        status = "✅ 評測完成；可將評測等級編輯為 0（錯誤）、1（部分對）或 2（全對），全對率會自動更新。"
         return status, automatic_qa_summary(report), automatic_qa_rows(report)
 
     def autosave_automatic_qa_judgements(project_id, question_set_id, rows):
@@ -1274,9 +1458,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         retrieval = retrieval_evaluation.last_result(project_id, question_set_id)
         if retrieval:
             summary += (
-                f"\n\n**Retrieval：** Recall@5 {retrieval.recall_at_5:.1%}"
-                f"｜Recall@10 {retrieval.recall_at_10:.1%}｜MRR {retrieval.mrr:.3f}"
+                f"\n\n**Retrieval：** Evidence Hit Rate "
+                f"{retrieval.evidence_hit_rate:.1%}" if retrieval.evidence_hit_rate is not None
+                else "\n\n**Retrieval：** 指標不可計算"
             )
+            if retrieval.evidence_hit_rate is not None:
+                summary += (
+                    f"｜Evidence Precision {retrieval.evidence_precision:.1%}" if retrieval.evidence_precision is not None else "｜Evidence Precision 不可計算"
+                )
+                summary += (
+                    f"｜Document Hit Rate {retrieval.document_hit_rate:.1%}"
+                    if retrieval.document_hit_rate is not None else "｜Document Hit Rate 不可計算"
+                )
+            summary += f"｜{retrieval.retrieval_metrics_status}"
         return summary, automatic_qa_result_rows(question_set, result)
 
     def import_automatic_question_set(project_id, uploaded):
@@ -2006,22 +2200,26 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("0-5 檢索實驗"):
             gr.Markdown(
-                "以同一份題目集比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略。"
+                "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
+                "以同一組實驗設定比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略；"
+                "執行與評測會涵蓋所有已匯入資料集，逐題結果會標示資料集。"
                 "來源排名只有在 GraphRAG 明確提供可靠排序時才計算；目前 API context 不保證依檢索相關度排序，因此會如實標示不可計算。"
             )
             with gr.Row():
-                experiment_question_file = gr.File(label="匯入既有格式 JSON 題目集", file_types=[".json"], type="filepath")
-                experiment_import_button = gr.Button("匯入題目集")
-                experiment_question_set_state = gr.State("")
+                experiment_question_file = gr.File(
+                    label="選擇要取代目前資料集的 JSON 題目集", file_types=[".json"], type="filepath", file_count="multiple"
+                )
+                experiment_import_button = gr.Button("取代題目集")
+                experiment_question_set_state = gr.State([])
             experiment_question_preview = gr.Dataframe(
-                headers=["題號", "題目", "正確答案", "題目來源", "答案來源"],
+                headers=["資料集", "題號", "題目", "正確答案", "題目來源", "答案來源"],
                 interactive=False,
-                datatype=["str", "str", "str", "str", "str"],
-                column_widths=["8%", "22%", "18%", "26%", "26%"],
-                label="目前匯入題目集",
+                datatype=["str", "str", "str", "str", "str", "str"],
+                column_widths=["14%", "7%", "20%", "17%", "21%", "21%"],
+                label="目前匯入資料集與題目",
                 wrap=True,
             )
-            gr.Markdown("題目 JSON 使用 `schema_version: 1`，欄位為題號、題目、正確答案、來源頁碼與來源文件；跨文件或題目／答案來源不同時，也支援選填 `question_sources` / `answer_sources` 來源明細。範例見 `docs/檢索實驗格式範例.json`。")
+            gr.Markdown("題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。")
             experiment_group_revision = gr.State(0)
             experiment_group_save_status = gr.Markdown()
             with gr.Group():
@@ -2044,6 +2242,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         answer_model_value = group.get("answer_model", connections.get_chat_model())
                         method_value = group.get("method", "local")
                         response_type_value = group.get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE)
+                        reasoning_effort_value = group.get(
+                            "answer_reasoning_effort", DEFAULT_REASONING_EFFORT
+                        )
                         model_choices = list(ALLOWED_CHAT_MODELS)
                         group_strategy_choices = strategy_choices
                         group_id = group["group_id"]
@@ -2076,6 +2277,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                                     interactive=True,
                                     key=f"experiment-response-type-{group_id}",
                                 )
+                                if answer_model_value == GPT6_LUNA_MODEL:
+                                    reasoning_effort = gr.Dropdown(
+                                        choices=list(EXPERIMENT_REASONING_EFFORT_OPTIONS),
+                                        value=reasoning_effort_value,
+                                        label="推理深度",
+                                        interactive=True,
+                                        key=f"experiment-reasoning-effort-{group_id}",
+                                    )
+                                else:
+                                    reasoning_effort = None
                         answer_model.input(
                             make_save_experiment_answer_model_handler(group_id),
                             inputs=[active_project_id, answer_model, experiment_group_revision],
@@ -2094,6 +2305,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             outputs=[experiment_group_save_status, experiment_group_revision],
                             key=f"experiment-response-type-save-{group_id}",
                         )
+                        if reasoning_effort is not None:
+                            reasoning_effort.input(
+                                make_save_experiment_reasoning_effort_handler(group_id),
+                                inputs=[active_project_id, reasoning_effort, experiment_group_revision],
+                                outputs=[experiment_group_save_status, experiment_group_revision],
+                                key=f"experiment-reasoning-effort-save-{group_id}",
+                            )
                         remove_button.click(
                             make_remove_experiment_group_handler(group_id),
                             inputs=[active_project_id, experiment_group_revision],
@@ -2124,18 +2342,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
             experiment_status = gr.Markdown()
             experiment_summary_table = gr.Dataframe(
-                headers=["實驗組名稱", "回答模型", "評測模型（全域）", "策略", "題數", "已完成", "答對", "正確率", "Recall@5", "Recall@10", "MRR", "檢索指標狀態"],
+                headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態"],
                 interactive=False,
-                datatype=["str"] * 12,
+                datatype=["str"] * 16,
                 label="實驗組摘要",
                 wrap=True,
             )
+            experiment_dataset_summary_table = gr.Dataframe(
+                headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態"],
+                interactive=False,
+                datatype=["str"] * 16,
+                label="實驗組 × 題目集摘要",
+                wrap=True,
+            )
             experiment_result_table = gr.Dataframe(
-                headers=["實驗組名稱", "題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
+                headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由"],
                 interactive=True,
-                datatype=["str", "str", "str", "str", "str", "str", "bool", "str"],
-                column_widths=["8%", "6%", "10%", "14%", "21%", "18%", "8%", "15%"],
-                label="逐題實驗結果",
+                datatype=["str"] * 9,
+                column_widths=["8%", "11%", "6%", "10%", "13%", "19%", "17%", "6%", "10%"],
+                label="逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）",
                 wrap=True,
             )
             gr.Markdown("### 匯出實驗結果")
@@ -2148,7 +2373,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
                 "## 答案正確性自動評測\n"
-                "僅根據題目、正確答案和系統回答判斷正確／錯誤並說明理由，不使用 Evidence，也不採用數值評分。"
+                "僅根據題目、正確答案和系統回答評為 0 錯誤、1 部分對或 2 全對並說明理由，不使用 Evidence。"
             )
             with gr.Row():
                 automatic_project_refresh = gr.Button("重新整理題目集")
@@ -2285,7 +2510,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_view,
             inputs=active_project_id,
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
+                     experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
             experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
@@ -2307,7 +2533,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_view,
             inputs=active_project_id,
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
+                     experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
             experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
@@ -2362,7 +2589,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_view,
             inputs=active_project_id,
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
+                     experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         upload_button.click(
@@ -2394,7 +2622,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             import_experiment_questions,
             inputs=[active_project_id, experiment_question_file],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
+                     experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
             experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
@@ -2423,7 +2652,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generate_retrieval_experiment_answers,
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
+                     experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode,
                      experiment_progress_bar],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
@@ -2432,13 +2662,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model,
                     experiment_evaluation_mode],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_result_table, experiment_max_concurrency, experiment_judge_model,
+                     experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
+                     experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         )
         experiment_result_table.change(
             update_retrieval_experiment_judgments,
             inputs=[active_project_id, experiment_result_table],
-            outputs=[experiment_status, experiment_summary_table, experiment_result_table],
+            outputs=[experiment_status, experiment_summary_table,
+                     experiment_dataset_summary_table, experiment_result_table],
         )
         experiment_stop_button.click(
             stop_retrieval_experiment,

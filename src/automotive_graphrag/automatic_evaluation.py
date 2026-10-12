@@ -34,6 +34,13 @@ class AutomaticEvaluationItem:
 
 
 @dataclass(frozen=True, slots=True)
+class AutomaticEvaluationGrade:
+    question_id: str
+    score: int
+    judge_reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class AutomaticEvaluationResult:
     project_id: str
     question_set_id: str
@@ -176,6 +183,55 @@ class AutomaticEvaluationService:
         except Exception as exc:
             raise ProjectError(f"答案評判 API 呼叫失敗：{exc}") from exc
         return self._parse_response(response, [case])[0]
+
+    def evaluate_single_answer_grade(
+        self, project_id: str, question_id: str, question: str, correct_answer: str,
+        system_answer: str, model: str, evaluation_mode: str = "strict",
+    ) -> AutomaticEvaluationGrade:
+        """Three-level evaluation for retrieval experiments only (0 incorrect, 1 partial, 2 full)."""
+        if model not in ALLOWED_CHAT_MODELS:
+            raise ProjectError(f"不支援的評判模型：{model}")
+        if evaluation_mode not in {"strict", "lenient"}:
+            raise ProjectError("不支援的評分方式")
+        case = BatchQuestion(question_id, question, correct_answer, answer=system_answer)
+        prompt = self._build_grade_prompt(case, evaluation_mode)
+        api_key = self.connections.apply_to_environment(project_id)
+        try:
+            response = self.client(self.connections.get_api_base_url(), api_key, model, prompt)
+        except ProjectError:
+            raise
+        except Exception as exc:
+            raise ProjectError(f"答案評判 API 呼叫失敗：{exc}") from exc
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+            except json.JSONDecodeError as exc:
+                raise ProjectError("三段評測結果不是有效 JSON") from exc
+        raw = response.get("item") if isinstance(response, dict) else None
+        if not isinstance(raw, dict) or raw.get("question_id") != question_id:
+            raise ProjectError("三段評測結果缺少正確的 question_id")
+        score = raw.get("result")
+        if isinstance(score, str) and score.isdigit():
+            score = int(score)
+        if isinstance(score, bool) or score not in {0, 1, 2}:
+            raise ProjectError(f"{question_id} 的 result 必須是 0、1 或 2")
+        reason = raw.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ProjectError(f"{question_id} 缺少評判理由")
+        return AutomaticEvaluationGrade(question_id, score, reason.strip())
+
+    @staticmethod
+    def _build_grade_prompt(case: BatchQuestion, evaluation_mode: str) -> str:
+        mode = "採較寬鬆語意理解，同義改寫及不改變正解的合理補充可接受。" if evaluation_mode == "lenient" else "採嚴格比對，不可缺少正解的必要資訊或步驟，也不可增加會導致錯誤的實質內容。"
+        return (
+            "你是答案比對員，只根據題目、正確答案和系統回答評判，不得使用外部知識或檢索證據。"
+            f"{mode}請分三等級：0=錯誤（核心內容錯誤、矛盾，或幾乎未答對）；"
+            "1=部分對（有正確核心內容，但仍缺少重要資訊／必要步驟，或有局部錯誤）；"
+            "2=全對（正確答案的所有必要資訊、條件與步驟均完整且無實質錯誤）。"
+            "流程題若漏任何必要步驟，不可評 2；若已答對部分步驟評 1。"
+            '只輸出 JSON：{"item":{"question_id":"...","result":0或1或2,"reason":"..."}}。'
+            f"理由簡短說明評級依據。案例：{json.dumps({'question_id':case.question_id,'question':case.question,'correct_answer':case.reference_answer,'system_answer':case.answer}, ensure_ascii=False)}"
+        )
 
     def last_result(self, project_id: str, question_set_id: str) -> AutomaticEvaluationResult | None:
         try:

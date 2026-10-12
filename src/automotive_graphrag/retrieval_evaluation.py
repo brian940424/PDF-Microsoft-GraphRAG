@@ -10,10 +10,39 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 
 from .evidence import Evidence
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
+
+
+def compute_source_metrics(
+    samples: Sequence[tuple[tuple[Evidence, ...], tuple[GoldEvidence, ...]]],
+) -> tuple[float | None, float | None, float | None, int]:
+    """Return question hit rate, macro page precision, document-hit rate, and no-evidence count."""
+    eligible = [(retrieved, gold) for retrieved, gold in samples if gold]
+    if not eligible:
+        return None, None, None, 0
+    hits = 0
+    document_hits = 0
+    no_evidence = 0
+    question_precisions = []
+    for retrieved, gold in eligible:
+        unique_retrieved = RetrievalEvaluationService._dedupe_pages(retrieved)
+        relevant = sum(RetrievalEvaluationService._is_relevant(item, gold) for item in unique_retrieved)
+        hits += relevant > 0
+        gold_documents = {item.document_id for item in gold}
+        document_hits += bool(gold_documents & {item.document_id for item in unique_retrieved})
+        no_evidence += not bool(unique_retrieved)
+        if RetrievalEvaluationService._has_page_gold(gold):
+            question_precisions.append(relevant / len(unique_retrieved) if unique_retrieved else 0.0)
+    return (
+        hits / len(eligible),
+        sum(question_precisions) / len(question_precisions) if question_precisions else None,
+        document_hits / len(eligible),
+        no_evidence,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,10 +51,11 @@ class RetrievalEvaluationItem:
     question: str
     gold_evidence: tuple[GoldEvidence, ...]
     retrieved_evidence: tuple[Evidence, ...]
-    first_relevant_rank: int | None
-    recall_at_5: bool
-    recall_at_10: bool
-    passed_at_k: bool
+    evidence_hit: bool | None
+    evidence_precision: float | None
+    document_hit: bool | None
+    retrieved_evidence_count: int
+    relevant_evidence_count: int
     duration_seconds: float | None
 
 
@@ -34,13 +64,13 @@ class RetrievalEvaluationResult:
     project_id: str
     question_set_id: str
     evaluated_at: str
-    top_k: int
+    method: str
     question_count: int
-    recall_at_5: float
-    recall_at_10: float
-    mrr: float
-    average_first_relevant_rank: float | None
-    evidence_source_accuracy: float
+    evidence_hit_rate: float | None
+    evidence_precision: float | None
+    document_hit_rate: float | None
+    no_evidence_question_count: int
+    retrieval_metrics_status: str
     average_latency_seconds: float | None
     items: tuple[RetrievalEvaluationItem, ...]
 
@@ -58,8 +88,6 @@ class RetrievalEvaluationService:
         rerun_queries: bool = False,
         method: str = "local",
     ) -> RetrievalEvaluationResult:
-        if not isinstance(top_k, int) or top_k < 1:
-            raise ProjectError("Top-K 必須是正整數")
         question_set = self.question_sets.get(project_id, question_set_id)
         eligible_ids = [item.question_id for item in question_set.questions if item.gold_evidence]
         if not eligible_ids:
@@ -71,33 +99,39 @@ class RetrievalEvaluationService:
                 method=method,
                 selected_question_ids=eligible_ids,
             )
-
         eligible = [item for item in question_set.questions if item.gold_evidence]
-        items = tuple(self._evaluate_question(item, top_k) for item in eligible)
+
+        # Context source lists are not guaranteed to represent GraphRAG ranking.
+        # DRIFT, Local and Basic return text-unit sources that can be mapped back
+        # to PDF metadata; Global community reports cannot be reliably matched.
+        # Also reject stale evidence from another strategy if queries were not rerun.
+        strategy_matches = rerun_queries or question_set.method == method
+        if method not in {"local", "basic", "drift"} or not strategy_matches:
+            items = tuple(self._evaluate_question(item, supported=False) for item in eligible)
+            metrics = (None, None, None)
+            status = (
+                f"暫不可計算：{method.upper()} 社群報告無法可靠映射至原始文件"
+                if method == "global"
+                else f"不可計算：題目集保存的是 {question_set.method} 策略證據，與所選 {method} 不同"
+            )
+        else:
+            items = tuple(self._evaluate_question(item, supported=True) for item in eligible)
+            metrics = compute_source_metrics(tuple((item.retrieved_evidence, item.gold_evidence) for item in eligible))[:3]
+            status = "已計算：依文件 ID／頁碼比對 Gold Evidence；逐題 precision 平均（無標註頁碼者排除），不使用檢索排名"
+
         count = len(items)
-        ranks = [item.first_relevant_rank for item in items if item.first_relevant_rank is not None]
         latencies = [item.duration_seconds for item in items if item.duration_seconds is not None]
-        considered_evidence = [
-            evidence
-            for item in eligible
-            for evidence in item.retrieved_evidence[:top_k]
-        ]
-        relevant_evidence = sum(
-            self._is_relevant(evidence, item.gold_evidence)
-            for item in eligible
-            for evidence in item.retrieved_evidence[:top_k]
-        )
         result = RetrievalEvaluationResult(
             project_id=project_id,
             question_set_id=question_set_id,
             evaluated_at=datetime.now(timezone.utc).isoformat(),
-            top_k=top_k,
+            method=method,
             question_count=count,
-            recall_at_5=sum(item.recall_at_5 for item in items) / count,
-            recall_at_10=sum(item.recall_at_10 for item in items) / count,
-            mrr=sum(1 / rank for rank in ranks) / count,
-            average_first_relevant_rank=sum(ranks) / len(ranks) if ranks else None,
-            evidence_source_accuracy=(relevant_evidence / len(considered_evidence) if considered_evidence else 0.0),
+            evidence_hit_rate=metrics[0],
+            evidence_precision=metrics[1],
+            document_hit_rate=metrics[2],
+            no_evidence_question_count=sum(item.retrieved_evidence_count == 0 for item in items),
+            retrieval_metrics_status=status,
             average_latency_seconds=sum(latencies) / len(latencies) if latencies else None,
             items=items,
         )
@@ -112,12 +146,15 @@ class RetrievalEvaluationService:
             return None
         items = []
         for item in value.pop("items"):
-            item.pop("recall_at_1", None)
-            item.pop("recall_at_3", None)
-            item.setdefault(
-                "recall_at_10",
-                item.get("first_relevant_rank") is not None and item["first_relevant_rank"] <= 10,
-            )
+            # Older saved reports can still be opened; old rank metrics are
+            # intentionally discarded because list order is not a rank signal.
+            for key in ("first_relevant_rank", "recall_at_1", "recall_at_3", "recall_at_5", "recall_at_10", "passed_at_k"):
+                item.pop(key, None)
+            item.setdefault("evidence_hit", None)
+            item.setdefault("evidence_precision", None)
+            item.setdefault("document_hit", None)
+            item.setdefault("retrieved_evidence_count", len(item.get("retrieved_evidence", [])))
+            item.setdefault("relevant_evidence_count", 0)
             item["gold_evidence"] = tuple(
                 GoldEvidence(
                     document_id=gold["document_id"],
@@ -128,9 +165,14 @@ class RetrievalEvaluationService:
             )
             item["retrieved_evidence"] = tuple(Evidence(**evidence) for evidence in item["retrieved_evidence"])
             items.append(RetrievalEvaluationItem(**item))
-        value.pop("recall_at_1", None)
-        value.pop("recall_at_3", None)
-        value.setdefault("recall_at_10", sum(item.recall_at_10 for item in items) / len(items))
+        for key in ("top_k", "recall_at_1", "recall_at_3", "recall_at_5", "recall_at_10", "mrr", "average_first_relevant_rank", "evidence_source_accuracy"):
+            value.pop(key, None)
+        value.setdefault("method", "local")
+        value.setdefault("evidence_hit_rate", None)
+        value.setdefault("evidence_precision", None)
+        value.setdefault("document_hit_rate", None)
+        value.setdefault("no_evidence_question_count", 0)
+        value.setdefault("retrieval_metrics_status", "舊版保存結果；請重新評估以計算新指標")
         return RetrievalEvaluationResult(**value, items=tuple(items))
 
     def export(self, project_id: str, question_set_id: str) -> tuple[Path, Path]:
@@ -147,10 +189,11 @@ class RetrievalEvaluationService:
             "question",
             "gold_evidence",
             "retrieved_evidence",
-            "first_relevant_rank",
-            "recall_at_5",
-            "recall_at_10",
-            "passed_at_k",
+            "evidence_hit",
+            "evidence_precision",
+            "document_hit",
+            "retrieved_evidence_count",
+            "relevant_evidence_count",
             "duration_seconds",
         ]
         writer = csv.DictWriter(buffer, fieldnames=fieldnames)
@@ -164,24 +207,26 @@ class RetrievalEvaluationService:
         return json_path, csv_path
 
     @classmethod
-    def _evaluate_question(cls, item: BatchQuestion, top_k: int) -> RetrievalEvaluationItem:
-        first_rank = next(
-            (
-                rank
-                for rank, evidence in enumerate(item.retrieved_evidence, start=1)
-                if cls._is_relevant(evidence, item.gold_evidence)
-            ),
-            None,
+    def _evaluate_question(cls, item: BatchQuestion, supported: bool = True) -> RetrievalEvaluationItem:
+        unique_retrieved = cls._dedupe_pages(item.retrieved_evidence)
+        relevant_count = sum(cls._is_relevant(evidence, item.gold_evidence) for evidence in unique_retrieved)
+        docs = {gold.document_id for gold in item.gold_evidence}
+        retrieved_docs = {evidence.document_id for evidence in unique_retrieved}
+        count = len(unique_retrieved)
+        precision = (
+            (relevant_count / count if count else 0.0)
+            if cls._has_page_gold(item.gold_evidence) else None
         )
         return RetrievalEvaluationItem(
             question_id=item.question_id,
             question=item.question,
             gold_evidence=item.gold_evidence,
             retrieved_evidence=item.retrieved_evidence,
-            first_relevant_rank=first_rank,
-            recall_at_5=first_rank is not None and first_rank <= 5,
-            recall_at_10=first_rank is not None and first_rank <= 10,
-            passed_at_k=first_rank is not None and first_rank <= top_k,
+            evidence_hit=(relevant_count > 0) if supported else None,
+            evidence_precision=precision if supported else None,
+            document_hit=(bool(docs & retrieved_docs)) if supported else None,
+            retrieved_evidence_count=count,
+            relevant_evidence_count=relevant_count,
             duration_seconds=item.duration_seconds,
         )
 
@@ -189,12 +234,31 @@ class RetrievalEvaluationService:
     def _is_relevant(evidence: Evidence, gold_evidence: tuple[GoldEvidence, ...]) -> bool:
         return any(
             evidence.document_id == gold.document_id
-            and (
-                (bool(gold.chunk_ids) and evidence.chunk_id in gold.chunk_ids)
-                or (bool(gold.pages) and evidence.page in gold.pages)
-            )
+            and evidence.page is not None
+            and evidence.page in gold.pages
             for gold in gold_evidence
         )
+
+    @staticmethod
+    def _has_page_gold(gold_evidence: Sequence[GoldEvidence]) -> bool:
+        return any(item.document_id and item.pages for item in gold_evidence)
+
+    @staticmethod
+    def _dedupe_pages(evidence: Sequence[Evidence]) -> tuple[Evidence, ...]:
+        """Deduplicate by document/page; unpaged evidence stays distinct and cannot match gold."""
+        unique = []
+        seen = set()
+        for item in evidence:
+            key = (
+                (item.document_id, "page", item.page)
+                if item.page is not None
+                else (item.document_id, "unpaged", item.evidence_id or item.text_unit_id or item.rank)
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return tuple(unique)
 
     def _result_path(self, project_id: str, question_set_id: str) -> Path:
         return self.projects.path_for(project_id) / "runs" / f"retrieval-evaluation-{question_set_id}.json"

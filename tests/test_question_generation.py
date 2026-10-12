@@ -253,9 +253,11 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         payload = json.loads(export_path.read_text(encoding="utf-8"))
         self.assertEqual(len(payload["questions"]), 1)
         self.assertEqual(payload["questions"][0]["question"], "編輯後問題")
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertNotIn("schema_version", payload)
         self.assertEqual(payload["questions"][0]["number"], 1)
         self.assertEqual(payload["questions"][0]["expected_answer"], "編輯後答案")
+        self.assertIn("question_sources", payload["questions"][0])
+        self.assertIn("answer_sources", payload["questions"][0])
 
     def test_app_builds_with_question_generation_review_controls(self) -> None:
         app = create_app(self.root / "ui-projects")
