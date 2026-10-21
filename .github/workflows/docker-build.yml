@@ -90,4 +90,4 @@ jobs:
       - name: Trigger Portainer Webhook
         if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
         run: |
-          curl -fsSL -X POST "${{ secrets.PORTAINER_WEBHOOK }}"
+          curl -k -fsSL -X POST "${{ secrets.PORTAINER_WEBHOOK }}"
