@@ -44,7 +44,7 @@ from .source_sampling import SourceSample, SourceSamplingService
 
 
 NEW_PROJECT_OPTION = "__new_project__"
-NEW_PROJECT_LABEL = "➕ 新增專案"
+NEW_PROJECT_LABEL = "+ 新增專案..."
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
@@ -67,6 +67,36 @@ INDEXING_LOG_AUTOSCROLL_JS = """() => {
         log.scrollTop = log.scrollHeight;
     }, 100);
 }"""
+# 目前主題的按鈕圓角為 0，需明確指定才會顯示為圓角方形
+APP_CSS = """
+.rounded-button {
+    border-radius: 8px !important;
+}
+/* 外觀同 Accordion，但固定展開、不可收合 */
+.static-section .label-wrap {
+    cursor: default !important;
+    pointer-events: none;
+}
+.static-section .label-wrap .icon {
+    display: none;
+}
+/* 按鈕列與周圍元件保持距離 */
+.button-row {
+    background: var(--block-background-fill) !important;
+    padding: var(--spacing-xl) var(--block-padding) !important;
+    gap: var(--spacing-xl) !important;
+}
+/* 區塊內容與邊框、周圍元件保持距離 */
+.padded-block {
+    padding: var(--spacing-xl) var(--block-padding) !important;
+    margin: var(--spacing-xl) var(--block-padding) !important;
+    width: auto !important;
+}
+.bold-title > .label-wrap span,
+.bold-title > * > .label-wrap span {
+    font-weight: 700 !important;
+}
+"""
 
 
 def _sort_experiment_results(raw_results, groups, questions, dataset_ids=()):
@@ -190,7 +220,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def connection_status(project_id: str | None = None) -> str:
         return (
-            f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key(project_id)}；"
+            f"**目前狀態**：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key(project_id)}；"
             f"Chat `{connections.get_chat_model()}`；Embedding `{connections.get_embedding_model()}`"
         )
 
@@ -229,7 +259,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def active_project_label(project_id: str | None) -> str:
         if not project_id:
-            return "目前沒有開啟的專案。請先到「專案設定」選取並開啟專案。"
+            return "目前沒有開啟的專案。請先到「專案與連線設定」選取並開啟專案。"
         try:
             project = store.get(project_id)
         except ProjectError:
@@ -768,7 +798,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def automatic_qa_saved_view(project_id):
         if not project_id:
-            return "請先於「專案設定」開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
+            return "請先於「專案與連線設定」開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
         try:
             saved_sets = question_sets.list(project_id)
             if not saved_sets:
@@ -824,7 +854,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def experiment_view(project_id: str | None, message: str = ""):
         if not project_id:
             return (
-                message or "請先在「專案設定」開啟專案", [], [], [], [], [], 5,
+                message or "請先在「專案與連線設定」開啟專案", [], [], [], [], [], 5,
                 gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                 "尚未生成答案。", gr.update(interactive=False), "strict",
             )
@@ -1753,6 +1783,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError:
             return {}
 
+    def project_details_view(project_id: str | None):
+        # 沒有專案資料時隱藏，避免顯示空白的 JSON 區塊
+        details = project_details(project_id)
+        return gr.JSON(value=details, visible=bool(details))
+
     def project_enabled_value(project_id: str | None) -> bool:
         try:
             return store.get(project_id).enabled if project_id else True
@@ -1777,7 +1812,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         choices = project_selector_choices()
         return (
             store.table_rows(),
-            gr.Dropdown(choices=choices, value=selected, allow_custom_value=True),
+            gr.Dropdown(choices=choices, value=selected),
             project_details(selected),
             active,
             active_project_label(active),
@@ -1788,7 +1823,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id:
             return "❌ 請先選擇專案", *refresh_project_views(None, active_id), False
         if not confirmed:
-            return "❌ 請勾選刪除確認", *refresh_project_views(project_id, active_id), False
+            return "已取消刪除", *refresh_project_views(project_id, active_id), False
         try:
             store.delete(project_id)
         except ProjectError as exc:
@@ -1853,7 +1888,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def import_documents(project_id: str | None, files: list[str] | None):
         if not project_id:
-            return "❌ 請先到「專案設定」開啟專案", [], [], gr.Dropdown(choices=[])
+            return "❌ 請先到「專案與連線設定」開啟專案", [], [], gr.Dropdown(choices=[])
         try:
             imported = documents.import_pdfs(project_id, files or [])
         except ProjectError as exc:
@@ -1869,7 +1904,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def preprocess_documents(project_id: str | None, option_rows: list[list[object]] | None):
         if not project_id:
-            return "❌ 請先到「專案設定」開啟專案", [], [], gr.Dropdown(choices=[])
+            return "❌ 請先到「專案與連線設定」開啟專案", [], [], gr.Dropdown(choices=[])
         try:
             report = documents.preprocess(project_id, parse_processing_options(option_rows))
         except (ProjectError, OSError, TypeError, ValueError) as exc:
@@ -1899,7 +1934,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def build_index(project_id: str | None, chat_model: str | None):
         if not project_id:
-            yield "❌ 請先到「專案設定」開啟專案", ""
+            yield "❌ 請先到「專案與連線設定」開啟專案", ""
             return
         chunks: queue.Queue[str] = queue.Queue()
         result_holder: list[object] = []
@@ -1951,7 +1986,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 description=description,
             )
         except ProjectError as exc:
-            selector = gr.Dropdown(choices=project_selector_choices(), allow_custom_value=True)
+            selector = gr.Dropdown(choices=project_selector_choices())
             return (
                 f"❌ {exc}",
                 store.table_rows(),
@@ -1962,11 +1997,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 description,
                 selector,
                 {},
+                gr.Group(visible=True),
+                gr.Button(visible=False),
             )
         selector = gr.Dropdown(
             choices=project_selector_choices(),
             value=project.project_id,
-            allow_custom_value=True,
         )
         return (
             f"✅ 已建立專案 {project.project_id}",
@@ -1978,6 +2014,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             "",
             selector,
             asdict(project),
+            gr.Group(visible=False),
+            gr.Button(visible=True),
         )
 
     with gr.Blocks(title="汽車維修 GraphRAG 管理後台") as demo:
@@ -1992,76 +2030,91 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         retrieval_project = active_project_id
         automatic_project = active_project_id
         sampling_project = active_project_id
-        with gr.Tab("0-0 專案設定"):
-            with gr.Row():
-                selected_project = gr.Dropdown(
-                    choices=project_selector_choices(),
-                    label="專案",
-                    allow_custom_value=True,
-                )
-                open_project_button = gr.Button("開啟專案", variant="primary")
-            open_project_result = gr.Markdown()
-            selected_project_details = gr.JSON(label="專案資料")
-            project_table = gr.Dataframe(
-                headers=PROJECT_COLUMNS,
-                value=refresh_projects,
-                interactive=False,
-                datatype=["str", "str", "number", "str", "bool", "str"],
-                label="Projects",
-            )
-            with gr.Row():
-                refresh_button = gr.Button("重新整理")
-                project_enabled = gr.Checkbox(label="啟用一般使用者查詢", value=True)
-                update_project_enabled_button = gr.Button("更新啟用狀態")
-            project_activation_result = gr.Markdown()
+        with gr.Tab("0 專案與連線設定"):
+            with gr.Accordion("專案工作區", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Group():
+                    selected_project = gr.Dropdown(
+                        choices=project_selector_choices(),
+                        label="選擇專案",
+                        info="請選擇一項專案",
+                        value=None,
+                        allow_custom_value=False,
+                    )
+                    selected_project_details = gr.JSON(label="專案資料", visible=False, elem_classes="padded-block")
+                    project_enabled = gr.Checkbox(label="啟用一般使用者查詢", value=True)
+                    with gr.Row(elem_classes="button-row"):
+                        open_project_button = gr.Button("開啟專案", variant="primary", elem_classes="rounded-button")
+                        update_project_enabled_button = gr.Button("更新啟用狀態", elem_classes="rounded-button")
+                        delete_button = gr.Button("刪除專案", variant="stop", elem_classes="rounded-button")
+                    # 由刪除按鈕的確認對話框寫入，不顯示於畫面
+                    delete_confirmation = gr.Checkbox(visible=False)
+                open_project_result = gr.Markdown()
+                project_activation_result = gr.Markdown()
+
             with gr.Group(visible=False) as new_project_group:
-                gr.Markdown("## 建立新專案")
-                project_id = gr.Textbox(label="Project ID", placeholder="L33-SM3E")
-                display_name = gr.Textbox(label="顯示名稱", placeholder="L33 / SM3E")
-                with gr.Row():
-                    vehicle_name = gr.Textbox(label="車型", placeholder="L33")
-                    manual_version = gr.Textbox(label="手冊版本", placeholder="SM3E")
-                description = gr.Textbox(label="說明", lines=3)
-                create_button = gr.Button("建立專案", variant="primary")
+                with gr.Accordion("建立新專案", open=True, elem_classes=["static-section", "bold-title"]):
+                    with gr.Group():
+                        project_id = gr.Textbox(label="Project ID", placeholder="L33-SM3E")
+                        display_name = gr.Textbox(label="顯示名稱", placeholder="L33 / SM3E")
+                        with gr.Row():
+                            vehicle_name = gr.Textbox(label="車型", placeholder="L33")
+                            manual_version = gr.Textbox(label="手冊版本", placeholder="SM3E")
+                        description = gr.Textbox(label="說明", lines=3)
+                        with gr.Row(elem_classes="button-row"):
+                            create_button = gr.Button("建立專案", variant="primary", elem_classes="rounded-button")
+            # 建立與刪除專案的結果
             result = gr.Markdown()
-            with gr.Group() as delete_project_group:
-                gr.Markdown("## 刪除專案")
-                delete_confirmation = gr.Checkbox(label="我確認要永久刪除選取的專案及其所有資料")
-                delete_button = gr.Button("刪除選取專案", variant="stop")
 
-        with gr.Tab("0-1 連線設定"):
-            gr.Markdown("## GraphRAG 共用連線設定")
-            gr.Markdown("API Base URL 與 API Key 由所有 Project 共用。")
-            connection_state = gr.Markdown(value=connection_status)
-            api_base_url = gr.Textbox(
-                label="API Base URL",
-                value=connections.get_api_base_url,
-                placeholder="https://api.openai.com/v1",
-            )
-            api_key = gr.Textbox(
-                label="API Key",
-                value=connections.get_api_key() or "",
-                type="password",
-                placeholder="輸入 API Key",
-            )
-            with gr.Row():
-                chat_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS),
-                    value=connections.get_chat_model,
-                    label="Chat 模型",
+            with gr.Accordion("專案清單", open=True, elem_classes=["static-section", "bold-title"]):
+                project_table = gr.Dataframe(
+                    headers=PROJECT_COLUMNS,
+                    value=refresh_projects,
+                    interactive=False,
+                    datatype=["str", "str", "number", "str", "bool", "str"],
+                    label="Projects",
                 )
-                embedding_model = gr.Dropdown(
-                    choices=list(ALLOWED_EMBEDDING_MODELS),
-                    value=connections.get_embedding_model,
-                    label="Embedding 模型",
-                )
-            gr.Markdown("Chat 模型預設為 `gpt-6-luna`；Embedding 模型預設為 `text-embedding-3-small`。")
-            with gr.Row():
-                test_connection_button = gr.Button("測試連線")
-                save_connection_button = gr.Button("儲存連線設定", variant="primary")
-            connection_result = gr.Markdown()
+                with gr.Row(elem_classes="button-row"):
+                    refresh_button = gr.Button("重新整理", elem_classes="rounded-button")
 
-        with gr.Tab("0-2 文件與建圖"):
+            with gr.Accordion(
+                "GraphRAG 共用連線設定（所有專案共用）",
+                open=True,
+                elem_classes=["static-section", "bold-title"],
+            ):
+                connection_state = gr.Markdown(value=connection_status)
+
+                with gr.Row():
+                    api_base_url = gr.Textbox(
+                        label="API Base URL",
+                        value=connections.get_api_base_url,
+                        placeholder="https://api.openai.com/v1",
+                    )
+                    api_key = gr.Textbox(
+                        label="API Key",
+                        value=connections.get_api_key() or "",
+                        type="password",
+                        placeholder="輸入 API Key",
+                    )
+
+                gr.Markdown("Chat 模型預設為 `gpt-6-luna`；Embedding 模型預設為 `text-embedding-3-small`。")
+                with gr.Row():
+                    chat_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS),
+                        value=connections.get_chat_model,
+                        label="Chat 模型",
+                    )
+                    embedding_model = gr.Dropdown(
+                        choices=list(ALLOWED_EMBEDDING_MODELS),
+                        value=connections.get_embedding_model,
+                        label="Embedding 模型",
+                    )
+
+                with gr.Row(elem_classes="button-row"):
+                    test_connection_button = gr.Button("測試連線", elem_classes="rounded-button")
+                    save_connection_button = gr.Button("儲存連線設定", variant="primary", elem_classes="rounded-button")
+                connection_result = gr.Markdown()
+
+        with gr.Tab("1 文件與建圖"):
             uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
             indexing_chat_model = gr.Dropdown(
                 choices=list(ALLOWED_CHAT_MODELS),
@@ -2101,7 +2154,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 elem_id="indexing-log",
             )
 
-        with gr.Tab("0-3 問答測試"):
+        with gr.Tab("2 問答測試"):
             with gr.Row():
                 with gr.Column():
                     question = gr.Textbox(label="問題", lines=5)
@@ -2152,7 +2205,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_evidence_detail = gr.Markdown()
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
 
-        with gr.Tab("0-4 自動問答測試"):
+        with gr.Tab("3 自動問答測試"):
             gr.Markdown(
                 "匯入或生成題目後，執行「檢索並生成回答」，全部完成後才能評測。"
                 "回答會先保存但不顯示，評測完成後才顯示回答與判斷；系統會跨 PDF 去重。"
@@ -2225,7 +2278,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 wrap=True,
             )
 
-        with gr.Tab("0-5 檢索實驗"):
+        with gr.Tab("4 檢索實驗"):
             gr.Markdown(
                 "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
                 "以同一組實驗設定比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略；"
@@ -2600,13 +2653,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         selected_project.change(
             lambda project_id: (
-                project_details(selected_project_id(project_id)),
+                project_details_view(selected_project_id(project_id)),
                 project_enabled_value(selected_project_id(project_id)),
                 gr.Group(visible=project_id == NEW_PROJECT_OPTION),
-                gr.Group(visible=project_id != NEW_PROJECT_OPTION),
+                gr.Button(visible=project_id != NEW_PROJECT_OPTION),
             ),
             inputs=selected_project,
-            outputs=[selected_project_details, project_enabled, new_project_group, delete_project_group],
+            outputs=[selected_project_details, project_enabled, new_project_group, delete_button],
         )
         update_project_enabled_button.click(
             update_project_enabled,
@@ -2626,9 +2679,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 description,
                 selected_project,
                 selected_project_details,
+                new_project_group,
+                delete_button,
             ],
         )
         delete_button.click(
+            None,
+            inputs=selected_project,
+            outputs=delete_confirmation,
+            js="(project) => !project || confirm(`確定要永久刪除專案「${project}」及其所有資料嗎？此動作無法復原。`)",
+        ).then(
             delete_project,
             inputs=[selected_project, delete_confirmation, active_project_id],
             outputs=[
@@ -2998,7 +3058,7 @@ def document_row(document: DocumentInfo) -> list[str | int | None]:
 
 
 def main() -> None:
-    create_app().queue(default_concurrency_limit=1).launch(js=INDEXING_LOG_AUTOSCROLL_JS)
+    create_app().queue(default_concurrency_limit=1).launch(js=INDEXING_LOG_AUTOSCROLL_JS, css=APP_CSS)
 
 
 if __name__ == "__main__":

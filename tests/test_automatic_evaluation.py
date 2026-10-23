@@ -329,7 +329,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             for component in app.blocks.values()
             if hasattr(component, "get_config")
         }
-        self.assertTrue({"0-0 專案設定", "0-1 連線設定", "0-2 文件與建圖", "0-3 問答測試", "0-4 自動問答測試", "0-5 檢索實驗"}.issubset(tabs))
+        self.assertTrue({"0 專案與連線設定", "1 文件與建圖", "2 問答測試", "3 自動問答測試", "4 檢索實驗"}.issubset(tabs))
         self.assertNotIn("新題目集名稱", labels)
         self.assertNotIn("題目集內容（每題均包含問題與答案）", labels)
         self.assertNotIn("將目前問題與編輯後答案加入題目集", button_values)
