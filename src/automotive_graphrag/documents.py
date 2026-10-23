@@ -39,6 +39,18 @@ class DocumentInfo:
     empty_pages: int = 0
     error_pages: int = 0
     error: str | None = None
+    processed_at: str | None = None
+    indexed: bool = False
+
+    @property
+    def preprocessed(self) -> bool:
+        return self.processed_at is not None and self.status.startswith("PROCESSED")
+
+
+# Called with (completed pages, total selected pages, current filename).
+ProgressCallback = Callable[[int, int, str], None]
+
+INDEXED_DOCUMENTS_FILE = "indexed_documents.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +89,8 @@ class DocumentService:
         source_directory = self.projects.path_for(project_id) / "source"
         for source in sources:
             self._atomic_copy(source, source_directory / source.name)
+        # A replaced PDF must be preprocessed again; other PDFs keep their output.
+        self._drop_processed_output(project_id, {source.name for source in sources})
 
         next_status = "STALE" if project.status in {"INDEXED", "STALE"} else "UPLOADED"
         self.projects.update_status(project_id, next_status)
@@ -85,6 +99,7 @@ class DocumentService:
     def list_documents(self, project_id: str) -> list[DocumentInfo]:
         source_directory = self.projects.path_for(project_id) / "source"
         report_by_name = self._document_reports(project_id)
+        indexed_by_name = self.indexed_documents(project_id)
         documents: list[DocumentInfo] = []
         for path in sorted(source_directory.glob("*"), key=lambda item: item.name.casefold()):
             if not path.is_file() or path.suffix.lower() != ".pdf":
@@ -93,6 +108,7 @@ class DocumentService:
             pages: int | None = previous.get("pages")
             status = previous.get("status", "UPLOADED")
             error = previous.get("error")
+            processed_at = previous.get("processed_at") if status.startswith("PROCESSED") else None
             if pages is None:
                 document: PdfDocument | None = None
                 try:
@@ -113,9 +129,29 @@ class DocumentService:
                     empty_pages=previous.get("empty_pages", 0),
                     error_pages=previous.get("error_pages", 0),
                     error=error,
+                    processed_at=processed_at,
+                    indexed=processed_at is not None and indexed_by_name.get(path.name) == processed_at,
                 )
             )
         return documents
+
+    def indexed_documents(self, project_id: str) -> dict[str, str]:
+        """Return filename -> processed_at of the documents in the last successful graph."""
+        path = self.projects.path_for(project_id) / "graphrag" / INDEXED_DOCUMENTS_FILE
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            # Graphs built before this file existed: an INDEXED project covers its processed PDFs.
+            if self.projects.get(project_id).status != "INDEXED":
+                return {}
+            return {
+                name: item["processed_at"]
+                for name, item in self._document_reports(project_id).items()
+                if item.get("processed_at") and str(item.get("status", "")).startswith("PROCESSED")
+            }
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
 
     def list_documents_if_available(self, project_id: str | None) -> list[DocumentInfo]:
         """Return an empty list when a UI selection refers to a deleted project."""
@@ -150,35 +186,58 @@ class DocumentService:
             raise ProjectError(f"找不到 PDF：{filename}")
 
         source.unlink()
-        for stale_output in (
-            project_path / "processed" / "input.jsonl",
-            project_path / "processed" / "report.json",
-            project_path / "graphrag" / "input" / "input.jsonl",
-        ):
-            stale_output.unlink(missing_ok=True)
-        next_status = "UPLOADED" if self.projects.document_count(project_id) else "EMPTY"
+        records = self._drop_processed_output(project_id, {filename})
+        (project_path / "graphrag" / "input" / "input.jsonl").unlink(missing_ok=True)
+        if not self.projects.document_count(project_id):
+            next_status = "EMPTY"
+        elif (project_path / "graphrag" / "output").is_dir():
+            next_status = "STALE"
+        elif records:
+            next_status = "READY"
+        else:
+            next_status = "UPLOADED"
         self.projects.update_status(project_id, next_status)
 
     def preprocess(
         self,
         project_id: str,
         options_by_filename: Mapping[str, Mapping[str, object]] | None = None,
+        filenames: Iterable[str] | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> ProcessingReport:
+        """Preprocess all PDFs, or only `filenames` while keeping other PDFs' previous output."""
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
-        sources = sorted((project_path / "source").glob("*.pdf"), key=lambda item: item.name.casefold())
-        if not sources:
+        all_sources = sorted((project_path / "source").glob("*.pdf"), key=lambda item: item.name.casefold())
+        if not all_sources:
             raise ProjectError("專案中沒有可處理的 PDF")
-        source_names = {source.name for source in sources}
+        source_names = {source.name for source in all_sources}
         unknown_options = set(options_by_filename or {}) - source_names
         if unknown_options:
             raise ProjectError(f"前處理設定含有不存在的 PDF：{', '.join(sorted(unknown_options))}")
+        selected_names = set(filenames) if filenames is not None else source_names
+        unknown_selection = selected_names - source_names
+        if unknown_selection:
+            raise ProjectError(f"找不到要前處理的 PDF：{', '.join(sorted(unknown_selection))}")
+        if not selected_names:
+            raise ProjectError("請至少選擇一份要前處理的 PDF")
+        sources = [source for source in all_sources if source.name in selected_names]
 
         self.projects.update_status(project_id, "PROCESSING")
         processed_directory = project_path / "processed"
+        previous_reports = self._document_reports(project_id)
+        kept_records = [
+            record
+            for record in self._read_jsonl(processed_directory / "input.jsonl")
+            if record.get("document_id") in source_names - selected_names
+        ]
         records: list[dict[str, Any]] = []
         document_reports: list[dict[str, Any]] = []
         totals = {"pages": 0, "successful_pages": 0, "empty_pages": 0, "error_pages": 0}
+        progress = _PageProgress(
+            progress_callback,
+            {source.name: self._page_estimate(source, previous_reports, options_by_filename) for source in sources},
+        )
 
         try:
             for source in sources:
@@ -188,22 +247,34 @@ class DocumentService:
                     records,
                     totals,
                     (options_by_filename or {}).get(source.name, {}),
+                    progress,
                 )
                 document_reports.append(document_report)
+            completed_at = datetime.now(timezone.utc).isoformat()
+            for document_report in document_reports:
+                document_report["processed_at"] = completed_at
+            reports_by_name = {
+                name: item for name, item in previous_reports.items() if name in source_names - selected_names
+            }
+            reports_by_name.update((item["filename"], item) for item in document_reports)
             report = ProcessingReport(
                 project_id=project_id,
                 documents=len(sources),
                 documents_with_errors=sum(1 for item in document_reports if item["error"] or item["error_pages"]),
                 output="input.jsonl",
-                completed_at=datetime.now(timezone.utc).isoformat(),
+                completed_at=completed_at,
                 **totals,
             )
-            self._write_jsonl(processed_directory / "input.jsonl", records)
+            self._write_jsonl(processed_directory / "input.jsonl", self._sorted_records(kept_records + records))
             self._write_json(
                 processed_directory / "report.json",
-                {"summary": asdict(report), "documents": document_reports},
+                {
+                    "summary": asdict(report),
+                    "documents": [reports_by_name[source.name] for source in all_sources if source.name in reports_by_name],
+                },
             )
-            self.projects.update_status(project_id, "READY")
+            self.projects.update_status(project_id, "STALE" if project.status in {"INDEXED", "STALE"} else "READY")
+            progress.finish()
             return report
         except Exception as exc:
             self.projects.update_status(
@@ -219,6 +290,7 @@ class DocumentService:
         records: list[dict[str, Any]],
         totals: dict[str, int],
         options: Mapping[str, object],
+        progress: _PageProgress | None = None,
     ) -> dict[str, Any]:
         report: dict[str, Any] = {
             "filename": source.name,
@@ -237,6 +309,8 @@ class DocumentService:
             if document is not None:
                 self._close_document(document)
             report.update(status="ERROR", error=str(exc))
+            if progress is not None:
+                progress.skip_document(source.name)
             return report
 
         page_count = len(pages)
@@ -244,6 +318,8 @@ class DocumentService:
         if page_count == 0:
             report.update(status="ERROR", error="PDF 沒有頁面")
             self._close_document(document)
+            if progress is not None:
+                progress.skip_document(source.name)
             return report
         try:
             header_ignore_percent, footer_ignore_percent = self._validate_ignored_margins(
@@ -270,12 +346,16 @@ class DocumentService:
             selected_pages=end_page - start_page + 1,
         )
         totals["pages"] += end_page - start_page + 1
+        if progress is not None:
+            progress.start_document(source.name, end_page - start_page + 1)
         document_stem = self._safe_identifier(source.stem)
         try:
             for page_index, page in enumerate(pages):
                 if not start_page <= page_index <= end_page:
                     continue
                 page_number = page_index + 1
+                if progress is not None:
+                    progress.advance()
                 try:
                     text = self._extract_page_text(page, header_ignore_percent, footer_ignore_percent).strip()
                 except Exception as exc:
@@ -356,13 +436,74 @@ class DocumentService:
         if callable(close):
             close()
 
-    def _document_reports(self, project_id: str) -> dict[str, dict[str, Any]]:
+    @staticmethod
+    def _page_estimate(
+        source: Path,
+        previous_reports: Mapping[str, Mapping[str, Any]],
+        options_by_filename: Mapping[str, Mapping[str, object]] | None,
+    ) -> int:
+        """Estimate selected pages before opening the PDF; corrected once the PDF is read."""
+        options = (options_by_filename or {}).get(source.name, {})
+        pages = previous_reports.get(source.name, {}).get("pages") or 0
+        try:
+            start = int(float(options.get("start_page", 0) or 0))
+            end_value = options.get("end_page")
+            end = pages - 1 if end_value in (None, "") else int(float(end_value))
+        except (TypeError, ValueError):
+            return pages
+        return max(end - start + 1, 0) if pages else 0
+
+    @staticmethod
+    def _sorted_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(records, key=lambda record: (str(record.get("document_id", "")).casefold(), record.get("page", 0)))
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        return [json.loads(line) for line in lines if line.strip()]
+
+    def _drop_processed_output(self, project_id: str, filenames: set[str]) -> list[dict[str, Any]]:
+        """Remove the given PDFs from processed output and return the remaining records."""
+        processed_directory = self.projects.path_for(project_id) / "processed"
+        report = self._read_report(project_id)
+        records = self._read_jsonl(processed_directory / "input.jsonl")
+        document_reports = report.get("documents", [])
+        if not any(item.get("filename") in filenames for item in document_reports):
+            return records
+        records = [record for record in records if record.get("document_id") not in filenames]
+        document_reports = [item for item in document_reports if item.get("filename") not in filenames]
+        if document_reports:
+            self._write_jsonl(processed_directory / "input.jsonl", records)
+            self._write_json(
+                processed_directory / "report.json",
+                {"summary": report.get("summary", {}), "documents": document_reports},
+            )
+        else:
+            (processed_directory / "input.jsonl").unlink(missing_ok=True)
+            (processed_directory / "report.json").unlink(missing_ok=True)
+        return records
+
+    def _read_report(self, project_id: str) -> dict[str, Any]:
         report_path = self.projects.path_for(project_id) / "processed" / "report.json"
         try:
             value = json.loads(report_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
-        return {item["filename"]: item for item in value.get("documents", [])}
+        return value if isinstance(value, dict) else {}
+
+    def _document_reports(self, project_id: str) -> dict[str, dict[str, Any]]:
+        report = self._read_report(project_id)
+        # Reports written before per-document timestamps share the run's completion time.
+        fallback = report.get("summary", {}).get("completed_at")
+        reports: dict[str, dict[str, Any]] = {}
+        for item in report.get("documents", []):
+            if fallback and "processed_at" not in item:
+                item = {**item, "processed_at": fallback}
+            reports[item["filename"]] = item
+        return reports
 
     @staticmethod
     def _safe_identifier(value: str) -> str:
@@ -401,3 +542,37 @@ class DocumentService:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+
+class _PageProgress:
+    """Aggregate per-page progress across documents for a ProgressCallback."""
+
+    def __init__(self, callback: ProgressCallback | None, estimates: Mapping[str, int]) -> None:
+        self.callback = callback
+        self.estimates = dict(estimates)
+        self.total = sum(self.estimates.values())
+        self.completed = 0
+        self.filename = ""
+
+    def start_document(self, filename: str, pages: int) -> None:
+        # Replace the pre-read estimate with the actual selected page count.
+        self.total += pages - self.estimates.pop(filename, 0)
+        self.filename = filename
+        self._emit()
+
+    def advance(self) -> None:
+        self.completed += 1
+        self._emit()
+
+    def skip_document(self, filename: str) -> None:
+        self.total -= self.estimates.pop(filename, 0)
+        self.filename = filename
+        self._emit()
+
+    def finish(self) -> None:
+        self.total = self.completed
+        self._emit()
+
+    def _emit(self) -> None:
+        if self.callback is not None:
+            self.callback(self.completed, max(self.total, self.completed), self.filename)

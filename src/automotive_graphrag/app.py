@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import queue
@@ -24,7 +25,7 @@ from .connections import (
 from .documents import DocumentInfo, DocumentService
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
-from .indexing import IndexingService
+from .indexing import IndexingService, parse_indexing_progress
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_generation import GeneratedQuestion, QuestionGenerationService
@@ -46,7 +47,7 @@ from .source_sampling import SourceSample, SourceSamplingService
 NEW_PROJECT_OPTION = "__new_project__"
 NEW_PROJECT_LABEL = "+ 新增專案..."
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
-DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
+DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
 EVIDENCE_COLUMNS = ["Context 順序", "Evidence ID", "來源／文件", "頁碼", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
@@ -259,16 +260,51 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def selected_project_id(project_id: str | None) -> str | None:
         return None if project_id == NEW_PROJECT_OPTION else project_id
 
-    def active_project_label(project_id: str | None) -> str:
-        if not project_id:
-            return "目前沒有開啟的專案。請先到「專案與連線設定」選取並開啟專案。"
+    def api_key_ready(project_id: str | None) -> bool:
         try:
-            project = store.get(project_id)
+            return connections.has_api_key(project_id)
         except ProjectError:
-            return "目前開啟的專案已不存在，請重新選取專案。"
+            return False
+
+    def workspace_lock_reason(project_id: str | None) -> str | None:
+        """Return why tabs 1~4 are locked, or None when a project is open and the API is configured."""
+        reasons = []
+        if not project_id:
+            reasons.append("尚未開啟專案")
+        else:
+            try:
+                store.get(project_id)
+            except ProjectError:
+                reasons.append("目前開啟的專案已不存在")
+        if not api_key_ready(project_id):
+            reasons.append("API Key 尚未設定")
+        if not reasons:
+            return None
+        steps = []
+        if any("專案" in reason for reason in reasons):
+            steps.append("選取並開啟專案")
+        if not api_key_ready(project_id):
+            steps.append("設定 API Key 並儲存連線設定")
+        return (
+            f"🔒 {'，且'.join(reasons)}，分頁 1～4 已鎖定。"
+            f"請先到「專案與連線設定」{'，並'.join(steps)}。"
+        )
+
+    def active_project_label(project_id: str | None) -> str:
+        reason = workspace_lock_reason(project_id)
+        if reason:
+            return reason
+        project = store.get(project_id)
         return (
             f"目前開啟專案：**{project.display_name}** (`{project.project_id}`)｜"
             f"狀態：{project.status}"
+        )
+
+    def workspace_tab_states(project_id: str | None):
+        unlocked = workspace_lock_reason(project_id) is None
+        return (
+            active_project_label(project_id),
+            *(gr.Tab(interactive=unlocked) for _ in range(4)),
         )
 
     def open_project(project_id: str | None):
@@ -1846,9 +1882,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         next_active = None if project_id == active_id else active_id
         return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None, next_active), False
 
-    def document_rows(project_id: str | None) -> list[list[str | int | None]]:
-        return [document_row(document) for document in documents.list_documents_if_available(project_id)]
-
     def processing_option_rows(project_id: str | None) -> list[list[str | int | float]]:
         if not project_id:
             return []
@@ -1888,9 +1921,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return options
 
     def document_view(project_id: str | None):
-        rows = document_rows(project_id)
-        choices = [row[0] for row in rows]
-        return rows, processing_option_rows(project_id), gr.Dropdown(choices=choices, value=None)
+        items = documents.list_documents_if_available(project_id)
+        choices = [item.filename for item in items]
+        # Preselect PDFs that still need preprocessing or are not in the current graph.
+        pending = [item.filename for item in items if not item.preprocessed or not item.indexed]
+        return (
+            [document_row(item) for item in items],
+            processing_option_rows(project_id),
+            gr.Dropdown(choices=choices, value=pending, multiselect=True),
+        )
 
     def active_project_views(project_id: str | None):
         documents_view = document_view(project_id)
@@ -1903,54 +1942,132 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def import_documents(project_id: str | None, files: list[str] | None):
         if not project_id:
-            return "❌ 請先到「專案與連線設定」開啟專案", [], [], gr.Dropdown(choices=[])
+            return "❌ 請先到「專案與連線設定」開啟專案", *document_view(None)
         try:
-            imported = documents.import_pdfs(project_id, files or [])
+            documents.import_pdfs(project_id, files or [])
         except ProjectError as exc:
-            rows, settings, selector = document_view(project_id)
-            return f"❌ {exc}", rows, settings, selector
-        rows = [document_row(item) for item in imported]
+            return f"❌ {exc}", *document_view(project_id)
+        return f"✅ 已匯入 {len(files or [])} 份 PDF", *document_view(project_id)
+
+    def task_progress_markup(fraction: float, status: str, detail: str = "") -> str:
+        percent = round(min(max(fraction, 0.0), 1.0) * 100)
         return (
-            f"✅ 已匯入 {len(files or [])} 份 PDF",
-            rows,
-            processing_option_rows(project_id),
-            gr.Dropdown(choices=[row[0] for row in rows]),
+            '<div style="width:100%;padding:0.25rem 0">'
+            f'<progress value="{percent}" max="100" '
+            'style="width:100%;height:1rem;accent-color:var(--color-accent)"></progress>'
+            '<div style="display:flex;justify-content:space-between;gap:1rem">'
+            f'<span>{html.escape(detail)}</span><span>{percent}%｜{html.escape(status)}</span></div></div>'
         )
 
-    def preprocess_documents(project_id: str | None, option_rows: list[list[object]] | None):
-        if not project_id:
-            return "❌ 請先到「專案與連線設定」開啟專案", [], [], gr.Dropdown(choices=[])
-        try:
-            report = documents.preprocess(project_id, parse_processing_options(option_rows))
-        except (ProjectError, OSError, TypeError, ValueError) as exc:
-            rows, settings, selector = document_view(project_id)
-            return f"❌ {exc}", rows, settings, selector
-        message = (
-            f"✅ 前處理完成：成功 {report.successful_pages} 頁、"
+    def run_preprocess(project_id: str, option_rows, targets: list[str] | None):
+        """Run preprocessing in a worker thread, yielding progress markup until it returns the report."""
+        updates: queue.Queue[tuple[int, int, str]] = queue.Queue()
+        result_holder: list[object] = []
+        error_holder: list[Exception] = []
+
+        def worker_task() -> None:
+            try:
+                result_holder.append(
+                    documents.preprocess(
+                        project_id,
+                        parse_processing_options(option_rows),
+                        filenames=targets or None,
+                        progress_callback=lambda done, total, name: updates.put((done, total, name)),
+                    )
+                )
+            except Exception as exc:
+                error_holder.append(exc)
+
+        worker = threading.Thread(target=worker_task, daemon=True)
+        worker.start()
+        yield task_progress_markup(0, "前處理中", "準備開啟 PDF…")
+        latest: tuple[int, int, str] | None = None
+        while worker.is_alive() or not updates.empty():
+            try:
+                latest = updates.get(timeout=0.25)
+                while not updates.empty():
+                    latest = updates.get_nowait()
+            except queue.Empty:
+                continue
+            done, total, name = latest
+            yield task_progress_markup(done / total if total else 0, "前處理中", f"{name}｜已處理 {done} / {total} 頁")
+        worker.join()
+        if error_holder:
+            raise error_holder[0]
+        return result_holder[0]
+
+    def preprocess_message(report) -> str:
+        return (
+            f"✅ 前處理完成（{report.documents} 份 PDF）：成功 {report.successful_pages} 頁、"
             f"無文字 {report.empty_pages} 頁、錯誤 {report.error_pages} 頁"
         )
-        rows, settings, selector = document_view(project_id)
-        return message, rows, settings, selector
 
-    def remove_document(project_id: str | None, filename: str | None, confirmed: bool):
-        if not project_id or not filename:
-            rows, settings, selector = document_view(project_id)
-            return "❌ 請先選擇 PDF", rows, settings, selector, False
-        if not confirmed:
-            rows, settings, selector = document_view(project_id)
-            return "❌ 請勾選移除確認", rows, settings, selector, False
-        try:
-            documents.remove_pdf(project_id, filename)
-        except ProjectError as exc:
-            rows, settings, selector = document_view(project_id)
-            return f"❌ {exc}", rows, settings, selector, False
-        rows, settings, selector = document_view(project_id)
-        return f"✅ 已移除 {filename}；請重新執行前處理與建圖", rows, settings, selector, False
-
-    def build_index(project_id: str | None, chat_model: str | None):
+    def preprocess_documents(project_id: str | None, option_rows: list[list[object]] | None, targets: list[str] | None):
         if not project_id:
-            yield "❌ 請先到「專案與連線設定」開啟專案", ""
+            yield "❌ 請先到「專案與連線設定」開啟專案", "", *document_view(None)
             return
+        steps = run_preprocess(project_id, option_rows, targets)
+        progress = ""
+        try:
+            while True:
+                progress = next(steps)
+                yield "⏳ 前處理執行中…", progress, gr.skip(), gr.skip(), gr.skip()
+        except StopIteration as finished:
+            report = finished.value
+        except (ProjectError, OSError, TypeError, ValueError) as exc:
+            yield f"❌ {exc}", progress, *document_view(project_id)
+            return
+        yield preprocess_message(report), task_progress_markup(1, "前處理完成", f"共 {report.pages} 頁"), *document_view(project_id)
+
+    def remove_documents(project_id: str | None, filenames: list[str] | None, confirmed: bool):
+        if not project_id or not filenames:
+            return "❌ 請先在「選擇要前處理／建圖的 PDF」選擇要刪除的 PDF", *document_view(project_id), False
+        if not confirmed:
+            return gr.skip(), gr.skip(), gr.skip(), gr.skip(), False
+        removed: list[str] = []
+        try:
+            for filename in filenames:
+                documents.remove_pdf(project_id, filename)
+                removed.append(filename)
+        except ProjectError as exc:
+            prefix = f"已刪除 {'、'.join(removed)}；" if removed else ""
+            return f"❌ {prefix}{exc}", *document_view(project_id), False
+        return f"✅ 已刪除 {'、'.join(removed)}；請重新建立 Graph", *document_view(project_id), False
+
+    def build_index(
+        project_id: str | None,
+        chat_model: str | None,
+        targets: list[str] | None = None,
+        option_rows: list[list[object]] | None = None,
+    ):
+        if not project_id:
+            yield "❌ 請先到「專案與連線設定」開啟專案", "", ""
+            return
+        try:
+            items = documents.list_documents(project_id)
+        except ProjectError as exc:
+            yield f"❌ {exc}", "", ""
+            return
+        # Selected PDFs that were never preprocessed are preprocessed first, then the whole graph is rebuilt.
+        pending = [item.filename for item in items if item.filename in set(targets or []) and not item.preprocessed]
+        progress = ""
+        if pending:
+            steps = run_preprocess(project_id, option_rows, pending)
+            try:
+                while True:
+                    progress = next(steps)
+                    yield f"⏳ 建圖前先前處理：{'、'.join(pending)}", "", progress
+            except StopIteration:
+                pass
+            except (ProjectError, OSError, TypeError, ValueError) as exc:
+                yield f"❌ 前處理失敗：{exc}", "", progress
+                return
+            items = documents.list_documents(project_id)
+        excluded = [item.filename for item in items if not item.preprocessed]
+        if len(excluded) == len(items):
+            yield "❌ 沒有已前處理的 PDF，請先選擇 PDF 並執行前處理", "", progress
+            return
+        excluded_note = f"（未前處理、不納入圖譜：{'、'.join(excluded)}）" if excluded else ""
         chunks: queue.Queue[str] = queue.Queue()
         result_holder: list[object] = []
         error_holder: list[Exception] = []
@@ -1963,27 +2080,44 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             except Exception as exc:
                 error_holder.append(exc)
 
+        def index_progress(log: str, status: str = "建圖中") -> str:
+            state = parse_indexing_progress(log)
+            if not state.total_workflows:
+                return task_progress_markup(0, status, "初始化 GraphRAG…")
+            current = f"｜目前：{state.current_workflow}" if state.current_workflow else ""
+            return task_progress_markup(
+                state.fraction,
+                status,
+                f"已完成 {state.completed_workflows} / {state.total_workflows} 個 workflow{current}",
+            )
+
         worker = threading.Thread(target=run_index, daemon=True)
         worker.start()
         log = ""
-        yield f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）", log
+        running = f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）{excluded_note}"
+        yield running, log, index_progress(log)
         while worker.is_alive() or not chunks.empty():
             try:
                 log += chunks.get(timeout=0.25)
             except queue.Empty:
                 pass
-            yield f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）", log
+            yield running, log, index_progress(log)
         worker.join()
         if error_holder:
-            yield f"❌ {error_holder[0]}", log
+            yield f"❌ {error_holder[0]}", log, index_progress(log, "建圖失敗")
             return
         result = result_holder[0]
         icon = "✅" if result.status == "INDEXED" else "❌"
         summary = (
             f"{icon} {result.status}｜建圖模型：{chat_model or connections.get_chat_model()}｜"
-            f"耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}"
+            f"耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}{excluded_note}"
         )
-        yield summary, log
+        final_progress = (
+            task_progress_markup(1, "建圖完成", "所有 workflow 已完成")
+            if result.status == "INDEXED"
+            else index_progress(log, "建圖失敗")
+        )
+        yield summary, log, final_progress
 
     def create_project(
         project_id: str,
@@ -2129,7 +2263,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     save_connection_button = gr.Button("儲存連線設定", variant="primary", elem_classes="rounded-button")
                 connection_result = gr.Markdown()
 
-        with gr.Tab("1 文件與建圖"):
+        with gr.Tab("1 文件與建圖", interactive=False) as documents_tab:
             uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
             indexing_chat_model = gr.Dropdown(
                 choices=list(ALLOWED_CHAT_MODELS),
@@ -2137,16 +2271,28 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 label="建圖模型",
                 info="只套用於 GraphRAG 建圖；更換模型後按「建立 Graph」即可重新建圖。",
             )
+            target_documents = gr.Dropdown(
+                label="選擇要前處理／建圖的 PDF",
+                multiselect=True,
+                info=(
+                    "預設選取尚未前處理或尚未建圖的 PDF。「開始前處理」只處理所選 PDF（未選則全部），其他 PDF 保留原結果；"
+                    "「建立 Graph」會先前處理所選但尚未前處理的 PDF，再以所有已前處理的 PDF 重建整個專案圖譜。"
+                ),
+            )
             with gr.Row():
                 upload_button = gr.Button("上傳")
                 preprocess_button = gr.Button("開始前處理", variant="primary")
                 index_button = gr.Button("建立 Graph", variant="primary")
                 document_refresh_button = gr.Button("重新整理")
+                remove_pdf_button = gr.Button("刪除所選 PDF", variant="stop")
+            # 由刪除按鈕的確認對話框寫入，不顯示於畫面
+            remove_pdf_confirmation = gr.Checkbox(visible=False)
             document_result = gr.Markdown()
+            document_progress = gr.HTML()
             document_table = gr.Dataframe(
                 headers=DOCUMENT_COLUMNS,
                 interactive=False,
-                datatype=["str", "number", "number", "str", "number", "number", "str"],
+                datatype=["str", "number", "number", "str", "str", "str", "number", "number", "str"],
                 label="Documents",
             )
             processing_options_table = gr.Dataframe(
@@ -2157,10 +2303,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 static_columns=[0, 1],
                 label="各 PDF 前處理設定（頁面索引從 0 開始，結束頁包含在範圍內）",
             )
-            with gr.Row():
-                removable_pdf = gr.Dropdown(label="選擇要移除的 PDF")
-                remove_pdf_confirmation = gr.Checkbox(label="我確認要移除選取的 PDF")
-                remove_pdf_button = gr.Button("移除 PDF", variant="stop")
             indexing_log = gr.Textbox(
                 label="建圖日誌",
                 lines=12,
@@ -2169,7 +2311,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 elem_id="indexing-log",
             )
 
-        with gr.Tab("2 問答測試"):
+        with gr.Tab("2 問答測試", interactive=False) as query_tab:
             with gr.Row():
                 with gr.Column():
                     question = gr.Textbox(label="問題", lines=5)
@@ -2221,7 +2363,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             query_evidence_detail = gr.Markdown()
             query_context = gr.JSON(label="原始 GraphRAG Query Context")
 
-        with gr.Tab("3 自動問答測試"):
+        with gr.Tab("3 自動問答測試", interactive=False) as autoqa_tab:
             gr.Markdown(
                 "匯入或生成題目後，執行「檢索並生成回答」，全部完成後才能評測。"
                 "回答會先保存但不顯示，評測完成後才顯示回答與判斷；系統會跨 PDF 去重。"
@@ -2294,7 +2436,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 wrap=True,
             )
 
-        with gr.Tab("4 檢索實驗"):
+        with gr.Tab("4 檢索實驗", interactive=False) as experiment_tab:
             gr.Markdown(
                 "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
                 "以同一組實驗設定比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略；"
@@ -2630,10 +2772,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generated_evidence = gr.JSON(label="引用來源與 Gold Evidence")
             generated_question_export = gr.File(label="Question Set JSON")
 
+        workspace_lock_outputs = [active_project_banner, documents_tab, query_tab, autoqa_tab, experiment_tab]
         refresh_button.click(
             refresh_project_views,
             inputs=[selected_project, active_project_id],
             outputs=[project_table, selected_project, selected_project_details, active_project_id, active_project_banner],
+        ).then(
+            workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
         ).then(
             experiment_view,
             inputs=active_project_id,
@@ -2649,9 +2794,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=selected_project,
             outputs=[active_project_id, active_project_banner, selected_project_details, api_key, open_project_result, connection_state],
         ).then(
+            workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
+        ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, automatic_question_set, sampling_sections],
+            outputs=[document_table, processing_options_table, target_documents, automatic_question_set, sampling_sections],
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
@@ -2717,9 +2864,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 delete_confirmation,
             ],
         ).then(
+            workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
+        ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, automatic_question_set, sampling_sections],
+            outputs=[document_table, processing_options_table, target_documents, automatic_question_set, sampling_sections],
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
@@ -2733,30 +2882,39 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
+        document_view_outputs = [document_table, processing_options_table, target_documents]
         upload_button.click(
             import_documents,
             inputs=[document_project, uploaded_files],
-            outputs=[document_result, document_table, processing_options_table, removable_pdf],
+            outputs=[document_result, *document_view_outputs],
         )
         preprocess_button.click(
             preprocess_documents,
-            inputs=[document_project, processing_options_table],
-            outputs=[document_result, document_table, processing_options_table, removable_pdf],
+            inputs=[document_project, processing_options_table, target_documents],
+            outputs=[document_result, document_progress, *document_view_outputs],
         )
         index_button.click(
             build_index,
-            inputs=[document_project, indexing_chat_model],
-            outputs=[document_result, indexing_log],
-        )
+            inputs=[document_project, indexing_chat_model, target_documents, processing_options_table],
+            outputs=[document_result, indexing_log, document_progress],
+        ).then(document_view, inputs=document_project, outputs=document_view_outputs)
         document_refresh_button.click(
             document_view,
             inputs=document_project,
-            outputs=[document_table, processing_options_table, removable_pdf],
+            outputs=document_view_outputs,
         )
         remove_pdf_button.click(
-            remove_document,
-            inputs=[document_project, removable_pdf, remove_pdf_confirmation],
-            outputs=[document_result, document_table, processing_options_table, removable_pdf, remove_pdf_confirmation],
+            None,
+            inputs=target_documents,
+            outputs=remove_pdf_confirmation,
+            js=(
+                "(files) => !files || files.length === 0 || "
+                "confirm(`確定要刪除以下 PDF 及其前處理結果嗎？此動作無法復原。\\n\\n${files.join('\\n')}`)"
+            ),
+        ).then(
+            remove_documents,
+            inputs=[document_project, target_documents, remove_pdf_confirmation],
+            outputs=[document_result, *document_view_outputs, remove_pdf_confirmation],
         )
         experiment_import_button.click(
             import_experiment_questions,
@@ -3057,15 +3215,26 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             save_connection,
             inputs=[api_base_url, api_key, chat_model, embedding_model],
             outputs=[connection_result, api_base_url, api_key, chat_model, embedding_model],
-        ).then(connection_status, outputs=connection_state)
+        ).then(connection_status, outputs=connection_state).then(
+            workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
+        )
+        demo.load(workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs)
     return demo
 
 
 def document_row(document: DocumentInfo) -> list[str | int | None]:
+    if document.preprocessed:
+        preprocessed, indexed = "✅ 已完成", ("✅ 已建圖" if document.indexed else "⏳ 未建圖")
+    elif document.status == "ERROR":
+        preprocessed, indexed = "❌ 失敗", "—"
+    else:
+        preprocessed, indexed = "⏳ 未前處理", "—"
     return [
         document.filename,
         document.pages,
         document.size_bytes,
+        preprocessed,
+        indexed,
         document.status,
         document.empty_pages,
         document.error_pages,
