@@ -43,6 +43,8 @@ from .retrieval_experiments import (
 from .source_sampling import SourceSample, SourceSamplingService
 
 
+NEW_PROJECT_OPTION = "__new_project__"
+NEW_PROJECT_LABEL = "➕ 新增專案"
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
@@ -219,6 +221,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def project_choices() -> list[tuple[str, str]]:
         return [(project.display_name, project.project_id) for project in store.list()]
 
+    def project_selector_choices() -> list[tuple[str, str]]:
+        return [*project_choices(), (NEW_PROJECT_LABEL, NEW_PROJECT_OPTION)]
+
+    def selected_project_id(project_id: str | None) -> str | None:
+        return None if project_id == NEW_PROJECT_OPTION else project_id
+
     def active_project_label(project_id: str | None) -> str:
         if not project_id:
             return "目前沒有開啟的專案。請先到「專案設定」選取並開啟專案。"
@@ -232,6 +240,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def open_project(project_id: str | None):
+        project_id = selected_project_id(project_id)
         if not project_id:
             return None, active_project_label(None), {}, connections.get_api_key() or "", "請先選取專案", connection_status()
         try:
@@ -1751,6 +1760,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return True
 
     def update_project_enabled(project_id: str | None, enabled: bool):
+        project_id = selected_project_id(project_id)
         if not project_id:
             return "❌ 請先選擇專案", store.table_rows(), {}
         try:
@@ -1762,9 +1772,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def refresh_project_views(project_id: str | None, active_id: str | None):
         available_ids = {project.project_id for project in store.list()}
-        selected = project_id if project_id in available_ids else None
+        selected = project_id if project_id in available_ids or project_id == NEW_PROJECT_OPTION else None
         active = active_id if active_id in available_ids else None
-        choices = project_choices()
+        choices = project_selector_choices()
         return (
             store.table_rows(),
             gr.Dropdown(choices=choices, value=selected, allow_custom_value=True),
@@ -1774,6 +1784,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def delete_project(project_id: str | None, confirmed: bool, active_id: str | None):
+        project_id = selected_project_id(project_id)
         if not project_id:
             return "❌ 請先選擇專案", *refresh_project_views(None, active_id), False
         if not confirmed:
@@ -1940,7 +1951,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 description=description,
             )
         except ProjectError as exc:
-            selector = gr.Dropdown(choices=project_choices(), allow_custom_value=True)
+            selector = gr.Dropdown(choices=project_selector_choices(), allow_custom_value=True)
             return (
                 f"❌ {exc}",
                 store.table_rows(),
@@ -1953,7 +1964,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 {},
             )
         selector = gr.Dropdown(
-            choices=project_choices(),
+            choices=project_selector_choices(),
             value=project.project_id,
             allow_custom_value=True,
         )
@@ -1984,7 +1995,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         with gr.Tab("0-0 專案設定"):
             with gr.Row():
                 selected_project = gr.Dropdown(
-                    choices=project_choices(),
+                    choices=project_selector_choices(),
                     label="專案",
                     allow_custom_value=True,
                 )
@@ -2003,18 +2014,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 project_enabled = gr.Checkbox(label="啟用一般使用者查詢", value=True)
                 update_project_enabled_button = gr.Button("更新啟用狀態")
             project_activation_result = gr.Markdown()
-            gr.Markdown("## 建立新專案")
-            project_id = gr.Textbox(label="Project ID", placeholder="L33-SM3E")
-            display_name = gr.Textbox(label="顯示名稱", placeholder="L33 / SM3E")
-            with gr.Row():
-                vehicle_name = gr.Textbox(label="車型", placeholder="L33")
-                manual_version = gr.Textbox(label="手冊版本", placeholder="SM3E")
-            description = gr.Textbox(label="說明", lines=3)
-            create_button = gr.Button("建立專案", variant="primary")
+            with gr.Group(visible=False) as new_project_group:
+                gr.Markdown("## 建立新專案")
+                project_id = gr.Textbox(label="Project ID", placeholder="L33-SM3E")
+                display_name = gr.Textbox(label="顯示名稱", placeholder="L33 / SM3E")
+                with gr.Row():
+                    vehicle_name = gr.Textbox(label="車型", placeholder="L33")
+                    manual_version = gr.Textbox(label="手冊版本", placeholder="SM3E")
+                description = gr.Textbox(label="說明", lines=3)
+                create_button = gr.Button("建立專案", variant="primary")
             result = gr.Markdown()
-            gr.Markdown("## 刪除專案")
-            delete_confirmation = gr.Checkbox(label="我確認要永久刪除選取的專案及其所有資料")
-            delete_button = gr.Button("刪除選取專案", variant="stop")
+            with gr.Group() as delete_project_group:
+                gr.Markdown("## 刪除專案")
+                delete_confirmation = gr.Checkbox(label="我確認要永久刪除選取的專案及其所有資料")
+                delete_button = gr.Button("刪除選取專案", variant="stop")
 
         with gr.Tab("0-1 連線設定"):
             gr.Markdown("## GraphRAG 共用連線設定")
@@ -2586,9 +2599,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
         )
         selected_project.change(
-            lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
+            lambda project_id: (
+                project_details(selected_project_id(project_id)),
+                project_enabled_value(selected_project_id(project_id)),
+                gr.Group(visible=project_id == NEW_PROJECT_OPTION),
+                gr.Group(visible=project_id != NEW_PROJECT_OPTION),
+            ),
             inputs=selected_project,
-            outputs=[selected_project_details, project_enabled],
+            outputs=[selected_project_details, project_enabled, new_project_group, delete_project_group],
         )
         update_project_enabled_button.click(
             update_project_enabled,
