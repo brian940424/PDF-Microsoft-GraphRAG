@@ -53,6 +53,8 @@ SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "檢索證據", "Evidence Hit", "Evidence Precision", "Document Hit"]
 SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk ID"]
 GENERATED_QUESTION_COLUMNS = ["Question ID", "Question", "Difficulty", "Status", "Sources"]
+QUERY_METHOD_LABELS = {"local": "Local", "global": "Global", "drift": "DRIFT", "basic": "Basic"}
+QUERY_METHOD_CHOICES = [("自動", "auto")] + [(label, method) for method, label in QUERY_METHOD_LABELS.items()]
 AUTOMATIC_EVALUATION_COLUMNS = [
     "Question ID",
     "判斷",
@@ -299,10 +301,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
             return
+        method_label = QUERY_METHOD_LABELS.get(query_result.method, query_result.method)
+        if query_result.requested_method == "auto":
+            method_label = f"自動 → {method_label}"
         summary = (
-            f"狀態：{query_result.status}｜方法：{query_result.method}｜"
+            f"狀態：{query_result.status}｜方法：{method_label}｜"
             f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
         )
+        if query_result.routing_reason:
+            summary += f"\n\n**選擇原因：** {query_result.routing_reason}"
         if query_result.status == "FAILED":
             yield "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, []
             return
@@ -1212,6 +1219,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
                 value=method,
             ),
+        )
+
+    def update_query_method_compatibility(answer_model: str | None, method: str | None):
+        """Same as update_model_method_compatibility, keeping the single-query auto option."""
+        answer_model = answer_model or connections.get_chat_model()
+        return (
+            gr.update(choices=list(ALLOWED_CHAT_MODELS), value=answer_model),
+            gr.update(choices=QUERY_METHOD_CHOICES, value=method or "auto"),
         )
 
     def generate_retrieval_experiment_answers(
@@ -2164,9 +2179,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="本次回答模型",
                     )
                     query_method = gr.Dropdown(
-                        choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                        value="local",
+                        choices=QUERY_METHOD_CHOICES,
+                        value="auto",
                         label="查詢方法",
+                        info="自動：由回答模型依問題類型選擇 Local／Global／DRIFT／Basic，並顯示選擇原因",
                     )
                     query_response_type = gr.Dropdown(
                         choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
@@ -2174,12 +2190,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="回答格式",
                     )
                     query_chat_model.input(
-                        update_model_method_compatibility,
+                        update_query_method_compatibility,
                         inputs=[query_chat_model, query_method],
                         outputs=[query_chat_model, query_method],
                     )
                     query_method.input(
-                        update_model_method_compatibility,
+                        update_query_method_compatibility,
                         inputs=[query_chat_model, query_method],
                         outputs=[query_chat_model, query_method],
                     )

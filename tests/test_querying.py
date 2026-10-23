@@ -13,6 +13,7 @@ from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.evidence import Evidence, EvidenceService
 from automotive_graphrag.querying import QueryExecution, QueryService
 from automotive_graphrag.source_metadata import SourceMetadata
+from automotive_graphrag.strategy_routing import StrategyDecision
 
 
 class FakeQueryRunner:
@@ -49,6 +50,16 @@ class FakeEvidenceService:
                 text="來源",
             )
         ]
+
+
+class FakeRouter:
+    def __init__(self, decision: StrategyDecision) -> None:
+        self.decision = decision
+        self.calls: list[tuple[str, str, str, str | None]] = []
+
+    def route(self, question: str, model: str, api_base_url: str, api_key: str | None) -> StrategyDecision:
+        self.calls.append((question, model, api_base_url, api_key))
+        return self.decision
 
 
 class FailingEvidenceService:
@@ -106,6 +117,45 @@ class QueryServiceTests(unittest.TestCase):
             settings["embedding_models"]["default_embedding_model"]["model"],
             "text-embedding-3-small",
         )
+
+    def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
+        runner = FakeQueryRunner()
+        router = FakeRouter(StrategyDecision("global", "問題要求整體主題歸納"))
+        service = QueryService(self.store, runner, self.connections, router=router)
+
+        result = service.ask("L33-SM3E", " 手冊涵蓋哪些系統？ ", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(router.calls, [("手冊涵蓋哪些系統？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key")])
+        command = runner.commands[0]
+        self.assertEqual(command[command.index("--method") + 1], "global")
+        self.assertEqual(result.method, "global")
+        self.assertEqual(result.requested_method, "auto")
+        self.assertEqual(result.routing_reason, "問題要求整體主題歸納")
+        self.assertEqual(service.history("L33-SM3E"), [result])
+
+    def test_fixed_method_does_not_call_router(self) -> None:
+        router = FakeRouter(StrategyDecision("global", "unused"))
+        service = QueryService(self.store, FakeQueryRunner(), self.connections, router=router)
+
+        result = service.ask("L33-SM3E", "測試", method="basic")
+
+        self.assertEqual(router.calls, [])
+        self.assertEqual(result.method, "basic")
+        self.assertEqual(result.requested_method, "basic")
+        self.assertIsNone(result.routing_reason)
+
+    def test_history_without_routing_fields_still_loads(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+        result = service.ask("L33-SM3E", "測試")
+        path = self.store.path_for("L33-SM3E") / "runs" / "queries.jsonl"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        del record["requested_method"], record["routing_reason"]
+        path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        loaded = service.history("L33-SM3E")[0]
+
+        self.assertEqual(loaded.query_id, result.query_id)
+        self.assertIsNone(loaded.routing_reason)
 
     def test_failed_query_is_saved_with_error(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(return_code=2), self.connections)
