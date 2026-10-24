@@ -14,6 +14,7 @@
 - [操作指南](docs/使用指南.md)
 - [檢索實驗策略與參數](docs/檢索實驗與策略參數.md)
 - [題目集 JSON 格式](docs/題目集格式.md)
+- [開發進度指揮中心（3D 進度儀表板）](progress-dashboard/README.md)
 
 ## 目錄
 
