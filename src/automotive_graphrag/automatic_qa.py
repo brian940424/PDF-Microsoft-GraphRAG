@@ -213,6 +213,7 @@ class AutomaticQATestService:
         method: str,
         answer_concurrency: int,
         response_type: str = "Single Paragraph",
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> AutomaticQAReport:
         """Generate and persist answers only; judging is a separate user action."""
         report = self._run_existing(
@@ -226,6 +227,7 @@ class AutomaticQATestService:
             (),
             evaluate=False,
             response_type=response_type,
+            progress_callback=progress_callback,
         )
         self.judging.clear_result(project_id, question_set_id)
         return report
@@ -240,6 +242,7 @@ class AutomaticQATestService:
         top_k: int = 5,
         concurrency: int = 3,
         response_type: str = "Single Paragraph",
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> AutomaticQAReport:
         question_set = self.question_sets.get(project_id, question_set_id)
         if question_set.response_type != response_type:
@@ -253,7 +256,8 @@ class AutomaticQATestService:
         judge_error = None
         try:
             judge = self.judging.evaluate(
-                project_id, question_set_id, model=judge_model, concurrency=concurrency
+                project_id, question_set_id, model=judge_model, concurrency=concurrency,
+                progress_callback=progress_callback,
             )
         except ProjectError as exc:
             judge_error = str(exc)
@@ -290,6 +294,7 @@ class AutomaticQATestService:
         generation_errors: tuple[str, ...],
         evaluate: bool = True,
         response_type: str = "Single Paragraph",
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> AutomaticQAReport:
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("回答並行數必須介於 1 到 32")
@@ -300,6 +305,8 @@ class AutomaticQATestService:
                 question_set.project_id, item.question, method,
                 chat_model=answer_model, response_type=response_type,
             )
+        if progress_callback:
+            progress_callback(0, len(pending))
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {pool.submit(answer, item): item for item in pending}
             for future in as_completed(futures):
@@ -314,6 +321,8 @@ class AutomaticQATestService:
                         method=method, status="FAILED", answer="", error=str(exc), started_at="",
                         completed_at="", duration_seconds=0,
                     )
+                if progress_callback:
+                    progress_callback(len(results), len(pending))
         updated = self.question_sets.update_answers(
             question_set.project_id, question_set.question_set_id, results, method,
             response_type=response_type,

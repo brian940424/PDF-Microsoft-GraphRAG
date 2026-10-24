@@ -74,6 +74,7 @@ class AutomaticEvaluationService:
         only_previous_failures: bool = False,
         model: str | None = None,
         concurrency: int = 3,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> AutomaticEvaluationResult:
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("評測並行數必須介於 1 到 32")
@@ -110,6 +111,8 @@ class AutomaticEvaluationService:
 
         judged_by_id: dict[str, AutomaticEvaluationItem] = {}
         failures: list[str] = []
+        if progress_callback:
+            progress_callback(0, len(eligible))
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {
                 pool.submit(
@@ -129,6 +132,8 @@ class AutomaticEvaluationService:
                     judged_by_id[question.question_id] = future.result()
                 except Exception as exc:
                     failures.append(f"{question.question_id}: {exc}")
+                if progress_callback:
+                    progress_callback(len(judged_by_id) + len(failures), len(eligible))
         if failures:
             raise ProjectError("自動評測部分請求失敗：" + "；".join(failures))
         judged = [judged_by_id[item.question_id] for item in eligible]
