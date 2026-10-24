@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import os
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -47,6 +49,8 @@ from .source_sampling import SourceSample, SourceSamplingService
 
 NEW_PROJECT_OPTION = "__new_project__"
 NEW_PROJECT_LABEL = "+ 新增專案..."
+UPLOAD_PDF_OPTION = "__upload_pdf__"
+UPLOAD_PDF_LABEL = "+ 上傳 PDF..."
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
@@ -56,6 +60,16 @@ RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "檢索證據", "Evidence Hit", 
 SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk ID"]
 GENERATED_QUESTION_COLUMNS = ["Question ID", "Question", "Difficulty", "Status", "Sources"]
 QUERY_METHOD_LABELS = {"local": "Local", "global": "Global", "drift": "DRIFT", "basic": "Basic"}
+PROJECT_STATUS_LABELS = {
+    "EMPTY": "空專案",
+    "UPLOADED": "已上傳",
+    "PROCESSING": "前處理中",
+    "READY": "可建圖",
+    "INDEXING": "建圖中",
+    "INDEXED": "可使用",
+    "STALE": "需重新建圖",
+    "FAILED": "失敗",
+}
 QUERY_METHOD_CHOICES = [("自動", "auto")] + [(label, method) for method, label in QUERY_METHOD_LABELS.items()]
 AUTOMATIC_EVALUATION_COLUMNS = [
     "Question ID",
@@ -90,15 +104,45 @@ APP_CSS = """
     padding: var(--spacing-xl) var(--block-padding) !important;
     gap: var(--spacing-xl) !important;
 }
+/* 按鈕列總寬與上方元件對齊 */
+.button-row.flush-row {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}
 /* 區塊內容與邊框、周圍元件保持距離 */
 .padded-block {
     padding: var(--spacing-xl) var(--block-padding) !important;
     margin: var(--spacing-xl) var(--block-padding) !important;
     width: auto !important;
 }
+/* 沒有訊息時不佔版面，避免上方留白 */
+.collapse-when-empty:has(.md:empty),
+.collapse-when-empty:has(.html-container > .prose:empty) {
+    display: none !important;
+}
 .bold-title > .label-wrap span,
 .bold-title > * > .label-wrap span {
     font-weight: 700 !important;
+}
+/* 問答頁回答框撐滿到與左欄同高，下方查詢資訊維持原本高度；回答過長時在框內捲動 */
+#query-answer {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+}
+#query-answer > label,
+#query-answer .input-container {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+}
+#query-answer textarea {
+    flex: 1 0 auto;
+    height: auto !important;
+    overflow-y: auto !important;
+}
+#query-summary {
+    flex: 0 0 auto !important;
 }
 """
 
@@ -268,7 +312,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return False
 
     def workspace_lock_reason(project_id: str | None) -> str | None:
-        """Return why tabs 1~4 are locked, or None when a project is open and the API is configured."""
+        """Return why tabs 1~5 are locked, or None when a project is open and the API is configured."""
         reasons = []
         if not project_id:
             reasons.append("尚未開啟專案")
@@ -287,7 +331,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not api_key_ready(project_id):
             steps.append("設定 API Key 並儲存連線設定")
         return (
-            f"🔒 {'，且'.join(reasons)}，分頁 1～4 已鎖定。"
+            f"🔒 {'，且'.join(reasons)}，分頁 1～5 已鎖定。"
             f"請先到「專案與連線設定」{'，並'.join(steps)}。"
         )
 
@@ -298,14 +342,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         project = store.get(project_id)
         return (
             f"目前開啟專案：**{project.display_name}** (`{project.project_id}`)｜"
-            f"狀態：{project.status}"
+            f"狀態：{project.status}（{PROJECT_STATUS_LABELS.get(project.status, project.status)}）"
         )
 
     def workspace_tab_states(project_id: str | None):
         unlocked = workspace_lock_reason(project_id) is None
         return (
             active_project_label(project_id),
-            *(gr.Tab(interactive=unlocked) for _ in range(4)),
+            *(gr.Tab(interactive=unlocked) for _ in range(5)),
         )
 
     def render_dashboard(project_id: str | None) -> str:
@@ -334,18 +378,42 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             connection_status(project.project_id),
         )
 
-    def ask_question(project_id: str | None, question: str, method: str, chat_model: str | None, response_type: str):
-        yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, []
+    def ask_question(
+        project_id: str | None,
+        question: str,
+        method: str,
+        chat_model: str | None,
+        response_type: str,
+        progress=gr.Progress(),
+    ):
+        hidden = gr.Group(visible=False)
         if not project_id:
-            yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
-            return
-        try:
-            query_result = querying.ask(
-                project_id, question, method, chat_model=chat_model, response_type=response_type
-            )
-        except ProjectError as exc:
-            yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
-            return
+            return "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, [], hidden
+        # querying.ask 沒有階段回報，改以背景執行緒搭配經過時間推估進度（上限 95%）
+        outcome: dict[str, object] = {}
+
+        def run_query() -> None:
+            try:
+                outcome["result"] = querying.ask(
+                    project_id, question, method, chat_model=chat_model, response_type=response_type
+                )
+            except Exception as exc:  # noqa: BLE001 - 交回主執行緒處理
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run_query, daemon=True)
+        started = time.monotonic()
+        worker.start()
+        while worker.is_alive():
+            elapsed = time.monotonic() - started
+            stage = "模型選擇查詢方法中" if method == "auto" and elapsed < 5 else "GraphRAG 檢索與生成回答中"
+            progress(min(0.95, 1 - math.exp(-elapsed / 30)), desc=f"⏳ {stage}…已經過 {elapsed:.0f} 秒")
+            worker.join(timeout=0.5)
+        progress(1.0, desc="完成")
+        if isinstance(outcome.get("error"), ProjectError):
+            return "", f"❌ {outcome['error']}", [], gr.Dropdown(choices=[]), "", {}, [], hidden
+        if "error" in outcome:
+            raise outcome["error"]
+        query_result = outcome["result"]
         method_label = QUERY_METHOD_LABELS.get(query_result.method, query_result.method)
         if query_result.requested_method == "auto":
             method_label = f"自動 → {method_label}"
@@ -356,8 +424,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if query_result.routing_reason:
             summary += f"\n\n**選擇原因：** {query_result.routing_reason}"
         if query_result.status == "FAILED":
-            yield "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, []
-            return
+            return "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, [], hidden
         evidence_values = [asdict(item) for item in query_result.evidence]
         evidence_rows = [
             [item.rank, item.evidence_id, item.document_id, item.page or "—", item.chunk_id or "—", item.score]
@@ -374,7 +441,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             choices=[item.evidence_id for item in query_result.evidence],
             value=selected,
         )
-        yield (
+        return (
             answer,
             f"✅ {summary}",
             evidence_rows,
@@ -382,6 +449,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             detail,
             querying.context_summary(query_result.context),
             evidence_values,
+            gr.Group(visible=True),
         )
 
     def evidence_markdown(evidence_id: str | None, evidence_values: list[dict[str, object]]) -> str:
@@ -1891,12 +1959,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         next_active = None if project_id == active_id else active_id
         return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None, next_active), False
 
-    def processing_option_rows(project_id: str | None) -> list[list[str | int | float]]:
-        if not project_id:
+    def processing_option_rows(
+        project_id: str | None,
+        targets: list[str] | None,
+        edited_rows: object | None = None,
+    ) -> list[list[str | int | float]]:
+        """Rows for the selected PDFs only; unsaved edits in `edited_rows` win over saved options."""
+        if not project_id or not targets:
             return []
-        saved = documents.processing_options(project_id)
+        selected = set(targets)
+        saved = {**documents.processing_options(project_id), **parse_processing_options(edited_rows)}
         rows: list[list[str | int | float]] = []
         for document in documents.list_documents_if_available(project_id):
+            if document.filename not in selected:
+                continue
             options = saved.get(document.filename, {})
             pages = document.pages or 0
             rows.append(
@@ -1931,13 +2007,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def document_view(project_id: str | None):
         items = documents.list_documents_if_available(project_id)
-        choices = [item.filename for item in items]
+        choices = [*(item.filename for item in items), (UPLOAD_PDF_LABEL, UPLOAD_PDF_OPTION)]
         # Preselect PDFs that still need preprocessing or are not in the current graph.
         pending = [item.filename for item in items if not item.preprocessed or not item.indexed]
         return (
-            [document_row(item) for item in items],
-            processing_option_rows(project_id),
+            gr.update(value=[document_row(item) for item in items], visible=bool(items)),
+            processing_option_rows(project_id, pending),
             gr.Dropdown(choices=choices, value=pending, multiselect=True),
+            gr.update(visible=not items),
         )
 
     def active_project_views(project_id: str | None):
@@ -1951,12 +2028,40 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def import_documents(project_id: str | None, files: list[str] | None):
         if not project_id:
-            return "❌ 請先到「專案與連線設定」開啟專案", *document_view(None)
+            return "❌ 請先到「專案與連線設定」開啟專案", *document_view(None), gr.skip(), gr.skip()
         try:
             documents.import_pdfs(project_id, files or [])
         except ProjectError as exc:
-            return f"❌ {exc}", *document_view(project_id)
-        return f"✅ 已匯入 {len(files or [])} 份 PDF", *document_view(project_id)
+            return f"❌ {exc}", *document_view(project_id), gr.skip(), gr.skip()
+        return f"✅ 已匯入 {len(files or [])} 份 PDF", *document_view(project_id), gr.Group(visible=False), None
+
+    def toggle_pdf_upload(targets: list[str] | None):
+        """Picking the upload option opens the upload panel instead of staying selected."""
+        targets = targets or []
+        if UPLOAD_PDF_OPTION not in targets:
+            return gr.skip(), gr.skip()
+        return [target for target in targets if target != UPLOAD_PDF_OPTION], gr.Group(visible=True)
+
+    def documents_tab_visibility(project_id: str | None, targets: list[str] | None):
+        # Gradio drops hide updates sent while this tab is inactive (e.g. when opening a project
+        # from tab 0), so re-apply visibility whenever the tab is selected.
+        has_documents = bool(documents.list_documents_if_available(project_id))
+        has_targets = any(target != UPLOAD_PDF_OPTION for target in targets or [])
+        return (
+            gr.update(visible=has_documents),
+            gr.update(visible=not has_documents),
+            gr.Accordion(visible=has_targets),
+        )
+
+    def processing_options_view(project_id: str | None, targets: list[str] | None, edited_rows):
+        targets = [target for target in targets or [] if target != UPLOAD_PDF_OPTION]
+        return processing_option_rows(project_id, targets, edited_rows), gr.Accordion(visible=bool(targets))
+
+    def preprocess_options(project_id: str, option_rows) -> dict[str, dict[str, object]]:
+        """Saved options for every PDF, overridden by the rows shown for the selected PDFs."""
+        existing = {item.filename for item in documents.list_documents_if_available(project_id)}
+        saved = {name: options for name, options in documents.processing_options(project_id).items() if name in existing}
+        return {**saved, **parse_processing_options(option_rows)}
 
     def task_progress_markup(fraction: float, status: str, detail: str = "") -> str:
         percent = round(min(max(fraction, 0.0), 1.0) * 100)
@@ -1979,7 +2084,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 result_holder.append(
                     documents.preprocess(
                         project_id,
-                        parse_processing_options(option_rows),
+                        preprocess_options(project_id, option_rows),
                         filenames=targets or None,
                         progress_callback=lambda done, total, name: updates.put((done, total, name)),
                     )
@@ -2020,7 +2125,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         try:
             while True:
                 progress = next(steps)
-                yield "⏳ 前處理執行中…", progress, gr.skip(), gr.skip(), gr.skip()
+                yield "⏳ 前處理執行中…", progress, gr.skip(), gr.skip(), gr.skip(), gr.skip()
         except StopIteration as finished:
             report = finished.value
         except (ProjectError, OSError, TypeError, ValueError) as exc:
@@ -2032,7 +2137,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id or not filenames:
             return "❌ 請先在「選擇要前處理／建圖的 PDF」選擇要刪除的 PDF", *document_view(project_id), False
         if not confirmed:
-            return gr.skip(), gr.skip(), gr.skip(), gr.skip(), False
+            return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), False
         removed: list[str] = []
         try:
             for filename in filenames:
@@ -2273,7 +2378,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 connection_result = gr.Markdown()
 
         with gr.Tab("1 文件與建圖", interactive=False) as documents_tab:
-            uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
+            document_empty_notice = gr.Markdown(
+                "⚠️ 目前檔案列表為空，請在「選擇要前處理／建圖的 PDF」選擇「+ 上傳 PDF...」匯入 PDF。"
+            )
+            document_table = gr.Dataframe(
+                headers=DOCUMENT_COLUMNS,
+                interactive=False,
+                datatype=["str", "number", "number", "str", "str", "str", "number", "number", "str"],
+                type="array",
+                # 約可顯示五筆，其餘以捲軸檢視
+                max_height=260,
+                visible=False,
+                label="Documents",
+            )
+            
             indexing_chat_model = gr.Dropdown(
                 choices=list(ALLOWED_CHAT_MODELS),
                 value=connections.get_chat_model,
@@ -2284,44 +2402,57 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 label="選擇要前處理／建圖的 PDF",
                 multiselect=True,
                 info=(
-                    "預設選取尚未前處理或尚未建圖的 PDF。「開始前處理」只處理所選 PDF（未選則全部），其他 PDF 保留原結果；"
-                    "「建立 Graph」會先前處理所選但尚未前處理的 PDF，再以所有已前處理的 PDF 重建整個專案圖譜。"
+                    "預設選取尚未前處理或尚未建圖的 PDF。**「開始前處理」**只處理所選 PDF（未選則全部），其他 PDF 保留原結果；"
+                    "**「建立 Graph」**會先前處理所選但尚未前處理的 PDF，再以所有已前處理的 PDF 重建整個專案圖譜。"
+                    "選「**+ 上傳 PDF...」**可匯入新的 PDF。"
                 ),
             )
+            with gr.Group(visible=False) as upload_pdf_group:
+                with gr.Accordion("上傳 PDF", open=True, elem_classes=["static-section", "bold-title"]):
+                    with gr.Group():
+                        uploaded_files = gr.File(
+                            file_count="multiple",
+                            file_types=[".pdf"],
+                            type="filepath",
+                            label="匯入 PDF",
+                            height=120,
+                        )
+                        with gr.Row(elem_classes=["button-row", "flush-row"]):
+                            upload_button = gr.Button("上傳", variant="primary", elem_classes="rounded-button")
+                            cancel_upload_button = gr.Button("取消", elem_classes="rounded-button")
             with gr.Row():
-                upload_button = gr.Button("上傳")
                 preprocess_button = gr.Button("開始前處理", variant="primary")
                 index_button = gr.Button("建立 Graph", variant="primary")
                 document_refresh_button = gr.Button("重新整理")
                 remove_pdf_button = gr.Button("刪除所選 PDF", variant="stop")
             # 由刪除按鈕的確認對話框寫入，不顯示於畫面
             remove_pdf_confirmation = gr.Checkbox(visible=False)
-            document_result = gr.Markdown()
-            document_progress = gr.HTML()
-            document_table = gr.Dataframe(
-                headers=DOCUMENT_COLUMNS,
-                interactive=False,
-                datatype=["str", "number", "number", "str", "str", "str", "number", "number", "str"],
-                label="Documents",
-            )
-            processing_options_table = gr.Dataframe(
-                headers=PROCESSING_COLUMNS,
-                interactive=True,
-                datatype=["str", "number", "number", "number", "number", "number"],
-                type="array",
-                static_columns=[0, 1],
-                label="各 PDF 前處理設定（頁面索引從 0 開始，結束頁包含在範圍內）",
-            )
-            indexing_log = gr.Textbox(
-                label="建圖日誌",
-                lines=12,
-                interactive=False,
-                autoscroll=True,
-                elem_id="indexing-log",
-            )
+            
+            with gr.Accordion(
+                "前處理設定（所選 PDF）", open=False, visible=False, elem_classes="bold-title"
+            ) as processing_options_section:
+                processing_options_table = gr.Dataframe(
+                    headers=PROCESSING_COLUMNS,
+                    interactive=True,
+                    datatype=["str", "number", "number", "number", "number", "number"],
+                    type="array",
+                    static_columns=[0, 1],
+                    label="頁面索引從 0 開始，結束頁包含在範圍內；設定在執行前處理後才會儲存",
+                )
+
+            with gr.Group():
+                document_result = gr.Markdown(elem_classes="collapse-when-empty")
+                document_progress = gr.HTML(elem_classes="collapse-when-empty")
+                indexing_log = gr.Textbox(
+                    label="建圖日誌",
+                    lines=12,
+                    interactive=False,
+                    autoscroll=True,
+                    elem_id="indexing-log",
+                )
 
         with gr.Tab("2 問答測試", interactive=False) as query_tab:
-            with gr.Row():
+            with gr.Row(equal_height=True):
                 with gr.Column():
                     question = gr.Textbox(label="問題", lines=5)
                     query_chat_model = gr.Dropdown(
@@ -2358,19 +2489,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="系統回答（可編輯）",
                         lines=10,
                         interactive=True,
+                        elem_id="query-answer",
                     )
-                    query_summary = gr.Markdown(label="查詢資訊")
-            gr.Markdown("### Evidence 詳情")
-            query_evidence_state = gr.State([])
-            query_evidence_table = gr.Dataframe(
-                headers=EVIDENCE_COLUMNS,
-                interactive=False,
-                datatype=["number", "str", "str", "number", "str", "number"],
-                label="Top Evidence",
-            )
-            query_evidence_selector = gr.Dropdown(label="選取證據全文")
-            query_evidence_detail = gr.Markdown()
-            query_context = gr.JSON(label="原始 GraphRAG Query Context")
+                    query_summary = gr.Markdown(label="查詢資訊", elem_id="query-summary", elem_classes=["collapse-when-empty"])
+            
+            with gr.Group(visible=False) as query_evidence_group:
+                gr.Markdown("### Evidence 詳情")
+                query_evidence_state = gr.State([])
+                query_evidence_table = gr.Dataframe(
+                    headers=EVIDENCE_COLUMNS,
+                    interactive=False,
+                    datatype=["number", "str", "str", "number", "str", "number"],
+                    label="Top Evidence",
+                )
+                query_evidence_selector = gr.Dropdown(label="選取證據全文")
+                query_evidence_detail = gr.Markdown()
+                query_context = gr.JSON(label="原始 GraphRAG Query Context")
 
         with gr.Tab("3 自動問答測試", interactive=False) as autoqa_tab:
             gr.Markdown(
@@ -2649,13 +2783,27 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 experiment_details_export_file = gr.File(label="逐題結果 JSON")
             experiment_export_status = gr.Markdown()
 
-        with gr.Tab("5 3D 儀表板"):
-            gr.Markdown(
-                "以策略遊戲地圖呈現目前專案的知識圖譜：六角形領地為社群，建築為實體（高度＝連結度、顏色＝類型），"
-                "弧線與光點為關係；面板顯示資源統計、小地圖、單位情報與問答紀錄。需要可連線至 cdn.jsdelivr.net 載入 three.js。"
-            )
-            dashboard_refresh_button = gr.Button("重新載入儀表板", elem_classes=["rounded-button"])
+        with gr.Tab("5 3D 儀表板", interactive=False) as dashboard_tab:
             dashboard_view = gr.HTML(dashboard_iframe(None, None))
+            dashboard_refresh_button = gr.Button("重新載入儀表板", elem_classes=["rounded-button"])
+            gr.Markdown(
+                "---\n"
+                "### 地圖說明\n"
+                "**地圖上對應的元素**\n"
+                "* **社群**：白色分區，左上角有標籤，點標籤就能選取。分區在畫面上太小時，標籤會自動隱藏，避免拉遠時疊在一起。\n"
+                "* **實體**：分區地塊上的小建築。高度代表連結度、占地代表出現次數、顏色代表類型。\n"
+                "* **未歸入社群的實體**：集中在「邊境」分區。\n"
+                "* **關係**：屋頂之間的藍色弧線和流動的光點。選取實體時，相關弧線和鄰近地塊會亮起來，上方插一根藍色圖釘。\n"
+                "* **最近問答**：沿著道路繞行的卡車，貨櫃色帶代表檢索方法。點卡車可以看那筆問答，例如它的耗時。\n"
+                "  \n"
+                "**畫面周圍的區塊**\n"
+                "* **導覽列**：可搜尋實體和社群，按 `/` 可以直接聚焦搜尋框；旁邊顯示專案名稱和建圖耗時。\n"
+                "* **KPI 卡**：實體、關係、社群、問答四張。\n"
+                "* **地圖控制**：放大、縮小、左右旋轉 45°、回到全景。\n"
+                "* **右側詳細卡**：沒選取時顯示總覽，選取後顯示該實體、社群或問答的細節。\n"
+                "* **右下分頁**：社群清單、類型篩選、問答紀錄。\n"
+                "* **左下「建圖流程」**：文件頁 → Chunk → 實體 → 關係 → 社群，各階段的數量，旁邊可以翻閱最近問答。\n"
+            )
 
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
@@ -2789,7 +2937,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generated_evidence = gr.JSON(label="引用來源與 Gold Evidence")
             generated_question_export = gr.File(label="Question Set JSON")
 
-        workspace_lock_outputs = [active_project_banner, documents_tab, query_tab, autoqa_tab, experiment_tab]
+        workspace_lock_outputs = [active_project_banner, documents_tab, query_tab, autoqa_tab, experiment_tab, dashboard_tab]
         refresh_button.click(
             refresh_project_views,
             inputs=[selected_project, active_project_id],
@@ -2815,7 +2963,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, target_documents, automatic_question_set, sampling_sections],
+            outputs=[document_table, processing_options_table, target_documents, document_empty_notice,
+                     automatic_question_set, sampling_sections],
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
@@ -2885,7 +3034,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, target_documents, automatic_question_set, sampling_sections],
+            outputs=[document_table, processing_options_table, target_documents, document_empty_notice,
+                     automatic_question_set, sampling_sections],
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
@@ -2899,11 +3049,30 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
-        document_view_outputs = [document_table, processing_options_table, target_documents]
+        document_view_outputs = [document_table, processing_options_table, target_documents, document_empty_notice]
+        documents_tab.select(
+            documents_tab_visibility,
+            inputs=[document_project, target_documents],
+            outputs=[document_table, document_empty_notice, processing_options_section],
+        )
+        target_documents.change(
+            processing_options_view,
+            inputs=[document_project, target_documents, processing_options_table],
+            outputs=[processing_options_table, processing_options_section],
+        )
+        target_documents.input(
+            toggle_pdf_upload,
+            inputs=target_documents,
+            outputs=[target_documents, upload_pdf_group],
+        )
         upload_button.click(
             import_documents,
             inputs=[document_project, uploaded_files],
-            outputs=[document_result, *document_view_outputs],
+            outputs=[document_result, *document_view_outputs, upload_pdf_group, uploaded_files],
+        )
+        cancel_upload_button.click(
+            lambda: (gr.Group(visible=False), None),
+            outputs=[upload_pdf_group, uploaded_files],
         )
         preprocess_button.click(
             preprocess_documents,
@@ -3050,6 +3219,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[autoqa_result, autoqa_json_export],
         )
         ask_button.click(
+            lambda: ("", "", gr.Group(visible=False)),
+            outputs=[query_answer, query_summary, query_evidence_group],
+            show_progress="hidden",
+        ).then(
             ask_question,
             inputs=[query_project, question, query_method, query_chat_model, query_response_type],
             outputs=[
@@ -3060,6 +3233,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail,
                 query_context,
                 query_evidence_state,
+                query_evidence_group,
             ],
         )
         query_evidence_selector.input(
@@ -3068,7 +3242,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=query_evidence_detail,
         )
         clear_question_button.click(
-            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, []),
+            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, [], gr.Group(visible=False)),
             outputs=[
                 question,
                 query_answer,
@@ -3078,6 +3252,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail,
                 query_context,
                 query_evidence_state,
+                query_evidence_group,
             ],
         )
         automatic_project_refresh.click(
