@@ -144,6 +144,70 @@ APP_CSS = """
 #query-summary {
     flex: 0 0 auto !important;
 }
+/* 匯入／匯出題目集兩欄等高：檔案區撐滿，按鈕固定在底部 */
+.file-action-group,
+.file-action-group .gr-group,
+.file-action-group .styler {
+    flex: 1 1 auto;
+    display: flex !important;
+    flex-direction: column;
+}
+/* 兩欄固定平分寬度；否則上傳後長檔名會撐寬內容，讓 Row 換行成上下兩列 */
+.file-action-row > .file-action-group {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+}
+/* File 的 height 在有檔案後只是清單的 max-height；固定檔案區高度讓上傳前後一致 */
+.file-action-group .no-dashed-file {
+    flex: 0 0 50px;
+    height: 50px;
+    min-height: 50px;
+    min-width: 0;
+    overflow: hidden;
+}
+/* Gradio 的上傳提示與空狀態內建 240px 最小高度，會把整列撐高 */
+.file-action-group .no-dashed-file .wrap {
+    min-height: 0 !important;
+    padding-top: 0 !important;
+}
+/* 上傳提示壓成一行：隱藏圖示與「- or -」，文字置中 */
+.file-action-group .no-dashed-file .upload-container .wrap {
+    display: block !important;
+    text-align: center;
+    line-height: 50px;
+    white-space: nowrap;
+}
+.file-action-group .no-dashed-file .upload-container .icon-wrap,
+.file-action-group .no-dashed-file .upload-container .or {
+    display: none !important;
+}
+/* 標籤下方剩約 24px，空狀態圖示與檔案清單都壓到一列 */
+.file-action-group .no-dashed-file .empty {
+    min-height: 0 !important;
+    height: 24px !important;
+}
+.file-action-group .no-dashed-file .file-preview,
+.file-action-group .no-dashed-file .file-preview tr {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+.file-action-group .no-dashed-file .file-preview td {
+    margin: 0 !important;
+    padding: 2px 10px !important;
+}
+.file-action-group .no-dashed-file table {
+    table-layout: fixed;
+    width: 100%;
+}
+.file-action-group .no-dashed-file td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* Gradio 在 File 沒有檔案時以行內樣式畫虛線框，這裡強制移除 */
+.no-dashed-file {
+    border-style: none !important;
+}
 """
 
 
@@ -787,6 +851,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ])
         return rows
 
+    def autoqa_rows_update(rows):
+        return gr.update(value=rows, visible=bool(rows))
+
     def format_autoqa_sources(evidence):
         return "；".join(
             f"{item.document_name or item.document_id}: {', '.join(str(page) for page in item.pages)}"
@@ -918,16 +985,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def automatic_qa_saved_view(project_id):
         if not project_id:
-            return "請先於「專案與連線設定」開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
+            return "請先於「專案與連線設定」開啟專案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
         try:
             saved_sets = question_sets.list(project_id)
             if not saved_sets:
-                return "此專案尚無已儲存的自動問答題目集", [], "", "", [], "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
+                return "此專案尚無已儲存的自動問答題目集", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
             question_set = saved_sets[0]
             judge = automatic_evaluation.last_result(project_id, question_set.question_set_id)
             retrieval = retrieval_evaluation.last_result(project_id, question_set.question_set_id)
         except ProjectError as exc:
-            return f"❌ 載入自動問答資料失敗：{exc}", [], "", "", [], "載入失敗。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
+            return f"❌ 載入自動問答資料失敗：{exc}", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "載入失敗。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
 
         judge_by_id = {item.question_id: item for item in judge.items} if judge else {}
         result_rows = automatic_qa_result_rows(question_set, judge)
@@ -962,10 +1029,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             summary += f"｜{retrieval.retrieval_metrics_status}"
         return (
             f"✅ 已自動載入最近題目集「{question_set.name}」及已儲存的測試資料",
-            autoqa_question_rows(question_set),
+            autoqa_rows_update(autoqa_question_rows(question_set)),
             question_set.question_set_id,
             summary,
-            result_rows,
+            autoqa_rows_update(result_rows),
             "✅ 已載入完成的回答，可以開始評測。" if answers_ready else "尚未生成完成所有回答。",
             gr.update(interactive=answers_ready),
             question_set.response_type,
@@ -1536,7 +1603,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method, progress=gr.Progress()):
         if not project_id:
-            return "❌ 請先開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+            return "❌ 請先開啟專案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False)
         try:
             question_set = automatic_qa.generate_question_set(
                 project_id,
@@ -1547,29 +1614,29 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 progress_callback=lambda fraction, description: progress(fraction, desc=description),
             )
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+            return "❌ " + str(exc), autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False)
         return (
             f"✅ 已生成 {len(question_set.questions)} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。\n\n{question_set.description}",
-            autoqa_question_rows(question_set),
+            autoqa_rows_update(autoqa_question_rows(question_set)),
             question_set.question_set_id,
             "",
-            [],
+            autoqa_rows_update([]),
             "尚未生成回答。完成前不能評測。",
             gr.update(interactive=False),
         )
 
     def generate_automatic_answers(project_id, question_set_id, rows, answer_model, method, concurrency, response_type):
         if not project_id or not question_set_id:
-            yield "❌ 請先生成或匯入題目集", "", [], gr.update(interactive=False)
+            yield "❌ 請先生成或匯入題目集", "", autoqa_rows_update([]), gr.update(interactive=False)
             return
-        yield "⏳ 正在檢索並生成回答；完成前無法進行評測…", "", [], gr.update(interactive=False)
+        yield "⏳ 正在檢索並生成回答；完成前無法進行評測…", "", autoqa_rows_update([]), gr.update(interactive=False)
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
             report = automatic_qa.answer_existing(
                 project_id, question_set_id, answer_model, method, int(concurrency), response_type
             )
         except (ProjectError, ValueError) as exc:
-            yield "❌ " + str(exc), "", [], gr.update(interactive=False)
+            yield "❌ " + str(exc), "", autoqa_rows_update([]), gr.update(interactive=False)
             return
         ready = bool(report.question_set.questions) and all(
             item.status == "COMPLETED" and item.answer.strip()
@@ -1586,13 +1653,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         yield (
             status,
             f"回答模型：{answer_model}｜檢索模式：{method}｜回答格式：{response_type}｜尚未評測。",
-            [],
+            autoqa_rows_update([]),
             gr.update(interactive=ready),
         )
 
     def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency, response_type):
         if not project_id or not question_set_id:
-            return "❌ 請先生成或匯入題目集", "", []
+            return "❌ 請先生成或匯入題目集", "", autoqa_rows_update([])
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
             report = automatic_qa.evaluate_existing(
@@ -1601,13 +1668,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 response_type=response_type,
             )
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), "", []
+            return "❌ " + str(exc), "", autoqa_rows_update([])
         status = "✅ 評測完成；可將評測等級編輯為 0（錯誤）、1（部分對）或 2（全對），全對率會自動更新。"
-        return status, automatic_qa_summary(report), automatic_qa_rows(report)
+        return status, automatic_qa_summary(report), autoqa_rows_update(automatic_qa_rows(report))
 
     def autosave_automatic_qa_judgements(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
-            return "請先完成評測", []
+            return "請先完成評測", autoqa_rows_update([])
         try:
             question_set = question_sets.get(project_id, question_set_id)
             if rows is None:
@@ -1628,7 +1695,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 project_id, question_set_id, decisions
             )
         except (ProjectError, TypeError, ValueError) as exc:
-            return f"❌ 評測結果儲存失敗：{exc}", []
+            return f"❌ 評測結果儲存失敗：{exc}", autoqa_rows_update([])
         total = len(question_set.questions)
         correct = result.correct_count
         summary = (
@@ -1652,24 +1719,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     if retrieval.document_hit_rate is not None else "｜Document Hit Rate 不可計算"
                 )
             summary += f"｜{retrieval.retrieval_metrics_status}"
-        return summary, automatic_qa_result_rows(question_set, result)
+        return summary, autoqa_rows_update(automatic_qa_result_rows(question_set, result))
 
     def import_automatic_question_set(project_id, uploaded):
         if not project_id or not uploaded:
-            return "❌ 請先開啟專案並選擇 JSON 題目集", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+            return "❌ 請先開啟專案並選擇 JSON 題目集", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False)
         source = uploaded if isinstance(uploaded, (str, Path)) else getattr(uploaded, "name", None)
         if not source:
-            return "❌ 無法讀取上傳檔案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+            return "❌ 無法讀取上傳檔案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False)
         try:
             question_set = question_sets.import_file(project_id, source)
         except ProjectError as exc:
-            return "❌ " + str(exc), [], "", "", [], "匯入失敗。", gr.update(interactive=False)
+            return "❌ " + str(exc), autoqa_rows_update([]), "", "", autoqa_rows_update([]), "匯入失敗。", gr.update(interactive=False)
         return (
             "✅ 已匯入題目集「" + question_set.name + "」，可先編輯再測試。",
-            autoqa_question_rows(question_set),
+            autoqa_rows_update(autoqa_question_rows(question_set)),
             question_set.question_set_id,
             "",
-            [],
+            autoqa_rows_update([]),
             "尚未生成回答。",
             gr.update(interactive=False),
         )
@@ -2508,76 +2575,97 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("3 自動問答測試", interactive=False) as autoqa_tab:
             gr.Markdown(
-                "匯入或生成題目後，執行「檢索並生成回答」，全部完成後才能評測。"
+                "**流程：** ① 匯入或生成題目 → ② 檢索並生成回答 → ③ 評測回答。"
                 "回答會先保存但不顯示，評測完成後才顯示回答與判斷；系統會跨 PDF 去重。"
             )
-            with gr.Row():
-                autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
-                autoqa_import_button = gr.Button("匯入題目集")
-                autoqa_export_button = gr.Button("匯出目前題目集")
-                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
-            autoqa_result = gr.Markdown()
             autoqa_question_set_state = gr.State("")
-            with gr.Row():
-                autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
-                autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
-                autoqa_generation_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
+
+            with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        autoqa_import_file = gr.File(
+                            label="匯入題目集 JSON",
+                            file_types=[".json"],
+                            type="filepath",
+                            height=50,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        autoqa_import_button = gr.Button("匯入題目集")
+
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        autoqa_json_export = gr.File(
+                            label="題目集 JSON（匯出）",
+                            height=50,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        autoqa_export_button = gr.Button("匯出目前題目集")
+
+                gr.Markdown("**或自動生成題目**")
+                with gr.Row(equal_height=True):
+                    autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
+                    autoqa_generation_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
+                    )
+                    autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                autoqa_generate_button = gr.Button("生成題目", variant="primary")
+                autoqa_result = gr.Markdown()
+                autoqa_questions_table = gr.Dataframe(
+                    headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
+                    interactive=True,
+                    datatype=["str", "str", "str", "str", "str"],
+                    column_widths=["8%", "22%", "18%", "26%", "26%"],
+                    label="生成題目與來源（可直接編輯）",
+                    wrap=True,
+                    visible=False,
                 )
-            autoqa_generate_button = gr.Button("生成題目", variant="primary")
-            gr.Markdown("### 回答設定")
-            with gr.Row():
-                autoqa_answer_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
+
+            with gr.Accordion("② 檢索並生成回答", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row():
+                    autoqa_answer_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
+                    )
+                    autoqa_method = gr.Dropdown(
+                        choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+                        value="local", label="檢索模式",
+                    )
+                    autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
+                    autoqa_response_type = gr.Dropdown(
+                        choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                        value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+                        label="回答格式",
+                    )
+                autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
+                autoqa_answer_model.input(
+                    update_model_method_compatibility,
+                    inputs=[autoqa_answer_model, autoqa_method],
+                    outputs=[autoqa_answer_model, autoqa_method],
                 )
-                autoqa_method = gr.Dropdown(
-                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                    value="local", label="檢索模式",
+                autoqa_method.input(
+                    update_model_method_compatibility,
+                    inputs=[autoqa_answer_model, autoqa_method],
+                    outputs=[autoqa_answer_model, autoqa_method],
                 )
-                autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
-                autoqa_response_type = gr.Dropdown(
-                    choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
-                    value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
-                    label="回答格式",
+                autoqa_generation_status = gr.Markdown("尚未生成回答。完成前不能評測。")
+
+            with gr.Accordion("③ 評測回答", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row():
+                    autoqa_judge_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
+                    )
+                    autoqa_judge_concurrency = gr.Number(
+                        label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
+                    )
+                autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
+                autoqa_summary = gr.Markdown()
+                autoqa_table = gr.Dataframe(
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
+                    interactive=True,
+                    datatype=["str", "str", "str", "str", "str", "bool", "str"],
+                    column_widths=["7%", "11%", "16%", "23%", "20%", "8%", "15%"],
+                    label="評測結果（勾選表示正確；修改後評判理由清空並自動重算正確率）",
+                    wrap=True,
+                    visible=False,
                 )
-            autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
-            autoqa_answer_model.input(
-                update_model_method_compatibility,
-                inputs=[autoqa_answer_model, autoqa_method],
-                outputs=[autoqa_answer_model, autoqa_method],
-            )
-            autoqa_method.input(
-                update_model_method_compatibility,
-                inputs=[autoqa_answer_model, autoqa_method],
-                outputs=[autoqa_answer_model, autoqa_method],
-            )
-            autoqa_generation_status = gr.Markdown("尚未生成回答。完成前不能評測。")
-            gr.Markdown("### 評測設定")
-            with gr.Row():
-                autoqa_judge_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
-                )
-                autoqa_judge_concurrency = gr.Number(
-                    label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
-                )
-            autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
-            autoqa_questions_table = gr.Dataframe(
-                headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
-                interactive=True,
-                datatype=["str", "str", "str", "str", "str"],
-                column_widths=["8%", "22%", "18%", "26%", "26%"],
-                label="生成題目與來源（可直接編輯）",
-                wrap=True,
-            )
-            autoqa_summary = gr.Markdown()
-            autoqa_table = gr.Dataframe(
-                headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
-                interactive=True,
-                datatype=["str", "str", "str", "str", "str", "bool", "str"],
-                column_widths=["7%", "11%", "16%", "23%", "20%", "8%", "15%"],
-                label="評測結果（勾選表示正確；修改後評判理由清空並自動重算正確率）",
-                wrap=True,
-            )
 
         with gr.Tab("4 檢索實驗", interactive=False) as experiment_tab:
             gr.Markdown(
@@ -2787,7 +2875,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             dashboard_view = gr.HTML(dashboard_iframe(None, None))
             dashboard_refresh_button = gr.Button("重新載入儀表板", elem_classes=["rounded-button"])
             gr.Markdown(
-                "---\n"
                 "### 地圖說明\n"
                 "**地圖上對應的元素**\n"
                 "* **社群**：白色分區，左上角有標籤，點標籤就能選取。分區在畫面上太小時，標籤會自動隱藏，避免拉遠時疊在一起。\n"
