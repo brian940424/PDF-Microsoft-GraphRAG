@@ -22,6 +22,7 @@ from .connections import (
     GPT6_LUNA_MODEL,
     ConnectionSettings,
 )
+from .dashboard3d import dashboard_iframe
 from .documents import DocumentInfo, DocumentService
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
@@ -306,6 +307,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             active_project_label(project_id),
             *(gr.Tab(interactive=unlocked) for _ in range(4)),
         )
+
+    def render_dashboard(project_id: str | None) -> str:
+        if not project_id:
+            return dashboard_iframe(None, None)
+        try:
+            return dashboard_iframe(store.get(project_id), store.path_for(project_id))
+        except ProjectError as exc:
+            return f"<p>❌ {html.escape(str(exc))}</p>"
 
     def open_project(project_id: str | None):
         project_id = selected_project_id(project_id)
@@ -2640,6 +2649,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 experiment_details_export_file = gr.File(label="逐題結果 JSON")
             experiment_export_status = gr.Markdown()
 
+        with gr.Tab("5 3D 儀表板"):
+            gr.Markdown(
+                "以策略遊戲地圖呈現目前專案的知識圖譜：六角形領地為社群，建築為實體（高度＝連結度、顏色＝類型），"
+                "弧線與光點為關係；面板顯示資源統計、小地圖、單位情報與問答紀錄。需要可連線至 cdn.jsdelivr.net 載入 three.js。"
+            )
+            dashboard_refresh_button = gr.Button("重新載入儀表板", elem_classes=["rounded-button"])
+            dashboard_view = gr.HTML(dashboard_iframe(None, None))
+
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
                 "## 答案正確性自動評測\n"
@@ -3219,6 +3236,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
         )
         demo.load(workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs)
+        active_project_id.change(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
+        dashboard_refresh_button.click(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
     return demo
 
 
