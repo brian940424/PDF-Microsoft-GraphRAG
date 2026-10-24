@@ -1041,7 +1041,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def experiment_view(project_id: str | None, message: str = ""):
         if not project_id:
             return (
-                message or "請先在「專案與連線設定」開啟專案", [], [], [], [], [], 5,
+                message or "請先在「專案與連線設定」開啟專案", [], gr.update(value=[], visible=False),
+                gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), 5,
                 gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                 "尚未生成答案。", gr.update(interactive=False), "strict",
             )
@@ -1160,14 +1161,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             status = message or (
                 f"最近實驗狀態：{run.get('status', '尚未執行')}｜資料集：{run.get('question_set_name', '尚未匯入')}"
             )
+            # 摘要與逐題結果等評測完才顯示
+            evaluated = bool(results)
             return (
-                status, question_set_ids, question_rows, summaries, dataset_summaries,
-                results, state.get("max_concurrency", 5),
+                status, question_set_ids, gr.update(value=question_rows, visible=bool(question_rows)),
+                gr.update(value=summaries, visible=evaluated),
+                gr.update(value=dataset_summaries, visible=evaluated),
+                gr.update(value=results, visible=evaluated), state.get("max_concurrency", 5),
                 gr.update(choices=list(ALLOWED_CHAT_MODELS), value=state.get("judge_model", connections.get_chat_model())),
                 generation_status, gr.update(interactive=answers_ready), state.get("evaluation_mode", "strict"),
             )
         except ProjectError as exc:
-            return (f"❌ {exc}", [], [], [], [], [], 5,
+            return (f"❌ {exc}", [], gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), 5,
                     gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                     "載入實驗狀態失敗。", gr.update(interactive=False), "strict")
 
@@ -1184,22 +1189,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f'<span>已處理 {completed} / {total} 題</span><span>{percent}%｜{status}</span></div></div>'
         )
 
-    def experiment_progress_for_project(project_id: str | None) -> str:
+    def experiment_progress_update(completed: int, total: int, status: str, visible: bool = True):
+        """進度條只在開始生成答案後顯示。"""
+        return gr.update(value=experiment_progress_markup(completed, total, status), visible=visible)
+
+    def experiment_progress_for_project(project_id: str | None):
         if not project_id:
-            return experiment_progress_markup(0, 0, "請先開啟專案")
+            return experiment_progress_update(0, 0, "請先開啟專案", visible=False)
         try:
             state = retrieval_experiments.load(project_id)
             run = state.get("run")
             if not isinstance(run, dict):
-                question_set_ids = retrieval_experiments._normalize_question_set_ids(
-                    state.get("question_set_ids", state.get("question_set_id", ""))
-                )
-                question_count = sum(
-                    len(question_sets.get(project_id, item).questions) for item in question_set_ids
-                )
-                return experiment_progress_markup(
-                    0, len(state.get("groups", [])) * question_count, "尚未開始"
-                )
+                return experiment_progress_update(0, 0, "尚未開始", visible=False)
             status = {
                 "generating_answers": "答案生成中",
                 "answers_completed": "答案生成完成",
@@ -1210,9 +1211,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 "running": "執行中",
             }.get(str(run.get("status", "")), "準備中")
             total = len(run.get("groups", [])) * int(run.get("question_count", 0))
-            return experiment_progress_markup(len(run.get("results", [])), total, status)
+            return experiment_progress_update(len(run.get("results", [])), total, status)
         except (ProjectError, TypeError, ValueError):
-            return experiment_progress_markup(0, 0, "尚未開始")
+            return experiment_progress_update(0, 0, "尚未開始", visible=False)
 
     def resolve_experiment_question_set_id(project_id: str, question_set_id: str | list[str] | None) -> list[str]:
         """Prefer the project's persisted datasets over stale/empty browser State."""
@@ -1416,7 +1417,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
             view[9] = gr.update(interactive=False)
-            yield (*view, experiment_progress_markup(0, 0, "請先開啟專案"))
+            yield (*view, experiment_progress_update(0, 0, "請先開啟專案", visible=False))
             return
         try:
             question_set_id = resolve_experiment_question_set_id(project_id, question_set_id)
@@ -1429,7 +1430,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         pending[0] = "⏳ 正在依各實驗組策略檢索並生成答案…"
         pending[8] = "⏳ 答案生成中；完成前無法評測。"
         pending[9] = gr.update(interactive=False)
-        yield (*pending, experiment_progress_markup(0, 0, "準備開始"))
+        yield (*pending, experiment_progress_update(0, 0, "準備開始"))
         try:
             state = retrieval_experiments.load(project_id)
             groups = [ExperimentGroup(**item) for item in state["groups"]]
@@ -1439,7 +1440,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             question_count = sum(len(question_sets.get(project_id, item).questions) for item in question_set_id)
             total = len(groups) * question_count
             pending[0] = f"⏳ 正在依各實驗組策略檢索並生成答案：0/{total} 題"
-            yield (*pending, experiment_progress_markup(0, total, "答案生成中"))
+            yield (*pending, experiment_progress_update(0, total, "答案生成中"))
             progress_updates: queue.Queue = queue.Queue(maxsize=1)
 
             def publish_progress(run_update):
@@ -1477,7 +1478,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     progress_view[9] = gr.update(interactive=False)
                     yield (
                         *progress_view,
-                        experiment_progress_markup(completed, total, "答案生成中"),
+                        experiment_progress_update(completed, total, "答案生成中"),
                     )
                 run = future.result()
         except (ProjectError, TypeError, ValueError, OSError) as exc:
@@ -1497,7 +1498,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             "answers_partial": "部分完成",
         }.get(run.status, "完成")
         yield (*experiment_view(project_id, message),
-               experiment_progress_markup(len(run.results), total, progress_status))
+               experiment_progress_update(len(run.results), total, progress_status))
 
     def evaluate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
@@ -2669,30 +2670,43 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         with gr.Tab("4 檢索實驗", interactive=False) as experiment_tab:
             gr.Markdown(
-                "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
+                "**流程：** ① 匯入題目集 → ② 設定實驗組 → ③ 檢索並生成答案 → ④ 評測答案 → ⑤ 匯出結果。"
                 "以同一組實驗設定比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略；"
                 "執行與評測會涵蓋所有已匯入資料集，逐題結果會標示資料集。"
                 "來源排名只有在 GraphRAG 明確提供可靠排序時才計算；目前 API context 不保證依檢索相關度排序，因此會如實標示不可計算。"
             )
-            with gr.Row():
-                experiment_question_file = gr.File(
-                    label="選擇要取代目前資料集的 JSON 題目集", file_types=[".json"], type="filepath", file_count="multiple"
+            experiment_question_set_state = gr.State([])
+
+            with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
+                gr.Markdown(
+                    "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
+                    "題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；"
+                    "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。"
                 )
-                experiment_import_button = gr.Button("取代題目集")
-                experiment_question_set_state = gr.State([])
-            experiment_question_preview = gr.Dataframe(
-                headers=["資料集", "題號", "題目", "正確答案", "題目來源", "答案來源"],
-                interactive=False,
-                datatype=["str", "str", "str", "str", "str", "str"],
-                column_widths=["14%", "7%", "20%", "17%", "21%", "21%"],
-                label="目前匯入資料集與題目",
-                wrap=True,
-            )
-            gr.Markdown("題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。")
+                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        experiment_question_file = gr.File(
+                            label="選擇要取代目前資料集的 JSON 題目集",
+                            file_types=[".json"],
+                            type="filepath",
+                            file_count="multiple",
+                            height=50,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        experiment_import_button = gr.Button("取代題目集")
+                experiment_question_preview = gr.Dataframe(
+                    headers=["資料集", "題號", "題目", "正確答案", "題目來源", "答案來源"],
+                    interactive=False,
+                    datatype=["str", "str", "str", "str", "str", "str"],
+                    column_widths=["14%", "7%", "20%", "17%", "21%", "21%"],
+                    label="目前匯入資料集與題目",
+                    wrap=True,
+                    visible=False,
+                )
+
             experiment_group_revision = gr.State(0)
-            experiment_group_save_status = gr.Markdown()
-            with gr.Group():
-                gr.Markdown("### 實驗組清單")
+            with gr.Accordion("② 實驗組", open=True, elem_classes=["static-section", "bold-title"]):
+                experiment_group_save_status = gr.Markdown(elem_classes="collapse-when-empty")
                 @gr.render(inputs=[active_project_id, experiment_group_revision])
                 def render_experiment_group_cards(project_id: str | None, revision: int):
                     if not project_id:
@@ -2819,57 +2833,67 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             outputs=[experiment_group_save_status, experiment_group_revision],
                             key=f"experiment-group-remove-action-{group_id}",
                         )
-            experiment_add_group_button = gr.Button("新增實驗組")
-            with gr.Row():
-                experiment_judge_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
-                    label="全域評測模型（套用至所有實驗組）",
+                experiment_add_group_button = gr.Button("新增實驗組")
+
+            with gr.Accordion("③ 檢索並生成答案", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row():
+                    experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
+                with gr.Row():
+                    experiment_run_button = gr.Button("檢索並生成答案", variant="primary")
+                    experiment_stop_button = gr.Button("停止實驗", variant="stop")
+                experiment_generation_status = gr.Markdown("尚未生成答案。完成前不能評測。")
+                experiment_progress_bar = gr.HTML(
+                    value=experiment_progress_markup(0, 0, "尚未開始"),
+                    label="回答生成進度",
+                    visible=False,
                 )
-                experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
-                experiment_run_button = gr.Button("檢索並生成答案", variant="primary")
-                experiment_stop_button = gr.Button("停止實驗", variant="stop")
-            with gr.Row():
-                experiment_evaluation_mode = gr.Dropdown(
-                    choices=[("嚴格評分（目前規則）", "strict"), ("寬鬆評分（答案完整包含即正確）", "lenient")],
-                    value="strict",
-                    label="答案評分方式",
+
+            with gr.Accordion("④ 評測答案", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row():
+                    experiment_judge_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
+                        label="全域評測模型（套用至所有實驗組）",
+                    )
+                    experiment_evaluation_mode = gr.Dropdown(
+                        choices=[("嚴格評分（目前規則）", "strict"), ("寬鬆評分（答案完整包含即正確）", "lenient")],
+                        value="strict",
+                        label="答案評分方式",
+                        info="寬鬆模式會使用評測模型做語意比對：涵蓋正解核心資訊即可；接受同義改寫與合理補充，不因答案較詳細而扣錯。",
+                    )
+                experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
+                experiment_status = gr.Markdown()
+                experiment_summary_table = gr.Dataframe(
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態"],
+                    interactive=False,
+                    datatype=["str"] * 16,
+                    label="實驗組摘要",
+                    wrap=True,
+                    visible=False,
                 )
-                gr.Markdown("寬鬆模式會使用評測模型做語意比對：涵蓋正解核心資訊即可；接受同義改寫與合理補充，不因答案較詳細而扣錯。")
-            experiment_generation_status = gr.Markdown("尚未生成答案。完成前不能評測。")
-            experiment_progress_bar = gr.HTML(
-                value=experiment_progress_markup(0, 0, "尚未開始"),
-                label="回答生成進度",
-            )
-            experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
-            experiment_status = gr.Markdown()
-            experiment_summary_table = gr.Dataframe(
-                headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態"],
-                interactive=False,
-                datatype=["str"] * 16,
-                label="實驗組摘要",
-                wrap=True,
-            )
-            experiment_dataset_summary_table = gr.Dataframe(
-                headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態"],
-                interactive=False,
-                datatype=["str"] * 16,
-                label="實驗組 × 題目集摘要",
-                wrap=True,
-            )
-            experiment_result_table = gr.Dataframe(
-                headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由"],
-                interactive=True,
-                datatype=["str"] * 9,
-                column_widths=["8%", "11%", "6%", "10%", "13%", "19%", "17%", "6%", "10%"],
-                label="逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）",
-                wrap=True,
-            )
-            gr.Markdown("### 匯出實驗結果")
-            with gr.Row():
+                experiment_dataset_summary_table = gr.Dataframe(
+                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態"],
+                    interactive=False,
+                    datatype=["str"] * 16,
+                    label="實驗組 × 題目集摘要",
+                    wrap=True,
+                    visible=False,
+                )
+                experiment_result_table = gr.Dataframe(
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由"],
+                    interactive=True,
+                    datatype=["str"] * 9,
+                    column_widths=["8%", "11%", "6%", "10%", "13%", "19%", "17%", "6%", "10%"],
+                    label="逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）",
+                    wrap=True,
+                    visible=False,
+                )
+
+            with gr.Accordion("⑤ 匯出實驗結果", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row(equal_height=True):
+                    experiment_summary_export_file = gr.File(label="精簡摘要 JSON")
+                    experiment_details_export_file = gr.File(label="逐題結果 JSON")
                 experiment_export_button = gr.Button("匯出兩種實驗結果 JSON")
-                experiment_summary_export_file = gr.File(label="精簡摘要 JSON")
-                experiment_details_export_file = gr.File(label="逐題結果 JSON")
-            experiment_export_status = gr.Markdown()
+                experiment_export_status = gr.Markdown()
 
         with gr.Tab("5 3D 儀表板", interactive=False) as dashboard_tab:
             dashboard_view = gr.HTML(dashboard_iframe(None, None))
