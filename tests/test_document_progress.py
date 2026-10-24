@@ -37,7 +37,8 @@ class DocumentProgressTests(unittest.TestCase):
         outputs = list(self.preprocess_documents("L33-SM3E", None, ["A.pdf"]))
 
         self.assertTrue(all("<progress" in output[1] for output in outputs))
-        message, progress, rows, _, targets = outputs[-1]
+        message, progress, table, _, targets, notice = outputs[-1]
+        rows = table["value"]
         self.assertIn("✅ 前處理完成（1 份 PDF）", message)
         self.assertIn("100%", progress)
         status = {row[0]: dict(zip(DOCUMENT_COLUMNS, row)) for row in rows}
@@ -46,13 +47,19 @@ class DocumentProgressTests(unittest.TestCase):
         self.assertEqual(status["B.pdf"]["前處理"], "⏳ 未前處理")
         # Unfinished PDFs stay selected so they can be processed or indexed again.
         self.assertEqual(targets.value, ["A.pdf", "B.pdf"])
+        self.assertTrue(table["visible"])
+        self.assertFalse(notice["visible"])
 
     def test_remove_selected_documents_after_confirmation(self) -> None:
-        message, rows, _, targets, confirmation = self.remove_documents("L33-SM3E", ["A.pdf", "B.pdf"], True)
+        message, table, _, targets, notice, confirmation = self.remove_documents("L33-SM3E", ["A.pdf", "B.pdf"], True)
+        rows = table["value"]
 
         self.assertIn("✅ 已刪除 A.pdf、B.pdf", message)
         self.assertEqual(rows, [])
-        self.assertEqual(targets.choices, [])
+        self.assertEqual(targets.choices, [("+ 上傳 PDF...", "__upload_pdf__")])
+        # An empty project hides the table and shows the empty-list notice instead.
+        self.assertFalse(table["visible"])
+        self.assertTrue(notice["visible"])
         self.assertFalse(confirmation)
 
     def test_cancelled_confirmation_keeps_documents(self) -> None:

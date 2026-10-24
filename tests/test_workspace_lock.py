@@ -8,7 +8,7 @@ from automotive_graphrag.app import create_app
 from automotive_graphrag.connections import API_KEY_ENVIRONMENT_VARIABLE, ConnectionSettings
 from automotive_graphrag.projects import ProjectStore
 
-LOCKED_TABS = ("1 文件與建圖", "2 問答測試", "3 自動問答測試", "4 檢索實驗")
+LOCKED_TABS = ("1 文件與建圖", "2 問答測試", "3 自動問答測試", "4 檢索實驗", "5 3D 儀表板")
 
 
 class WorkspaceLockTests(unittest.TestCase):

@@ -90,6 +90,8 @@ class Dashboard3DTests(unittest.TestCase):
         page = render_dashboard_html(data)
         self.assertNotIn("LONELY </script>", page)
         self.assertNotIn("__DASHBOARD_DATA__", page)
+        self.assertNotIn("__THREE_VERSION__", page)
+        self.assertIn("three@0.160.0", page)
         embedded = page.split('id="data">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(embedded), data)
 
