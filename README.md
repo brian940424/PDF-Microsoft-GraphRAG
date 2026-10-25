@@ -57,7 +57,7 @@ Chat 模型預設為 `gpt-6-luna`，Embedding 模型預設為 `text-embedding-3-
 
 ```text
 PDF
-  → PyMuPDF 逐頁擷取文字
+  → PyMuPDF 逐頁擷取文字（含圖表或無文字層的頁面可改以 Vision 模型轉寫）
   → 排除指定比例的頁首／頁尾
   → processed/input.jsonl
   → Microsoft GraphRAG index
@@ -371,8 +371,8 @@ $env:GRADIO_SERVER_NAME="0.0.0.0"; $env:GRADIO_SERVER_PORT="7860"; .\.venv\Scrip
 ## 限制與注意事項
 
 - LLM 回答、生成題目與 Judge 評分都可能出錯；正式用途必須檢查 Evidence 並進行人工抽查。
-- 系統只能從文字型 PDF 擷取內容；掃描影像 PDF 尚未內建 OCR。
-- 表格、跨欄版面、圖片及複雜公式的文字順序可能不完整。
+- 停用 Vision 時只能擷取 PDF 文字層，掃描影像 PDF 無法取得內容；啟用 Vision 會依送出頁數額外計費，轉寫品質仍需以「逐頁檢查」抽查。
+- 表格、跨欄版面、圖片及複雜公式的文字順序可能不完整（啟用 Vision 可改善，但不保證正確）。
 - GraphRAG 建圖需要 API Token、記憶體、磁碟及時間，請先用少量文件驗證設定。
 - 不同專案的資料互相隔離，但共用 API 連線設定及模型設定。
 - 不要在建圖、查詢或評測執行期間刪除其專案，也不要讓多個管理程序同時修改同一專案。
