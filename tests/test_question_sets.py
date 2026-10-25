@@ -228,6 +228,30 @@ class QuestionSetServiceTests(unittest.TestCase):
             [("使用手冊.pdf", (43,)), ("網路手冊.pdf", (8, 9))],
         )
 
+    def test_imports_neo4j_demo_export_ignoring_document_id(self) -> None:
+        value = {
+            "schema_version": 1,
+            "questions": [{
+                "number": 1,
+                "question": "問題？",
+                "expected_answer": "答案",
+                "question_sources": [{"document_id": "neo4j-doc-1", "document_name": "手冊.pdf", "pages": [3]}],
+                "answer_sources": [{"document_id": "", "document_name": "手冊.pdf", "pages": [3, 4]}],
+            }],
+        }
+
+        imported = self.service.import_file("L33-SM3E", self.write_question_set(value))
+        question = imported.questions[0]
+
+        self.assertEqual(
+            [(item.document_id, item.document_name, item.pages) for item in question.question_source_evidence],
+            [("手冊.pdf", "手冊.pdf", (3,))],
+        )
+        self.assertEqual(
+            [(item.document_id, item.pages) for item in question.answer_source_evidence],
+            [("手冊.pdf", (3, 4))],
+        )
+
     def test_rejects_old_question_set_formats(self) -> None:
         value = {
             "schema_version": 1,
@@ -239,8 +263,10 @@ class QuestionSetServiceTests(unittest.TestCase):
                 "document": "手冊.pdf",
             }],
         }
-        with self.assertRaisesRegex(ProjectError, "不支援的題目集欄位"):
+        with self.assertRaisesRegex(ProjectError, "不支援的欄位 document, source_pages"):
             self.service.import_file("L33-SM3E", self.write_question_set(value))
+        with self.assertRaisesRegex(ProjectError, "不支援的題目集欄位"):
+            self.service.import_file("L33-SM3E", self.write_question_set({**value, "name": "x"}))
 
         legacy_value = {"questions": [{
             "question_id": "Q0001", "question": "問題？", "reference_answer": "答案",

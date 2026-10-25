@@ -425,7 +425,8 @@ class QuestionSetService:
         if not isinstance(value, dict):
             raise ProjectError("題目集根節點必須是 JSON object")
         errors: list[str] = []
-        unsupported_root_fields = set(value) - {"questions"}
+        # schema_version is added by Neo4j-DEMO's write_json; accepted and ignored.
+        unsupported_root_fields = set(value) - {"questions", "schema_version"}
         if unsupported_root_fields:
             errors.append("不支援的題目集欄位：" + ", ".join(sorted(unsupported_root_fields)))
         name = "匯入題目集"
@@ -508,7 +509,8 @@ class QuestionSetService:
             item_location = f"{location}[{index}]"
             if not isinstance(item, dict):
                 raise ProjectError(f"{item_location}：必須是 object")
-            unsupported = set(item) - {"document_name", "pages"}
+            # document_id is accepted for Neo4j-DEMO exports but ignored: its IDs are project-specific.
+            unsupported = set(item) - {"document_name", "pages", "document_id"}
             if unsupported:
                 raise ProjectError(f"{item_location}：不支援的欄位 " + ", ".join(sorted(unsupported)))
             document_name = item.get("document_name")
