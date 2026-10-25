@@ -41,6 +41,8 @@ from .retrieval_evaluation import RetrievalEvaluationService
 from .retrieval_evaluation import compute_source_metrics
 from .retrieval_experiments import (
     DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+    EVIDENCE_METHODS,
+    EXPERIMENT_AUTO_METHOD,
     EXPERIMENT_REASONING_EFFORT_OPTIONS,
     EXPERIMENT_RESPONSE_TYPE_OPTIONS,
     EXPERIMENT_STRATEGY_PARAMETER_SPECS,
@@ -268,6 +270,7 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
         "global": "Microsoft GraphRAG Global",
         "drift": "Microsoft GraphRAG DRIFT",
         "basic": "Microsoft GraphRAG Basic",
+        "auto": "自動（逐題選擇策略）",
     }
     raw_results = (run or {}).get("results", [])
     run_ids = list((run or {}).get("question_set_ids", []))
@@ -288,9 +291,11 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
             partial = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
             incorrect = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
             metric_samples = []
-            if method in {"local", "basic", "drift"}:
+            if method in EVIDENCE_METHODS or method == EXPERIMENT_AUTO_METHOD:
                 for item in selected:
                     if item.get("status") == "failed":
+                        continue
+                    if (item.get("routed_method") or item.get("method")) not in EVIDENCE_METHODS:
                         continue
                     question = next((q for q in question_set.questions if q.question_id == item.get("question_id")), None)
                     if question is None:
@@ -323,6 +328,16 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 metric_status,
             ])
     return rows
+
+
+def _experiment_strategy_cell(item, strategy_labels):
+    """Show the strategy GraphRAG actually ran, plus the router's reason for auto groups."""
+    routed = item.get("routed_method")
+    if not routed:
+        method = item.get("method", "")
+        return strategy_labels.get(method, method)
+    reason = item.get("routing_reason") or ""
+    return f"自動 → {strategy_labels.get(routed, routed)}" + (f"：{reason}" if reason else "")
 
 
 def _experiment_grade_label(value):
@@ -1139,6 +1154,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 "global": "Microsoft GraphRAG Global",
                 "drift": "Microsoft GraphRAG DRIFT",
                 "basic": "Microsoft GraphRAG Basic",
+                "auto": "自動（逐題選擇策略）",
             }
             summaries = [
                 [
@@ -1175,6 +1191,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("actual_answer"), item.get("correct_answer"),
                     _experiment_grade_label(item.get("evaluation_result")) if item.get("evaluation_result") not in (None, "待評測") else "",
                     item.get("evaluation_reason") or item.get("error") or "",
+                    _experiment_strategy_cell(item, strategy_labels),
                 ]
                 for item in ordered_raw_results
                 if item.get("evaluation_result") not in (None, "待評測")
@@ -3072,7 +3089,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     if not groups:
                         gr.Markdown("尚未新增實驗組。")
                         return
-                    strategy_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
+                    strategy_choices = [
+                        ("自動", EXPERIMENT_AUTO_METHOD),
+                        ("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic"),
+                    ]
                     for group in groups:
                         answer_model_value = group.get("answer_model", connections.get_chat_model())
                         method_value = group.get("method", "local")
@@ -3125,9 +3145,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                                     )
                                 else:
                                     reasoning_effort = None
-                            gr.Markdown("#### 此策略可調參數")
+                            if method_value == EXPERIMENT_AUTO_METHOD:
+                                gr.Markdown(
+                                    "自動：每題先由回答模型選擇 Local／Global／DRIFT／Basic（多一次 LLM 呼叫，"
+                                    "判斷失敗時改用 Local），再沿用本組該策略的參數。"
+                                    "要調整參數，請暫時切換到該策略修改後再切回「自動」。",
+                                    key=f"experiment-auto-note-{group_id}",
+                                )
+                            else:
+                                gr.Markdown("#### 此策略可調參數", key=f"experiment-params-title-{group_id}")
                             visible_specs = [
-                                item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS[method_value]
+                                item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS.get(method_value, ())
                                 if not (
                                     method_value == "global"
                                     and item[0].startswith("dynamic_search_")
@@ -3232,10 +3260,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     visible=False,
                 )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略"],
                     interactive=True,
-                    datatype=["str"] * 9,
-                    column_widths=["8%", "11%", "6%", "10%", "13%", "19%", "17%", "6%", "10%"],
+                    datatype=["str"] * 10,
+                    column_widths=["7%", "10%", "5%", "9%", "12%", "17%", "15%", "6%", "9%", "10%"],
                     label="逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）",
                     wrap=True,
                     visible=False,

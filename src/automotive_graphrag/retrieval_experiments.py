@@ -31,9 +31,13 @@ from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
+from .strategy_routing import StrategyRouter
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
+EXPERIMENT_AUTO_METHOD = "auto"
+EXPERIMENT_GROUP_METHODS = (*EXPERIMENT_METHODS, EXPERIMENT_AUTO_METHOD)
+EVIDENCE_METHODS = frozenset({"local", "basic", "drift"})
 DEFAULT_EXPERIMENT_RESPONSE_TYPE = "Single Paragraph"
 EXPERIMENT_RESPONSE_TYPE_OPTIONS = (
     ("單句", "Single Sentence"),
@@ -150,6 +154,13 @@ class ExperimentQuestionResult:
     dataset_id: str = ""
     dataset_name: str = ""
     answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    routed_method: str = ""
+    routing_reason: str = ""
+
+    @property
+    def effective_method(self) -> str:
+        """The strategy GraphRAG actually ran; differs from ``method`` only for auto groups."""
+        return self.routed_method or self.method
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,12 +216,14 @@ class RetrievalExperimentService:
         connections: ConnectionSettings,
         judging: AutomaticEvaluationService,
         query_function: QueryFunction | None = None,
+        router: StrategyRouter | None = None,
     ) -> None:
         self.projects = projects
         self.question_sets = question_sets
         self.connections = connections
         self.judging = judging
         self.query_function = query_function or self._graphrag_query
+        self.router = router or StrategyRouter()
         self._lock = threading.RLock()
         self._stop_events: dict[str, threading.Event] = {}
 
@@ -431,7 +444,7 @@ class RetrievalExperimentService:
                     group[field_name] = value
             if len(row) >= 4:
                 method = str(row[3] or "").strip()
-                if method in EXPERIMENT_METHODS:
+                if method in EXPERIMENT_GROUP_METHODS:
                     group["method"] = method
                 elif method:
                     raise ProjectError(f"{group.get('group_id')} 的 GraphRAG 策略不支援")
@@ -440,7 +453,7 @@ class RetrievalExperimentService:
         return current
 
     def set_group_method(self, project_id: str, group_id: str, method: str) -> dict[str, object]:
-        if method not in EXPERIMENT_METHODS:
+        if method not in EXPERIMENT_GROUP_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
         current = self.load(project_id)
         matched = False
@@ -977,6 +990,7 @@ class RetrievalExperimentService:
             "global": "Microsoft GraphRAG Global",
             "drift": "Microsoft GraphRAG DRIFT",
             "basic": "Microsoft GraphRAG Basic",
+            "auto": "自動（回答模型逐題選擇 Microsoft GraphRAG 策略）",
         }.get(method)
 
     @staticmethod
@@ -1017,9 +1031,20 @@ class RetrievalExperimentService:
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
         dataset_id: str = "", dataset_name: str = "",
     ) -> ExperimentQuestionResult:
+        routed_method = routing_reason = ""
+        method = group.method
         try:
+            if group.method == EXPERIMENT_AUTO_METHOD:
+                decision = self.router.route(
+                    question.question,
+                    group.answer_model,
+                    self.connections.get_api_base_url(),
+                    self.connections.get_api_key(project_id),
+                )
+                method = routed_method = decision.method
+                routing_reason = decision.reason
             query_arguments = (
-                project_id, question.question, group.method, group.answer_model, group.response_type,
+                project_id, question.question, method, group.answer_model, group.response_type,
                 group.answer_reasoning_effort,
             )
             parameters = inspect.signature(self.query_function).parameters.values()
@@ -1028,16 +1053,19 @@ class RetrievalExperimentService:
             ) or len(inspect.signature(self.query_function).parameters) >= 7
             if accepts_strategy_parameters:
                 answer, context = self.query_function(
-                    *query_arguments, group.strategy_parameters.get(group.method, {})
+                    *query_arguments, group.strategy_parameters.get(method, {})
                 )
             else:
                 answer, context = self.query_function(*query_arguments)
         except Exception as exc:
-            return self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name)
+            return replace(
+                self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name),
+                routed_method=routed_method, routing_reason=routing_reason,
+            )
         try:
             retrieved_evidence: tuple[Evidence, ...] = ()
             mapping_error = None
-            if group.method in {"local", "basic", "drift"}:
+            if method in EVIDENCE_METHODS:
                 try:
                     retrieved_evidence = self._resolved_evidence(project_id, context)
                     raw_sources = EvidenceService.source_records(context)
@@ -1058,7 +1086,7 @@ class RetrievalExperimentService:
             retrieval_status = (
                 f"不可計算：{mapping_error}" if mapping_error else
                 "已映射至原始文件／頁碼；不使用 context 順序作排名"
-                if group.method in {"local", "basic", "drift"} else UNSUPPORTED_RETRIEVAL_METRICS
+                if method in EVIDENCE_METHODS else UNSUPPORTED_RETRIEVAL_METRICS
             )
             return ExperimentQuestionResult(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
@@ -1069,9 +1097,14 @@ class RetrievalExperimentService:
                 retrieved_evidence=tuple(retrieved_evidence),
                 dataset_id=dataset_id,
                 dataset_name=dataset_name,
+                routed_method=routed_method,
+                routing_reason=routing_reason,
             )
         except Exception as exc:
-            return self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name)
+            return replace(
+                self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name),
+                routed_method=routed_method, routing_reason=routing_reason,
+            )
 
     def _evaluate_case(
         self,
@@ -1160,10 +1193,12 @@ class RetrievalExperimentService:
             incorrect = sum(self._parse_grade(item.evaluation_result) == 0 for item in judged)
             total = sum(len(question_set.questions) for question_set in question_sets)
             answered = sum(bool(item.actual_answer.strip()) for item in group_items)
-            if group.method in {"local", "basic", "drift"}:
+            if group.method in EVIDENCE_METHODS or group.method == EXPERIMENT_AUTO_METHOD:
+                # Auto groups only score questions that were routed to an evidence-mapping strategy.
                 metric_results = [
                     item for item in group_items
-                    if item.status != "failed" and not item.retrieval_metrics_status.startswith("不可計算：")
+                    if item.status != "failed" and item.effective_method in EVIDENCE_METHODS
+                    and not item.retrieval_metrics_status.startswith("不可計算：")
                 ]
                 metric_samples = []
                 for item in metric_results:
@@ -1178,6 +1213,8 @@ class RetrievalExperimentService:
                     "尚無成功完成來源解析的題目"
                     if not metric_results else "已計算：依文件 ID／頁碼比對 Gold Evidence；逐題 precision 平均（無標註頁碼者排除），不使用排名"
                 )
+                if metric_results and group.method == EXPERIMENT_AUTO_METHOD:
+                    metrics_status += "；自動選擇 Global 的題目不計入"
             else:
                 evidence_hit_rate = evidence_precision = document_hit_rate = None
                 no_evidence_count = 0
@@ -1189,7 +1226,11 @@ class RetrievalExperimentService:
                 (2 * correct + partial) / (2 * total) if total else None,
                 evidence_hit_rate, evidence_precision, document_hit_rate,
                 no_evidence_count, metrics_status, group.response_type, group.answer_reasoning_effort,
-                dict(group.strategy_parameters.get(group.method, {})),
+                (
+                    {method: dict(params) for method, params in group.strategy_parameters.items()}
+                    if group.method == EXPERIMENT_AUTO_METHOD
+                    else dict(group.strategy_parameters.get(group.method, {}))
+                ),
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
@@ -1337,7 +1378,7 @@ class RetrievalExperimentService:
                 raise ProjectError(f"{group.group_id} 的實驗組名稱不可空白")
             if group.answer_model not in ALLOWED_CHAT_MODELS:
                 raise ProjectError(f"{group.group_id} 的回答模型不支援")
-            if group.method not in EXPERIMENT_METHODS:
+            if group.method not in EXPERIMENT_GROUP_METHODS:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 策略不支援")
             if group.response_type not in EXPERIMENT_RESPONSE_TYPES:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 回答格式不支援")
