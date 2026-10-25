@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import io
 import json
 import math
 import os
@@ -14,6 +15,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import gradio as gr
+from PIL import Image
 
 from .automatic_evaluation import AutomaticEvaluationService
 from .automatic_qa import AutomaticQATestService
@@ -25,7 +27,7 @@ from .connections import (
     ConnectionSettings,
 )
 from .dashboard3d import dashboard_iframe
-from .documents import DocumentInfo, DocumentService
+from .documents import DocumentInfo, DocumentService, PageReview
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService, parse_indexing_progress
@@ -45,6 +47,7 @@ from .retrieval_experiments import (
     RetrievalExperimentService,
 )
 from .source_sampling import SourceSample, SourceSamplingService
+from .vision import ALLOWED_VISION_MODELS, DEFAULT_VISION_SCOPE, SCOPE_ALL, SCOPE_DIAGRAMS, SCOPE_FIGURES, SCOPE_TABLES, VisionSettings
 
 
 NEW_PROJECT_OPTION = "__new_project__"
@@ -54,6 +57,23 @@ UPLOAD_PDF_LABEL = "+ 上傳 PDF..."
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
+VISION_DISABLED = "__vision_disabled__"
+VISION_MODEL_CHOICES = [("停用（僅擷取 PDF 文字層）", VISION_DISABLED), *((model, model) for model in ALLOWED_VISION_MODELS)]
+REVIEW_FILTERS = ["全部", "未檢查", "已修改", "Vision", "文字層", "Vision 失敗", "空白／錯誤"]
+REVIEW_COLUMNS = ["頁碼", "解析方式", "已檢查", "已修改", "字元數"]
+PAGE_SOURCE_LABELS = {
+    "vision": "Vision",
+    "text": "文字層",
+    "fallback": "Vision 失敗→文字層",
+    "empty": "空白",
+    "error": "錯誤",
+}
+VISION_SCOPE_CHOICES = [
+    ("僅含圖表或表格的頁面（純文字頁用文字層，省 token）", SCOPE_FIGURES),
+    ("只讀表格（僅含表格的頁面）", SCOPE_TABLES),
+    ("只讀圖表（僅含圖片或向量圖的頁面）", SCOPE_DIAGRAMS),
+    ("全部頁面", SCOPE_ALL),
+]
 EVIDENCE_COLUMNS = ["Context 順序", "Evidence ID", "來源／文件", "頁碼", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "檢索證據", "Evidence Hit", "Evidence Precision", "Document Hit"]
@@ -2255,7 +2275,132 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f'<span>{html.escape(detail)}</span><span>{percent}%｜{html.escape(status)}</span></div></div>'
         )
 
-    def run_preprocess(project_id: str, option_rows, targets: list[str] | None):
+    def review_document_choices(project_id: str | None, current: str | None):
+        names = [item.filename for item in documents.list_documents_if_available(project_id) if item.preprocessed]
+        return gr.Dropdown(choices=names, value=current if current in names else (names[0] if names else None))
+
+    def filtered_reviews(project_id: str | None, filename: str | None, review_filter: str | None) -> list[PageReview]:
+        if not project_id or not filename:
+            return []
+        return [item for item in documents.page_reviews(project_id, filename) if review_matches(item, review_filter)]
+
+    def review_rows(reviews: list[PageReview]) -> list[list[object]]:
+        return [
+            [
+                item.page,
+                PAGE_SOURCE_LABELS[item.source],
+                "✅" if item.reviewed else "",
+                ("⚠️ 解析結果已變" if item.source_changed else "✏️") if item.edited else "",
+                len(item.text),
+            ]
+            for item in reviews
+        ]
+
+    def review_page_view(project_id: str | None, filename: str | None, page: object):
+        """Image, text and status line of one page."""
+        try:
+            page_number = int(page)
+            review = next(
+                (item for item in documents.page_reviews(project_id, filename) if item.page == page_number), None
+            ) if project_id and filename else None
+        except (TypeError, ValueError, ProjectError):
+            review = None
+        if review is None:
+            return None, "", ""
+        image = Image.open(io.BytesIO(documents.render_page_image(project_id, filename, review.page)))
+        flags = [f"**第 {review.page} 頁**", f"解析方式：{PAGE_SOURCE_LABELS[review.source]}"]
+        flags.append("✅ 已檢查" if review.reviewed else "⬜ 未檢查")
+        if review.edited:
+            flags.append("✏️ 已手動修改，重新前處理會保留")
+        if review.source_changed:
+            flags.append("⚠️ 修改後重新前處理過且解析結果已變，請確認修改是否仍正確")
+        if review.error:
+            flags.append(f"錯誤：{' '.join(review.error.split())[:200]}")
+        return image, review.text, "｜".join(flags)
+
+    def review_refresh(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        """Reload the page list, keeping the current page when it still matches the filter."""
+        try:
+            reviews = filtered_reviews(project_id, filename, review_filter)
+        except ProjectError as exc:
+            return [], None, None, "", f"❌ {exc}"
+        pages = [item.page for item in reviews]
+        try:
+            current = int(page)
+        except (TypeError, ValueError):
+            current = None
+        selected = current if current in pages else (pages[0] if pages else None)
+        return review_rows(reviews), selected, *review_page_view(project_id, filename, selected)
+
+    def review_select(project_id: str | None, filename: str | None, evt: gr.SelectData):
+        page = (evt.row_value or [None])[0]
+        return page, *review_page_view(project_id, filename, page)
+
+    def review_step(project_id: str | None, filename: str | None, review_filter: str | None, page: object, step: int):
+        try:
+            pages = [item.page for item in filtered_reviews(project_id, filename, review_filter)]
+        except ProjectError:
+            pages = []
+        if not pages:
+            return None, None, "", ""
+        try:
+            current = int(page)
+        except (TypeError, ValueError):
+            current = pages[0]
+        later = [number for number in pages if (number > current if step > 0 else number < current)]
+        target = (min(later) if step > 0 else max(later)) if later else current
+        return target, *review_page_view(project_id, filename, target)
+
+    def review_previous_page(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        return review_step(project_id, filename, review_filter, page, -1)
+
+    def review_next_page(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        return review_step(project_id, filename, review_filter, page, 1)
+
+    def review_save(project_id: str | None, filename: str | None, page: object, text: str | None, revert: bool = False):
+        if not project_id or not filename or page in (None, ""):
+            return "❌ 請先選擇 PDF 與頁面"
+        try:
+            if revert:
+                review = documents.revert_page_text(project_id, filename, int(page))
+                return f"✅ 第 {review.page} 頁已還原為解析結果；需重新建立 Graph 才會套用"
+            review = documents.save_page_text(project_id, filename, int(page), text or "")
+        except (ProjectError, ValueError) as exc:
+            return f"❌ {exc}"
+        edited = "，內容與解析結果不同，已標示為手動修改" if review.edited else ""
+        return f"✅ 第 {review.page} 頁已儲存並標示已檢查{edited}；需重新建立 Graph 才會套用"
+
+    def review_extract(
+        project_id: str | None, filename: str | None, page: object, use_vision: bool,
+        vision_model: str | None = None, vision_scope: str | None = None,
+    ):
+        """Extract the page again into the editor without saving it."""
+        if not project_id or not filename or page in (None, ""):
+            return gr.skip(), "❌ 請先選擇 PDF 與頁面"
+        try:
+            vision = vision_settings(project_id, vision_model, vision_scope) if use_vision else None
+            if use_vision and vision is None:
+                return gr.skip(), "❌ 請先在「前處理設定」選擇 Vision 模型"
+            text = documents.extract_page_text(project_id, filename, int(page), vision)
+        except Exception as exc:
+            return gr.skip(), f"❌ {exc}"
+        source = "Vision" if use_vision else "文字層"
+        return text, f"⏳ 已以{source}重新解析第 {int(page)} 頁，**尚未儲存**；確認後請按「儲存並標示已檢查」"
+
+    def vision_settings(project_id: str, model: str | None, scope: str | None) -> VisionSettings | None:
+        if not model or model == VISION_DISABLED:
+            return None
+        api_key = connections.get_api_key(project_id)
+        if not api_key:
+            raise ProjectError("使用 Vision 前請先在「專案與連線設定」設定 API Key")
+        return VisionSettings(
+            model=model,
+            scope=scope or DEFAULT_VISION_SCOPE,
+            api_base_url=connections.get_api_base_url(),
+            api_key=api_key,
+        )
+
+    def run_preprocess(project_id: str, option_rows, targets: list[str] | None, vision: VisionSettings | None = None):
         """Run preprocessing in a worker thread, yielding progress markup until it returns the report."""
         updates: queue.Queue[tuple[int, int, str]] = queue.Queue()
         result_holder: list[object] = []
@@ -2269,6 +2414,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         preprocess_options(project_id, option_rows),
                         filenames=targets or None,
                         progress_callback=lambda done, total, name: updates.put((done, total, name)),
+                        vision=vision,
                     )
                 )
             except Exception as exc:
@@ -2293,16 +2439,39 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return result_holder[0]
 
     def preprocess_message(report) -> str:
-        return (
+        message = (
             f"✅ 前處理完成（{report.documents} 份 PDF）：成功 {report.successful_pages} 頁、"
             f"無文字 {report.empty_pages} 頁、錯誤 {report.error_pages} 頁"
         )
+        if report.edited_pages:
+            message += f"；保留 {report.edited_pages} 頁手動修改（可在「逐頁檢查」篩選「已修改」）"
+        return f"{message}\n\n{vision_summary(report)}" if report.vision_model else message
 
-    def preprocess_documents(project_id: str | None, option_rows: list[list[object]] | None, targets: list[str] | None):
+    def vision_summary(report) -> str:
+        summary = f"Vision（{report.vision_model}）解析 {report.vision_pages} 頁"
+        if report.vision_abort_reason:
+            reason = " ".join(report.vision_abort_reason.split())[:160]
+            return f"⚠️ {summary}，已中止：{reason}；{report.vision_fallback_pages} 頁改用文字層"
+        if report.vision_fallback_pages:
+            return f"⚠️ {summary}；{report.vision_fallback_pages} 頁解析失敗，改用文字層（詳見 processed/report.json）"
+        return f"{summary}，其餘頁面使用文字層"
+
+    def preprocess_documents(
+        project_id: str | None,
+        option_rows: list[list[object]] | None,
+        targets: list[str] | None,
+        vision_model: str | None = None,
+        vision_scope: str | None = None,
+    ):
         if not project_id:
             yield "❌ 請先到「專案與連線設定」開啟專案", "", *document_view(None)
             return
-        steps = run_preprocess(project_id, option_rows, targets)
+        try:
+            vision = vision_settings(project_id, vision_model, vision_scope)
+        except ProjectError as exc:
+            yield f"❌ {exc}", "", *document_view(project_id)
+            return
+        steps = run_preprocess(project_id, option_rows, targets, vision)
         progress = ""
         try:
             while True:
@@ -2335,6 +2504,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         chat_model: str | None,
         targets: list[str] | None = None,
         option_rows: list[list[object]] | None = None,
+        vision_model: str | None = None,
+        vision_scope: str | None = None,
     ):
         if not project_id:
             yield "❌ 請先到「專案與連線設定」開啟專案", "", ""
@@ -2348,7 +2519,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         pending = [item.filename for item in items if item.filename in set(targets or []) and not item.preprocessed]
         progress = ""
         if pending:
-            steps = run_preprocess(project_id, option_rows, pending)
+            try:
+                vision = vision_settings(project_id, vision_model, vision_scope)
+            except ProjectError as exc:
+                yield f"❌ 前處理失敗：{exc}", "", progress
+                return
+            steps = run_preprocess(project_id, option_rows, pending, vision)
             try:
                 while True:
                     progress = next(steps)
@@ -2613,6 +2789,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             with gr.Accordion(
                 "前處理設定（所選 PDF）", open=False, visible=False, elem_classes="bold-title"
             ) as processing_options_section:
+                with gr.Row():
+                    vision_model = gr.Dropdown(
+                        choices=VISION_MODEL_CHOICES,
+                        value=GPT6_LUNA_MODEL,
+                        label="Vision 模型",
+                        info="以 Vision 模型轉寫頁面影像：表格轉 Markdown、圖片與圖解改寫成文字描述，失敗的頁面改用文字層。會依頁數呼叫 API。",
+                    )
+                    vision_scope = gr.Dropdown(
+                        choices=VISION_SCOPE_CHOICES,
+                        value=DEFAULT_VISION_SCOPE,
+                        label="Vision 解析範圍",
+                        info="沒有文字層的頁面（例如掃描頁）一律送 Vision。",
+                    )
                 processing_options_table = gr.Dataframe(
                     headers=PROCESSING_COLUMNS,
                     interactive=True,
@@ -2632,6 +2821,34 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     autoscroll=True,
                     elem_id="indexing-log",
                 )
+
+            with gr.Accordion("逐頁檢查", open=False, elem_classes="bold-title"):
+                with gr.Row():
+                    review_document = gr.Dropdown(label="PDF（已前處理）", choices=[], scale=2)
+                    review_filter = gr.Dropdown(REVIEW_FILTERS, value="全部", label="篩選頁面", scale=1)
+                review_table = gr.Dataframe(
+                    headers=REVIEW_COLUMNS,
+                    interactive=False,
+                    type="array",
+                    max_height=260,
+                    label="點選列切換頁面",
+                )
+                with gr.Row(equal_height=True):
+                    review_previous = gr.Button("◀ 上一頁")
+                    review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
+                    review_next = gr.Button("下一頁 ▶")
+                review_info = gr.Markdown(elem_classes="collapse-when-empty")
+                with gr.Row(equal_height=True):
+                    review_image = gr.Image(type="pil", label="PDF 原頁", interactive=False, height=760)
+                    review_text = gr.Textbox(
+                        label="解析結果（可直接修改，此為送去建圖的文字）", lines=30, max_lines=40, interactive=True
+                    )
+                with gr.Row():
+                    review_save_button = gr.Button("儲存並標示已檢查", variant="primary")
+                    review_vision_button = gr.Button("重跑 Vision（本頁）")
+                    review_text_layer_button = gr.Button("改用文字層")
+                    review_revert_button = gr.Button("還原為解析結果")
+                review_status = gr.Markdown(elem_classes="collapse-when-empty")
 
         with gr.Tab("2 問答測試", interactive=False) as query_tab:
             with gr.Row(equal_height=True):
@@ -3291,6 +3508,37 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             documents_tab_visibility,
             inputs=[document_project, target_documents],
             outputs=[document_table, document_empty_notice, processing_options_section],
+        ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document)
+        review_inputs = [document_project, review_document, review_filter, review_page]
+        review_outputs = [review_table, review_page, review_image, review_text, review_info]
+        review_page_outputs = [review_image, review_text, review_info]
+        review_document.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
+        review_filter.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
+        review_page.submit(review_page_view, inputs=[document_project, review_document, review_page], outputs=review_page_outputs)
+        review_table.select(review_select, inputs=[document_project, review_document], outputs=[review_page, *review_page_outputs])
+        review_previous.click(review_previous_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
+        review_next.click(review_next_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
+        review_save_button.click(
+            review_save, inputs=[document_project, review_document, review_page, review_text], outputs=review_status,
+        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
+            document_view, inputs=document_project, outputs=document_view_outputs
+        )
+        review_revert_button.click(
+            lambda project_id, filename, page: review_save(project_id, filename, page, None, revert=True),
+            inputs=[document_project, review_document, review_page],
+            outputs=review_status,
+        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
+            document_view, inputs=document_project, outputs=document_view_outputs
+        )
+        review_vision_button.click(
+            lambda project_id, filename, page, model, scope: review_extract(project_id, filename, page, True, model, scope),
+            inputs=[document_project, review_document, review_page, vision_model, vision_scope],
+            outputs=[review_text, review_status],
+        )
+        review_text_layer_button.click(
+            lambda project_id, filename, page: review_extract(project_id, filename, page, False),
+            inputs=[document_project, review_document, review_page],
+            outputs=[review_text, review_status],
         )
         target_documents.change(
             processing_options_view,
@@ -3313,12 +3561,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         preprocess_button.click(
             preprocess_documents,
-            inputs=[document_project, processing_options_table, target_documents],
+            inputs=[document_project, processing_options_table, target_documents, vision_model, vision_scope],
             outputs=[document_result, document_progress, *document_view_outputs],
+        ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document).then(
+            review_refresh, inputs=review_inputs, outputs=review_outputs
         )
         index_button.click(
             build_index,
-            inputs=[document_project, indexing_chat_model, target_documents, processing_options_table],
+            inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope],
             outputs=[document_result, indexing_log, document_progress],
         ).then(document_view, inputs=document_project, outputs=document_view_outputs)
         document_refresh_button.click(
@@ -3663,6 +3913,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         active_project_id.change(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
         dashboard_refresh_button.click(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
     return demo
+
+
+def review_matches(review: PageReview, review_filter: str | None) -> bool:
+    return {
+        "未檢查": not review.reviewed,
+        "已修改": review.edited,
+        "Vision": review.source == "vision",
+        "文字層": review.source == "text",
+        "Vision 失敗": review.source == "fallback",
+        "空白／錯誤": review.source in {"empty", "error"},
+    }.get(review_filter or "全部", True)
 
 
 def document_row(document: DocumentInfo) -> list[str | int | None]:

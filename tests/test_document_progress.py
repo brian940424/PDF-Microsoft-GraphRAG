@@ -1,6 +1,8 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pymupdf
 
@@ -49,6 +51,14 @@ class DocumentProgressTests(unittest.TestCase):
         self.assertEqual(targets.value, ["A.pdf", "B.pdf"])
         self.assertTrue(table["visible"])
         self.assertFalse(notice["visible"])
+
+    def test_vision_preprocess_requires_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {"GRAPHRAG_API_KEY": ""}):
+            outputs = list(self.preprocess_documents("L33-SM3E", None, ["A.pdf"], "gpt-6-luna", "figures"))
+
+        self.assertEqual(len(outputs), 1)
+        self.assertIn("使用 Vision 前請先", outputs[0][0])
+        self.assertFalse((self.root / "L33-SM3E" / "processed" / "input.jsonl").exists())
 
     def test_remove_selected_documents_after_confirmation(self) -> None:
         message, table, _, targets, notice, confirmation = self.remove_documents("L33-SM3E", ["A.pdf", "B.pdf"], True)
