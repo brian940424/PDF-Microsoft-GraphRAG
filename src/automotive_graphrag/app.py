@@ -853,6 +853,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 judged.judge_reason if judged else (
                     report.judge_error or question.error or "尚無評判結果"
                 ),
+                autoqa_strategy_cell(report.question_set, question),
             ])
         return rows
 
@@ -870,8 +871,48 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 evidence_docs, question.question, question.answer, question.reference_answer,
                 bool(judged and judged.is_correct),
                 judged.judge_reason if judged else "尚無評判結果",
+                autoqa_strategy_cell(question_set, question),
             ])
         return rows
+
+    def autoqa_strategy_cell(question_set, question):
+        if not question.routed_method:
+            return QUERY_METHOD_LABELS.get(question_set.method, question_set.method)
+        label = QUERY_METHOD_LABELS.get(question.routed_method, question.routed_method)
+        return f"自動 → {label}" + (f"：{question.routing_reason}" if question.routing_reason else "")
+
+    def autoqa_method_summary(question_set):
+        """Name the saved strategy; for auto, also count which strategy each question was routed to."""
+        if question_set.method != "auto":
+            return QUERY_METHOD_LABELS.get(question_set.method, question_set.method)
+        counts = {}
+        for item in question_set.questions:
+            if item.routed_method:
+                counts[item.routed_method] = counts.get(item.routed_method, 0) + 1
+        detail = "、".join(
+            f"{QUERY_METHOD_LABELS.get(method, method)} {count} 題" for method, count in counts.items()
+        )
+        return "自動" + (f"（{detail}）" if detail else "")
+
+    def autoqa_question_set_choices(project_id, selected_id):
+        if not project_id:
+            return gr.update(choices=[], value=None)
+        try:
+            saved_sets = question_sets.list(project_id)
+        except ProjectError:
+            return gr.update(choices=[], value=None)
+        choices = []
+        for item in saved_sets:
+            try:
+                created = datetime.fromisoformat(item.imported_at).astimezone().strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                created = item.imported_at
+            choices.append((
+                f"{item.name}｜{len(item.questions)} 題｜{created}｜{item.question_set_id[:8]}",
+                item.question_set_id,
+            ))
+        ids = {value for _label, value in choices}
+        return gr.update(choices=choices, value=selected_id if selected_id in ids else None)
 
     def autoqa_question_rows(question_set):
         rows = []
@@ -989,6 +1030,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question_source_evidence=question_sources,
                 answer_source_evidence=answer_sources,
                 source_documents=source_documents,
+                routed_method=old.routed_method,
+                routing_reason=old.routing_reason,
             ))
         return question_sets.update_questions(project_id, question_set_id, updated)
 
@@ -1017,16 +1060,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             lines.append("**評判提醒：** " + report.judge_error)
         if report.generation_errors:
             lines.append("**部分 PDF 生題未完成：** " + "；".join(report.generation_errors))
+        lines.insert(2, "**檢索模式：** " + autoqa_method_summary(report.question_set))
         return "\n\n".join(lines)
 
-    def automatic_qa_saved_view(project_id):
+    def automatic_qa_saved_view(project_id, question_set_id=None):
         if not project_id:
             return "請先於「專案與連線設定」開啟專案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
         try:
             saved_sets = question_sets.list(project_id)
             if not saved_sets:
                 return "此專案尚無已儲存的自動問答題目集", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
-            question_set = saved_sets[0]
+            question_set = next(
+                (item for item in saved_sets if item.question_set_id == question_set_id), saved_sets[0]
+            )
             judge = automatic_evaluation.last_result(project_id, question_set.question_set_id)
             retrieval = retrieval_evaluation.last_result(project_id, question_set.question_set_id)
         except ProjectError as exc:
@@ -1043,12 +1089,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         correct = sum(item.is_correct for item in judge_by_id.values())
         if judge:
             summary = (
-                f"**最近題目集：** {question_set.name}｜**答對：** {correct}/{total} "
+                f"**題目集：** {question_set.name}｜**答對：** {correct}/{total} "
                 f"（{correct / total:.1%}）｜評判 {len(judge_by_id)}/{total} 題\n\n"
-                f"**檢索模式：** {question_set.method}｜**評判模型：** {judge.model}"
+                f"**檢索模式：** {autoqa_method_summary(question_set)}｜**評判模型：** {judge.model}"
             )
         else:
-            summary = f"**最近題目集：** {question_set.name}｜尚無已儲存的自動問答評判結果。"
+            summary = f"**題目集：** {question_set.name}｜尚無已儲存的自動問答評判結果。"
         if retrieval:
             summary += (
                 f"\n\n**Retrieval：** Evidence Hit Rate {retrieval.evidence_hit_rate:.1%}"
@@ -1064,7 +1110,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
             summary += f"｜{retrieval.retrieval_metrics_status}"
         return (
-            f"✅ 已自動載入最近題目集「{question_set.name}」及已儲存的測試資料",
+            (
+                f"✅ 已載入題目集「{question_set.name}」及已儲存的測試資料"
+                if question_set.question_set_id == question_set_id
+                else f"✅ 已自動載入最近題目集「{question_set.name}」及已儲存的測試資料"
+            ),
             autoqa_rows_update(autoqa_question_rows(question_set)),
             question_set.question_set_id,
             summary,
@@ -1467,15 +1517,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return f"✅ {group_id} Luna 推理深度已儲存", refresh_experiment_groups(revision)
 
     def update_model_method_compatibility(answer_model: str | None, method: str | None):
-        """Keep all supported models and query strategies selectable together."""
+        """Keep all supported models and query strategies, including auto, selectable together."""
         answer_model = answer_model or connections.get_chat_model()
         method = method or "local"
         return (
             gr.update(choices=list(ALLOWED_CHAT_MODELS), value=answer_model),
-            gr.update(
-                choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                value=method,
-            ),
+            gr.update(choices=QUERY_METHOD_CHOICES, value=method),
         )
 
     def update_query_method_compatibility(answer_model: str | None, method: str | None):
@@ -2947,6 +2994,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             autoqa_question_set_state = gr.State("")
 
             with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
+                autoqa_question_set_selector = gr.Dropdown(
+                    label="選擇已存在的題目集",
+                    info="列出此專案所有已儲存的題目集（含「4 檢索實驗」匯入的題目集），選取後載入題目與已儲存的回答、評測",
+                    choices=[],
+                    interactive=True,
+                )
                 with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
                     with gr.Group(elem_classes=["file-action-group"]):
                         autoqa_import_file = gr.File(
@@ -2993,8 +3046,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
                     )
                     autoqa_method = gr.Dropdown(
-                        choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
+                        choices=QUERY_METHOD_CHOICES,
                         value="local", label="檢索模式",
+                        info="自動：每題由回答模型選擇策略（多一次 LLM 呼叫）",
                     )
                     autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
                     autoqa_response_type = gr.Dropdown(
@@ -3028,10 +3082,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_progress = gr.HTML(label="回答評測進度", visible=False)
                 autoqa_summary = gr.Markdown()
                 autoqa_table = gr.Dataframe(
-                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由", "實際檢索策略"],
                     interactive=True,
-                    datatype=["str", "str", "str", "str", "str", "bool", "str"],
-                    column_widths=["7%", "11%", "16%", "23%", "20%", "8%", "15%"],
+                    datatype=["str", "str", "str", "str", "str", "bool", "str", "str"],
+                    column_widths=["6%", "10%", "15%", "21%", "18%", "7%", "13%", "10%"],
                     label="評測結果（勾選表示正確；修改後評判理由清空並自動重算正確率）",
                     wrap=True,
                     visible=False,
@@ -3464,6 +3518,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
         ).then(
+            autoqa_question_set_choices,
+            inputs=[active_project_id, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
+        ).then(
             lambda: (hidden_progress,) * 3,
             outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
         ).then(
@@ -3538,6 +3596,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
+        ).then(
+            autoqa_question_set_choices,
+            inputs=[active_project_id, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
         ).then(
             lambda: (hidden_progress,) * 3,
             outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
@@ -3732,6 +3794,26 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[automatic_project, autoqa_question_set_state],
             outputs=autoqa_current_question_set,
             show_progress="hidden",
+        ).then(
+            autoqa_question_set_choices,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
+            show_progress="hidden",
+        )
+        autoqa_tab.select(
+            autoqa_question_set_choices,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
+            show_progress="hidden",
+        )
+        autoqa_question_set_selector.input(
+            automatic_qa_saved_view,
+            inputs=[automatic_project, autoqa_question_set_selector],
+            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
+                     autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
+        ).then(
+            lambda: (hidden_progress,) * 3,
+            outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
         )
         autoqa_questions_table.change(
             autosave_automatic_questions,

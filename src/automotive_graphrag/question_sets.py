@@ -46,6 +46,8 @@ class BatchQuestion:
     question_source_evidence: tuple[GoldEvidence, ...] = ()
     answer_source_evidence: tuple[GoldEvidence, ...] = ()
     source_documents: tuple[str, ...] = ()
+    routed_method: str = ""
+    routing_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +188,9 @@ class QuestionSetService:
                     question_source_evidence=item.question_source_evidence,
                     answer_source_evidence=item.answer_source_evidence,
                     source_documents=item.source_documents,
+                    # Auto queries report the strategy the router picked in ``method``.
+                    routed_method=result.method if result.requested_method == "auto" else "",
+                    routing_reason=(result.routing_reason or "") if result.requested_method == "auto" else "",
                 )
             )
         updated = self._replace(question_set, questions, method, response_type=response_type)

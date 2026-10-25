@@ -57,7 +57,7 @@ class StrategyRouterTests(unittest.TestCase):
 
 
 class QueryTabAutoStrategyTests(unittest.TestCase):
-    def test_query_tab_defaults_to_auto_and_other_tabs_do_not_offer_it(self) -> None:
+    def test_query_tab_defaults_to_auto_and_automatic_qa_also_offers_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             app = create_app(Path(directory) / "projects")
 
@@ -74,7 +74,8 @@ class QueryTabAutoStrategyTests(unittest.TestCase):
         _model, method_update = handlers["update_query_method_compatibility"]("gpt-4o-mini", "auto")
         self.assertEqual(method_update["value"], "auto")
         _model, other_update = handlers["update_model_method_compatibility"]("gpt-4o-mini", "local")
-        self.assertNotIn("auto", [value for _label, value in other_update["choices"]])
+        self.assertEqual(other_update["value"], "local")
+        self.assertIn("auto", [value for _label, value in other_update["choices"]])
 
 
 if __name__ == "__main__":

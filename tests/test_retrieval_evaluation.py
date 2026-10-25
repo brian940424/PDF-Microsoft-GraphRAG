@@ -195,6 +195,32 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(result.document_hit_rate, 1.0)
         self.assertIn("不使用檢索排名", result.retrieval_metrics_status)
 
+    def test_auto_answers_keep_routed_strategy_and_metrics_skip_global_questions(self) -> None:
+        current = self.question_sets.get("L33-SM3E", self.question_set.question_set_id)
+        routed = {"Q0001": "local", "Q0002": "global", "Q0003": "basic"}
+        results = {
+            item.question_id: replace(
+                EvaluationQueryRunner().ask("L33-SM3E", item.question, routed[item.question_id]),
+                requested_method="auto", routing_reason=f"選 {routed[item.question_id]}",
+            )
+            for item in current.questions
+        }
+        updated = self.question_sets.update_answers(
+            "L33-SM3E", self.question_set.question_set_id, results, "auto"
+        )
+
+        self.assertEqual(updated.method, "auto")
+        self.assertEqual([item.routed_method for item in updated.questions], ["local", "global", "basic"])
+        self.assertEqual(updated.questions[0].routing_reason, "選 local")
+        reloaded = self.question_sets.get("L33-SM3E", self.question_set.question_set_id)
+        self.assertEqual(reloaded.questions[2].routed_method, "basic")
+
+        result = self.service.evaluate("L33-SM3E", self.question_set.question_set_id, method="auto")
+
+        self.assertAlmostEqual(result.evidence_hit_rate, 0.5)
+        self.assertEqual([item.evidence_hit for item in result.items], [True, None, False])
+        self.assertIn("2/3", result.retrieval_metrics_status)
+
     def test_global_metrics_remain_unavailable_for_unmapped_community_reports(self) -> None:
         result = self.service.evaluate(
             "L33-SM3E", self.question_set.question_set_id, method="global", rerun_queries=True
