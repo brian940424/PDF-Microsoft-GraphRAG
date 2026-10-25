@@ -89,23 +89,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         source.write_text(
             json.dumps(
                 {
-                    "name": "自動評測集",
                     "questions": [
                         {
-                            "question_id": "Q001",
+                            "number": 1,
                             "question": "問題一",
-                            "reference_answer": "參考答案一",
-                            "gold_evidence": [
-                                {"document_id": "WW.pdf", "pages": [21], "chunk_ids": ["gold-1"]}
-                            ],
+                            "expected_answer": "參考答案一",
+                            "question_sources": [],
+                            "answer_sources": [{"document_name": "WW.pdf", "pages": [21]}],
                         },
                         {
-                            "question_id": "Q002",
+                            "number": 2,
                             "question": "問題二",
-                            "reference_answer": "參考答案二",
-                            "gold_evidence": [
-                                {"document_id": "WW.pdf", "pages": [22], "chunk_ids": ["gold-2"]}
-                            ],
+                            "expected_answer": "參考答案二",
+                            "question_sources": [],
+                            "answer_sources": [{"document_name": "WW.pdf", "pages": [22]}],
                         },
                     ],
                 },
@@ -128,12 +125,12 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         return {
             "items": [
                 {
-                    "question_id": "Q001",
+                    "question_id": "Q0001",
                     "result": "incorrect" if q1_score < 4 else "correct",
                     "reason": "第一題評語",
                 },
                 {
-                    "question_id": "Q002",
+                    "question_id": "Q0002",
                     "result": "correct",
                     "reason": "第二題評語",
                 },
@@ -162,7 +159,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
 
         ReviewService(self.store, self.question_sets).save(
-            "L33-SM3E", self.question_set_id, "Q001", "partially_correct", "人工抽查"
+            "L33-SM3E", self.question_set_id, "Q0001", "partially_correct", "人工抽查"
         )
         json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
         payload = json.loads(json_path.read_text(encoding="utf-8"))
@@ -178,7 +175,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
 
         result = service.evaluate_single_answer(
-            "L33-SM3E", "Q001", "問題一", "核心正確答案", "改寫後的回答與額外補充", "gpt-4o-mini",
+            "L33-SM3E", "Q0001", "問題一", "核心正確答案", "改寫後的回答與額外補充", "gpt-4o-mini",
             evaluation_mode="lenient",
         )
 
@@ -212,10 +209,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         rerun_prompt = next(
             prompt
             for _, _, _, prompt in judge.calls
-            if '"question_id": "Q001"' in prompt and "correct_answer" in prompt
+            if '"question_id": "Q0001"' in prompt and "correct_answer" in prompt
         )
-        self.assertIn("Q001", rerun_prompt)
-        self.assertNotIn("Q002", rerun_prompt)
+        self.assertIn("Q0001", rerun_prompt)
+        self.assertNotIn("Q0002", rerun_prompt)
         self.assertEqual(result.question_count, 2)
         self.assertTrue(result.items[0].is_correct)
         self.assertTrue(result.items[1].is_correct)
@@ -265,7 +262,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         service.evaluate("L33-SM3E", self.question_set_id)
 
         updated = service.update_manual_results(
-            "L33-SM3E", self.question_set_id, {"Q001": "正確", "Q002": "正確"}
+            "L33-SM3E", self.question_set_id, {"Q0001": "正確", "Q0002": "正確"}
         )
 
         self.assertEqual(updated.correct_count, 2)
@@ -314,7 +311,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             for component in app.blocks.values()
             if hasattr(component, "get_config")
         ])
-        ask_handler = next(fn for fn in app.fns.values() if fn.fn.__name__ == "ask_question")
+        ask_handler = next(fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "ask_question")
         self.assertEqual(len(ask_handler.inputs), 5)
         response_type_dropdowns = [
             component for component in app.blocks.values()

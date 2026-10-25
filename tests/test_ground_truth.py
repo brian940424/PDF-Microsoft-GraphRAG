@@ -23,8 +23,15 @@ class GroundTruthServiceTests(unittest.TestCase):
         source.write_text(
             json.dumps(
                 {
-                    "name": "Gold Evidence 測試",
-                    "questions": [{"question_id": "Q001", "question": "雨刷不會動"}],
+                    "questions": [
+                        {
+                            "number": 1,
+                            "question": "雨刷不會動",
+                            "expected_answer": "檢查雨刷保險絲與馬達",
+                            "question_sources": [],
+                            "answer_sources": [],
+                        }
+                    ],
                 },
                 ensure_ascii=False,
             ),
@@ -71,7 +78,7 @@ class GroundTruthServiceTests(unittest.TestCase):
         updated = self.service.save(
             "L33-SM3E",
             self.question_set.question_set_id,
-            "Q001",
+            "Q0001",
             [
                 {
                     "document_id": "WW.pdf",
@@ -92,35 +99,36 @@ class GroundTruthServiceTests(unittest.TestCase):
             self.service.save(
                 "L33-SM3E",
                 self.question_set.question_set_id,
-                "Q001",
+                "Q0001",
                 [{"document_id": "PG.pdf", "pages": [1], "chunk_ids": []}],
             )
         with self.assertRaisesRegex(ProjectError, "找不到頁碼.*99"):
             self.service.save(
                 "L33-SM3E",
                 self.question_set.question_set_id,
-                "Q001",
+                "Q0001",
                 [{"document_id": "WW.pdf", "pages": [99], "chunk_ids": []}],
             )
         with self.assertRaisesRegex(ProjectError, "找不到 Chunk"):
             self.service.save(
                 "L33-SM3E",
                 self.question_set.question_set_id,
-                "Q001",
+                "Q0001",
                 [{"document_id": "WW.pdf", "pages": [], "chunk_ids": ["missing"]}],
             )
 
-    def test_question_set_import_reports_invalid_gold_evidence_position(self) -> None:
+    def test_question_set_import_reports_invalid_answer_source_position(self) -> None:
         source = self.root / "invalid.json"
         source.write_text(
             json.dumps(
                 {
-                    "name": "Invalid",
                     "questions": [
                         {
-                            "question_id": "Q001",
+                            "number": 1,
                             "question": "問題",
-                            "gold_evidence": [{"document_id": "WW.pdf", "pages": [0], "chunk_ids": []}],
+                            "expected_answer": "答案",
+                            "question_sources": [],
+                            "answer_sources": [{"document_name": "WW.pdf", "pages": [0]}],
                         }
                     ],
                 }
@@ -128,7 +136,7 @@ class GroundTruthServiceTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(ProjectError, r"questions\[0\].gold_evidence\[0\].pages"):
+        with self.assertRaisesRegex(ProjectError, r"questions\[0\].answer_sources\[0\].pages"):
             self.question_sets.import_file("L33-SM3E", source)
 
 
