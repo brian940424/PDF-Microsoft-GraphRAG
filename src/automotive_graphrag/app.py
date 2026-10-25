@@ -12,6 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
@@ -1876,6 +1877,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.update(interactive=False),
         )
 
+    def current_question_set_markup(project_id, question_set_id):
+        if not project_id or not question_set_id:
+            return "**目前題目集：** 尚未載入；請先生成或匯入題目集"
+        try:
+            question_set = question_sets.get(project_id, question_set_id)
+        except ProjectError as exc:
+            return f"**目前題目集：** ❌ {exc}"
+        try:
+            created = datetime.fromisoformat(question_set.imported_at).astimezone().strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            created = question_set.imported_at
+        return (
+            f"**目前題目集：** {question_set.name}｜{len(question_set.questions)} 題｜"
+            f"建立於 {created}｜ID `{question_set.question_set_id[:8]}`"
+        )
+
     def export_automatic_question_set(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
             return "❌ 請先生成或匯入題目集", None
@@ -2919,15 +2936,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             label="匯入題目集 JSON",
                             file_types=[".json"],
                             type="filepath",
-                            height=50,
+                            height=70,
                             elem_classes=["no-dashed-file"],
                         )
                         autoqa_import_button = gr.Button("匯入題目集")
 
                     with gr.Group(elem_classes=["file-action-group"]):
                         autoqa_json_export = gr.File(
-                            label="題目集 JSON（匯出）",
-                            height=50,
+                            label="題目集 JSON（按匯出後顯示）",
+                            height=70,
                             elem_classes=["no-dashed-file"],
                         )
                         autoqa_export_button = gr.Button("匯出目前題目集")
@@ -2953,6 +2970,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
 
             with gr.Accordion("② 檢索並生成回答", open=True, elem_classes=["static-section", "bold-title"]):
+                autoqa_current_question_set = gr.Markdown(current_question_set_markup(None, ""))
                 with gr.Row():
                     autoqa_answer_model = gr.Dropdown(
                         choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
@@ -3680,6 +3698,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             lambda: (hidden_progress,) * 3,
             outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
+        )
+        autoqa_question_set_state.change(
+            current_question_set_markup,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=autoqa_current_question_set,
+            show_progress="hidden",
         )
         autoqa_questions_table.change(
             autosave_automatic_questions,
