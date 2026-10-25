@@ -114,6 +114,20 @@ class Dashboard3DTests(unittest.TestCase):
         srcdoc = frame.split('srcdoc="', 1)[1].split('" style=', 1)[0]
         self.assertEqual(html.unescape(srcdoc), page)
 
+    def test_render_loop_stops_when_hidden_or_paused_and_idle(self) -> None:
+        self.write_index()
+        page = render_dashboard_html(build_dashboard_data(self.project, self.project_path))
+
+        # 看不見時不排下一幀
+        self.assertIn("new IntersectionObserver(", page)
+        self.assertIn('document.addEventListener("visibilitychange", wake)', page)
+        self.assertIn("if (frameRequested || !onScreen || document.hidden) return;", page)
+        # 暫停且閒置時停止重畫；互動與鏡頭阻尼會喚醒
+        self.assertIn("if (!paused || goal || performance.now() < awakeUntil) scheduleFrame();", page)
+        self.assertIn("if (viewMoved) awakeUntil = performance.now() + IDLE_GRACE_MS;", page)
+        self.assertNotIn('controls.addEventListener("change", wake)', page)
+        self.assertNotIn("updateTag();\n  requestAnimationFrame(tick);", page)
+
 
 if __name__ == "__main__":
     unittest.main()

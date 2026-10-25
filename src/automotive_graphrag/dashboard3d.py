@@ -1295,8 +1295,29 @@ function tick() {
   for (const zone of zones) zone.label.visible = zone.w * camera.zoom > 150 || (selection?.kind === "region" && selection.r === zone.r);
   renderer.render(scene, camera); labelRenderer.render(scene, camera);
   updateTag();
+  // 鏡頭仍在移動（例如放開滑鼠後的阻尼滑動）就繼續畫；OrbitControls 的 change 事件實測每幀都會觸發，不能拿來判斷
+  const viewMoved = lastCameraPosition.distanceToSquared(camera.position) > 1e-6
+    || lastTarget.distanceToSquared(controls.target) > 1e-6 || Math.abs(lastZoom - camera.zoom) > 1e-6;
+  lastCameraPosition.copy(camera.position); lastTarget.copy(controls.target); lastZoom = camera.zoom;
+  if (viewMoved) awakeUntil = performance.now() + IDLE_GRACE_MS;
+  frameRequested = false;
+  // 動畫進行中或鏡頭仍在移動才排下一幀；暫停且閒置時停止重畫
+  if (!paused || goal || performance.now() < awakeUntil) scheduleFrame();
+}
+// 看不見（分頁隱藏、iframe 不在畫面上）時停止渲染，避免背景持續佔用 CPU/GPU
+const IDLE_GRACE_MS = 600;
+let onScreen = true, frameRequested = true, awakeUntil = 0, lastZoom = camera.zoom;
+const lastCameraPosition = camera.position.clone(), lastTarget = controls.target.clone();
+function scheduleFrame() {
+  if (frameRequested || !onScreen || document.hidden) return;
+  frameRequested = true;
   requestAnimationFrame(tick);
 }
+function wake() { awakeUntil = performance.now() + IDLE_GRACE_MS; scheduleFrame(); }
+for (const type of ["pointerdown", "pointermove", "wheel", "keydown"]) addEventListener(type, wake, { capture: true, passive: true });
+addEventListener("resize", wake);
+document.addEventListener("visibilitychange", wake);
+new IntersectionObserver(([entry]) => { onScreen = entry.isIntersecting; wake(); }).observe(renderer.domElement);
 tick();
 </script>
 <script>
