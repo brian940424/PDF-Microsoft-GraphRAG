@@ -14,7 +14,7 @@ class FakeQuestionRunner:
         self.failing_questions = failing_questions or set()
         self.questions: list[str] = []
 
-    def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
+    def ask(self, project_id: str, question: str, method: str = "local", source: str | None = None) -> QueryResult:
         self.questions.append(question)
         if question in self.failing_questions:
             raise RuntimeError("temporary query error")

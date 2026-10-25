@@ -21,7 +21,7 @@ class ConcurrentQuery:
         self.response_types = []
         self.lock = threading.Lock()
 
-    def ask(self, project_id, question, method="local", chat_model=None, response_type="Single Paragraph"):
+    def ask(self, project_id, question, method="local", chat_model=None, response_type="Single Paragraph", source=None):
         with self.lock:
             self.active += 1
             self.maximum_active = max(self.maximum_active, self.active)

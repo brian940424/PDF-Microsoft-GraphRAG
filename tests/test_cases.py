@@ -22,7 +22,7 @@ class StoredQueries:
     def history(self, project_id: str) -> list[QueryResult]:
         return [item for item in self.results if item.project_id == project_id]
 
-    def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
+    def ask(self, project_id: str, question: str, method: str = "local", source: str | None = None) -> QueryResult:
         self.calls.append((project_id, question, method))
         return replace(self.results[0], project_id=project_id, question=question, method=method)
 

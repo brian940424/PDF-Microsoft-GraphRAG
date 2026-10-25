@@ -157,6 +157,15 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(loaded.query_id, result.query_id)
         self.assertIsNone(loaded.routing_reason)
 
+    def test_query_source_is_saved_and_defaults_to_none(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+
+        manual = service.ask("L33-SM3E", "測試", source="manual")
+        untagged = service.ask("L33-SM3E", "測試")
+
+        self.assertEqual([item.source for item in service.history("L33-SM3E")], ["manual", None])
+        self.assertEqual(service.history("L33-SM3E"), [manual, untagged])
+
     def test_failed_query_is_saved_with_error(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(return_code=2), self.connections)
 

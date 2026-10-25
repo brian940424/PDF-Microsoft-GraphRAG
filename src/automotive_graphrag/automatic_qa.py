@@ -303,7 +303,7 @@ class AutomaticQATestService:
         def answer(item: BatchQuestion) -> QueryResult:
             return self.querying.ask(
                 question_set.project_id, item.question, method,
-                chat_model=answer_model, response_type=response_type,
+                chat_model=answer_model, response_type=response_type, source="automatic_qa",
             )
         if progress_callback:
             progress_callback(0, len(pending))

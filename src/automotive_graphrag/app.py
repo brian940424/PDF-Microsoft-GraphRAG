@@ -93,6 +93,7 @@ PROJECT_STATUS_LABELS = {
     "STALE": "需重新建圖",
     "FAILED": "失敗",
 }
+QUERY_HISTORY_LIMIT = 50
 QUERY_METHOD_CHOICES = [("自動", "auto")] + [(label, method) for method, label in QUERY_METHOD_LABELS.items()]
 AUTOMATIC_EVALUATION_COLUMNS = [
     "Question ID",
@@ -495,7 +496,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         def run_query() -> None:
             try:
                 outcome["result"] = querying.ask(
-                    project_id, question, method, chat_model=chat_model, response_type=response_type
+                    project_id, question, method, chat_model=chat_model, response_type=response_type, source="manual"
                 )
             except Exception as exc:  # noqa: BLE001 - 交回主執行緒處理
                 outcome["error"] = exc
@@ -513,7 +514,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "", f"❌ {outcome['error']}", [], gr.Dropdown(choices=[]), "", {}, [], hidden
         if "error" in outcome:
             raise outcome["error"]
-        query_result = outcome["result"]
+        return query_result_outputs(outcome["result"])
+
+    def query_result_outputs(query_result):
+        hidden = gr.Group(visible=False)
         method_label = QUERY_METHOD_LABELS.get(query_result.method, query_result.method)
         if query_result.requested_method == "auto":
             method_label = f"自動 → {method_label}"
@@ -530,7 +534,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             [item.rank, item.evidence_id, item.document_id, item.page or "—", item.chunk_id or "—", item.score]
             for item in query_result.evidence
         ]
-        answer = query_result.answer
         if query_result.evidence:
             selected = query_result.evidence[0].evidence_id
             detail = evidence_markdown(selected, evidence_values)
@@ -542,7 +545,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             value=selected,
         )
         return (
-            answer,
+            query_result.answer,
             f"✅ {summary}",
             evidence_rows,
             selector,
@@ -550,6 +553,54 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             querying.context_summary(query_result.context),
             evidence_values,
             gr.Group(visible=True),
+        )
+
+    def manual_query_history(project_id: str | None) -> list:
+        """Manual Q&A records, newest first; untagged legacy records are included."""
+        if not project_id:
+            return []
+        try:
+            records = querying.history(project_id)
+        except ProjectError:
+            return []
+        manual = [item for item in records if item.source in (None, "manual")]
+        return list(reversed(manual))[:QUERY_HISTORY_LIMIT]
+
+    def load_query_history(project_id: str | None):
+        records = manual_query_history(project_id)
+        rows = [
+            [
+                format_history_time(item.completed_at),
+                item.question if len(item.question) <= 60 else item.question[:60] + "…",
+                QUERY_METHOD_LABELS.get(item.method, item.method)
+                + ("（自動）" if item.requested_method == "auto" else ""),
+                item.status,
+                round(item.duration_seconds, 1),
+            ]
+            for item in records
+        ]
+        return rows, [item.query_id for item in records]
+
+    def format_history_time(value: str) -> str:
+        try:
+            return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return value
+
+    def select_query_history(project_id: str | None, query_ids: list[str], evt: gr.SelectData):
+        row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+        query_id = query_ids[row] if query_ids and 0 <= row < len(query_ids) else None
+        record = next(
+            (item for item in manual_query_history(project_id) if item.query_id == query_id), None
+        )
+        if record is None:
+            raise gr.Error("找不到這筆問答紀錄，請重新整理歷史清單")
+        method = record.requested_method or record.method
+        return (
+            record.question,
+            gr.update(value=method),
+            gr.update(value=record.response_type),
+            *query_result_outputs(record),
         )
 
     def evidence_markdown(evidence_id: str | None, evidence_values: list[dict[str, object]]) -> str:
@@ -2986,6 +3037,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail = gr.Markdown()
                 query_context = gr.JSON(label="原始 GraphRAG Query Context")
 
+            with gr.Accordion("歷史紀錄", open=False):
+                query_history_ids = gr.State([])
+                with gr.Row():
+                    gr.Markdown(f"最近 {QUERY_HISTORY_LIMIT} 筆手動問答，點選一列可載回問題與回答")
+                    query_history_refresh = gr.Button("重新整理", size="sm", scale=0)
+                query_history_table = gr.Dataframe(
+                    headers=["時間", "問題", "方法", "狀態", "耗時（秒）"],
+                    datatype=["str", "str", "str", "str", "number"],
+                    column_widths=["18%", "52%", "14%", "8%", "8%"],
+                    interactive=False,
+                    wrap=True,
+                )
+
         with gr.Tab("3 自動問答測試", interactive=False) as autoqa_tab:
             gr.Markdown(
                 "**流程：** ① 匯入或生成題目 → ② 檢索並生成回答 → ③ 評測回答。"
@@ -3859,6 +3923,35 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ask_question,
             inputs=[query_project, question, query_method, query_chat_model, query_response_type],
             outputs=[
+                query_answer,
+                query_summary,
+                query_evidence_table,
+                query_evidence_selector,
+                query_evidence_detail,
+                query_context,
+                query_evidence_state,
+                query_evidence_group,
+            ],
+        ).then(
+            load_query_history,
+            inputs=query_project,
+            outputs=[query_history_table, query_history_ids],
+            show_progress="hidden",
+        )
+        for history_trigger in (query_history_refresh.click, query_tab.select, active_project_id.change):
+            history_trigger(
+                load_query_history,
+                inputs=query_project,
+                outputs=[query_history_table, query_history_ids],
+                show_progress="hidden",
+            )
+        query_history_table.select(
+            select_query_history,
+            inputs=[query_project, query_history_ids],
+            outputs=[
+                question,
+                query_method,
+                query_response_type,
                 query_answer,
                 query_summary,
                 query_evidence_table,

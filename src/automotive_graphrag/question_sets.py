@@ -328,7 +328,7 @@ class QuestionSetService:
             current = self._replace(current, questions, method)
             self._write(current)
             try:
-                result = self.query_service.ask(project_id, item.question, method)
+                result = self.query_service.ask(project_id, item.question, method, source="question_set")
                 questions[index] = BatchQuestion(
                     question_id=item.question_id,
                     question=item.question,

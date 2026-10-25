@@ -34,7 +34,7 @@ def evidence(chunk_id: str, page: int) -> Evidence:
 
 
 class AnswerRunner:
-    def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
+    def ask(self, project_id: str, question: str, method: str = "local", source: str | None = None) -> QueryResult:
         number = 1 if question == "問題一" else 2
         now = datetime.now(timezone.utc).isoformat()
         return QueryResult(

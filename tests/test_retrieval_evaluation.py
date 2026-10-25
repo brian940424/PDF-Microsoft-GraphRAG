@@ -30,7 +30,7 @@ def evidence(rank: int, chunk_id: str, document_id: str = "WW.pdf", page: int = 
 
 
 class EvaluationQueryRunner:
-    def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
+    def ask(self, project_id: str, question: str, method: str = "local", source: str | None = None) -> QueryResult:
         evidence_by_question = {
             "問題一": (
                 evidence(1, "irrelevant", page=10),

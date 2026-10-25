@@ -56,6 +56,7 @@ class QueryResult:
     response_type: str = "Single Paragraph"
     requested_method: str | None = None
     routing_reason: str | None = None
+    source: str | None = None
 
 
 class QueryService:
@@ -81,6 +82,7 @@ class QueryService:
         method: str = "local",
         chat_model: str | None = None,
         response_type: str = "Single Paragraph",
+        source: str | None = None,
     ) -> QueryResult:
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
@@ -160,6 +162,7 @@ class QueryService:
             response_type=response_type,
             requested_method=requested_method,
             routing_reason=routing_reason,
+            source=source,
         )
         try:
             self._append_record(project_path / "runs" / "queries.jsonl", query_result)
