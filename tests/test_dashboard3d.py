@@ -83,6 +83,16 @@ class Dashboard3DTests(unittest.TestCase):
         self.assertEqual([event["q"] for event in data["events"]], ["q2", "q1"])
         self.assertEqual(data["types"][0], {"name": "EVENT", "count": 2})
 
+    def test_alerts_list_failed_queries_isolated_entities_and_frontier(self) -> None:
+        self.write_index()
+
+        alerts = build_dashboard_data(self.project, self.project_path)["alerts"]
+
+        self.assertEqual([alert["tone"] for alert in alerts], ["bad", "warn", "info"])
+        self.assertEqual(alerts[0], {"tone": "bad", "title": "問答未完成：FAILED", "body": "q2", "sel": {"kind": "query", "k": 0}})
+        self.assertEqual(alerts[1]["sel"], {"kind": "node", "i": 2})
+        self.assertEqual(alerts[2]["sel"], {"kind": "region", "r": -1})
+
     def test_rendered_page_embeds_data_safely_in_iframe(self) -> None:
         self.write_index()
         data = build_dashboard_data(self.project, self.project_path)
@@ -91,6 +101,10 @@ class Dashboard3DTests(unittest.TestCase):
         self.assertNotIn("LONELY </script>", page)
         self.assertNotIn("__DASHBOARD_DATA__", page)
         self.assertNotIn("__THREE_VERSION__", page)
+        self.assertNotIn("__WORLD_JS__", page)
+        # 城鎮、車流與物流倉庫的共用模擬（由 progress-dashboard/lib/world.ts 產生）已內嵌
+        self.assertIn("function createTraffic(", page)
+        self.assertIn("function layoutTown(", page)
         self.assertIn("three@0.160.0", page)
         embedded = page.split('id="data">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(embedded), data)

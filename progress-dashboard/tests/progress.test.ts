@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { commitType, parseLog, parseStatus } from "@/lib/git";
 import { recentCommits } from "@/components/theme";
-import { layoutSite, roadPoint } from "@/lib/layout";
+import { layoutSite } from "@/lib/layout";
 import { parseHandoff, parsePlan, plainText } from "@/lib/markdown";
 import { parseJUnit } from "@/lib/tests";
 
@@ -127,15 +127,6 @@ describe("layoutSite", () => {
 
   it("omits the yard when tests have not run", () => {
     expect(layoutSite(parsePlan(PLAN), []).yard).toBeNull();
-  });
-});
-
-describe("roadPoint", () => {
-  it("walks the road rectangle clockwise and wraps around", () => {
-    const road = { x: 0, z: 0, w: 10, d: 6 };
-    expect(roadPoint(road, 0)).toMatchObject({ x: -5, z: 3, heading: 0 });
-    expect(roadPoint(road, 10 / 32)).toMatchObject({ x: 5, z: 3 });
-    expect(roadPoint(road, 1.25)).toEqual(roadPoint(road, 0.25));
   });
 });
 

@@ -9,6 +9,7 @@ from typing import Any
 
 import pandas as pd
 
+from .dashboard_world import WORLD_JS
 from .projects import Project
 
 THREE_VERSION = "0.160.0"
@@ -70,6 +71,7 @@ def build_dashboard_data(project: Project, project_path: str | Path) -> dict[str
         "nodes": nodes,
         "links": links,
         "events": events["recent"],
+        "alerts": _alerts(nodes, regions, events["recent"]),
     }
 
 
@@ -79,6 +81,7 @@ def render_dashboard_html(data: dict[str, Any]) -> str:
     return (
         DASHBOARD_TEMPLATE
         .replace("__THREE_VERSION__", THREE_VERSION)
+        .replace("__WORLD_JS__", WORLD_JS)
         .replace("__DASHBOARD_DATA__", payload)
     )
 
@@ -123,6 +126,33 @@ def _top_level_regions(
             "n": len(entity_ids),
         })
     return regions, region_of_entity
+
+
+def _alerts(nodes: list[dict[str, Any]], regions: list[dict[str, Any]], recent: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """鈴鐺清單：未完成的問答、孤立實體、缺少報告的社群、未歸入社群的實體，嚴重的排前面。"""
+    alerts = [
+        {"tone": "bad", "title": f"問答未完成：{event['s'] or '未知'}", "body": event["q"], "sel": {"kind": "query", "k": k}}
+        for k, event in enumerate(recent)
+        if event["s"] != "COMPLETED"
+    ]
+    isolated = [i for i, node in enumerate(nodes) if node["deg"] == 0]
+    if isolated:
+        alerts.append({
+            "tone": "warn", "title": f"{len(isolated)} 個孤立實體", "body": f"例如 {nodes[isolated[0]]['t']}，沒有任何關係",
+            "sel": {"kind": "node", "i": isolated[0]},
+        })
+    unreported = [r for r, region in enumerate(regions) if region["rank"] is None]
+    if unreported:
+        alerts.append({
+            "tone": "warn", "title": f"{len(unreported)} 個社群缺少報告", "body": regions[unreported[0]]["t"],
+            "sel": {"kind": "region", "r": unreported[0]},
+        })
+    frontier = sum(1 for node in nodes if node["r"] == -1)
+    if frontier and regions:
+        alerts.append({
+            "tone": "info", "title": f"{frontier} 個實體未歸入社群", "body": "位於地圖的邊境分區", "sel": {"kind": "region", "r": -1},
+        })
+    return alerts
 
 
 def _recent_queries(path: Path) -> dict[str, Any]:
@@ -226,6 +256,22 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
   .site-badge { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 9px; background: var(--blue); color: #fff; flex: none; }
   .live { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 14px; border-radius: 999px; background: #e7f7ee; color: #15803d; font-weight: 600; white-space: nowrap; }
   .live i { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.18); }
+  .bell { position: relative; display: grid; place-items: center; width: 40px; height: 40px; border-radius: 10px; color: #374151; flex: none; }
+  .bell:hover, .bell.on { background: var(--soft); color: var(--blue); }
+  .bell i { position: absolute; top: 3px; right: 2px; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 999px; border: 2px solid #fff;
+    background: var(--bad); color: #fff; font: 700 10px/14px var(--font); font-style: normal; text-align: center; }
+  .bell i.warn { background: #f59e0b; }
+  .bell-menu { z-index: 40; top: calc(var(--nav) - 4px); right: var(--gutter); width: 340px; max-height: calc(100% - var(--nav) - 24px); overflow-y: auto; padding: 8px; display: none; scrollbar-width: thin; }
+  .bell-menu.open { display: block; }
+  .dd-head { display: flex; justify-content: space-between; align-items: baseline; padding: 8px 8px 4px; font-size: 13px; }
+  .notice { width: 100%; display: flex; align-items: flex-start; gap: 10px; padding: 8px; border-radius: 10px; }
+  .notice:hover { background: var(--soft); }
+  .notice-icon { flex: none; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; color: #fff; background: var(--blue); }
+  .notice.bad .notice-icon { background: var(--bad); }
+  .notice.warn .notice-icon { background: #f59e0b; }
+  .notice-text { flex: 1; min-width: 0; }
+  .notice-text b { display: block; font-size: 13px; font-weight: 600; }
+  .notice-text small { display: block; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   /* ---------- KPI ---------- */
   .kpis { position: absolute; z-index: 20; top: calc(var(--nav) + 14px); left: var(--gutter); display: flex; gap: 12px; }
@@ -244,6 +290,8 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
   .map-controls { top: calc(var(--nav) + 14px); right: calc(var(--gutter) + var(--detail-w) + 12px); display: flex; flex-direction: column; padding: 6px; gap: 2px; border-radius: 14px; }
   .map-controls button { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 10px; color: #374151; }
   .map-controls button:hover { background: var(--soft); color: var(--blue); }
+  .map-controls button.on { background: var(--blue-soft); color: var(--blue); }
+  .map-controls button:last-child { border-top: 1px solid var(--line); border-radius: 0 0 10px 10px; margin-top: 4px; padding-top: 4px; }
   .map-controls button:nth-child(3) { border-top: 1px solid var(--line); border-radius: 0 0 10px 10px; margin-top: 4px; padding-top: 4px; }
 
   /* ---------- 右側詳細卡 ---------- */
@@ -276,6 +324,10 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
   .inventory-row:hover { background: var(--soft); }
   .inventory-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .inv-icon { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; }
+  .follow-button { display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 12px; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); font-weight: 600; color: #374151; }
+  .follow-button:hover { border-color: #b9c7f5; color: var(--blue); }
+  .follow-button.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .follow-button kbd { margin-left: auto; font: 11px var(--font); padding: 0 6px; border: 1px solid currentColor; border-radius: 5px; opacity: 0.6; }
   .prose { margin: 0 0 6px; color: #374151; font-size: 13.5px; white-space: pre-wrap; word-break: break-word; }
 
   /* ---------- 左下：建圖流程 ---------- */
@@ -334,12 +386,17 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
   .zone-label.on span { color: #dbe4ff; }
   .tooltip3d { position: absolute; z-index: 25; display: none; padding: 6px 12px; border-radius: 10px; background: #fff; box-shadow: var(--shadow); font: 12.5px var(--font); color: var(--text);
     white-space: nowrap; max-width: 340px; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+  /* 選取物件上方的藍色標籤（WareTrack 的 tag3d），每幀投影到螢幕座標 */
+  .tag3d { position: absolute; left: 0; top: 0; z-index: 24; display: none; padding: 4px 9px; border-radius: 7px; background: var(--blue); color: #fff; box-shadow: var(--shadow);
+    font: 700 11.5px ui-monospace, "SF Mono", "Cascadia Mono", monospace; white-space: nowrap; max-width: 280px; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+  .tag3d small { margin-left: 6px; font: 500 11px var(--font); opacity: 0.8; }
   #error { position: absolute; inset: 0; z-index: 40; display: none; align-items: center; justify-content: center; text-align: center; padding: 24px; color: var(--muted); background: var(--bg); }
 
   @media (max-width: 1320px) { .kpi:nth-child(4) { display: none; } .next-card { display: none; } }
   @media (max-width: 1120px) { :root { --detail-w: 300px; } .kpi { min-width: 0; } .kpi:nth-child(3), .live { display: none; } .logo span:last-child { display: none; } }
   @media (max-width: 860px) {
     .search, .site-pill, .kpis, .map-controls, .tracker { display: none; }
+    .bell-menu { left: var(--gutter); width: auto; }
     .detail { left: var(--gutter); width: auto; top: auto; height: 34%; bottom: calc(var(--tabs-h) + var(--gutter) + 12px); }
     .tabs-card { left: var(--gutter); width: auto; }
   }
@@ -366,7 +423,9 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
     <div><b id="projectName"></b><small id="projectMeta"></small></div>
   </div>
   <div class="live" id="live"></div>
+  <button class="bell" id="bell" aria-label="通知" aria-expanded="false"></button>
 </nav>
+<div class="card bell-menu" id="bellMenu" role="dialog" aria-label="通知"></div>
 <div class="kpis" id="kpis"></div>
 <div class="card map-controls" id="mapControls"></div>
 <aside class="card detail">
@@ -376,12 +435,19 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
 <section class="card tracker" id="tracker"></section>
 <section class="card tabs-card" id="tabs"></section>
 <div class="tooltip3d" id="tooltip"></div>
+<div class="tag3d" id="tag3d"></div>
 <div id="error">無法載入 three.js（需要可連線至 cdn.jsdelivr.net）。</div>
 <script type="application/json" id="data">__DASHBOARD_DATA__</script>
 <script type="module">
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CSS2DRenderer, CSS2DObject } from "three/addons/renderers/CSS2DRenderer.js";
+
+// 城鎮、車流與物流倉庫的共用模擬：由 progress-dashboard/lib/world.ts 產生（dashboard_world.py），包在命名空間內避免撞名
+const World = (() => {
+__WORLD_JS__
+return { packBlocks, createTraffic, stepTraffic, vehiclePose, bayState, layoutTown, streetParts, signalLamps, lightState };
+})();
 
 const DATA = JSON.parse(document.getElementById("data").textContent);
 const S = DATA.stats;
@@ -407,6 +473,10 @@ const ICONS = {
   close: "M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6L19 6.4 17.6 5 12 10.6z",
   pin: "M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7Zm0 4a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z",
   doc: "M6 2h8l6 6v14H6V2Zm7 1.5V9h5.5L13 3.5ZM8 12v2h8v-2H8Zm0 4v2h8v-2H8Z",
+  bell: "M12 3a6 6 0 0 0-6 6v4l-2 3v1h16v-1l-2-3V9a6 6 0 0 0-6-6Zm-2 16a2 2 0 0 0 4 0h-4Z",
+  play: "M8 5v14l11-7z",
+  pause: "M7 5h4v14H7zm6 0h4v14h-4z",
+  target: "M11 2h2v5h-2zm0 15h2v5h-2zM2 11h5v2H2zm15 0h5v2h-5zm-5-2a3 3 0 1 1 0 6a3 3 0 1 1 0-6Z",
 };
 const icon = (name, size = 18) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="${ICONS[name]}"/></svg>`;
 document.querySelectorAll("[data-icon]").forEach((el) => { el.innerHTML = icon(el.dataset.icon, Number(el.dataset.size || 18)); });
@@ -434,8 +504,8 @@ const maxFreq = Math.max(1, ...DATA.nodes.map((n) => n.freq));
 const isolated = DATA.nodes.filter((n) => n.deg === 0).length;
 const avgDeg = DATA.nodes.length ? (DATA.links.length * 2 / DATA.nodes.length).toFixed(1) : "0";
 
-// ---------- 版面：社群 = 分區，實體 = 地塊上的建築（貨架式排列） ----------
-const LOT = 3.4, ZONE_PADDING = 1.5, LABEL_SPACE = 1.6, GAP = 3.5, ROAD_OFFSET = 5, ROAD_WIDTH = 3.6, BASE_Y = 0.12;
+// ---------- 版面：社群 = 分區，實體 = 地塊上的建築；分區以格狀重劃排進街廓（四周都是街道） ----------
+const LOT = 3.4, ZONE_PADDING = 1.5, LABEL_SPACE = 1.6, BASE_Y = 0.12;
 const groups = new Map();
 DATA.nodes.forEach((n, i) => { if (!groups.has(n.r)) groups.set(n.r, []); groups.get(n.r).push(i); });
 for (const members of groups.values()) members.sort((a, b) => DATA.nodes[b].deg - DATA.nodes[a].deg);
@@ -445,18 +515,10 @@ const blocks = [...groups.keys()]
     const count = groups.get(r).length, cols = Math.ceil(Math.sqrt(count)), rows = Math.ceil(count / cols);
     return { r, cols, w: cols * LOT + ZONE_PADDING * 2, d: rows * LOT + ZONE_PADDING * 2 + LABEL_SPACE };
   });
-const area = blocks.reduce((sum, b) => sum + (b.w + GAP) * (b.d + GAP), 0);
-const shelfWidth = Math.max(Math.sqrt(area) * 1.35, ...blocks.map((b) => b.w), 1);
-let cursorX = 0, cursorZ = 0, shelfDepth = 0;
-for (const b of blocks) {
-  if (cursorX > 0 && cursorX + b.w > shelfWidth) { cursorX = 0; cursorZ += shelfDepth + GAP; shelfDepth = 0; }
-  b.x = cursorX + b.w / 2; b.z = cursorZ + b.d / 2;
-  cursorX += b.w + GAP; shelfDepth = Math.max(shelfDepth, b.d);
-}
-const maxX = Math.max(0, ...blocks.map((b) => b.x + b.w / 2)), maxZ = Math.max(0, ...blocks.map((b) => b.z + b.d / 2));
+const packed = World.packBlocks(blocks);
 const positions = new Array(DATA.nodes.length);
-const zones = blocks.map((b) => {
-  const x = b.x - maxX / 2, z = b.z - maxZ / 2;
+const zones = blocks.map((b, index) => {
+  const { x, z } = packed.centers[index];
   const left = x - b.w / 2 + ZONE_PADDING, top = z - b.d / 2 + ZONE_PADDING + LABEL_SPACE;
   groups.get(b.r).forEach((nodeIndex, k) => {
     positions[nodeIndex] = new THREE.Vector3(left + (k % b.cols) * LOT + LOT / 2, BASE_Y, top + Math.floor(k / b.cols) * LOT + LOT / 2);
@@ -464,7 +526,7 @@ const zones = blocks.map((b) => {
   return { r: b.r, x, z, w: b.w, d: b.d };
 });
 const zoneOf = new Map(zones.map((zone) => [zone.r, zone]));
-const road = { w: maxX + ROAD_OFFSET * 2, d: maxZ + ROAD_OFFSET * 2 };
+const road = packed.bounds; // 分區街廓的外框（最外圈街道中心線）
 const radius = Math.hypot(road.w, road.d) / 2 + 6;
 
 const footprint = (n) => 1.5 + 0.9 * Math.log2(n.freq + 1) / Math.log2(maxFreq + 1);
@@ -508,44 +570,165 @@ sun.position.set(-0.5 * radius, radius, 0.66 * radius);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02;
-Object.assign(sun.shadow.camera, { left: -radius, right: radius, top: radius, bottom: -radius, far: radius * 4 });
+const shadowRange = radius + 22; // 涵蓋道路外側的城鎮與倉庫
+Object.assign(sun.shadow.camera, { left: -shadowRange, right: shadowRange, top: shadowRange, bottom: -shadowRange, far: radius * 4 + 60 });
 scene.add(sun);
 
 const mat = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.75, metalness: 0.05, ...extra });
+const box = (size, position, color) => {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), mat(color));
+  mesh.position.set(...position); mesh.castShadow = true; mesh.receiveShadow = true;
+  return mesh;
+};
 function plane(w, d, color, y, basic = false) {
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, d), basic ? new THREE.MeshBasicMaterial({ color }) : mat(color));
   mesh.rotation.x = -Math.PI / 2; mesh.position.y = y; mesh.receiveShadow = true; scene.add(mesh);
   return mesh;
 }
 plane(radius * 8, radius * 8, "#e3e9f4", -0.03);
-plane(road.w + 20, road.d + 20, "#d9eedb", -0.02);
-plane(road.w + ROAD_WIDTH, road.d + ROAD_WIDTH, "#c7cfe3", -0.01);
-plane(road.w - ROAD_WIDTH, road.d - ROAD_WIDTH, "#f1f4fa", 0);
-{ // 道路標線
-  const dashes = [];
-  for (let x = -road.w / 2 + 2; x < road.w / 2 - 1; x += 2.4) dashes.push([x, -road.d / 2, 1.2, 0.14], [x, road.d / 2, 1.2, 0.14]);
-  for (let z = -road.d / 2 + 2; z < road.d / 2 - 1; z += 2.4) dashes.push([-road.w / 2, z, 0.14, 1.2], [road.w / 2, z, 0.14, 1.2]);
-  const geo = new THREE.PlaneGeometry(1, 1); geo.rotateX(-Math.PI / 2);
-  const mesh = new THREE.InstancedMesh(geo, new THREE.MeshBasicMaterial({ color: "#ffffff" }), dashes.length);
-  const m = new THREE.Matrix4();
-  dashes.forEach(([x, z, w, d], k) => mesh.setMatrixAt(k, m.compose(new THREE.Vector3(x, 0.005, z), new THREE.Quaternion(), new THREE.Vector3(w, 1, d))));
+plane(road.w + 44, road.d + 44, "#d9eedb", -0.02); // 城鎮綠地
+plane(road.w, road.d, "#f1f4fa", -0.01); // 分區街廓的淺色鋪面
+
+// ---------- 城市：路網與號誌、外圍住宅街廓、車流、物流倉庫（同 progress-dashboard） ----------
+const truckEvents = DATA.events.slice(0, 8);
+const traffic = World.createTraffic(packed, truckEvents.map((_, k) => `q${k}`));
+const town = World.layoutTown(traffic, packed.parks);
+const noRaycast = () => {};
+const UP = new THREE.Vector3(0, 1, 0);
+// 實例化繪製：上百棟建物與樹木只用少數幾次 draw call
+function instanced(parts, geometry, shadows = true) {
+  const mesh = new THREE.InstancedMesh(geometry, mat("#ffffff", { roughness: 0.8, metalness: 0.02 }), Math.max(1, parts.length));
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), c = new THREE.Color();
+  parts.forEach((p, i) => {
+    mesh.setMatrixAt(i, m.compose(new THREE.Vector3(p.x, p.y, p.z), q.setFromAxisAngle(UP, p.rotation), new THREE.Vector3(p.sx, p.sy, p.sz)));
+    mesh.setColorAt(i, c.set(p.color));
+  });
+  mesh.count = parts.length; mesh.castShadow = shadows; mesh.receiveShadow = true; mesh.raycast = noRaycast;
   scene.add(mesh);
+  return mesh;
 }
-{ // 行道樹：以座標雜湊決定疏密，結果固定
-  const trees = [];
-  const offset = 5.5, step = 4.5, halfW = road.w / 2 + offset, halfD = road.d / 2 + offset;
-  const add = (x, z) => { const h = Math.abs(Math.sin(x * 12.9898 + z * 78.233) * 43758.5453) % 1; if (h > 0.38) trees.push([x, z, 0.8 + h * 0.5]); };
-  for (let x = -halfW; x <= halfW; x += step) { add(x, -halfD); add(x, halfD); }
-  for (let z = -halfD + step; z < halfD; z += step) { add(-halfW, z); add(halfW, z); }
-  const trunkGeo = new THREE.CylinderGeometry(0.12, 0.16, 0.7, 8), crownGeo = new THREE.ConeGeometry(0.75, 1.6, 8), topGeo = new THREE.ConeGeometry(0.55, 1.1, 8);
-  const trunkMat = mat(PALETTE.trunk), crownMat = mat(PALETTE.leafDark), topMat = mat(PALETTE.leaf);
-  for (const [x, z, s] of trees) {
-    const g = new THREE.Group(); g.position.set(x, 0, z); g.scale.setScalar(s);
-    [[trunkGeo, trunkMat, 0.35], [crownGeo, crownMat, 1.3], [topGeo, topMat, 1.95]].forEach(([geo, material, y]) => {
-      const mesh = new THREE.Mesh(geo, material); mesh.position.y = y; mesh.castShadow = true; g.add(mesh);
-    });
-    scene.add(g);
+const gableGeo = (() => { // 單位山形屋頂：底部 y=0、屋脊高 1、屋脊沿 x
+  const shape = new THREE.Shape(); shape.moveTo(-0.5, 0); shape.lineTo(0.5, 0); shape.lineTo(0, 1); shape.closePath();
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: 1, bevelEnabled: false }); geo.translate(0, 0, -0.5); geo.rotateY(Math.PI / 2);
+  return geo;
+})();
+const unitBox = new THREE.BoxGeometry(1, 1, 1);
+const streets = World.streetParts(traffic);
+instanced(streets.sidewalks, unitBox, false);
+instanced(streets.asphalt, unitBox, false);
+instanced(streets.markings, unitBox, false);
+instanced(streets.poles, unitBox);
+// 號誌燈：每個路口每個進入方向一盞，每幀依燈號變色
+const lamps = World.signalLamps(traffic);
+const LIGHT_COLORS = { green: new THREE.Color("#22c55e"), amber: new THREE.Color("#f59e0b"), red: new THREE.Color("#ef4444") };
+const lampMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.17, 10, 8), new THREE.MeshBasicMaterial({ toneMapped: false }), Math.max(1, lamps.length));
+lamps.forEach((lamp, i) => { lampMesh.setMatrixAt(i, new THREE.Matrix4().makeTranslation(lamp.x, lamp.y, lamp.z)); lampMesh.setColorAt(i, LIGHT_COLORS.red); });
+lampMesh.count = lamps.length; lampMesh.raycast = noRaycast; scene.add(lampMesh);
+function updateLamps() {
+  if (!lamps.length) return;
+  lamps.forEach((lamp, i) => lampMesh.setColorAt(i, LIGHT_COLORS[World.lightState(traffic, lamp.node, lamp.lane)]));
+  lampMesh.instanceColor.needsUpdate = true;
+}
+instanced(town.lawns, unitBox, false);
+instanced(town.boxes, unitBox);
+instanced(town.roofs, gableGeo);
+{ // 住宅街廓後院與公園的樹木
+  const all = town.trees;
+  const parts = (color) => all.map((t) => ({ x: t.x, y: 0, z: t.z, sx: t.scale, sy: t.scale, sz: t.scale, rotation: 0, color }));
+  instanced(parts(PALETTE.trunk), new THREE.CylinderGeometry(0.12, 0.16, 0.7, 8).translate(0, 0.35, 0));
+  instanced(parts(PALETTE.leafDark), new THREE.ConeGeometry(0.75, 1.6, 8).translate(0, 1.3, 0));
+  instanced(parts(PALETTE.leaf), new THREE.ConeGeometry(0.55, 1.1, 8).translate(0, 1.95, 0));
+}
+
+// 一般車流：小客車與廂型車，雙向行駛、保持跟車距離
+const CAR_COLORS = ["#ec5a5f", "#f6c544", "#f8fafc", "#1fb5a8", "#3a4256", "#6f91ff", "#ff8a3d"];
+const wheelGeo = new THREE.CylinderGeometry(0.22, 0.22, 0.16, 12), wheelMat = mat(PALETTE.dark);
+const cars = traffic.vehicles.filter((v) => v.kind !== "truck").map((vehicle) => {
+  const g = new THREE.Group(), color = CAR_COLORS[vehicle.color % CAR_COLORS.length];
+  if (vehicle.kind === "van") {
+    g.add(box([2.5, 1.05, 1.1], [0, 0.78, 0], color), box([0.06, 0.42, 0.9], [1.26, 1.0, 0], "#1c2433"),
+      box([1.0, 0.36, 0.04], [0.55, 1.0, 0.56], "#1c2433"), box([1.0, 0.36, 0.04], [0.55, 1.0, -0.56], "#1c2433"));
+  } else {
+    g.add(box([2.1, 0.5, 1.0], [0, 0.5, 0], color), box([1.1, 0.42, 0.9], [-0.15, 0.95, 0], color), box([1.12, 0.3, 0.92], [-0.15, 0.97, 0], "#2b3550"));
   }
+  for (const x of [-0.7, 0.7]) for (const z of [-0.5, 0.5]) {
+    const wheel = new THREE.Mesh(wheelGeo, wheelMat); wheel.rotation.x = Math.PI / 2; wheel.position.set(x, 0.24, z); g.add(wheel);
+  }
+  g.traverse((o) => { o.raycast = noRaycast; });
+  scene.add(g);
+  return { vehicle, group: g };
+});
+
+// 物流倉庫：兩條穿越式卸貨道，卡車從一端捲門開進去、卸貨、從另一端開出來（門上燈號：綠＝空、黃＝進出、紅＝卸貨）
+const depot = traffic.depot, depotDoors = [], depotLamps = [];
+const LAMP = { free: "#24b46e", moving: "#f0a623", unloading: "#e0564b" };
+const DOOR_HEIGHT = 2.6, WALL_HEIGHT = 3.3, OPENING = 2.3;
+let depotSign = null;
+if (depot) {
+  for (const bay of depot.bays) { // 卸貨道路面
+    const pos = [], index = [], half = 1.2;
+    bay.path.forEach((p, k) => {
+      const a = bay.path[Math.max(0, k - 1)], b = bay.path[Math.min(bay.path.length - 1, k + 1)];
+      const len = Math.hypot(b.x - a.x, b.z - a.z) || 1, nx = -(b.z - a.z) / len, nz = (b.x - a.x) / len;
+      pos.push(p.x + nx * half, 0.004, p.z + nz * half, p.x - nx * half, 0.004, p.z - nz * half);
+      if (k < bay.path.length - 1) index.push(k * 2, k * 2 + 2, k * 2 + 1, k * 2 + 1, k * 2 + 2, k * 2 + 3);
+    });
+    const geo = new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute(pos, 3)); geo.setIndex(index); geo.computeVertexNormals();
+    const strip = new THREE.Mesh(geo, mat("#c7cfe3", { side: THREE.DoubleSide })); strip.receiveShadow = true; scene.add(strip);
+  }
+  const g = new THREE.Group(); g.position.set(depot.x, 0, depot.z); g.rotation.y = depot.rotation; scene.add(g);
+  const halfL = depot.length / 2, halfD = depot.depth / 2, center = (depot.bays[0].v + depot.bays[depot.bays.length - 1].v) / 2;
+  const aisles = depot.bays.map((bay) => bay.v - center);
+  g.add(box([depot.length + 6, 0.06, depot.depth + 1.2], [0, 0.03, 0], "#dde3ee"),
+    box([depot.length, WALL_HEIGHT, 0.25], [0, WALL_HEIGHT / 2, -halfD], "#4570f5"),
+    box([depot.length, WALL_HEIGHT, 0.25], [0, WALL_HEIGHT / 2, halfD], "#4570f5"),
+    box([depot.length + 0.5, 0.3, depot.depth + 0.5], [0, WALL_HEIGHT + 0.15, 0], "#2447c4")); // 屋頂遮住倉庫內的卡車
+  for (const x of [-3, 0, 3]) g.add(box([1.6, 0.12, depot.depth * 0.7], [x, WALL_HEIGHT + 0.36, 0], "#cfe0ff"));
+  for (const x of [-halfL, halfL]) { // 兩端牆面：卸貨道處留出門洞
+    const edges = [-halfD, ...aisles.flatMap((z) => [z - OPENING / 2, z + OPENING / 2]), halfD];
+    for (let k = 0; k < edges.length; k += 2) if (edges[k + 1] - edges[k] > 0.01) g.add(box([0.25, WALL_HEIGHT, edges[k + 1] - edges[k]], [x, WALL_HEIGHT / 2, (edges[k] + edges[k + 1]) / 2], "#eef2f9"));
+    for (const z of aisles) g.add(box([0.25, WALL_HEIGHT - DOOR_HEIGHT, OPENING], [x, (WALL_HEIGHT + DOOR_HEIGHT) / 2, z], "#eef2f9"));
+  }
+  aisles.forEach((z, bay) => [-1, 1].forEach((side, sideIndex) => {
+    const door = new THREE.Mesh(new THREE.BoxGeometry(0.1, 1, OPENING - 0.1), mat("#d6dbe5", { roughness: 0.6 }));
+    door.position.set(side * (halfL + 0.05), DOOR_HEIGHT / 2, z); door.castShadow = true; g.add(door); depotDoors[bay * 2 + sideIndex] = door;
+    const lampMat = mat(LAMP.free, { emissive: LAMP.free, emissiveIntensity: 0.8 });
+    const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.22, 0.22), lampMat);
+    lamp.position.set(side * (halfL + 0.2), DOOR_HEIGHT + 0.35, z + OPENING / 2 - 0.2); g.add(lamp); depotLamps[bay * 2 + sideIndex] = lampMat;
+    const guide = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 0.12), new THREE.MeshBasicMaterial({ color: "#f6c544" }));
+    guide.rotation.x = -Math.PI / 2; guide.position.set(side * (halfL + 1.6), 0.07, z); g.add(guide);
+  }));
+  for (const [x, layers] of [[-2, 3], [-0.6, 2], [0.8, 1]]) { // 門邊的棧板
+    for (let k = 0; k < layers; k++) g.add(box([1.1, 0.42, 1.1], [x, 0.27 + k * 0.44, halfD + 1.1], k % 2 ? "#c98f55" : "#e3b27c"));
+  }
+  g.traverse((o) => { o.raycast = noRaycast; });
+  // 屋頂看板：canvas 貼圖的 sprite，卸貨數變化時重畫
+  const canvas = document.createElement("canvas"); canvas.width = 420; canvas.height = 112;
+  const texture = new THREE.CanvasTexture(canvas); texture.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false }));
+  sprite.position.set(depot.x, WALL_HEIGHT + 2.2, depot.z); sprite.scale.set(10.5, 10.5 * 112 / 420, 1); sprite.raycast = noRaycast; scene.add(sprite);
+  depotSign = { canvas, texture, sprite, busy: -1 };
+}
+function drawDepotSign() {
+  const busy = traffic.occupants.filter(Boolean).length;
+  if (!depotSign || busy === depotSign.busy) return;
+  depotSign.busy = busy;
+  const { canvas, texture, sprite } = depotSign, label = "索引倉庫 · 卸貨", count = `${busy}/${depot.bays.length}`;
+  const font = '700 50px Inter, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif';
+  let ctx = canvas.getContext("2d"); ctx.font = font;
+  // 依字寬決定看板大小，避免名稱與數字重疊
+  canvas.width = Math.ceil(ctx.measureText(label).width + ctx.measureText("8/8").width + 96);
+  ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  sprite.scale.set(2.8 * w / h, 2.8, 1);
+  const rounded = (x, y, rw, rh, r) => { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + rw, y, x + rw, y + rh, r); ctx.arcTo(x + rw, y + rh, x, y + rh, r); ctx.arcTo(x, y + rh, x, y, r); ctx.arcTo(x, y, x + rw, y, r); ctx.closePath(); };
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "rgba(31, 52, 102, 0.16)"; rounded(6, 10, w - 12, h - 14, 22); ctx.fill();
+  ctx.fillStyle = "#ffffff"; rounded(4, 4, w - 8, h - 14, 22); ctx.fill();
+  ctx.font = font; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#1f2937"; ctx.textAlign = "left"; ctx.fillText(label, 28, h / 2 - 4);
+  ctx.fillStyle = busy ? "#c2410c" : "#6b7280"; ctx.textAlign = "right"; ctx.fillText(count, w - 28, h / 2 - 4);
+  texture.needsUpdate = true;
 }
 
 // 分區底座、邊框與標籤
@@ -664,26 +847,31 @@ function makePin(color) {
 }
 const pin = makePin(PALETTE.blue);
 
-// 道路上的卡車：最近的問答（貨櫃色帶＝檢索方法）
-const roadPoint = (t) => {
-  const hw = road.w / 2, hd = road.d / 2, perimeter = 2 * (road.w + road.d);
-  let s = (((t % 1) + 1) % 1) * perimeter;
-  if (s < road.w) return { x: -hw + s, z: hd, heading: 0 };
-  s -= road.w;
-  if (s < road.d) return { x: hw, z: hd - s, heading: Math.PI / 2 };
-  s -= road.d;
-  if (s < road.w) return { x: hw - s, z: -hd, heading: Math.PI };
-  s -= road.w;
-  return { x: -hw, z: -hd + s, heading: -Math.PI / 2 };
-};
-const box = (size, position, color) => {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), mat(color));
-  mesh.position.set(...position); mesh.castShadow = true; mesh.receiveShadow = true;
-  return mesh;
-};
-const trucks = DATA.events.slice(0, 8).map((ev, k, list) => {
+// 選取框：WareTrack 風格的藍色角框＋淡藍填色＋地面光暈（不在 pick() 的判定清單內，不會擋住點擊）
+const brackets = new THREE.Group(); brackets.visible = false; scene.add(brackets);
+const bracketMats = [
+  new THREE.LineBasicMaterial({ color: PALETTE.blue }),
+  new THREE.MeshBasicMaterial({ color: PALETTE.blue, transparent: true, opacity: 0.07, depthWrite: false }),
+  new THREE.MeshBasicMaterial({ color: PALETTE.blue, transparent: true, opacity: 0.14, depthWrite: false }),
+];
+function setBrackets(size) {
+  brackets.children.forEach((child) => child.geometry.dispose()); brackets.clear();
+  brackets.visible = Boolean(size);
+  if (!size) return;
+  const [w, h, d] = size, arm = Math.min(w, h, d) * 0.28 + 0.18, pts = [];
+  for (const x of [-w / 2, w / 2]) for (const y of [0, h]) for (const z of [-d / 2, d / 2]) {
+    const sx = x < 0 ? 1 : -1, sy = y === 0 ? 1 : -1, sz = z < 0 ? 1 : -1;
+    pts.push(x, y, z, x + sx * arm, y, z, x, y, z, x, y + sy * arm, z, x, y, z, x, y, z + sz * arm);
+  }
+  brackets.add(new THREE.LineSegments(new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute(pts, 3)), bracketMats[0]));
+  const fill = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), bracketMats[1]); fill.position.y = h / 2;
+  const glow = new THREE.Mesh(new THREE.PlaneGeometry(w + 1.4, d + 1.4), bracketMats[2]); glow.rotation.x = -Math.PI / 2; glow.position.y = 0.02;
+  brackets.add(fill, glow);
+}
+
+// 道路上的卡車：最近的問答（貨櫃色帶＝檢索方法），會開進物流倉庫卸貨
+const trucks = truckEvents.map((ev, k) => {
   const outer = new THREE.Group(), body = new THREE.Group();
-  body.position.z = 0.9; // 靠右行駛
   body.add(
     box([3.2, 0.3, 1.3], [0, 0.42, 0], PALETTE.dark),
     box([2.1, 1.2, 1.3], [-0.45, 1.17, 0], "#ffffff"),
@@ -697,15 +885,19 @@ const trucks = DATA.events.slice(0, 8).map((ev, k, list) => {
   }
   body.traverse((o) => { o.userData.truck = k; });
   outer.add(body); scene.add(outer);
-  return { ev, group: outer, body, progress: k / list.length };
+  return { ev, group: outer, body, vehicle: traffic.vehicles.find((v) => v.id === `q${k}`) };
 });
 const truckPin = makePin(PALETTE.blue);
 
 // ---------- 鏡頭：等角正交，平滑移動 ----------
 let fitZoom = 10, hudRight = 0, goal = null;
+// 跟隨：鏡頭目標每幀追著選取的卡車；followZoom 為 null 代表使用者已自行縮放，不再拉回
+let following = false, followZoom = null;
+// 偏好減少動態的使用者預設暫停動畫
+let paused = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
 const currentDirection = () => camera.position.clone().sub(controls.target).normalize();
 function setGoal(target, zoom, direction = currentDirection()) { goal = { target: target.clone(), zoom, direction }; }
-controls.addEventListener("start", () => { goal = null; });
+controls.addEventListener("start", () => { if (following) followZoom = null; else goal = null; });
 function cameraCommand(kind) {
   const base = goal ?? { target: controls.target.clone(), direction: currentDirection(), zoom: camera.zoom };
   if (kind === "zoomIn") goal = { ...base, zoom: Math.min(fitZoom * 8, base.zoom * 1.4) };
@@ -714,17 +906,36 @@ function cameraCommand(kind) {
     goal = { ...base, direction: base.direction.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), kind === "rotateLeft" ? Math.PI / 4 : -Math.PI / 4) };
   }
   if (kind === "home") goal = { target: new THREE.Vector3(), direction: VIEW_DIRECTION.clone(), zoom: fitZoom };
+  if (following) followZoom = goal.zoom;
 }
 $("mapControls").innerHTML = [["plus", "zoomIn", "放大"], ["minus", "zoomOut", "縮小"], ["rotateLeft", "rotateLeft", "向左旋轉"], ["rotateRight", "rotateRight", "向右旋轉"], ["home", "home", "回到全景"]]
-  .map(([name, kind, label]) => `<button data-cmd="${kind}" title="${label}" aria-label="${label}">${icon(name)}</button>`).join("");
+  .map(([name, kind, label]) => `<button data-cmd="${kind}" title="${label}" aria-label="${label}">${icon(name)}</button>`).join("")
+  + '<button data-cmd="pause" id="pauseButton"></button>';
+function setPaused(on) {
+  paused = on;
+  const button = $("pauseButton"), label = paused ? "繼續動畫" : "暫停動畫";
+  button.innerHTML = icon(paused ? "play" : "pause");
+  button.classList.toggle("on", paused);
+  button.title = `${label} (Space)`; button.setAttribute("aria-label", label); button.setAttribute("aria-pressed", String(paused));
+}
+setPaused(paused);
+function setFollow(on) {
+  following = Boolean(on) && selection?.kind === "query" && Boolean(trucks[selection.k]);
+  followZoom = following ? Math.max(fitZoom * 2.4, camera.zoom) : null;
+  if (!following) goal = null;
+  renderDetail();
+}
 $("mapControls").addEventListener("click", (e) => {
   const button = e.target.closest("[data-cmd]"); if (!button) return;
+  if (button.dataset.cmd === "pause") { setPaused(!paused); return; }
   if (button.dataset.cmd === "home") select(null, false);
   cameraCommand(button.dataset.cmd);
 });
 
 // ---------- 選取 ----------
+const sameSelection = (a, b) => Boolean(a && b) && a.kind === b.kind && a.i === b.i && a.r === b.r && a.k === b.k;
 function select(next, fly = true) {
+  if (!sameSelection(next, selection)) { following = false; followZoom = null; }
   selection = next;
   const node = selectedNode();
   packetPool = node != null && neighbors[node].length ? neighbors[node].map((x) => x.li) : allLinks;
@@ -733,6 +944,11 @@ function select(next, fly = true) {
   linkMaterial.opacity = node != null ? 0.07 : 0.2;
   pin.visible = node != null;
   if (node != null) pin.position.set(positions[node].x, roofTop(node) + 0.1, positions[node].z);
+  if (node != null) {
+    const n = DATA.nodes[node], w = footprint(n) + 0.5;
+    setBrackets([w, heightOf(n) + roofRise(n) + 0.15, footprint(n) * 0.85 + 0.5]);
+    brackets.position.copy(positions[node]); brackets.rotation.y = 0;
+  } else setBrackets(next?.kind === "query" && trucks[next.k] ? [3.6, 1.9, 1.7] : null);
   paintBuildings();
   zoneLabels.forEach((div, r) => div.classList.toggle("on", selection?.kind === "region" && selection.r === r));
   renderDetail(); renderTracker(); renderTabs();
@@ -744,11 +960,12 @@ function select(next, fly = true) {
     setGoal(new THREE.Vector3(zone.x, 0, zone.z), Math.max(fitZoom * 1.2, zoom));
   }
   if (next.kind === "query" && trucks[next.k]) {
-    const point = roadPoint(trucks[next.k].progress);
+    const point = trucks[next.k].group.position;
     setGoal(new THREE.Vector3(point.x, 0, point.z), Math.max(fitZoom * 2.4, camera.zoom));
   }
 }
 $("detailClose").onclick = () => select(null);
+$("detail").addEventListener("click", (e) => { if (e.target.closest("[data-follow]")) setFollow(!following); });
 $("logo").onclick = () => { select(null, false); cameraCommand("home"); };
 document.addEventListener("click", (e) => {
   const target = e.target.closest("[data-node],[data-region],[data-query]");
@@ -775,6 +992,27 @@ $("kpis").innerHTML = [
   kpi("truck", "問答", S.queries_completed, `/ ${S.queries}`, S.queries ? (failedQueries ? `${failedQueries} 未完成` : "全數完成") : "", failedQueries ? "bad" : "good", `最新 ${shortTime(DATA.events[0]?.at)}`),
 ].join("");
 
+// ---------- 通知鈴鐺：未完成問答、孤立實體、缺少報告的社群 ----------
+const ALERT_ICON = { bad: "close", warn: "flag", info: "bell" };
+const badAlerts = DATA.alerts.filter((a) => a.tone === "bad").length, warnAlerts = DATA.alerts.filter((a) => a.tone === "warn").length;
+const badge = badAlerts || warnAlerts;
+$("bell").innerHTML = icon("bell", 20) + (badge ? `<i class="${badAlerts ? "" : "warn"}">${badge > 9 ? "9+" : badge}</i>` : "");
+$("bell").title = DATA.alerts.length ? `${DATA.alerts.length} 項需要注意` : "通知";
+$("bellMenu").innerHTML = `<div class="dd-head"><b>需要注意</b><span class="muted">${DATA.alerts.length}</span></div>`
+  + (DATA.alerts.map((a, k) => `<button class="notice ${a.tone}" data-alert="${k}"><span class="notice-icon">${icon(ALERT_ICON[a.tone], 14)}</span>
+    <span class="notice-text"><b>${esc(a.title)}</b>${a.body ? `<small>${esc(a.body)}</small>` : ""}</span></button>`).join("")
+    || '<p class="muted pad">索引與問答紀錄沒有需要處理的事項。</p>');
+const bellOpen = () => $("bellMenu").classList.contains("open");
+function setBell(open) { $("bellMenu").classList.toggle("open", open); $("bell").classList.toggle("on", open); $("bell").setAttribute("aria-expanded", String(open)); }
+$("bell").onclick = () => setBell(!bellOpen());
+$("bellMenu").addEventListener("click", (e) => {
+  const button = e.target.closest("[data-alert]"); if (!button) return;
+  const alert = DATA.alerts[Number(button.dataset.alert)];
+  setBell(false);
+  if (alert.sel) select(alert.sel);
+});
+document.addEventListener("pointerdown", (e) => { if (bellOpen() && !e.target.closest("#bellMenu, #bell")) setBell(false); });
+
 // ---------- 搜尋 ----------
 const searchInput = $("search"), searchResults = $("searchResults");
 let results = [];
@@ -793,7 +1031,14 @@ searchInput.addEventListener("focus", renderSearch);
 searchInput.addEventListener("blur", () => setTimeout(() => searchResults.classList.remove("open"), 150));
 searchInput.addEventListener("keydown", (e) => { if (e.key === "Enter") pickResult(0); if (e.key === "Escape") searchInput.blur(); });
 searchResults.addEventListener("mousedown", (e) => { const b = e.target.closest("[data-result]"); if (b) pickResult(Number(b.dataset.result)); });
-addEventListener("keydown", (e) => { if (e.key === "/" && document.activeElement !== searchInput) { e.preventDefault(); searchInput.focus(); } });
+// 快捷鍵（同 WareTrack）：/ 搜尋、Esc 關閉選單或取消選取、Space 暫停動畫、F 跟隨選取的卡車
+addEventListener("keydown", (e) => {
+  if (document.activeElement === searchInput || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "/") { e.preventDefault(); searchInput.focus(); }
+  else if (e.key === "Escape") { if (bellOpen()) setBell(false); else select(null, false); }
+  else if (e.key === " ") { e.preventDefault(); setPaused(!paused); }
+  else if (e.key === "f" || e.key === "F") setFollow(!following);
+});
 
 // ---------- 右側詳細卡 ----------
 const header = (eyebrow, title, subtitle, iconName) => `
@@ -834,6 +1079,7 @@ function renderDetail() {
     const ev = DATA.events[selection.k];
     html = header(`QUERY · ${methodLabel(ev.m)}`, ev.q, shortTime(ev.at), "truck")
       + statusRow(queryPill(ev).replace('class="pill', 'class="pill big'), ev.s === "COMPLETED" ? "已完成問答" : "問答未完成")
+      + (trucks[selection.k] ? `<button class="follow-button ${following ? "on" : ""}" data-follow aria-pressed="${following}">${icon("target", 16)} ${following ? "停止跟隨" : "鏡頭跟隨卡車"} <kbd>F</kbd></button>` : "")
       + `<div class="stat-grid">${stat("耗時", ev.sec != null ? Math.round(ev.sec) : "—", "秒")}${stat("檢索方法", methodLabel(ev.m))}</div>`
       + '<p class="muted">完整回答與來源請到「2 問答測試」的問答紀錄查看。</p>';
   } else {
@@ -935,7 +1181,14 @@ renderer.domElement.addEventListener("pointerup", (e) => {
   if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5 || e.button !== 0) return;
   select(pick(e), true);
 });
+let lastHover = 0;
 renderer.domElement.addEventListener("pointermove", (e) => {
+  // 拖曳平移超過 6px 視為手動操作，結束跟隨
+  if (e.buttons && downAt && following && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 6) setFollow(false);
+  // 拖曳中不做滑過判定；其餘以 50ms 節流，避免每次移動都對全部實體做 raycast
+  const now = performance.now();
+  if (e.buttons || now - lastHover < 50) return;
+  lastHover = now;
   const hit = pick(e);
   const nextHovered = hit?.kind === "node" ? hit.i : null;
   hoveredTruck = hit?.kind === "query" ? hit.k : null;
@@ -971,8 +1224,48 @@ function resize() {
 addEventListener("resize", resize); resize();
 select(null, false);
 const clock = new THREE.Clock();
+const tag = $("tag3d"), tagAnchor = new THREE.Vector3();
+// 選取物件上方的藍色標籤：每幀投影到螢幕座標
+function updateTag() {
+  let html = "";
+  if (selection?.kind === "node") {
+    const i = selection.i;
+    tagAnchor.set(positions[i].x, roofTop(i) + 2.3, positions[i].z);
+    html = `${esc(DATA.nodes[i].t)}<small>${esc(DATA.nodes[i].y)}</small>`;
+  } else if (selection?.kind === "query" && trucks[selection.k]) {
+    trucks[selection.k].body.getWorldPosition(tagAnchor); tagAnchor.y = 4;
+    html = `${methodLabel(DATA.events[selection.k].m)}<small>${following ? "跟隨中" : esc(shortTime(DATA.events[selection.k].at))}</small>`;
+  }
+  if (!html) { tag.style.display = "none"; return; }
+  tagAnchor.project(camera);
+  if (tag.dataset.html !== html) { tag.innerHTML = html; tag.dataset.html = html; }
+  tag.style.display = "block";
+  tag.style.transform = `translate(${(tagAnchor.x + 1) / 2 * innerWidth}px, ${(1 - tagAnchor.y) / 2 * innerHeight - 6}px) translate(-50%, -100%)`;
+}
 function tick() {
-  const dt = Math.min(clock.getDelta(), 0.05), time = clock.elapsedTime;
+  const dt = Math.min(clock.getDelta(), 0.05), time = clock.elapsedTime, moveDt = paused ? 0 : dt;
+  // 跟隨中的卡車繼續行駛；否則選取或滑過時停下來方便查看（後方車輛會排隊）
+  trucks.forEach((truck, k) => { truck.vehicle.held = !following && ((selection?.kind === "query" && selection.k === k) || hoveredTruck === k); });
+  World.stepTraffic(traffic, moveDt);
+  updateLamps();
+  for (const item of [...trucks, ...cars]) {
+    const pose = World.vehiclePose(traffic, item.vehicle);
+    item.group.position.set(pose.x, 0, pose.z); item.group.rotation.y = pose.heading;
+  }
+  if (depot) {
+    depot.bays.forEach((_, bay) => [0, 1].forEach((side) => {
+      const door = depotDoors[bay * 2 + side], height = DOOR_HEIGHT * (1 - traffic.doors[bay][side] * 0.9);
+      door.scale.y = height; door.position.y = DOOR_HEIGHT - height / 2;
+      const color = LAMP[World.bayState(traffic, bay)];
+      depotLamps[bay * 2 + side].color.set(color); depotLamps[bay * 2 + side].emissive.set(color);
+    }));
+    drawDepotSign();
+  }
+  const followed = selection?.kind === "query" ? trucks[selection.k] : null;
+  if (following && followed) {
+    const p = followed.group.position;
+    goal = { target: new THREE.Vector3(p.x, 0, p.z), direction: goal?.direction ?? currentDirection(), zoom: followZoom ?? camera.zoom };
+  }
   if (goal) {
     const k = 1 - Math.exp(-dt * 4);
     controls.target.lerp(goal.target, k);
@@ -980,23 +1273,18 @@ function tick() {
     camera.position.copy(controls.target).add(direction.multiplyScalar(VIEW_DISTANCE));
     camera.zoom += (goal.zoom - camera.zoom) * k;
     camera.updateProjectionMatrix();
-    if (controls.target.distanceTo(goal.target) < 0.02 && Math.abs(camera.zoom - goal.zoom) < 0.05 && currentDirection().distanceTo(goal.direction) < 0.002) goal = null;
+    if (!following && controls.target.distanceTo(goal.target) < 0.02 && Math.abs(camera.zoom - goal.zoom) < 0.05 && currentDirection().distanceTo(goal.direction) < 0.002) goal = null;
   }
   controls.update();
-  const perimeter = 2 * (road.w + road.d);
-  trucks.forEach((truck, k) => {
-    const held = (selection?.kind === "query" && selection.k === k) || hoveredTruck === k;
-    if (!held) truck.progress += (dt * 3.2) / perimeter;
-    const point = roadPoint(truck.progress);
-    truck.group.position.set(point.x, 0, point.z); truck.group.rotation.y = point.heading;
-  });
-  const followed = selection?.kind === "query" ? trucks[selection.k] : null;
   truckPin.visible = Boolean(followed);
-  if (followed) { followed.body.getWorldPosition(truckPin.position); truckPin.position.y = 2.1 + 0.15 * Math.sin(time * 3); }
+  if (followed) {
+    followed.body.getWorldPosition(truckPin.position); truckPin.position.y = 2.1 + 0.15 * Math.sin(time * 3);
+    followed.body.getWorldPosition(brackets.position); brackets.rotation.y = followed.group.rotation.y;
+  }
   if (pin.visible) pin.position.y = roofTop(selection.i) + 0.1 + 0.15 * Math.sin(time * 3);
   const attr = packetGeo.attributes.position;
   packetState.forEach((p, k) => {
-    p.t += p.v * dt;
+    p.t += p.v * moveDt;
     if (p.t >= 1) { p.t = 0; p.li = randomLink(packetPool); }
     const pts = curves[p.li]; if (!pts) return;
     const f = p.t * (pts.length - 1), a = Math.floor(f), b = Math.min(a + 1, pts.length - 1);
@@ -1006,6 +1294,7 @@ function tick() {
   // 分區在畫面上太小時隱藏標籤，避免拉遠時標籤互相重疊
   for (const zone of zones) zone.label.visible = zone.w * camera.zoom > 150 || (selection?.kind === "region" && selection.r === zone.r);
   renderer.render(scene, camera); labelRenderer.render(scene, camera);
+  updateTag();
   requestAnimationFrame(tick);
 }
 tick();

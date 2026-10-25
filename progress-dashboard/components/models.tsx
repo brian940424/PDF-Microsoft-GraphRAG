@@ -359,3 +359,38 @@ export function Hoverable({ children, onClick, onHover }: { children: ReactNode;
     </group>
   );
 }
+
+const noRaycast = () => null;
+
+/** 選取框：WareTrack 風格的藍色角框＋淡藍填色＋地面光暈；不參與點擊判定，避免擋住其他物件。 */
+export function SelectionBrackets({ size, color = PALETTE.blue }: { size: Vec3; color?: string }) {
+  const [width, height, depth] = size;
+  const geometry = useMemo(() => {
+    const points: number[] = [];
+    const arm = Math.min(width, height, depth) * 0.28 + 0.18;
+    for (const x of [-width / 2, width / 2]) {
+      for (const y of [0, height]) {
+        for (const z of [-depth / 2, depth / 2]) {
+          const sx = x < 0 ? 1 : -1, sy = y === 0 ? 1 : -1, sz = z < 0 ? 1 : -1;
+          points.push(x, y, z, x + sx * arm, y, z, x, y, z, x, y + sy * arm, z, x, y, z, x, y, z + sz * arm);
+        }
+      }
+    }
+    return new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute(points, 3));
+  }, [width, height, depth]);
+  return (
+    <group>
+      <lineSegments geometry={geometry} raycast={noRaycast}>
+        <lineBasicMaterial color={color} />
+      </lineSegments>
+      <mesh position-y={height / 2} raycast={noRaycast}>
+        <boxGeometry args={size} />
+        <meshBasicMaterial color={color} transparent opacity={0.07} depthWrite={false} />
+      </mesh>
+      <mesh rotation-x={-Math.PI / 2} position-y={0.02} raycast={noRaycast}>
+        <planeGeometry args={[width + 1.4, depth + 1.4]} />
+        <meshBasicMaterial color={color} transparent opacity={0.14} depthWrite={false} />
+      </mesh>
+    </group>
+  );
+}

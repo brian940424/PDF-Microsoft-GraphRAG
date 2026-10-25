@@ -2,93 +2,142 @@
 
 import { Html, OrbitControls, OrthographicCamera } from "@react-three/drei";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
+import {
+  createContext, useContext, useEffect, useMemo, useRef, useState,
+  type ComponentProps, type ComponentRef, type MutableRefObject, type RefObject,
+} from "react";
 import * as THREE from "three";
 
-import { LOT_SIZE, layoutSite, roadPoint, type Lot, type SiteLayout } from "@/lib/layout";
+import { LOT_SIZE, layoutSite, type Lot, type SiteLayout } from "@/lib/layout";
+import { createTraffic, layoutTown, syncTrucks, vehiclePose, type Traffic } from "@/lib/world";
 import type { Commit, ProgressData } from "@/lib/types";
 
 import {
   Cone, ConstructionSite, Forklift, Hoverable, LotOutline, MapPin, PALETTE, Pallet,
-  ShippingContainer, TowerCrane, Tree, Truck, Warehouse,
+  SelectionBrackets, ShippingContainer, TowerCrane, Truck, Warehouse,
 } from "./models";
-import { commitColor, recentCommits, type CameraCommand, type Selection } from "./theme";
+import { Cars, DepotSign, DepotView, StreetsView, TownView, TrafficDriver, TrafficLights, Trees } from "./Town";
+import { commitColor, recentCommits, statusStyle, type CameraCommand, type Selection } from "./theme";
 
 interface WorldProps {
   data: ProgressData;
   selection: Selection;
   statusFilter: Set<string>;
   cameraCommand: CameraCommand | null;
+  /** 暫停時停止動畫並改為按需渲染，只在鏡頭或狀態改變時重繪 */
+  paused: boolean;
+  /** 鏡頭持續跟隨目前選取的卡車 */
+  following: boolean;
+  onFollowEnd: () => void;
   onSelect: (selection: Selection) => void;
 }
+
+/** 各卡車目前的道路座標，供跟隨鏡頭讀取 */
+type TruckPositions = MutableRefObject<Map<string, THREE.Vector3>>;
 
 const VIEW_DIRECTION = new THREE.Vector3(1, 0.95, 1).normalize();
 const VIEW_DISTANCE = 120;
 const HUD_RIGHT = 400;
 
+/**
+ * 3D 標籤的固定容器。drei 的 Html 預設掛在畫布的父節點上，但第一次渲染時畫布可能還沒進 DOM，
+ * 之後目標改變會重建內部 root，舊 root 延遲卸載時把新內容一起清空，造成標籤隨機消失；
+ * 改掛到從一開始就存在的容器即可避免。
+ */
+const HtmlLayer = createContext<RefObject<HTMLDivElement | null> | null>(null);
+
+function Label(props: ComponentProps<typeof Html>) {
+  const layer = useContext(HtmlLayer);
+  return <Html {...props} portal={(layer ?? undefined) as MutableRefObject<HTMLElement> | undefined} />;
+}
+
 export default function World(props: WorldProps) {
+  const htmlLayer = useRef<HTMLDivElement>(null);
   const layout = useMemo(() => layoutSite(props.data.plan, props.data.tests?.modules ?? []), [props.data]);
   const trucks = useMemo(() => recentCommits(props.data.git.commits), [props.data.git.commits]);
+  const truckPositions = useRef(new Map<string, THREE.Vector3>());
+  // 城市（路網、城鎮、車流）只在街廓格線改變時重建；提交清單變動時同步卡車，其他車輛維持原位
+  const roadKey = [...layout.grid.xs, 0, ...layout.grid.zs].map((value) => value.toFixed(2)).join(",");
+  const truckIds = trucks.map((commit) => commit.hash).join(",");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const traffic = useMemo(() => createTraffic(layout.grid, truckIds.split(",").filter(Boolean)), [roadKey]);
+  useEffect(() => { syncTrucks(traffic, truckIds.split(",").filter(Boolean)); }, [traffic, truckIds]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const town = useMemo(() => layoutTown(traffic, layout.parks), [traffic]);
+  const shadowRange = layout.radius + 22;
+  const followHash = props.following && props.selection?.kind === "commit" ? props.selection.hash : null;
   return (
-    <Canvas shadows flat dpr={[1, 2]} onPointerMissed={() => props.onSelect(null)}>
-      <color attach="background" args={["#e9eef7"]} />
-      <OrthographicCamera makeDefault position={VIEW_DIRECTION.clone().multiplyScalar(VIEW_DISTANCE).toArray()} near={1} far={500} zoom={10} />
-      <ambientLight intensity={1.15} />
-      <hemisphereLight args={["#ffffff", "#c9d3e6", 0.7]} />
-      <directionalLight
-        castShadow
-        position={[-30, 60, 40]}
-        intensity={1.5}
-        shadow-mapSize={[4096, 4096]}
-        shadow-bias={-0.0004}
-        shadow-normalBias={0.02}
-        shadow-camera-left={-layout.radius}
-        shadow-camera-right={layout.radius}
-        shadow-camera-top={layout.radius}
-        shadow-camera-bottom={-layout.radius}
-        shadow-camera-far={200}
-      />
-      <Ground layout={layout} />
-      {layout.zones.map((zone) => (
-        <group key={zone.name}>
-          <ZonePad x={zone.x} z={zone.z} w={zone.w} d={zone.d} label={`${zone.name}區`} count={zone.lots.length} />
-          {zone.lots.map((lot) => (
-            <LotView
-              key={lot.item.id}
-              lot={lot}
-              selected={props.selection?.kind === "plan" && props.selection.id === lot.item.id}
-              dimmed={props.statusFilter.size > 0 && !props.statusFilter.has(lot.item.status)}
-              onSelect={props.onSelect}
-            />
-          ))}
-        </group>
-      ))}
-      {layout.yard && <YardView layout={layout} selection={props.selection} onSelect={props.onSelect} />}
-      {trucks.map((commit, index) => (
-        <MovingTruck
-          key={commit.hash}
-          commit={commit}
-          road={layout.road}
-          offset={index / trucks.length}
-          selected={props.selection?.kind === "commit" && props.selection.hash === commit.hash}
-          onSelect={props.onSelect}
+    <HtmlLayer.Provider value={htmlLayer}>
+      <Canvas shadows flat dpr={[1, 2]} frameloop={props.paused ? "demand" : "always"} onPointerMissed={() => props.onSelect(null)}>
+        <color attach="background" args={["#e9eef7"]} />
+        <OrthographicCamera makeDefault position={VIEW_DIRECTION.clone().multiplyScalar(VIEW_DISTANCE).toArray()} near={1} far={500} zoom={10} />
+        <ambientLight intensity={1.15} />
+        <hemisphereLight args={["#ffffff", "#c9d3e6", 0.7]} />
+        <directionalLight
+          castShadow
+          position={[-30, 60, 40]}
+          intensity={1.5}
+          shadow-mapSize={[4096, 4096]}
+          shadow-bias={-0.0004}
+          shadow-normalBias={0.02}
+          shadow-camera-left={-shadowRange}
+          shadow-camera-right={shadowRange}
+          shadow-camera-top={shadowRange}
+          shadow-camera-bottom={-shadowRange}
+          shadow-camera-far={260}
         />
-      ))}
-      {layout.trees.map((tree, i) => <Tree key={i} position={[tree.x, 0, tree.z]} scale={tree.scale} />)}
-      <CameraRig layout={layout} selection={props.selection} command={props.cameraCommand} />
-    </Canvas>
+        <Ground layout={layout} />
+        <TrafficDriver traffic={traffic} paused={props.paused} />
+        <StreetsView traffic={traffic} />
+        <TrafficLights traffic={traffic} />
+        <TownView town={town} />
+        {traffic.depot && <DepotView traffic={traffic} depot={traffic.depot} />}
+        {traffic.depot && <DepotSign traffic={traffic} depot={traffic.depot} label="Git 倉庫 · 卸貨" />}
+        <Cars traffic={traffic} />
+        {layout.zones.map((zone) => (
+          <group key={zone.name}>
+            <ZonePad x={zone.x} z={zone.z} w={zone.w} d={zone.d} label={`${zone.name}區`} count={zone.lots.length} />
+            {zone.lots.map((lot) => (
+              <LotView
+                key={lot.item.id}
+                lot={lot}
+                selected={props.selection?.kind === "plan" && props.selection.id === lot.item.id}
+                dimmed={props.statusFilter.size > 0 && !props.statusFilter.has(lot.item.status)}
+                onSelect={props.onSelect}
+              />
+            ))}
+          </group>
+        ))}
+        {layout.yard && <YardView layout={layout} selection={props.selection} onSelect={props.onSelect} />}
+        {trucks.map((commit) => (
+          <MovingTruck
+            key={commit.hash}
+            commit={commit}
+            traffic={traffic}
+            selected={props.selection?.kind === "commit" && props.selection.hash === commit.hash}
+            following={followHash === commit.hash}
+            positions={truckPositions}
+            onSelect={props.onSelect}
+          />
+        ))}
+        <Trees trees={town.trees} />
+        <CameraRig
+          layout={layout}
+          selection={props.selection}
+          command={props.cameraCommand}
+          followHash={followHash}
+          truckPositions={truckPositions}
+          onFollowEnd={props.onFollowEnd}
+        />
+      </Canvas>
+      <div ref={htmlLayer} className="html-layer" />
+    </HtmlLayer.Provider>
   );
 }
 
+/** 地面：遠處淺灰、城鎮綠地、分區街廓的淺色鋪面（街道由 StreetsView 畫）。 */
 function Ground({ layout }: { layout: SiteLayout }) {
   const { road } = layout;
-  const roadWidth = 3.6;
-  const dashes = useMemo(() => {
-    const result: { x: number; z: number; horizontal: boolean }[] = [];
-    for (let x = -road.w / 2 + 2; x < road.w / 2 - 1; x += 2.4) result.push({ x, z: -road.d / 2, horizontal: true }, { x, z: road.d / 2, horizontal: true });
-    for (let z = -road.d / 2 + 2; z < road.d / 2 - 1; z += 2.4) result.push({ x: -road.w / 2, z, horizontal: false }, { x: road.w / 2, z, horizontal: false });
-    return result;
-  }, [road]);
   return (
     <group>
       <mesh rotation-x={-Math.PI / 2} position-y={-0.03} receiveShadow>
@@ -96,23 +145,13 @@ function Ground({ layout }: { layout: SiteLayout }) {
         <meshStandardMaterial color="#e3e9f4" />
       </mesh>
       <mesh rotation-x={-Math.PI / 2} position-y={-0.02} receiveShadow>
-        <planeGeometry args={[road.w + 20, road.d + 20]} />
+        <planeGeometry args={[road.w + 44, road.d + 44]} />
         <meshStandardMaterial color="#d9eedb" />
       </mesh>
       <mesh rotation-x={-Math.PI / 2} position-y={-0.01} receiveShadow>
-        <planeGeometry args={[road.w + roadWidth, road.d + roadWidth]} />
-        <meshStandardMaterial color="#c7cfe3" />
-      </mesh>
-      <mesh rotation-x={-Math.PI / 2} position-y={0} receiveShadow>
-        <planeGeometry args={[road.w - roadWidth, road.d - roadWidth]} />
+        <planeGeometry args={[road.w, road.d]} />
         <meshStandardMaterial color="#f1f4fa" />
       </mesh>
-      {dashes.map((dash, i) => (
-        <mesh key={i} rotation-x={-Math.PI / 2} position={[dash.x, 0.005, dash.z]}>
-          <planeGeometry args={dash.horizontal ? [1.2, 0.14] : [0.14, 1.2]} />
-          <meshBasicMaterial color="#ffffff" />
-        </mesh>
-      ))}
     </group>
   );
 }
@@ -130,9 +169,9 @@ function ZonePad({ x, z, w, d, label, count }: { x: number; z: number; w: number
           <meshBasicMaterial color="#c9d4ea" />
         </mesh>
       ))}
-      <Html position={[-w / 2 + 0.4, 0.2, -d / 2 + 0.8]} zIndexRange={[5, 0]} className="zone-label">
+      <Label position={[-w / 2 + 0.4, 0.2, -d / 2 + 0.8]} zIndexRange={[5, 0]} className="zone-label">
         {label}<span>{count}</span>
-      </Html>
+      </Label>
     </group>
   );
 }
@@ -143,6 +182,8 @@ function LotView({ lot, selected, dimmed, onSelect }: {
   const [hovered, setHovered] = useState(false);
   const { item } = lot;
   const [width, depth, height] = item.priority === "高" ? [4.6, 3.6, 2.6] : item.priority === "中" ? [4.0, 3.2, 2.2] : [3.4, 2.8, 1.9];
+  // 選取框與圖釘的高度：倉庫含屋頂、施工中含鷹架，待辦只有棧板
+  const top = item.status === "完成" ? height + depth * 0.22 : item.status === "進行中" ? height + 0.2 : 1.6;
   if (dimmed) {
     return (
       <group position={[lot.x, 0.12, lot.z]}>
@@ -177,22 +218,22 @@ function LotView({ lot, selected, dimmed, onSelect }: {
         )}
         {item.status === "不處理" && <Cone position={[0, 0, 0]} />}
         {item.status === "待確認" && !selected && <MapPin position={[0, 2.2, 0]} color={PALETTE.yellow} />}
-        {selected && (
-          <MapPin
-            position={[0, item.status === "完成" ? height + depth * 0.22 + 0.6 : item.status === "進行中" ? height + 0.8 : 2.6, 0]}
-            color={PALETTE.blue}
-            scale={1.15}
-          />
-        )}
+        {selected && <MapPin position={[0, top + 0.6, 0]} color={PALETTE.blue} scale={1.15} />}
       </Hoverable>
-      <Html position={[0, 0.2, LOT_SIZE / 2 - 0.55]} center zIndexRange={[6, 0]} className={`lot-sign ${selected ? "on" : ""}`}>
+      {selected && <SelectionBrackets size={[LOT_SIZE - 0.6, top, LOT_SIZE - 0.6]} />}
+      {selected && (
+        <Label position={[0, top + 3.2, 0]} center zIndexRange={[8, 0]} className="tag3d">
+          {item.id}<small>{statusStyle(item.status).label}</small>
+        </Label>
+      )}
+      <Label position={[0, 0.2, LOT_SIZE / 2 - 0.55]} center zIndexRange={[6, 0]} className={`lot-sign ${selected ? "on" : ""}`}>
         {item.id}
         {item.uncommitted && <i title="已完成但未提交" />}
-      </Html>
+      </Label>
       {hovered && !selected && (
-        <Html position={[0, 4.6, 0]} center zIndexRange={[7, 0]} className="tooltip3d">
+        <Label position={[0, 4.6, 0]} center zIndexRange={[7, 0]} className="tooltip3d">
           <b>{item.id}</b> {item.title.replace(/`/g, "")}
-        </Html>
+        </Label>
       )}
     </group>
   );
@@ -231,41 +272,46 @@ function ContainerView({ slot, selected, onSelect }: {
         />
       </Hoverable>
       {(failing || selected) && <MapPin position={[0, 2.5, 0]} color={selected ? PALETTE.blue : PALETTE.red} scale={0.8} />}
+      {selected && <SelectionBrackets size={[3.2, 1.9, 1.7]} />}
       {(hovered || selected) && (
-        <Html position={[0, 4.4, 0]} center zIndexRange={[7, 0]} className="tooltip3d">
-          <b>{slot.module.module}</b> {slot.module.passed}/{total} 通過
-        </Html>
+        <Label position={[0, 4.4, 0]} center zIndexRange={[7, 0]} className={selected ? "tag3d" : "tooltip3d"}>
+          {selected ? <>{slot.module.module}<small>{slot.module.passed}/{total} 通過</small></> : <><b>{slot.module.module}</b> {slot.module.passed}/{total} 通過</>}
+        </Label>
       )}
     </group>
   );
 }
 
-function MovingTruck({ commit, road, offset, selected, onSelect }: {
-  commit: Commit; road: SiteLayout["road"]; offset: number; selected: boolean; onSelect: WorldProps["onSelect"];
+function MovingTruck({ commit, traffic, selected, following, positions, onSelect }: {
+  commit: Commit; traffic: Traffic; selected: boolean; following: boolean;
+  positions: TruckPositions; onSelect: WorldProps["onSelect"];
 }) {
   const ref = useRef<THREE.Group>(null);
   const [hovered, setHovered] = useState(false);
-  const progress = useRef(offset);
-  const perimeter = 2 * (road.w + road.d);
-  useFrame((_, dt) => {
-    if (!ref.current) return;
-    if (!selected && !hovered) progress.current += (dt * 3.2) / perimeter;
-    const point = roadPoint(road, progress.current);
-    ref.current.position.set(point.x, 0, point.z);
-    ref.current.rotation.y = point.heading;
+  useEffect(() => () => { positions.current.delete(commit.hash); }, [positions, commit.hash]);
+  useFrame(() => {
+    const vehicle = traffic.vehicles.find((candidate) => candidate.id === commit.hash);
+    if (!ref.current || !vehicle) return;
+    // 跟隨中的卡車繼續行駛；否則選取或滑過時停下來方便查看（後方車輛會排隊）
+    vehicle.held = !following && (selected || hovered);
+    const pose = vehiclePose(traffic, vehicle);
+    ref.current.position.set(pose.x, 0, pose.z);
+    ref.current.rotation.y = pose.heading;
+    const stored = positions.current.get(commit.hash);
+    if (stored) stored.set(pose.x, 0, pose.z);
+    else positions.current.set(commit.hash, new THREE.Vector3(pose.x, 0, pose.z));
   });
   return (
     <group ref={ref}>
-      {/* 靠右行駛 */}
-      <group position={[0, 0, 0.9]}>
+      <group>
         <Hoverable onClick={() => onSelect({ kind: "commit", hash: commit.hash })} onHover={setHovered}>
           <Truck stripe={commitColor(commit.type)} highlight={hovered || selected} />
         </Hoverable>
-        {selected && <MapPin position={[0, 2.6, 0]} color={PALETTE.blue} scale={0.8} />}
+        {selected && <SelectionBrackets size={[3.6, 1.9, 1.7]} />}
         {(hovered || selected) && (
-          <Html position={[0, 4.4, 0]} center zIndexRange={[7, 0]} className="tooltip3d">
-            <b>{commit.hash}</b> {commit.subject}
-          </Html>
+          <Label position={[0, 3.2, 0]} center zIndexRange={[7, 0]} className={selected ? "tag3d" : "tooltip3d"}>
+            {selected ? <>{commit.hash}<small>{following ? "跟隨中" : commit.type}</small></> : <><b>{commit.hash}</b> {commit.subject}</>}
+          </Label>
         )}
       </group>
     </group>
@@ -279,15 +325,21 @@ interface CameraGoal {
 }
 
 /** 等角正交鏡頭：平滑移動到選取目標，並處理縮放、旋轉、回到全景等指令。 */
-function CameraRig({ layout, selection, command }: { layout: SiteLayout; selection: Selection; command: CameraCommand | null }) {
+function CameraRig({ layout, selection, command, followHash, truckPositions, onFollowEnd }: {
+  layout: SiteLayout; selection: Selection; command: CameraCommand | null;
+  followHash: string | null; truckPositions: TruckPositions; onFollowEnd: () => void;
+}) {
   const controls = useRef<ComponentRef<typeof OrbitControls>>(null);
-  const { camera, size } = useThree();
+  const { camera, size, gl, invalidate } = useThree();
   const ortho = camera as THREE.OrthographicCamera;
   // 右側卡片遮住約 HUD_RIGHT 像素：以 view offset 讓場景中心落在可見區域中央
   const hudRight = size.width > 1100 ? HUD_RIGHT : 0;
   const fitZoom = Math.min((size.width - hudRight) / (layout.radius * 1.9), size.height / (layout.radius * 1.35));
   const goal = useRef<CameraGoal | null>(null);
   const initialized = useRef(false);
+  // 跟隨時鏡頭目標每幀追著卡車；followZoom 為 null 代表使用者已自行縮放，不再拉回
+  const following = useRef(followHash);
+  const followZoom = useRef<number | null>(null);
 
   const currentDirection = () =>
     controls.current ? camera.position.clone().sub(controls.current.target).normalize() : VIEW_DIRECTION.clone();
@@ -313,6 +365,13 @@ function CameraRig({ layout, selection, command }: { layout: SiteLayout; selecti
   }, [selection]);
 
   useEffect(() => {
+    following.current = followHash;
+    followZoom.current = followHash ? Math.max(fitZoom * 2, ortho.zoom) : null;
+    invalidate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followHash]);
+
+  useEffect(() => {
     if (!command || !controls.current) return;
     const target = controls.current.target.clone();
     const direction = currentDirection();
@@ -324,27 +383,61 @@ function CameraRig({ layout, selection, command }: { layout: SiteLayout; selecti
       goal.current = { ...base, direction: base.direction.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), angle) };
     }
     if (command.kind === "home") goal.current = { target: new THREE.Vector3(), direction: VIEW_DIRECTION.clone(), zoom: fitZoom };
+    if (following.current) followZoom.current = goal.current?.zoom ?? null;
+    invalidate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [command]);
 
   useEffect(() => {
     const instance = controls.current;
     if (!instance) return;
-    const cancel = () => { goal.current = null; };
+    // 跟隨中滾輪縮放不中斷跟隨，只是不再把縮放拉回
+    const cancel = () => {
+      if (following.current) followZoom.current = null;
+      else goal.current = null;
+    };
     instance.addEventListener("start", cancel);
     return () => instance.removeEventListener("start", cancel);
   }, []);
 
+  useEffect(() => {
+    // 拖曳平移超過 6px 視為手動操作，結束跟隨（同 WareTrack）
+    const element = gl.domElement;
+    let down: [number, number] | null = null;
+    const onDown = (event: PointerEvent) => { down = [event.clientX, event.clientY]; };
+    const onMove = (event: PointerEvent) => {
+      if (!down || Math.hypot(event.clientX - down[0], event.clientY - down[1]) < 6) return;
+      down = null;
+      if (following.current) { goal.current = null; onFollowEnd(); }
+    };
+    const onUp = () => { down = null; };
+    element.addEventListener("pointerdown", onDown);
+    element.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      element.removeEventListener("pointerdown", onDown);
+      element.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, [gl, onFollowEnd]);
+
   useFrame((_, dt) => {
     const instance = controls.current;
-    if (!instance || !goal.current) return;
+    if (!instance) return;
+    const truck = following.current ? truckPositions.current.get(following.current) : undefined;
+    if (truck) {
+      goal.current = { target: truck.clone(), direction: goal.current?.direction ?? currentDirection(), zoom: followZoom.current ?? ortho.zoom };
+    }
+    if (!goal.current) return;
+    // 按需渲染（暫停）時，鏡頭移動期間持續要求下一幀
+    invalidate();
     const k = 1 - Math.exp(-dt * 4);
     instance.target.lerp(goal.current.target, k);
     const direction = currentDirection().lerp(goal.current.direction, k).normalize();
     camera.position.copy(instance.target).add(direction.multiplyScalar(VIEW_DISTANCE));
     ortho.zoom += (goal.current.zoom - ortho.zoom) * k;
     ortho.updateProjectionMatrix();
-    if (instance.target.distanceTo(goal.current.target) < 0.02 && Math.abs(ortho.zoom - goal.current.zoom) < 0.05
+    if (!truck && instance.target.distanceTo(goal.current.target) < 0.02 && Math.abs(ortho.zoom - goal.current.zoom) < 0.05
       && currentDirection().distanceTo(goal.current.direction) < 0.002) {
       goal.current = null;
     }

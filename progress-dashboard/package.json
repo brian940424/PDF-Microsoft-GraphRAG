@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start -H 127.0.0.1 -p 3100",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "export-world": "node scripts/export-world.mjs"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",

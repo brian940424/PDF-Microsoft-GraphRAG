@@ -15,6 +15,8 @@ const PATHS = {
   crane: "M4 21V5h2v2h14v2H11l-3 3v9H4Zm2-12v1.2L7.2 9H6Zm11 1h2v6h-2v-6Z",
   flag: "M5 3h2v1h11l-2 4 2 4H7v9H5V3Z",
   play: "M8 5v14l11-7z",
+  pause: "M7 5h4v14H7zm6 0h4v14h-4z",
+  target: "M11 2h2v5h-2zm0 15h2v5h-2zM2 11h5v2H2zm15 0h5v2h-5zm-5-2a3 3 0 1 1 0 6a3 3 0 1 1 0-6Z",
   chevronLeft: "M15.4 6.6 14 5.2 7.2 12l6.8 6.8 1.4-1.4L10 12z",
   chevronRight: "M8.6 6.6 10 5.2l6.8 6.8-6.8 6.8-1.4-1.4L14 12z",
   close: "M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6L19 6.4 17.6 5 12 10.6z",

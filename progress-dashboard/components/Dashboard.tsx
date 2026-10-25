@@ -1,8 +1,9 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
+import { buildAlerts, diffProgress, type Alert } from "@/lib/alerts";
 import { STATUS_ORDER, priorityRank, statusRank } from "@/lib/layout";
 import { plainText } from "@/lib/markdown";
 import type { Commit, PlanItem, ProgressData, TestReport } from "@/lib/types";
@@ -16,22 +17,58 @@ const World = dynamic(() => import("./World"), {
 });
 
 const REFRESH_MS = 20_000;
+const TOAST_MS = 3800;
+const EVENT_LIMIT = 30;
+
+/** 自動更新偵測到的動態：顯示為提示，也保留在鈴鐺的「最近動態」 */
+export interface FeedEvent extends Alert {
+  at: number;
+}
 
 export default function Dashboard({ initial }: { initial: ProgressData }) {
   const [data, setData] = useState(initial);
-  const [selection, setSelection] = useState<Selection>(null);
+  const [selection, setSelectionState] = useState<Selection>(null);
   const [statusFilter, setStatusFilter] = useState<Set<string>>(new Set());
   const [cameraCommand, setCameraCommand] = useState<CameraCommand | null>(null);
   const [testRunning, setTestRunning] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [following, setFollowing] = useState(false);
+  const [events, setEvents] = useState<FeedEvent[]>([]);
+  const [toasts, setToasts] = useState<FeedEvent[]>([]);
+  const [unread, setUnread] = useState(0);
+  const [bellOpen, setBellOpen] = useState(false);
+  const dataRef = useRef(initial);
+
+  const setSelection = useCallback((next: Selection) => {
+    setSelectionState(next);
+    if (next?.kind !== "commit") setFollowing(false);
+  }, []);
+
+  // 偏好減少動態的使用者預設暫停動畫
+  useEffect(() => {
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) setPaused(true);
+  }, []);
+
+  const applyData = useCallback((next: ProgressData) => {
+    const found = diffProgress(dataRef.current, next).map((event) => ({ ...event, at: Date.now() }));
+    dataRef.current = next;
+    setData(next);
+    if (!found.length) return;
+    setEvents((current) => [...found, ...current].slice(0, EVENT_LIMIT));
+    setUnread((count) => count + found.length);
+    setToasts((current) => [...current, ...found].slice(-3));
+    const ids = new Set(found.map((event) => `${event.id}@${event.at}`));
+    setTimeout(() => setToasts((current) => current.filter((toast) => !ids.has(`${toast.id}@${toast.at}`))), TOAST_MS);
+  }, []);
 
   const refresh = useCallback(async () => {
     const response = await fetch("/api/progress", { cache: "no-store" });
     if (!response.ok) return;
-    const next = (await response.json()) as ProgressData & { testRunActive: boolean };
-    setData(next);
-    setTestRunning((running) => running || next.testRunActive);
-  }, []);
+    const { testRunActive, ...next } = (await response.json()) as ProgressData & { testRunActive: boolean };
+    applyData(next);
+    setTestRunning((running) => running || testRunActive);
+  }, [applyData]);
 
   useEffect(() => {
     const timer = setInterval(() => { refresh().catch(() => undefined); }, REFRESH_MS);
@@ -45,7 +82,7 @@ export default function Dashboard({ initial }: { initial: ProgressData }) {
       const response = await fetch("/api/tests", { method: "POST" });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? response.statusText);
-      setData((current) => ({ ...current, tests: body as TestReport }));
+      applyData({ ...dataRef.current, tests: body as TestReport });
     } catch (error) {
       setTestError(String(error));
     } finally {
@@ -54,13 +91,52 @@ export default function Dashboard({ initial }: { initial: ProgressData }) {
   };
 
   const camera = (kind: CameraCommand["kind"]) => setCameraCommand({ kind, nonce: Date.now() });
+  const endFollow = useCallback(() => setFollowing(false), []);
+  const toggleFollow = useCallback(() => setFollowing((on) => !on), []);
+
+  // 快捷鍵（同 WareTrack）：/ 搜尋、Esc 取消選取、Space 暫停動畫、F 跟隨選取的卡車
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") {
+        if (event.key === "Escape") target.blur();
+        return;
+      }
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === "/") { event.preventDefault(); document.getElementById("site-search")?.focus(); }
+      else if (event.key === "Escape") { if (bellOpen) setBellOpen(false); else setSelection(null); }
+      else if (event.key === " ") { event.preventDefault(); setPaused((on) => !on); }
+      else if ((event.key === "f" || event.key === "F") && selection?.kind === "commit") toggleFollow();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [bellOpen, selection, setSelection, toggleFollow]);
+
+  const alerts = useMemo(() => buildAlerts(data), [data]);
+  const openBell = () => {
+    setBellOpen((open) => !open);
+    setUnread(0);
+  };
 
   return (
     <main className="shell">
       <div className="scene">
-        <World data={data} selection={selection} statusFilter={statusFilter} cameraCommand={cameraCommand} onSelect={setSelection} />
+        <World
+          data={data}
+          selection={selection}
+          statusFilter={statusFilter}
+          cameraCommand={cameraCommand}
+          paused={paused}
+          following={following}
+          onFollowEnd={endFollow}
+          onSelect={setSelection}
+        />
       </div>
-      <TopNav data={data} onSelect={setSelection} />
+      <TopNav data={data} onSelect={setSelection} alerts={alerts} unread={unread} bellOpen={bellOpen} onBell={openBell} />
+      {bellOpen && (
+        <BellMenu alerts={alerts} events={events} onClose={() => setBellOpen(false)} onSelect={(next) => { setSelection(next); setBellOpen(false); }} />
+      )}
+      <Toasts toasts={toasts} onSelect={setSelection} />
       <KpiRow data={data} testRunning={testRunning} onRunTests={runTests} />
       <div className="card map-controls">
         {([["plus", "zoomIn", "放大"], ["minus", "zoomOut", "縮小"], ["rotateLeft", "rotateLeft", "向左旋轉"],
@@ -70,8 +146,17 @@ export default function Dashboard({ initial }: { initial: ProgressData }) {
               <Icon name={icon} />
             </button>
           ))}
+        <button
+          className={paused ? "on" : ""}
+          title={paused ? "繼續動畫 (Space)" : "暫停動畫 (Space)"}
+          aria-label={paused ? "繼續動畫" : "暫停動畫"}
+          aria-pressed={paused}
+          onClick={() => setPaused((on) => !on)}
+        >
+          <Icon name={paused ? "play" : "pause"} />
+        </button>
       </div>
-      <DetailCard data={data} selection={selection} onSelect={setSelection} />
+      <DetailCard data={data} selection={selection} onSelect={setSelection} following={following} onToggleFollow={toggleFollow} />
       <Tracker data={data} selection={selection} />
       <TabsCard
         data={data}
@@ -89,7 +174,9 @@ export default function Dashboard({ initial }: { initial: ProgressData }) {
 
 /* ---------------- 頂部導覽 ---------------- */
 
-function TopNav({ data, onSelect }: { data: ProgressData; onSelect: (s: Selection) => void }) {
+function TopNav({ data, onSelect, alerts, unread, bellOpen, onBell }: {
+  data: ProgressData; onSelect: (s: Selection) => void; alerts: Alert[]; unread: number; bellOpen: boolean; onBell: () => void;
+}) {
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
   const results = useMemo(() => {
@@ -103,7 +190,9 @@ function TopNav({ data, onSelect }: { data: ProgressData; onSelect: (s: Selectio
       .map((module) => ({ key: module.module, label: module.module, hint: "測試貨櫃", select: { kind: "module", module: module.module } as Selection }));
     return [...plans, ...modules].slice(0, 8);
   }, [data, query]);
-  const failing = data.tests?.failed ?? 0;
+  // 徽章：有未讀動態時顯示未讀數（紅），否則只計失敗項目（橘）；待確認與未提交留在選單內
+  const failing = alerts.filter((alert) => alert.tone === "bad").length;
+  const badge = unread || failing;
   const initials = (data.git.user || "Dev").split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
   return (
     <nav className="topnav">
@@ -114,6 +203,7 @@ function TopNav({ data, onSelect }: { data: ProgressData; onSelect: (s: Selectio
       <div className="search">
         <Icon name="search" size={18} />
         <input
+          id="site-search"
           value={query}
           placeholder="搜尋改善項目、測試模組…"
           onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
@@ -142,9 +232,15 @@ function TopNav({ data, onSelect }: { data: ProgressData; onSelect: (s: Selectio
         </div>
       </div>
       <LiveClock />
-      <button className="bell" title={failing ? `${failing} 項測試失敗` : "沒有警示"}>
+      <button
+        className={`bell ${bellOpen ? "on" : ""}`}
+        title={alerts.length ? `${alerts.length} 項需要注意` : "通知"}
+        aria-label="通知"
+        aria-expanded={bellOpen}
+        onClick={onBell}
+      >
         <Icon name="bell" size={20} />
-        {failing > 0 && <i />}
+        {badge > 0 && <i className={unread ? "new" : ""}>{badge > 9 ? "9+" : badge}</i>}
       </button>
       <div className="user">
         <span className="avatar">{initials}</span>
@@ -166,6 +262,51 @@ function LiveClock() {
     return () => clearInterval(timer);
   }, []);
   return <div className="live"><i />Live {now ?? "--:--"}</div>;
+}
+
+/* ---------------- 通知：鈴鐺選單與提示 ---------------- */
+
+const TONE_ICON: Record<Alert["tone"], IconName> = { bad: "close", warn: "flag", good: "check", info: "bell" };
+
+function BellMenu({ alerts, events, onClose, onSelect }: {
+  alerts: Alert[]; events: FeedEvent[]; onClose: () => void; onSelect: (s: Selection) => void;
+}) {
+  return (
+    <>
+      <div className="dd-backdrop" onClick={onClose} />
+      <div className="card bell-menu" role="dialog" aria-label="通知">
+        <div className="dd-head"><b>需要注意</b><span className="muted">{alerts.length}</span></div>
+        {alerts.map((alert) => <NoticeRow key={alert.id} notice={alert} onSelect={onSelect} />)}
+        {!alerts.length && <p className="muted pad">目前沒有需要處理的事項。</p>}
+        <div className="dd-head"><b>最近動態</b><span className="muted">每 {REFRESH_MS / 1000} 秒更新</span></div>
+        {events.map((event) => <NoticeRow key={`${event.id}@${event.at}`} notice={event} onSelect={onSelect} time={event.at} />)}
+        {!events.length && <p className="muted pad">開啟後的新提交、狀態變更與測試結果會出現在這裡。</p>}
+      </div>
+    </>
+  );
+}
+
+function NoticeRow({ notice, onSelect, time }: { notice: Alert; onSelect: (s: Selection) => void; time?: number }) {
+  return (
+    <button className={`notice ${notice.tone}`} onClick={() => onSelect(notice.select)}>
+      <span className="notice-icon"><Icon name={TONE_ICON[notice.tone]} size={14} /></span>
+      <span className="notice-text"><b>{notice.title}</b>{notice.body && <small>{notice.body}</small>}</span>
+      {time !== undefined && <time>{new Date(time).toLocaleTimeString("zh-TW", { hour: "2-digit", minute: "2-digit", hour12: false })}</time>}
+    </button>
+  );
+}
+
+function Toasts({ toasts, onSelect }: { toasts: FeedEvent[]; onSelect: (s: Selection) => void }) {
+  return (
+    <div className="toasts" aria-live="polite">
+      {toasts.map((toast) => (
+        <button key={`${toast.id}@${toast.at}`} className={`toast ${toast.tone}`} onClick={() => onSelect(toast.select)}>
+          <span className="notice-icon"><Icon name={TONE_ICON[toast.tone]} size={14} /></span>
+          <span className="notice-text"><b>{toast.title}</b>{toast.body && <small>{toast.body}</small>}</span>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 /* ---------------- KPI 卡片 ---------------- */
@@ -224,7 +365,9 @@ function Kpi({ icon, label, value, unit, delta, tone = "good", sub, action }: {
 
 /* ---------------- 右側詳細卡 ---------------- */
 
-function DetailCard({ data, selection, onSelect }: { data: ProgressData; selection: Selection; onSelect: (s: Selection) => void }) {
+function DetailCard({ data, selection, onSelect, following, onToggleFollow }: {
+  data: ProgressData; selection: Selection; onSelect: (s: Selection) => void; following: boolean; onToggleFollow: () => void;
+}) {
   let body: ReactNode = <SiteOverview data={data} onSelect={onSelect} />;
   if (selection?.kind === "plan") {
     const item = data.plan.find((plan) => plan.id === selection.id);
@@ -255,7 +398,7 @@ function DetailCard({ data, selection, onSelect }: { data: ProgressData; selecti
     }
   } else if (selection?.kind === "commit") {
     const commit = data.git.commits.find((c) => c.hash === selection.hash);
-    if (commit) body = <CommitDetail commit={commit} />;
+    if (commit) body = <CommitDetail commit={commit} following={following} onToggleFollow={onToggleFollow} />;
   } else if (selection?.kind === "zone") {
     const items = data.plan.filter((item) => item.district === selection.name);
     body = (
@@ -357,11 +500,14 @@ function PlanDetail({ item }: { item: PlanItem }) {
   );
 }
 
-function CommitDetail({ commit }: { commit: Commit }) {
+function CommitDetail({ commit, following, onToggleFollow }: { commit: Commit; following: boolean; onToggleFollow: () => void }) {
   return (
     <>
       <Header eyebrow={`TRUCK · ${commit.type}`} title={commit.subject} subtitle={`${commit.author} · ${commit.hash}`} icon="truck" />
       <StatusRow pill={{ label: commit.type, fg: commitColor(commit.type), bg: "#eef2ff" }} text={<Time iso={commit.date} />} />
+      <button className={`follow-button ${following ? "on" : ""}`} onClick={onToggleFollow} aria-pressed={following}>
+        <Icon name="target" size={16} /> {following ? "停止跟隨" : "鏡頭跟隨卡車"} <kbd>F</kbd>
+      </button>
       <div className="stat-grid">
         <Stat label="變更檔案" value={`${commit.files}`} unit="個" />
         <Stat label="行數" value={`+${commit.insertions}`} unit={`−${commit.deletions}`} />
