@@ -319,6 +319,18 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                         continue
                     metric_samples.append((result.retrieved_evidence, gold))
             metrics = compute_source_metrics(tuple(metric_samples)) if metric_samples else (None, None, None, 0)
+            coverages = [float(item["answer_point_coverage_percent"]) for item in selected
+                         if isinstance(item.get("answer_point_coverage_percent"), (int, float))]
+            unsupported_counts = [int(item["unsupported_claim_count"]) for item in selected
+                                  if isinstance(item.get("unsupported_claim_count"), int)]
+            refusal_labels = [item.get("refusal_correctness") for item in selected]
+            scored_refusals = [value for value in refusal_labels if value in {"correct", "incorrect"}]
+            quality_reviewed = sum(
+                item.get("answer_point_coverage_percent") is not None
+                or item.get("unsupported_claim_count") is not None
+                or item.get("refusal_correctness") is not None
+                for item in selected
+            )
             metric_status = (
                 "已計算（文件 ID／頁碼比對；逐題 precision 平均，無頁碼 Gold 排除）" if metric_samples else
                 "不可計算：Global／Agentic 社群報告無法可靠映射" if method in {"global", EXPERIMENT_AGENTIC_METHOD} else
@@ -336,6 +348,11 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 f"{metrics[1]:.1%}" if metrics[1] is not None else "不可計算",
                 f"{metrics[2]:.1%}" if metrics[2] is not None else "不可計算",
                 metric_status,
+                f"{sum(coverages) / len(coverages):.1f}%" if coverages else "未標註",
+                f"{sum(count > 0 for count in unsupported_counts) / len(unsupported_counts):.1%}" if unsupported_counts else "未標註",
+                f"{sum(unsupported_counts) / len(unsupported_counts):.2f}" if unsupported_counts else "未標註",
+                f"{sum(value == 'correct' for value in scored_refusals) / len(scored_refusals):.1%}" if scored_refusals else "未標註",
+                quality_reviewed,
             ])
     return rows
 
@@ -361,6 +378,10 @@ def _experiment_trace_cell(trace):
     )
     stop_reason = metadata.get("stop_reason", "") if isinstance(metadata, dict) else ""
     return f"{step_text}｜停止：{stop_reason}" if stop_reason else step_text
+
+
+def _quality_annotation_label(value):
+    return {"correct": "正確", "incorrect": "錯誤", "not_applicable": "不適用"}.get(value, "")
 
 
 def _experiment_grade_label(value):
@@ -1308,6 +1329,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     f"{item['average_search_steps']:.2f}" if item.get("average_search_steps") is not None else "—",
                     f"{item['average_agent_model_calls']:.2f}" if item.get("average_agent_model_calls") is not None else "—",
                     "未知（無 Token 用量）",
+                    f"{item['answer_point_coverage_percent']:.1f}%" if item.get("answer_point_coverage_percent") is not None else "未標註",
+                    f"{item['unsupported_answer_rate']:.1%}" if item.get("unsupported_answer_rate") is not None else "未標註",
+                    f"{item['average_unsupported_claim_count']:.2f}" if item.get("average_unsupported_claim_count") is not None else "未標註",
+                    f"{item['refusal_accuracy']:.1%}" if item.get("refusal_accuracy") is not None else "未標註",
+                    item.get("quality_reviewed_count", 0),
                 ]
                 for item in run.get("groups", [])
             ]
@@ -1328,9 +1354,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("evaluation_reason") or item.get("error") or "",
                     _experiment_strategy_cell(item, strategy_labels),
                     _experiment_trace_cell(item.get("execution_trace", {})),
+                    f"{item['answer_point_coverage_percent']:.1f}" if item.get("answer_point_coverage_percent") is not None else "",
+                    str(item["unsupported_claim_count"]) if item.get("unsupported_claim_count") is not None else "",
+                    _quality_annotation_label(item.get("refusal_correctness")),
                 ]
                 for item in ordered_raw_results
-                if item.get("evaluation_result") not in (None, "待評測")
+                if str(item.get("actual_answer", "") or "").strip()
+                or item.get("evaluation_result") not in (None, "待評測")
             ]
             status = message or (
                 f"最近實驗狀態：{run.get('status', '尚未執行')}｜資料集：{run.get('question_set_name', '尚未匯入')}"
@@ -1806,6 +1836,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         else:
             table_rows = table_data or []
         judgments = []
+        quality_annotations = []
         run = retrieval_experiments.load(project_id).get("run") or {}
         dataset_display_to_id = {
             f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})": item.get("dataset_id", "")
@@ -1818,10 +1849,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             grade = row[7] if is_multidataset_row else row[6]
             if is_multidataset_row:
                 display = str(row[1])
-                judgments.append((str(row[0]), str(dataset_display_to_id.get(display, "")), str(row[2]), grade))
+                dataset_id = str(dataset_display_to_id.get(display, ""))
+                question_id = str(row[2])
+                judgments.append((str(row[0]), dataset_id, question_id, grade))
             else:
-                judgments.append((str(row[0]), str(row[1]), grade))
+                dataset_id = ""
+                question_id = str(row[1])
+                judgments.append((str(row[0]), question_id, grade))
+            if len(row) >= 14:
+                quality_annotations.append((
+                    str(row[0]), dataset_id, question_id,
+                    str(row[11] if row[11] is not None else ""),
+                    str(row[12] if row[12] is not None else ""),
+                    str(row[13] if row[13] is not None else ""),
+                ))
         try:
+            retrieval_experiments.update_quality_annotations(project_id, quality_annotations)
             retrieval_experiments.update_manual_judgments(project_id, judgments)
         except ProjectError as exc:
             return f"❌ 儲存人工判斷失敗：{exc}", [], [], []
@@ -3475,28 +3518,32 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
                 experiment_evaluate_progress = gr.HTML(label="答案評測進度", visible=False)
                 experiment_status = gr.Markdown()
+                gr.Markdown(
+                    "人工欄位可留白表示未複核。答案要點覆蓋率以標準答案中的必要事實為分母，填 0–100；"
+                    "無根據主張數只計回答中沒有來源支持的事實主張；拒答欄僅對預期無答案題填「正確」或「錯誤」，其餘填「不適用」。"
+                )
                 experiment_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本"],
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數"],
                     interactive=False,
-                    datatype=["str"] * 21,
+                    datatype=["str"] * 26,
                     label="實驗組摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_dataset_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態"],
+                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數"],
                     interactive=False,
-                    datatype=["str"] * 16,
+                    datatype=["str"] * 21,
                     label="實驗組 × 題目集摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定"],
                     interactive=True,
-                    datatype=["str"] * 11,
-                    column_widths=["7%", "10%", "5%", "9%", "12%", "17%", "15%", "6%", "9%", "10%"],
-                    label="逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）",
+                    datatype=["str"] * 14,
+                    column_widths=["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%"],
+                    label="逐題實驗結果（不執行模型評測也可手動編輯等級與品質欄位；拒答欄填正確／錯誤／不適用）",
                     wrap=True,
                     visible=False,
                 )
