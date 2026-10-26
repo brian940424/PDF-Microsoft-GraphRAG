@@ -73,6 +73,7 @@ class QueryService:
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
+        self._custom_runner = runner is not None
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
         self.evidence_service = evidence_service or EvidenceService(projects)
         self.router = router or StrategyRouter()
@@ -140,11 +141,13 @@ class QueryService:
             prompt,
         ]
         if normalized_method == AGENTIC_METHOD:
-            def execute_search(search_method: str, search_question: str):
+            def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
                 search_command = [
                     sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
                     "--method", search_method, "--response-type", response_type, search_question,
                 ]
+                if not self._custom_runner:
+                    return self._run(search_command, timeout_seconds=timeout_seconds)
                 return self.runner(search_command)
 
             decision = self.agentic_search.run(
@@ -230,7 +233,7 @@ class QueryService:
         return QueryResult(**value)
 
     @staticmethod
-    def _run(command: list[str]) -> subprocess.CompletedProcess[str] | QueryExecution:
+    def _run(command: list[str], timeout_seconds: float | None = None) -> subprocess.CompletedProcess[str] | QueryExecution:
         method = command[command.index("--method") + 1]
         root = Path(command[command.index("--root") + 1])
         question = command[-1]
@@ -272,6 +275,7 @@ class QueryService:
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=timeout_seconds,
             )
             response = json.loads(completed.stdout)
             if not isinstance(response, dict):
@@ -286,6 +290,8 @@ class QueryService:
                 completed.stderr or "",
                 context if isinstance(context, dict) else {},
             )
+        except subprocess.TimeoutExpired:
+            return QueryExecution(124, "", "Agentic GraphRAG 搜尋超過單題時間上限")
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             detail = (completed.stderr or completed.stdout).strip().splitlines() if "completed" in locals() else []
             error = detail[-1] if detail else str(exc)

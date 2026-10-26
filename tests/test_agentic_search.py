@@ -74,6 +74,25 @@ class AgenticSearchTests(unittest.TestCase):
         self.assertIn("補充搜尋失敗", result.stop_reason)
         self.assertEqual(result.answer, "依第一輪來源可確認的部分 [E1]。")
 
+    def test_search_receives_remaining_total_time_budget(self) -> None:
+        model_responses = iter([
+            {"method": "local", "query": "q", "purpose": "p"},
+            {"sufficient": True, "gap": "", "method": "", "query": ""},
+            {"answer": "A [E1]"},
+        ])
+        budgets: list[float] = []
+
+        def search(_method: str, _query: str, timeout_seconds: float) -> QueryExecution:
+            budgets.append(timeout_seconds)
+            return QueryExecution(0, "A", "", {"sources": [{"id": "tu1", "text": "evidence"}]})
+
+        result = AgenticSearch(lambda *_: next(model_responses)).run("q", "model", "https://api", "key", search)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(budgets), 1)
+        self.assertGreater(budgets[0], 0)
+        self.assertLessEqual(budgets[0], 300)
+
     def test_invalid_planner_method_falls_back_to_local(self) -> None:
         calls = 0
 

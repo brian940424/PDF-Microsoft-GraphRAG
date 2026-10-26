@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -12,6 +13,7 @@ from .strategy_routing import ROUTABLE_METHODS, StrategyRouter
 
 
 MAX_SEARCH_STEPS = 2
+MAX_TOTAL_SECONDS = 300
 MAX_EVIDENCE_ITEMS = 24
 MAX_EVIDENCE_CHARS = 1200
 
@@ -44,7 +46,7 @@ Retrieved results (JSON):
 
 
 ChatFunction = Callable[..., object]
-SearchFunction = Callable[[str, str], object]
+SearchFunction = Callable[..., object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,17 +75,21 @@ class AgenticSearch:
         search: SearchFunction,
         reasoning_effort: str = "medium",
     ) -> AgenticDecision:
+        deadline = time.monotonic() + MAX_TOTAL_SECONDS
         if not api_key:
-            return self._fallback(question, search, "尚未設定 API Key")
+            return self._fallback(question, search, "尚未設定 API Key", deadline)
 
         try:
-            plan = self._chat_json(api_base_url, api_key, model, PLAN_PROMPT.format(question=question), reasoning_effort)
+            plan = self._chat_json(api_base_url, api_key, model, PLAN_PROMPT.format(question=question), reasoning_effort, deadline)
             method, query = self._validated_step(plan)
         except ProjectError as exc:
-            return self._fallback(question, search, str(exc))
+            return self._fallback(question, search, str(exc), deadline)
 
         steps: list[dict[str, Any]] = []
-        first = search(method, query)
+        try:
+            first = self._run_search(search, method, query, deadline)
+        except ProjectError as exc:
+            return AgenticDecision(method, "", {}, (), f"Agentic 搜尋未能開始：{exc}", 1, str(exc))
         steps.append(self._step_record(method, query, str(getattr(first, "stdout", "")), getattr(first, "context", {}), getattr(first, "returncode", 1), str(plan.get("purpose", ""))))
         if getattr(first, "returncode", 1) != 0:
             return AgenticDecision(method, "", {"agentic_steps": [{"method": method, "query": query, "context": steps[0]["context"]}]}, tuple(steps), "初次 GraphRAG 搜尋失敗", int(getattr(first, "returncode", 1)), str(getattr(first, "stderr", "GraphRAG 查詢失敗")))
@@ -92,11 +98,11 @@ class AgenticSearch:
             assessment = self._chat_json(
                 api_base_url, api_key, model,
                 ASSESS_PROMPT.format(question=question, results=self._serialize_steps(steps)),
-                reasoning_effort,
+                reasoning_effort, deadline,
             )
             if assessment.get("sufficient") is not True and len(steps) < MAX_SEARCH_STEPS:
                 follow_method, follow_query = self._validated_step(assessment)
-                second = search(follow_method, follow_query)
+                second = self._run_search(search, follow_method, follow_query, deadline)
                 steps.append(self._step_record(follow_method, follow_query, str(getattr(second, "stdout", "")), getattr(second, "context", {}), getattr(second, "returncode", 1), str(assessment.get("gap", ""))))
                 stop_reason = (
                     "已執行一次針對證據缺口的補充搜尋"
@@ -108,17 +114,17 @@ class AgenticSearch:
         except ProjectError as exc:
             stop_reason = f"證據檢查失敗，停止補搜：{exc}"
 
-        return self._decision_from_results(question, model, api_base_url, api_key, steps, reasoning_effort, stop_reason)
+        return self._decision_from_results(question, model, api_base_url, api_key, steps, reasoning_effort, stop_reason, deadline)
 
     def _decision_from_results(
         self, question: str, model: str, api_base_url: str, api_key: str,
-        steps: list[dict[str, Any]], reasoning_effort: str, stop_reason: str,
+        steps: list[dict[str, Any]], reasoning_effort: str, stop_reason: str, deadline: float,
     ) -> AgenticDecision:
         results = self._serialize_steps(steps)
         try:
             final = self._chat_json(
                 api_base_url, api_key, model,
-                ANSWER_PROMPT.format(question=question, results=results), reasoning_effort,
+                ANSWER_PROMPT.format(question=question, results=results), reasoning_effort, deadline,
             )
             answer = str(final.get("answer", "")).strip()
             if not answer:
@@ -134,15 +140,35 @@ class AgenticSearch:
         first_step_succeeded = bool(steps) and steps[0]["returncode"] == 0
         return AgenticDecision(used_method, answer, context, tuple(steps), stop_reason, 0 if first_step_succeeded else 1, None if first_step_succeeded else "GraphRAG 搜尋失敗")
 
-    def _fallback(self, question: str, search: SearchFunction, detail: str) -> AgenticDecision:
-        result = search("local", question)
+    def _fallback(self, question: str, search: SearchFunction, detail: str, deadline: float) -> AgenticDecision:
+        try:
+            result = self._run_search(search, "local", question, deadline)
+        except ProjectError as exc:
+            return AgenticDecision("local", "", {}, (), f"Agentic Search 回退 Local 失敗：{detail}；{exc}", 1, str(exc))
         step = self._step_record("local", question, str(getattr(result, "stdout", "")), getattr(result, "context", {}), getattr(result, "returncode", 1))
         return AgenticDecision("local", step["answer"], {"agentic_steps": [step]}, (step,), f"Agentic Search 回退 Local：{detail}", int(getattr(result, "returncode", 1)), None if getattr(result, "returncode", 1) == 0 else str(getattr(result, "stderr", "Local 查詢失敗")))
 
-    def _chat_json(self, base: str, key: str, model: str, prompt: str, effort: str) -> dict[str, Any]:
+    @staticmethod
+    def _run_search(search: SearchFunction, method: str, query: str, deadline: float) -> object:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProjectError("Agentic 搜尋已達單題 300 秒上限")
+        if "timeout_seconds" in inspect.signature(search).parameters:
+            return search(method, query, timeout_seconds=remaining)
+        return search(method, query)
+
+    def _chat_json(self, base: str, key: str, model: str, prompt: str, effort: str, deadline: float) -> dict[str, Any]:
         try:
             parameters = inspect.signature(self.chat).parameters
-            response = self.chat(base, key, model, prompt, reasoning_effort=effort) if "reasoning_effort" in parameters else self.chat(base, key, model, prompt)
+            kwargs = {}
+            if "reasoning_effort" in parameters:
+                kwargs["reasoning_effort"] = effort
+            if "timeout_seconds" in parameters:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProjectError("Agentic 搜尋已達單題 300 秒上限")
+                kwargs["timeout_seconds"] = min(60, remaining)
+            response = self.chat(base, key, model, prompt, **kwargs)
         except Exception as exc:
             raise ProjectError(f"Agentic 模型呼叫失敗：{exc}") from exc
         if not isinstance(response, dict):

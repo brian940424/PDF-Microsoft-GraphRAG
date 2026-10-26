@@ -79,7 +79,10 @@ class StrategyRouter:
         return StrategyDecision(FALLBACK_METHOD, f"自動判斷失敗（{detail}），改用預設 Local")
 
     @staticmethod
-    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str = "medium") -> object:
+    def _openai_chat(
+        api_base_url: str, api_key: str, model: str, prompt: str,
+        reasoning_effort: str = "medium", timeout_seconds: float = 60,
+    ) -> object:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -93,7 +96,7 @@ class StrategyRouter:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 value = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raise ProjectError(f"策略判斷 API 回應 HTTP {exc.code}") from exc
