@@ -17,12 +17,18 @@ def test_normalize_answer_matches_musique_rules():
 def test_normalize_answer_removes_graphrag_source_citations():
     assert normalize_answer("定影器。[Data: Sources (123)]") == "定影器"
     assert normalize_answer("定影器 [data: sources (123, 456)]") == "定影器"
+    assert normalize_answer(
+        "定影器 [Data: Sources (178); Entities (197); Relationships (180)]"
+    ) == "定影器"
 
 
 def test_exact_match_uses_normalized_strings():
     assert exact_match_score("The answer!", "answer") == 1.0
     assert exact_match_score("answer one", "answer two") == 0.0
     assert exact_match_score("定影器。[Data: Sources (123)]", "定影器") == 1.0
+    assert exact_match_score(
+        "定影器 [Data: Sources (178); Entities (197); Relationships (180)]", "定影器"
+    ) == 1.0
 
 
 def test_f1_uses_character_multiset_overlap():
@@ -34,6 +40,9 @@ def test_f1_scores_chinese_partial_overlap_by_character():
     assert f1_score("答案是定影器", "定影器很燙") == pytest.approx(6 / 11)
     assert f1_score("定影 器", "定影器很燙") == pytest.approx(0.75)
     assert f1_score("定影器。[Data: Sources (123)]", "定影器") == 1.0
+    assert f1_score(
+        "定影器 [Data: Sources (178); Entities (197); Relationships (180)]", "定影器"
+    ) == 1.0
 
 
 def test_empty_answers_follow_musique_no_answer_behavior():

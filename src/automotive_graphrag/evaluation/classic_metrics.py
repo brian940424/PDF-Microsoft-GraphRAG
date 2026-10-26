@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 def normalize_answer(text: str) -> str:
     """Remove GraphRAG source citations, then apply MuSiQue/SQuAD normalization."""
     without_source_citations = re.sub(
-        r"\[\s*data\s*:\s*sources?\s*\(\s*\d+(?:\s*[,;]\s*\d+)*\s*\)\s*\]",
+        r"\[\s*data\s*:[^\]]*\]",
         " ",
         text,
         flags=re.IGNORECASE,
