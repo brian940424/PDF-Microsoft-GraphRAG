@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import unittest
 
+import pandas as pd
+
 from automotive_graphrag.agentic_search import AgenticSearch
 from automotive_graphrag.querying import QueryExecution
+from automotive_graphrag.querying import QueryService
 
 
 class AgenticSearchTests(unittest.TestCase):
@@ -92,6 +95,22 @@ class AgenticSearchTests(unittest.TestCase):
         self.assertEqual(len(budgets), 1)
         self.assertGreater(budgets[0], 0)
         self.assertLessEqual(budgets[0], 300)
+
+    def test_evidence_extractor_reads_graph_rag_32_serialized_context_records(self) -> None:
+        graph_context = QueryService._serialize_context({
+            "sources": pd.DataFrame([
+                {"id": "text-unit-1", "text": "檢查保險絲", "in_context": True},
+                {"id": "candidate-only", "text": "未進入查詢脈絡", "in_context": False},
+            ]),
+            "reports": pd.DataFrame([
+                {"id": "report-2", "title": "電氣系統", "summary": "系統級摘要"},
+            ]),
+        })
+
+        evidence = AgenticSearch._extract_evidence(graph_context)
+
+        self.assertEqual([item["source_id"] for item in evidence], ["text-unit-1", "report-2"])
+        self.assertEqual([item["text"] for item in evidence], ["檢查保險絲", "系統級摘要"])
 
     def test_invalid_planner_method_falls_back_to_local(self) -> None:
         calls = 0

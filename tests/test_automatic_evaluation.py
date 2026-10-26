@@ -312,7 +312,8 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             if hasattr(component, "get_config")
         ])
         ask_handler = next(fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "ask_question")
-        self.assertEqual(len(ask_handler.inputs), 5)
+        # Single-query now also accepts the reasoning-effort control.
+        self.assertEqual(len(ask_handler.inputs), 6)
         response_type_dropdowns = [
             component for component in app.blocks.values()
             if hasattr(component, "get_config")

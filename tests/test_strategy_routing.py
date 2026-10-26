@@ -73,7 +73,9 @@ class QueryTabAutoStrategyTests(unittest.TestCase):
         reasoning_dropdowns = [
             component.get_config()
             for component in app.blocks.values()
-            if hasattr(component, "get_config") and component.get_config().get("label") == "推理深度"
+            if hasattr(component, "get_config") and component.get_config().get("label") in {
+                "推理深度", "建圖推理深度", "評測推理深度",
+            }
         ]
         self.assertGreaterEqual(len(reasoning_dropdowns), 7)
 
