@@ -77,6 +77,12 @@ class AgenticSearchTests(unittest.TestCase):
 
         self.assertEqual(len(result.steps), 2)
         self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.model_call_count, 3)
+        self.assertIsNone(result.estimated_cost_usd)
+        self.assertEqual(result.execution_metadata["prompt_version"], "agentic-v1")
+        self.assertEqual(result.execution_metadata["search_step_count"], 2)
+        self.assertGreaterEqual(result.context["agentic_steps"][0]["duration_seconds"], 0)
+        self.assertEqual(result.context["agentic_steps"][0]["evidence"][0]["source_type"], "text_unit")
         self.assertIsNone(result.error)
         self.assertIn("補充搜尋失敗", result.stop_reason)
         self.assertEqual(result.answer, "依第一輪來源可確認的部分 [E1]。")
@@ -113,8 +119,9 @@ class AgenticSearchTests(unittest.TestCase):
 
         evidence = AgenticSearch._extract_evidence(graph_context)
 
-        self.assertEqual([item["source_id"] for item in evidence], ["text-unit-1", "report-2"])
-        self.assertEqual([item["text"] for item in evidence], ["檢查保險絲", "系統級摘要"])
+        self.assertEqual([item.source_id for item in evidence], ["text-unit-1", "report-2"])
+        self.assertEqual([item.source_type for item in evidence], ["text_unit", "community_report"])
+        self.assertEqual([item.text for item in evidence], ["檢查保險絲", "系統級摘要"])
 
     def test_invalid_planner_method_falls_back_to_local(self) -> None:
         calls = 0

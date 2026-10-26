@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -60,6 +61,7 @@ class QueryResult:
     requested_method: str | None = None
     routing_reason: str | None = None
     source: str | None = None
+    execution_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class QueryService:
@@ -119,6 +121,18 @@ class QueryService:
         started_clock = time.monotonic()
         requested_method = normalized_method
         routing_reason = None
+        execution_metadata: dict[str, Any] = {
+            "trace_schema_version": "1",
+            "model": selected_model,
+            "reasoning_effort": reasoning_effort,
+            "response_type": response_type,
+            "requested_method": requested_method,
+            "prompt_version": None,
+            "model_call_count": None,
+            "estimated_cost_usd": None,
+            "cost_status": "unknown_usage_not_returned_by_query_adapter",
+            "settings_sha256": hashlib.sha256((graph_root / "settings.yaml").read_bytes()).hexdigest(),
+        }
         if normalized_method == AUTO_METHOD:
             decision = self.router.route(
                 prompt,
@@ -161,6 +175,8 @@ class QueryService:
             )
             result = QueryExecution(decision.returncode, decision.answer, decision.error or "", decision.context)
             routing_reason = decision.stop_reason
+            execution_metadata.update(decision.execution_metadata)
+            execution_metadata["requested_method"] = requested_method
         else:
             result = self.runner(command)
         completed = datetime.now(timezone.utc)
@@ -195,6 +211,7 @@ class QueryService:
             requested_method=requested_method,
             routing_reason=routing_reason,
             source=source,
+            execution_metadata=execution_metadata,
         )
         try:
             self._append_record(project_path / "runs" / "queries.jsonl", query_result)
@@ -253,6 +270,7 @@ class QueryService:
     def _result_from_dict(value: dict[str, Any]) -> QueryResult:
         value["evidence"] = tuple(Evidence(**item) for item in value.get("evidence", []))
         value.setdefault("context", {})
+        value.setdefault("execution_metadata", {})
         return QueryResult(**value)
 
     @staticmethod

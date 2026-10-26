@@ -174,6 +174,10 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.answer, "根據手冊先檢查保險絲 [E1]。")
         self.assertEqual(result.routing_reason, "檢索證據足以回答")
         self.assertEqual(result.evidence[0].page, 25)
+        self.assertEqual(result.execution_metadata["model"], "gpt-4.1-mini")
+        self.assertEqual(result.execution_metadata["reasoning_effort"], "high")
+        self.assertIsNone(result.execution_metadata["model_call_count"])
+        self.assertRegex(result.execution_metadata["settings_sha256"], r"^[0-9a-f]{64}$")
         self.assertIn("agentic_steps", result.context)
 
     def test_agentic_citations_are_aligned_to_visible_evidence_ids(self) -> None:
@@ -203,6 +207,15 @@ class QueryServiceTests(unittest.TestCase):
 
         self.assertEqual(loaded.query_id, result.query_id)
         self.assertIsNone(loaded.routing_reason)
+        self.assertEqual(loaded.execution_metadata["model"], "gpt-6-luna")
+
+    def test_community_report_evidence_keeps_its_source_type(self) -> None:
+        evidence = EvidenceService(self.store).from_context(
+            "L33-SM3E",
+            {"reports": [{"id": "report-1", "summary": "系統摘要"}]},
+        )
+        self.assertEqual(evidence[0].source_type, "community_report")
+        self.assertIsNone(evidence[0].page)
 
     def test_query_source_is_saved_and_defaults_to_none(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)
