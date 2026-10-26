@@ -22,19 +22,21 @@ def exact_match_score(prediction: str, ground_truth: str) -> float:
 
 
 def f1_score(prediction: str, ground_truth: str) -> float:
-    """Compute token multiset F1 after MuSiQue/SQuAD answer normalization."""
-    prediction_tokens = normalize_answer(prediction).split()
-    ground_truth_tokens = normalize_answer(ground_truth).split()
+    """Compute character multiset F1 after MuSiQue/SQuAD answer normalization."""
+    prediction_tokens = list(normalize_answer(prediction).replace(" ", ""))
+    ground_truth_tokens = list(normalize_answer(ground_truth).replace(" ", ""))
     if not prediction_tokens or not ground_truth_tokens:
         # MuSiQue treats two normalized no-answer strings as a correct match.
         return float(prediction_tokens == ground_truth_tokens)
 
-    overlap = sum((Counter(prediction_tokens) & Counter(ground_truth_tokens)).values())
-    if overlap == 0:
+    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
         return 0.0
-    precision = overlap / len(prediction_tokens)
-    recall = overlap / len(ground_truth_tokens)
-    return 2 * precision * recall / (precision + recall)
+
+    precision = 1.0 * num_same / len(prediction_tokens)
+    recall = 1.0 * num_same / len(ground_truth_tokens)
+    return (2 * precision * recall) / (precision + recall)
 
 
 def metric_max_over_ground_truths(

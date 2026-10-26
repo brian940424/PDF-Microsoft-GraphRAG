@@ -19,9 +19,14 @@ def test_exact_match_uses_normalized_strings():
     assert exact_match_score("answer one", "answer two") == 0.0
 
 
-def test_f1_uses_token_multiset_overlap():
+def test_f1_uses_character_multiset_overlap():
     assert f1_score("the red red car", "red car") == pytest.approx(0.8)
-    assert f1_score("red car", "blue truck") == 0.0
+    assert f1_score("xyz", "123") == 0.0
+
+
+def test_f1_scores_chinese_partial_overlap_by_character():
+    assert f1_score("答案是定影器", "定影器很燙") == pytest.approx(6 / 11)
+    assert f1_score("定影 器", "定影器很燙") == pytest.approx(0.75)
 
 
 def test_empty_answers_follow_musique_no_answer_behavior():
