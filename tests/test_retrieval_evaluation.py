@@ -195,6 +195,28 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(result.document_hit_rate, 1.0)
         self.assertIn("不使用檢索排名", result.retrieval_metrics_status)
 
+    def test_agentic_metrics_use_saved_mapped_evidence(self) -> None:
+        current = self.question_sets.get("L33-SM3E", self.question_set.question_set_id)
+        results = {
+            item.question_id: replace(
+                EvaluationQueryRunner().ask("L33-SM3E", item.question, "agentic"),
+                requested_method="agentic",
+            )
+            for item in current.questions
+        }
+        self.question_sets.update_answers(
+            "L33-SM3E", self.question_set.question_set_id, results, "agentic"
+        )
+
+        result = self.service.evaluate(
+            "L33-SM3E", self.question_set.question_set_id, method="agentic"
+        )
+
+        self.assertAlmostEqual(result.evidence_hit_rate or 0, 2 / 3)
+        self.assertAlmostEqual(result.evidence_precision or 0, 0.5)
+        self.assertEqual(result.document_hit_rate, 1.0)
+        self.assertIn("不使用檢索排名", result.retrieval_metrics_status)
+
     def test_auto_answers_keep_routed_strategy_and_metrics_skip_global_questions(self) -> None:
         current = self.question_sets.get("L33-SM3E", self.question_set.question_set_id)
         routed = {"Q0001": "local", "Q0002": "global", "Q0003": "basic"}

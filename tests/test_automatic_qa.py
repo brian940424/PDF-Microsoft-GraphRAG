@@ -176,6 +176,30 @@ class AutomaticQATests(unittest.TestCase):
             self.assertEqual(len(query.models), 1)
             self.assertIn("test judge unavailable", evaluated.judge_error)
 
+    def test_answer_existing_accepts_agentic_search_method(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "projects")
+            store.create(
+                project_id="TEST", display_name="Test", vehicle_name="Vehicle", manual_version="Version"
+            )
+            store.update_status("TEST", "INDEXED")
+            sets = QuestionSetService(store)
+            question_set = sets.create_with_questions(
+                "TEST", "automatic", [BatchQuestion("Q0001", "問題", "正解")]
+            )
+            query = ConcurrentQuery()
+            service = AutomaticQATestService(
+                store, object(), object(), query, sets, NoJudge(), NoRetrieval()
+            )
+
+            report = service.answer_existing(
+                "TEST", question_set.question_set_id, "gpt-4.1-mini", "agentic", 1,
+            )
+
+            self.assertEqual(query.models, ["gpt-4.1-mini"])
+            self.assertEqual(report.question_set.method, "agentic")
+            self.assertEqual(report.question_set.questions[0].status, "COMPLETED")
+
     def test_answer_concurrency_and_model_are_applied_to_all_questions(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = ProjectStore(Path(temporary) / "projects")

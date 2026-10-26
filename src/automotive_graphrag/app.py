@@ -99,6 +99,7 @@ PROJECT_STATUS_LABELS = {
 QUERY_HISTORY_LIMIT = 50
 STANDARD_QUERY_METHOD_CHOICES = [("自動", "auto")] + [(label, method) for method, label in QUERY_METHOD_LABELS.items() if method != "agentic"]
 QUERY_METHOD_CHOICES = [*STANDARD_QUERY_METHOD_CHOICES, (QUERY_METHOD_LABELS["agentic"], "agentic")]
+AUTOQA_QUERY_METHOD_CHOICES = [*STANDARD_QUERY_METHOD_CHOICES, (QUERY_METHOD_LABELS["agentic"], "agentic")]
 AUTOMATIC_EVALUATION_COLUMNS = [
     "Question ID",
     "判斷",
@@ -1639,6 +1640,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return (
             gr.update(choices=list(ALLOWED_CHAT_MODELS), value=answer_model),
             gr.update(choices=STANDARD_QUERY_METHOD_CHOICES, value=method),
+        )
+
+    def update_autoqa_model_method_compatibility(answer_model: str | None, method: str | None):
+        """Keep Agentic Search selectable in automatic QA for every supported model."""
+        answer_model = answer_model or connections.get_chat_model()
+        return (
+            gr.update(choices=list(ALLOWED_CHAT_MODELS), value=answer_model),
+            gr.update(choices=AUTOQA_QUERY_METHOD_CHOICES, value=method or "local"),
         )
 
     def update_query_method_compatibility(answer_model: str | None, method: str | None):
@@ -3239,9 +3248,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
                     )
                     autoqa_method = gr.Dropdown(
-                        choices=STANDARD_QUERY_METHOD_CHOICES,
+                        choices=AUTOQA_QUERY_METHOD_CHOICES,
                         value="local", label="檢索模式",
-                        info="自動：每題由回答模型選擇策略（多一次 LLM 呼叫）",
+                        info="自動：每題由回答模型選擇策略（多一次 LLM 呼叫）。Agentic Search 會依證據缺口補搜，增加模型呼叫與延遲。",
                     )
                     autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
                     autoqa_response_type = gr.Dropdown(
@@ -3252,7 +3261,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
                 autoqa_answer_progress = gr.HTML(label="檢索與回答進度", visible=False)
                 autoqa_answer_model.input(
-                    update_model_method_compatibility,
+                    update_autoqa_model_method_compatibility,
                     inputs=[autoqa_answer_model, autoqa_method],
                     outputs=[autoqa_answer_model, autoqa_method],
                 )
@@ -3261,7 +3270,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     inputs=autoqa_answer_model, outputs=autoqa_answer_effort,
                 )
                 autoqa_method.input(
-                    update_model_method_compatibility,
+                    update_autoqa_model_method_compatibility,
                     inputs=[autoqa_answer_model, autoqa_method],
                     outputs=[autoqa_answer_model, autoqa_method],
                 )
