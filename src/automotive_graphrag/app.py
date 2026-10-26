@@ -2103,9 +2103,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             known_ids = {question.question_id for question in question_set.questions}
             previous = automatic_evaluation.last_result(project_id, question_set_id)
             if previous is not None and not previous.items:
-                return "LLM Judge 未啟用，沒有可修改的正確性判斷。", autoqa_rows_update(
-                    automatic_qa_result_rows(question_set, previous)
-                )
+                return "LLM Judge 未啟用；整表編輯目前只暫存於畫面，沒有可保存的正確性判斷。"
             decisions = {}
             for row in values:
                 if len(row) < 6 or str(row[0]).strip() not in known_ids:
@@ -2117,13 +2115,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 project_id, question_set_id, decisions
             )
         except (ProjectError, TypeError, ValueError) as exc:
-            return f"❌ 評測結果儲存失敗：{exc}", autoqa_rows_update([])
+            return f"❌ 評測結果儲存失敗：{exc}；目前表格內容仍留在畫面。"
         total = len(question_set.questions)
         correct = result.correct_count
         summary = (
             f"**題目集：** {question_set.name}｜**答對：** {correct}/{total} "
             f"（{correct / total:.1%}）｜評測 {len(result.items)}/{total} 題\n\n"
-            f"**評測模型：** {result.model}｜人工修改後的判斷已自動保存"
+            f"**評測模型：** {result.model}｜人工修改後的判斷已保存；其餘欄位編輯暫存於目前畫面"
         )
         retrieval = retrieval_evaluation.last_result(project_id, question_set_id)
         if retrieval:
@@ -2141,7 +2139,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     if retrieval.document_hit_rate is not None else "｜Document Hit Rate 不可計算"
                 )
             summary += f"｜{retrieval.retrieval_metrics_status}"
-        return summary, autoqa_rows_update(automatic_qa_result_rows(question_set, result))
+        return summary
 
     def import_automatic_question_set(project_id, uploaded):
         if not project_id or not uploaded:
@@ -3391,7 +3389,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     interactive=True,
                     datatype=["str", "str", "str", "str", "str", "bool", "str", "str", "number", "number"],
                     column_widths=["5%", "9%", "13%", "19%", "15%", "6%", "11%", "9%", "6%", "6%"],
-                    label="評測結果（勾選表示正確；修改後評判理由清空並自動重算正確率）",
+                    label="評測結果（暫時開放整表編輯；判斷欄會保存，其餘欄位只暫存於目前畫面）",
                     wrap=True,
                     visible=False,
                 )
@@ -4215,7 +4213,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         autoqa_table.input(
             autosave_automatic_qa_judgements,
             inputs=[automatic_project, autoqa_question_set_state, autoqa_table],
-            outputs=[autoqa_summary, autoqa_table],
+            outputs=autoqa_summary,
         )
         autoqa_export_button.click(
             export_automatic_question_set,
