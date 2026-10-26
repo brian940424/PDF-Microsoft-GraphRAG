@@ -1,0 +1,36 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "管理後台（自動重啟）",
+            "type": "shell",
+            "command": "./start.sh",
+            "options": {
+                "env": {
+                    "DEV_RELOAD": "1",
+                    "OPEN_BROWSER": "0",
+                    "GRADIO_SERVER_NAME": "0.0.0.0"
+                }
+            },
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": false
+            },
+            "problemMatcher": {
+                "owner": "automotive-graphrag",
+                "pattern": {
+                    "regexp": "^(\\w*Error): (.*)$",
+                    "code": 1,
+                    "message": 2
+                },
+                "background": {
+                    "activeBegin": true,
+                    "beginsPattern": "偵測到原始碼變更|管理後台已結束",
+                    "endsPattern": "Running on local URL"
+                }
+            }
+        }
+    ]
+}

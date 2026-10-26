@@ -33,4 +33,44 @@ if [[ "${OPEN_BROWSER:-1}" == "1" ]]; then
 fi
 
 cd "$PROJECT_DIR"
-exec "$APP"
+
+if [[ "${DEV_RELOAD:-0}" != "1" ]]; then
+    exec "$APP"
+fi
+
+# 開發模式：src/ 下的 .py 檔有變更時自動重啟管理後台
+SOURCE_DIR="$PROJECT_DIR/src"
+source_snapshot() {
+    find "$SOURCE_DIR" -name '*.py' -printf '%p %T@\n' | sort
+}
+
+APP_PID=""
+stop_app() {
+    if [[ -n "$APP_PID" ]] && kill -0 "$APP_PID" 2>/dev/null; then
+        kill "$APP_PID" 2>/dev/null || true
+        wait "$APP_PID" 2>/dev/null || true
+    fi
+}
+trap 'stop_app; exit 0' INT TERM
+
+while true; do
+    "$APP" &
+    APP_PID=$!
+    snapshot="$(source_snapshot)"
+    while kill -0 "$APP_PID" 2>/dev/null; do
+        sleep 1
+        if [[ "$(source_snapshot)" != "$snapshot" ]]; then
+            printf '偵測到原始碼變更，重新啟動管理後台…\n' >&2
+            sleep 1
+            break
+        fi
+    done
+    stop_app
+    if [[ "$(source_snapshot)" == "$snapshot" ]]; then
+        # 程式自行結束（例如啟動錯誤），等待原始碼變更後再重試
+        printf '管理後台已結束，等待原始碼變更後重新啟動…\n' >&2
+        while [[ "$(source_snapshot)" == "$snapshot" ]]; do
+            sleep 1
+        done
+    fi
+done

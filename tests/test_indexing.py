@@ -1,3 +1,4 @@
+import json
 import subprocess
 import tempfile
 import unittest
@@ -6,7 +7,7 @@ from pathlib import Path
 import yaml
 
 from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult
-from automotive_graphrag.indexing import IndexingService
+from automotive_graphrag.indexing import IndexingService, parse_indexing_progress
 from automotive_graphrag.projects import ProjectError, ProjectStore
 
 
@@ -112,6 +113,56 @@ class IndexingServiceTests(unittest.TestCase):
         self.assertEqual(service.last_result("L33-SM3E"), result)
         self.assertEqual(self.metadata_projects, ["L33-SM3E"])
         self.assertFalse((self.store.path_for("L33-SM3E") / "graphrag" / ".indexing.lock").exists())
+
+    def test_successful_build_records_indexed_documents(self) -> None:
+        processed = self.store.path_for("L33-SM3E") / "processed"
+        (processed / "report.json").write_text(
+            json.dumps(
+                {
+                    "summary": {"completed_at": "2026-01-01T00:00:00+00:00"},
+                    "documents": [
+                        {"filename": "WW.pdf", "status": "PROCESSED", "processed_at": "2026-01-02T00:00:00+00:00"},
+                        {"filename": "PG.pdf", "status": "ERROR"},
+                    ],
+                }
+            )
+        )
+        service = IndexingService(
+            self.store, FakeGraphRag(), connection_settings=self.connections, metadata_builder=self.build_metadata
+        )
+
+        service.build("L33-SM3E")
+
+        indexed = json.loads((self.store.path_for("L33-SM3E") / "graphrag" / "indexed_documents.json").read_text())
+        self.assertEqual(indexed, {"WW.pdf": "2026-01-02T00:00:00+00:00"})
+
+    def test_failed_build_keeps_previous_indexed_documents(self) -> None:
+        indexed_path = self.store.path_for("L33-SM3E") / "graphrag" / "indexed_documents.json"
+        indexed_path.write_text('{"WW.pdf": "old"}')
+        service = IndexingService(
+            self.store, FakeGraphRag(fail_index=True), connection_settings=self.connections, metadata_builder=self.build_metadata
+        )
+
+        service.build("L33-SM3E")
+
+        self.assertEqual(json.loads(indexed_path.read_text()), {"WW.pdf": "old"})
+
+    def test_parse_indexing_progress_counts_workflows_and_item_progress(self) -> None:
+        log = (
+            "Starting pipeline with workflows: load_input_documents, extract_graph, finalize_graph, embed\n"
+            "Starting workflow: load_input_documents\n"
+            "\n"
+            "Workflow complete: load_input_documents\n"
+            "Starting workflow: extract_graph\n"
+            "  5 / 10 .....\n"
+        )
+
+        progress = parse_indexing_progress(log)
+
+        self.assertEqual((progress.completed_workflows, progress.total_workflows), (1, 4))
+        self.assertEqual(progress.current_workflow, "extract_graph")
+        self.assertAlmostEqual(progress.fraction, 1.5 / 4)
+        self.assertEqual(parse_indexing_progress("").fraction, 0.0)
 
     def test_build_uses_selected_gpt6_luna_model(self) -> None:
         runner = FakeGraphRag()

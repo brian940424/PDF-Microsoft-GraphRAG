@@ -22,7 +22,7 @@ class StoredQueries:
     def history(self, project_id: str) -> list[QueryResult]:
         return [item for item in self.results if item.project_id == project_id]
 
-    def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
+    def ask(self, project_id: str, question: str, method: str = "local", source: str | None = None) -> QueryResult:
         self.calls.append((project_id, question, method))
         return replace(self.results[0], project_id=project_id, question=question, method=method)
 
@@ -139,14 +139,13 @@ class CaseServiceTests(unittest.TestCase):
             component.get_config()
             for component in admin_app.blocks.values()
             if hasattr(component, "get_config")
-            and component.get_config().get("label")
-            in {"專案", "選擇專案紀錄", "已建圖專案"}
+            and component.get_config().get("label") == "選擇專案"
         ]
         self.assertTrue(portal_project_dropdowns)
         self.assertTrue(admin_project_dropdowns)
-        self.assertTrue(
-            all(config.get("allow_custom_value") for config in portal_project_dropdowns + admin_project_dropdowns)
-        )
+        self.assertTrue(all(config.get("allow_custom_value") for config in portal_project_dropdowns))
+        # 管理後台只能從清單選擇專案（含「+ 新增專案...」），不接受手動輸入
+        self.assertFalse(any(config.get("allow_custom_value") for config in admin_project_dropdowns))
 
 
 if __name__ == "__main__":

@@ -21,9 +21,11 @@ import yaml
 from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, configure_completion_model
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
+from .strategy_routing import StrategyRouter
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
+AUTO_METHOD = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,9 @@ class QueryResult:
     evidence: tuple[Evidence, ...] = ()
     context: dict[str, Any] = field(default_factory=dict)
     response_type: str = "Single Paragraph"
+    requested_method: str | None = None
+    routing_reason: str | None = None
+    source: str | None = None
 
 
 class QueryService:
@@ -61,11 +66,13 @@ class QueryService:
         runner: CommandRunner | None = None,
         connection_settings: ConnectionSettings | None = None,
         evidence_service: EvidenceService | None = None,
+        router: StrategyRouter | None = None,
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
         self.evidence_service = evidence_service or EvidenceService(projects)
+        self.router = router or StrategyRouter()
         self._history_lock = threading.Lock()
 
     def ask(
@@ -75,6 +82,8 @@ class QueryService:
         method: str = "local",
         chat_model: str | None = None,
         response_type: str = "Single Paragraph",
+        source: str | None = None,
+        reasoning_effort: str = "medium",
     ) -> QueryResult:
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
@@ -84,7 +93,7 @@ class QueryService:
             raise ProjectError(f"專案狀態 {project.status} 尚未完成建圖，無法查詢")
         if not prompt:
             raise ProjectError("問題為必填")
-        if normalized_method not in QUERY_METHODS:
+        if normalized_method not in QUERY_METHODS | {AUTO_METHOD}:
             raise ProjectError(f"不支援的查詢方法：{method}")
         selected_model = chat_model or self.connection_settings.get_chat_model()
         if selected_model not in ALLOWED_CHAT_MODELS:
@@ -98,9 +107,21 @@ class QueryService:
             self.connection_settings.get_api_base_url(),
             selected_model,
             self.connection_settings.get_embedding_model(),
+            reasoning_effort,
         )
         started = datetime.now(timezone.utc)
         started_clock = time.monotonic()
+        requested_method = normalized_method
+        routing_reason = None
+        if normalized_method == AUTO_METHOD:
+            decision = self.router.route(
+                prompt,
+                selected_model,
+                self.connection_settings.get_api_base_url(),
+                self.connection_settings.get_api_key(project_id),
+                reasoning_effort,
+            )
+            normalized_method, routing_reason = decision.method, decision.reason
         command = [
             sys.executable,
             "-m",
@@ -142,6 +163,9 @@ class QueryService:
             evidence=evidence,
             context=context,
             response_type=response_type,
+            requested_method=requested_method,
+            routing_reason=routing_reason,
+            source=source,
         )
         try:
             self._append_record(project_path / "runs" / "queries.jsonl", query_result)
@@ -274,6 +298,7 @@ class QueryService:
         api_base_url: str,
         chat_model: str,
         embedding_model: str,
+        reasoning_effort: str = "medium",
     ) -> None:
         try:
             value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
@@ -283,7 +308,7 @@ class QueryService:
             for model in value.get(section, {}).values():
                 model["api_base"] = api_base_url
         for model in value.get("completion_models", {}).values():
-            configure_completion_model(model, chat_model)
+            configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
             model["model"] = embedding_model
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")

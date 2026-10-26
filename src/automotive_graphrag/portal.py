@@ -42,7 +42,7 @@ class UserPortalService:
 
     def ask(self, project_id: str, question: str) -> QueryResult:
         self.selected_project(project_id)
-        return self.queries.ask(project_id, question, "local")
+        return self.queries.ask(project_id, question, "local", source="portal")
 
 
 def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:

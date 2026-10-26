@@ -204,7 +204,7 @@ class DocumentServiceTests(unittest.TestCase):
 
         self.assertEqual(self.store.get("L33-SM3E").status, "UPLOADED")
 
-    def test_remove_pdf_deletes_selected_file_and_invalidates_processed_input(self) -> None:
+    def test_remove_pdf_deletes_selected_file_and_keeps_other_processed_output(self) -> None:
         self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf"), self.upload("PG.pdf")])
         self.service.preprocess("L33-SM3E")
         project_path = self.store.path_for("L33-SM3E")
@@ -214,11 +214,84 @@ class DocumentServiceTests(unittest.TestCase):
 
         self.service.remove_pdf("L33-SM3E", "WW.pdf")
 
-        self.assertEqual([item.filename for item in self.service.list_documents("L33-SM3E")], ["PG.pdf"])
-        self.assertEqual(self.store.get("L33-SM3E").status, "UPLOADED")
-        self.assertFalse((project_path / "processed" / "input.jsonl").exists())
-        self.assertFalse((project_path / "processed" / "report.json").exists())
+        documents = self.service.list_documents("L33-SM3E")
+        self.assertEqual([item.filename for item in documents], ["PG.pdf"])
+        self.assertTrue(documents[0].preprocessed)
+        self.assertEqual(self.store.get("L33-SM3E").status, "READY")
+        records = [json.loads(line) for line in (project_path / "processed" / "input.jsonl").read_text().splitlines()]
+        self.assertEqual({record["document_id"] for record in records}, {"PG.pdf"})
         self.assertFalse(graph_input.exists())
+
+    def test_remove_pdf_marks_existing_graph_stale(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf"), self.upload("PG.pdf")])
+        self.service.preprocess("L33-SM3E")
+        (self.store.path_for("L33-SM3E") / "graphrag" / "output").mkdir(parents=True)
+        self.store.update_status("L33-SM3E", "INDEXED")
+
+        self.service.remove_pdf("L33-SM3E", "WW.pdf")
+
+        self.assertEqual(self.store.get("L33-SM3E").status, "STALE")
+
+    def test_preprocess_selected_files_keeps_other_documents_output(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf"), self.upload("PG.pdf")])
+        self.service.preprocess("L33-SM3E", filenames=["PG.pdf"])
+
+        documents = {item.filename: item for item in self.service.list_documents("L33-SM3E")}
+        self.assertTrue(documents["PG.pdf"].preprocessed)
+        self.assertFalse(documents["WW.pdf"].preprocessed)
+        first_processed_at = documents["PG.pdf"].processed_at
+
+        report = self.service.preprocess("L33-SM3E", filenames=["WW.pdf"])
+
+        self.assertEqual(report.documents, 1)
+        documents = {item.filename: item for item in self.service.list_documents("L33-SM3E")}
+        self.assertTrue(all(item.preprocessed for item in documents.values()))
+        self.assertEqual(documents["PG.pdf"].processed_at, first_processed_at)
+        processed = self.store.path_for("L33-SM3E") / "processed"
+        records = [json.loads(line) for line in (processed / "input.jsonl").read_text().splitlines()]
+        self.assertEqual([record["document_id"] for record in records], ["PG.pdf", "WW.pdf"])
+
+    def test_preprocess_rejects_unknown_selected_file(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
+
+        with self.assertRaisesRegex(ProjectError, "找不到要前處理的 PDF"):
+            self.service.preprocess("L33-SM3E", filenames=["missing.pdf"])
+
+    def test_preprocess_reports_page_progress(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf"), self.upload("PG.pdf")])
+        updates: list[tuple[int, int, str]] = []
+
+        self.service.preprocess("L33-SM3E", progress_callback=lambda *update: updates.append(update))
+
+        self.assertEqual(updates[-1], (4, 4, "WW.pdf"))
+        self.assertEqual([done for done, _, _ in updates], sorted(done for done, _, _ in updates))
+        self.assertTrue(all(done <= total for done, total, _ in updates))
+
+    def test_reimported_pdf_must_be_preprocessed_again(self) -> None:
+        uploaded = self.upload("WW.pdf")
+        self.service.import_pdfs("L33-SM3E", [uploaded, self.upload("PG.pdf")])
+        self.service.preprocess("L33-SM3E")
+
+        self.service.import_pdfs("L33-SM3E", [uploaded])
+
+        documents = {item.filename: item for item in self.service.list_documents("L33-SM3E")}
+        self.assertFalse(documents["WW.pdf"].preprocessed)
+        self.assertTrue(documents["PG.pdf"].preprocessed)
+
+    def test_document_is_indexed_only_while_its_processed_output_matches_the_graph(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf"), self.upload("PG.pdf")])
+        self.service.preprocess("L33-SM3E")
+        processed_at = {item.filename: item.processed_at for item in self.service.list_documents("L33-SM3E")}
+        graph_root = self.store.path_for("L33-SM3E") / "graphrag"
+        (graph_root / "indexed_documents.json").write_text(json.dumps(processed_at))
+
+        self.assertTrue(all(item.indexed for item in self.service.list_documents("L33-SM3E")))
+
+        self.service.preprocess("L33-SM3E", filenames=["WW.pdf"])
+
+        documents = {item.filename: item for item in self.service.list_documents("L33-SM3E")}
+        self.assertTrue(documents["PG.pdf"].indexed)
+        self.assertFalse(documents["WW.pdf"].indexed)
 
     def test_remove_last_pdf_returns_project_to_empty(self) -> None:
         self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])

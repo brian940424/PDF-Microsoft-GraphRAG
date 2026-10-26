@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,12 +18,52 @@ from typing import Callable
 import yaml
 
 from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, configure_completion_model
+from .documents import INDEXED_DOCUMENTS_FILE
 from .projects import ProjectError, ProjectStore
 from .source_metadata import SourceMetadataService
 
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 MetadataBuilder = Callable[[str], object]
+
+
+_PIPELINE_PATTERN = re.compile(r"Starting pipeline with workflows:\s*(.+)")
+_WORKFLOW_START_PATTERN = re.compile(r"Starting workflow:\s*(\S+)")
+_WORKFLOW_END_PATTERN = re.compile(r"Workflow complete:\s*(\S+)")
+_ITEM_PROGRESS_PATTERN = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s")
+
+
+@dataclass(frozen=True, slots=True)
+class IndexingProgress:
+    completed_workflows: int
+    total_workflows: int
+    current_workflow: str | None
+    fraction: float
+
+
+def parse_indexing_progress(log: str) -> IndexingProgress:
+    """Estimate overall progress from `graphrag index` console output."""
+    workflows: list[str] = []
+    completed: set[str] = set()
+    current: str | None = None
+    item_fraction = 0.0
+    for line in log.splitlines():
+        if match := _PIPELINE_PATTERN.search(line):
+            workflows = [name.strip() for name in match.group(1).split(",") if name.strip()]
+        elif match := _WORKFLOW_START_PATTERN.search(line):
+            current, item_fraction = match.group(1), 0.0
+        elif match := _WORKFLOW_END_PATTERN.search(line):
+            completed.add(match.group(1))
+            current, item_fraction = None, 0.0
+        elif current and (match := _ITEM_PROGRESS_PATTERN.match(line)):
+            done, total = int(match.group(1)), int(match.group(2))
+            item_fraction = min(done / total, 1.0) if total else 0.0
+    total = len(workflows)
+    if not total:
+        return IndexingProgress(0, 0, current, 0.0)
+    done = len(completed & set(workflows))
+    fraction = min((done + (item_fraction if current else 0.0)) / total, 1.0)
+    return IndexingProgress(done, total, current, fraction)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +100,10 @@ class IndexingService:
     def initialize(self, project_id: str) -> Path:
         return self._initialize(project_id, self.chat_model)
 
-    def _initialize(self, project_id: str, chat_model_override: str | None) -> Path:
+    def _initialize(
+        self, project_id: str, chat_model_override: str | None,
+        reasoning_effort: str = "medium",
+    ) -> Path:
         self.connection_settings.apply_to_environment(project_id)
         chat_model = chat_model_override or self.chat_model or self.connection_settings.get_chat_model()
         embedding_model = self.embedding_model or self.connection_settings.get_embedding_model()
@@ -87,7 +131,7 @@ class IndexingService:
             raise ProjectError("GraphRAG 初始化後未產生 settings.yaml")
         self._configure_jsonl_input(settings)
         self._configure_api_base(settings, self.connection_settings.get_api_base_url())
-        self._configure_models(settings, chat_model, embedding_model)
+        self._configure_models(settings, chat_model, embedding_model, reasoning_effort)
         self._sync_input(project_path, graph_root)
         return settings
 
@@ -96,6 +140,7 @@ class IndexingService:
         project_id: str,
         log_callback: Callable[[str], None] | None = None,
         chat_model: str | None = None,
+        reasoning_effort: str = "medium",
     ) -> IndexingResult:
         project = self.projects.get(project_id)
         if project.status not in {"READY", "STALE", "FAILED", "INDEXED"}:
@@ -116,7 +161,8 @@ class IndexingService:
             self._active_log = log_path
             self._active_log.write_text("", encoding="utf-8")
             self._log_callback = log_callback
-            self._initialize(project_id, chat_model)
+            self._initialize(project_id, chat_model, reasoning_effort)
+            indexed_documents = self._processed_documents(project_path)
             self.projects.update_status(project_id, "INDEXING")
             if backup.exists():
                 shutil.rmtree(backup)
@@ -131,6 +177,10 @@ class IndexingService:
             if not output.is_dir():
                 raise ProjectError("GraphRAG 建圖完成但找不到 output 目錄")
             self.metadata_builder(project_id)
+            self._atomic_text(
+                graph_root / INDEXED_DOCUMENTS_FILE,
+                json.dumps(indexed_documents, ensure_ascii=False, indent=2) + "\n",
+            )
             if backup.exists():
                 shutil.rmtree(backup)
             status = "INDEXED"
@@ -189,6 +239,8 @@ class IndexingService:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
+            # Unbuffered output lets the UI follow workflow progress live.
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
         output: list[str] = []
         assert process.stdout is not None
@@ -205,6 +257,20 @@ class IndexingService:
                 log.flush()
         if self._log_callback is not None and text:
             self._log_callback(text)
+
+    @staticmethod
+    def _processed_documents(project_path: Path) -> dict[str, str]:
+        """Snapshot filename -> processed_at for the PDFs included in this build's input."""
+        try:
+            report = json.loads((project_path / "processed" / "report.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        fallback = report.get("summary", {}).get("completed_at")
+        return {
+            item["filename"]: item.get("processed_at") or fallback
+            for item in report.get("documents", [])
+            if str(item.get("status", "")).startswith("PROCESSED") and (item.get("processed_at") or fallback)
+        }
 
     @staticmethod
     def _configure_jsonl_input(settings_path: Path) -> None:
@@ -250,10 +316,13 @@ class IndexingService:
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
 
     @staticmethod
-    def _configure_models(settings_path: Path, chat_model: str, embedding_model: str) -> None:
+    def _configure_models(
+        settings_path: Path, chat_model: str, embedding_model: str,
+        reasoning_effort: str = "medium",
+    ) -> None:
         value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
         for model in value.get("completion_models", {}).values():
-            configure_completion_model(model, chat_model)
+            configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
             model["model"] = embedding_model
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))

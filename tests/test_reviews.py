@@ -24,10 +24,21 @@ class ReviewServiceTests(unittest.TestCase):
         source.write_text(
             json.dumps(
                 {
-                    "name": "人工評測集",
                     "questions": [
-                        {"question_id": "Q001", "question": "問題一"},
-                        {"question_id": "Q002", "question": "問題二"},
+                        {
+                            "number": 1,
+                            "question": "問題一",
+                            "expected_answer": "答案一",
+                            "question_sources": [],
+                            "answer_sources": [],
+                        },
+                        {
+                            "number": 2,
+                            "question": "問題二",
+                            "expected_answer": "答案二",
+                            "question_sources": [],
+                            "answer_sources": [],
+                        },
                     ],
                 },
                 ensure_ascii=False,
@@ -55,10 +66,10 @@ class ReviewServiceTests(unittest.TestCase):
 
     def test_save_review_and_update_existing_label(self) -> None:
         first = self.reviews.save(
-            "L33-SM3E", self.question_set.question_set_id, "Q001", "partially_correct", "缺少步驟"
+            "L33-SM3E", self.question_set.question_set_id, "Q0001", "partially_correct", "缺少步驟"
         )
         updated = self.reviews.save(
-            "L33-SM3E", self.question_set.question_set_id, "Q001", "correct", "重新確認"
+            "L33-SM3E", self.question_set.question_set_id, "Q0001", "correct", "重新確認"
         )
 
         self.assertEqual(first.human_label, "partially_correct")
@@ -70,7 +81,7 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertIsNotNone(records[0].reviewed_at)
 
     def test_progress_counts_reviewed_questions(self) -> None:
-        self.reviews.save("L33-SM3E", self.question_set.question_set_id, "Q001", "incorrect")
+        self.reviews.save("L33-SM3E", self.question_set.question_set_id, "Q0001", "incorrect")
 
         progress = self.reviews.progress("L33-SM3E", self.question_set.question_set_id)
 
@@ -78,12 +89,12 @@ class ReviewServiceTests(unittest.TestCase):
 
     def test_invalid_label_and_unknown_question_are_rejected(self) -> None:
         with self.assertRaisesRegex(ProjectError, "有效"):
-            self.reviews.save("L33-SM3E", self.question_set.question_set_id, "Q001", "maybe")
+            self.reviews.save("L33-SM3E", self.question_set.question_set_id, "Q0001", "maybe")
         with self.assertRaisesRegex(ProjectError, "找不到題號"):
             self.reviews.save("L33-SM3E", self.question_set.question_set_id, "Q999", "correct")
 
     def test_export_contains_answers_and_human_reviews(self) -> None:
-        self.reviews.save("L33-SM3E", self.question_set.question_set_id, "Q001", "correct", "完整")
+        self.reviews.save("L33-SM3E", self.question_set.question_set_id, "Q0001", "correct", "完整")
 
         json_path, csv_path = self.reviews.export("L33-SM3E", self.question_set.question_set_id)
 

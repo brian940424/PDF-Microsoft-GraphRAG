@@ -25,6 +25,7 @@ from automotive_graphrag.retrieval_experiments import (
     RetrievalExperimentService,
 )
 from automotive_graphrag.source_metadata import SourceMetadata
+from automotive_graphrag.strategy_routing import StrategyDecision
 
 
 class FakeJudge:
@@ -41,7 +42,10 @@ class FakeJudge:
         reason = f"寬鬆評分 model={model}" if evaluation_mode == "lenient" else f"model={model}"
         return AutomaticEvaluationItem(question_id, is_correct, reason)
 
-    def evaluate_single_answer_grade(self, project_id, question_id, question, correct, actual, model, evaluation_mode="strict"):
+    def evaluate_single_answer_grade(
+        self, project_id, question_id, question, correct, actual, model,
+        evaluation_mode="strict", reasoning_effort="medium",
+    ):
         self.calls.append((project_id, question_id, question, correct, actual, model, evaluation_mode))
         score = 2 if actual == correct else (1 if actual and correct and actual in correct else 0)
         if evaluation_mode == "lenient" and self.lenient_result is not None:
@@ -283,6 +287,68 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(summary.evidence_hit_rate, 1.0)
         self.assertEqual(summary.evidence_precision, 1.0)
         self.assertEqual(summary.document_hit_rate, 1.0)
+
+    def test_auto_group_routes_each_question_and_uses_routed_strategy_parameters(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        question = question_set.questions[0]
+        routed = []
+
+        class FakeRouter:
+            def route(self, question_text, model, api_base_url, api_key):
+                routed.append((question_text, model, api_key))
+                return StrategyDecision("basic", "單一數值查詢")
+
+        received = []
+        self.service.router = FakeRouter()  # type: ignore[assignment]
+        self.service.query_function = lambda *args: (received.append(args) or "回答", {})
+        state = self.service.add_group("project")
+        group_id = state["groups"][0]["group_id"]
+        self.service.set_group_method("project", group_id, "auto")
+        self.service.set_group_strategy_parameter("project", group_id, "basic", "k", 3)
+        group = ExperimentGroup(**self.service.load("project")["groups"][0])
+
+        result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+
+        self.assertEqual(routed, [(question.question, group.answer_model, "test-key")])
+        self.assertEqual(received[0][2], "basic")
+        self.assertEqual(received[0][6]["k"], 3)
+        self.assertEqual(result.method, "auto")
+        self.assertEqual(result.routed_method, "basic")
+        self.assertEqual(result.effective_method, "basic")
+        self.assertEqual(result.routing_reason, "單一數值查詢")
+        self.assertIn("已映射", result.retrieval_metrics_status)
+
+    def test_auto_group_metrics_skip_questions_routed_to_global(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        question = question_set.questions[0]
+        gold = question.gold_evidence[0]
+        evidence = Evidence(
+            evidence_id="E1", rank=1, context_id="7", text_unit_id="tu-7",
+            chunk_id="chunk-7", section_id="section", section_name="Section",
+            document_id=gold.document_id, page=gold.pages[0], block_id="block", text="gold source",
+        )
+        group = ExperimentGroup("G01", "自動", "gpt-4o-mini", "auto")
+        base = self.service._failed_result(group, question, "gpt-4.1-mini", "", question_set.question_set_id)
+        local_result = replace(
+            base, status="completed", error=None, actual_answer="回答", evaluation_result=2,
+            routed_method="local", retrieved_evidence=(evidence,),
+            retrieval_metrics_status="已映射至原始文件／頁碼",
+        )
+        global_result = replace(
+            base, question_id="other", status="completed", error=None, actual_answer="回答",
+            evaluation_result=0, routed_method="global",
+            retrieval_metrics_status="已映射至原始文件／頁碼",
+        )
+
+        run = self.service._persist_run(
+            "project", question_set.question_set_id, [group], "gpt-4.1-mini", 1, "started", "completed",
+            {("G01", "a"): local_result, ("G01", "b"): global_result},
+        )
+
+        summary = run.groups[0]
+        self.assertEqual(summary.evidence_hit_rate, 1.0)
+        self.assertIn("Global 的題目不計入", summary.retrieval_metrics_status)
+        self.assertEqual(set(summary.strategy_parameters), {"local", "global", "drift", "basic"})
 
     def test_legacy_per_group_judge_model_migrates_to_global_setting(self):
         path = self.service._path("project")
@@ -717,13 +783,13 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertTrue(experiment_results["interactive"])
         self.assertEqual(
             experiment_results["column_widths"],
-            ["8%", "11%", "6%", "10%", "13%", "19%", "17%", "6%", "10%"],
+            ["7%", "10%", "5%", "9%", "12%", "17%", "15%", "6%", "9%", "10%"],
         )
         block_values = list(app.blocks.values())
         result_table_position = next(

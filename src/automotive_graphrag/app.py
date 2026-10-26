@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import html
+import io
 import json
+import math
 import os
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
+from PIL import Image
 
 from .automatic_evaluation import AutomaticEvaluationService
 from .automatic_qa import AutomaticQATestService
@@ -21,10 +27,11 @@ from .connections import (
     GPT6_LUNA_MODEL,
     ConnectionSettings,
 )
-from .documents import DocumentInfo, DocumentService
+from .dashboard3d import dashboard_iframe
+from .documents import DocumentInfo, DocumentService, PageReview
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
-from .indexing import IndexingService
+from .indexing import IndexingService, parse_indexing_progress
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_generation import GeneratedQuestion, QuestionGenerationService
@@ -34,6 +41,8 @@ from .retrieval_evaluation import RetrievalEvaluationService
 from .retrieval_evaluation import compute_source_metrics
 from .retrieval_experiments import (
     DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+    EVIDENCE_METHODS,
+    EXPERIMENT_AUTO_METHOD,
     EXPERIMENT_REASONING_EFFORT_OPTIONS,
     EXPERIMENT_RESPONSE_TYPE_OPTIONS,
     EXPERIMENT_STRATEGY_PARAMETER_SPECS,
@@ -41,16 +50,53 @@ from .retrieval_experiments import (
     RetrievalExperimentService,
 )
 from .source_sampling import SourceSample, SourceSamplingService
+from .vision import ALLOWED_VISION_MODELS, DEFAULT_VISION_SCOPE, SCOPE_ALL, SCOPE_DIAGRAMS, SCOPE_FIGURES, SCOPE_TABLES, VISION_REASONING_EFFORT_OPTIONS, VisionSettings
 
 
+NEW_PROJECT_OPTION = "__new_project__"
+NEW_PROJECT_LABEL = "+ 新增專案..."
+UPLOAD_PDF_OPTION = "__upload_pdf__"
+UPLOAD_PDF_LABEL = "+ 上傳 PDF..."
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
-DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
+DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
+VISION_DISABLED = "__vision_disabled__"
+VISION_MODEL_CHOICES = [("停用（僅擷取 PDF 文字層）", VISION_DISABLED), *((model, model) for model in ALLOWED_VISION_MODELS)]
+REVIEW_FILTERS = ["全部", "未檢查", "已修改", "Vision", "文字層", "Vision 失敗", "空白／錯誤"]
+REVIEW_COLUMNS = ["頁碼", "解析方式", "已檢查", "已修改", "字元數"]
+PAGE_SOURCE_LABELS = {
+    "vision": "Vision",
+    "text": "文字層",
+    "fallback": "Vision 失敗→文字層",
+    "empty": "空白",
+    "error": "錯誤",
+}
+VISION_SCOPE_CHOICES = [
+    ("僅含圖表或表格的頁面（純文字頁用文字層，省 token）", SCOPE_FIGURES),
+    ("只讀表格（僅含表格的頁面）", SCOPE_TABLES),
+    ("只讀圖表（僅含圖片或向量圖的頁面）", SCOPE_DIAGRAMS),
+    ("全部頁面", SCOPE_ALL),
+]
+REASONING_EFFORT_CHOICES = [(value, value) for value in ("low", "medium", "high")]
+VISION_REASONING_EFFORT_CHOICES = [(value, value) for value in VISION_REASONING_EFFORT_OPTIONS]
 EVIDENCE_COLUMNS = ["Context 順序", "Evidence ID", "來源／文件", "頁碼", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "檢索證據", "Evidence Hit", "Evidence Precision", "Document Hit"]
 SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk ID"]
 GENERATED_QUESTION_COLUMNS = ["Question ID", "Question", "Difficulty", "Status", "Sources"]
+QUERY_METHOD_LABELS = {"local": "Local", "global": "Global", "drift": "DRIFT", "basic": "Basic"}
+PROJECT_STATUS_LABELS = {
+    "EMPTY": "空專案",
+    "UPLOADED": "已上傳",
+    "PROCESSING": "前處理中",
+    "READY": "可建圖",
+    "INDEXING": "建圖中",
+    "INDEXED": "可使用",
+    "STALE": "需重新建圖",
+    "FAILED": "失敗",
+}
+QUERY_HISTORY_LIMIT = 50
+QUERY_METHOD_CHOICES = [("自動", "auto")] + [(label, method) for method, label in QUERY_METHOD_LABELS.items()]
 AUTOMATIC_EVALUATION_COLUMNS = [
     "Question ID",
     "判斷",
@@ -65,6 +111,130 @@ INDEXING_LOG_AUTOSCROLL_JS = """() => {
         log.scrollTop = log.scrollHeight;
     }, 100);
 }"""
+# 目前主題的按鈕圓角為 0，需明確指定才會顯示為圓角方形
+APP_CSS = """
+.rounded-button {
+    border-radius: 8px !important;
+}
+/* 外觀同 Accordion，但固定展開、不可收合 */
+.static-section .label-wrap {
+    cursor: default !important;
+    pointer-events: none;
+}
+.static-section .label-wrap .icon {
+    display: none;
+}
+/* 按鈕列與周圍元件保持距離 */
+.button-row {
+    background: var(--block-background-fill) !important;
+    padding: var(--spacing-xl) var(--block-padding) !important;
+    gap: var(--spacing-xl) !important;
+}
+/* 按鈕列總寬與上方元件對齊 */
+.button-row.flush-row {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}
+/* 區塊內容與邊框、周圍元件保持距離 */
+.padded-block {
+    padding: var(--spacing-xl) var(--block-padding) !important;
+    margin: var(--spacing-xl) var(--block-padding) !important;
+    width: auto !important;
+}
+/* 沒有訊息時不佔版面，避免上方留白 */
+.collapse-when-empty:has(.md:empty),
+.collapse-when-empty:has(.html-container > .prose:empty) {
+    display: none !important;
+}
+.bold-title > .label-wrap span,
+.bold-title > * > .label-wrap span {
+    font-weight: 700 !important;
+}
+/* 問答頁回答框撐滿到與左欄同高，下方查詢資訊維持原本高度；回答過長時在框內捲動 */
+#query-answer {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+}
+#query-answer > label,
+#query-answer .input-container {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+}
+#query-answer textarea {
+    flex: 1 0 auto;
+    height: auto !important;
+    overflow-y: auto !important;
+}
+#query-summary {
+    flex: 0 0 auto !important;
+}
+/* 匯入／匯出題目集兩欄等高：檔案區撐滿，按鈕固定在底部 */
+.file-action-group,
+.file-action-group .gr-group,
+.file-action-group .styler {
+    flex: 1 1 auto;
+    display: flex !important;
+    flex-direction: column;
+}
+/* 兩欄固定平分寬度；否則上傳後長檔名會撐寬內容，讓 Row 換行成上下兩列 */
+.file-action-row > .file-action-group {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+}
+/* File 的 height 在有檔案後只是清單的 max-height；固定檔案區高度讓上傳前後一致 */
+.file-action-group .no-dashed-file {
+    flex: 0 0 50px;
+    height: 50px;
+    min-height: 50px;
+    min-width: 0;
+    overflow: hidden;
+}
+/* Gradio 的上傳提示與空狀態內建 240px 最小高度，會把整列撐高 */
+.file-action-group .no-dashed-file .wrap {
+    min-height: 0 !important;
+    padding-top: 0 !important;
+}
+/* 上傳提示壓成一行：隱藏圖示與「- or -」，文字置中 */
+.file-action-group .no-dashed-file .upload-container .wrap {
+    display: block !important;
+    text-align: center;
+    line-height: 50px;
+    white-space: nowrap;
+}
+.file-action-group .no-dashed-file .upload-container .icon-wrap,
+.file-action-group .no-dashed-file .upload-container .or {
+    display: none !important;
+}
+/* 標籤下方剩約 24px，空狀態圖示與檔案清單都壓到一列 */
+.file-action-group .no-dashed-file .empty {
+    min-height: 0 !important;
+    height: 24px !important;
+}
+.file-action-group .no-dashed-file .file-preview,
+.file-action-group .no-dashed-file .file-preview tr {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+.file-action-group .no-dashed-file .file-preview td {
+    margin: 0 !important;
+    padding: 2px 10px !important;
+}
+.file-action-group .no-dashed-file table {
+    table-layout: fixed;
+    width: 100%;
+}
+.file-action-group .no-dashed-file td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* Gradio 在 File 沒有檔案時以行內樣式畫虛線框，這裡強制移除 */
+.no-dashed-file {
+    border-style: none !important;
+}
+"""
 
 
 def _sort_experiment_results(raw_results, groups, questions, dataset_ids=()):
@@ -103,6 +273,7 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
         "global": "Microsoft GraphRAG Global",
         "drift": "Microsoft GraphRAG DRIFT",
         "basic": "Microsoft GraphRAG Basic",
+        "auto": "自動（逐題選擇策略）",
     }
     raw_results = (run or {}).get("results", [])
     run_ids = list((run or {}).get("question_set_ids", []))
@@ -123,9 +294,11 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
             partial = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
             incorrect = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
             metric_samples = []
-            if method in {"local", "basic", "drift"}:
+            if method in EVIDENCE_METHODS or method == EXPERIMENT_AUTO_METHOD:
                 for item in selected:
                     if item.get("status") == "failed":
+                        continue
+                    if (item.get("routed_method") or item.get("method")) not in EVIDENCE_METHODS:
                         continue
                     question = next((q for q in question_set.questions if q.question_id == item.get("question_id")), None)
                     if question is None:
@@ -160,6 +333,16 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
     return rows
 
 
+def _experiment_strategy_cell(item, strategy_labels):
+    """Show the strategy GraphRAG actually ran, plus the router's reason for auto groups."""
+    routed = item.get("routed_method")
+    if not routed:
+        method = item.get("method", "")
+        return strategy_labels.get(method, method)
+    reason = item.get("routing_reason") or ""
+    return f"自動 → {strategy_labels.get(routed, routed)}" + (f"：{reason}" if reason else "")
+
+
 def _experiment_grade_label(value):
     score = RetrievalExperimentService._parse_grade(value)
     return {0: "0 錯誤", 1: "1 部分對", 2: "2 全對"}.get(score, value or "")
@@ -188,7 +371,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def connection_status(project_id: str | None = None) -> str:
         return (
-            f"目前狀態：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key(project_id)}；"
+            f"**目前狀態**：Base URL `{connections.get_api_base_url()}`；API Key {connections.masked_api_key(project_id)}；"
             f"Chat `{connections.get_chat_model()}`；Embedding `{connections.get_embedding_model()}`"
         )
 
@@ -219,19 +402,69 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def project_choices() -> list[tuple[str, str]]:
         return [(project.display_name, project.project_id) for project in store.list()]
 
-    def active_project_label(project_id: str | None) -> str:
-        if not project_id:
-            return "目前沒有開啟的專案。請先到「專案設定」選取並開啟專案。"
+    def project_selector_choices() -> list[tuple[str, str]]:
+        return [*project_choices(), (NEW_PROJECT_LABEL, NEW_PROJECT_OPTION)]
+
+    def selected_project_id(project_id: str | None) -> str | None:
+        return None if project_id == NEW_PROJECT_OPTION else project_id
+
+    def api_key_ready(project_id: str | None) -> bool:
         try:
-            project = store.get(project_id)
+            return connections.has_api_key(project_id)
         except ProjectError:
-            return "目前開啟的專案已不存在，請重新選取專案。"
+            return False
+
+    def workspace_lock_reason(project_id: str | None) -> str | None:
+        """Return why tabs 1~5 are locked, or None when a project is open and the API is configured."""
+        reasons = []
+        if not project_id:
+            reasons.append("尚未開啟專案")
+        else:
+            try:
+                store.get(project_id)
+            except ProjectError:
+                reasons.append("目前開啟的專案已不存在")
+        if not api_key_ready(project_id):
+            reasons.append("API Key 尚未設定")
+        if not reasons:
+            return None
+        steps = []
+        if any("專案" in reason for reason in reasons):
+            steps.append("選取並開啟專案")
+        if not api_key_ready(project_id):
+            steps.append("設定 API Key 並儲存連線設定")
         return (
-            f"目前開啟專案：**{project.display_name}** (`{project.project_id}`)｜"
-            f"狀態：{project.status}"
+            f"🔒 {'，且'.join(reasons)}，分頁 1～5 已鎖定。"
+            f"請先到「專案與連線設定」{'，並'.join(steps)}。"
         )
 
+    def active_project_label(project_id: str | None) -> str:
+        reason = workspace_lock_reason(project_id)
+        if reason:
+            return reason
+        project = store.get(project_id)
+        return (
+            f"目前開啟專案：**{project.display_name}** (`{project.project_id}`)｜"
+            f"狀態：{project.status}（{PROJECT_STATUS_LABELS.get(project.status, project.status)}）"
+        )
+
+    def workspace_tab_states(project_id: str | None):
+        unlocked = workspace_lock_reason(project_id) is None
+        return (
+            active_project_label(project_id),
+            *(gr.Tab(interactive=unlocked) for _ in range(5)),
+        )
+
+    def render_dashboard(project_id: str | None) -> str:
+        if not project_id:
+            return dashboard_iframe(None, None)
+        try:
+            return dashboard_iframe(store.get(project_id), store.path_for(project_id))
+        except ProjectError as exc:
+            return f"<p>❌ {html.escape(str(exc))}</p>"
+
     def open_project(project_id: str | None):
+        project_id = selected_project_id(project_id)
         if not project_id:
             return None, active_project_label(None), {}, connections.get_api_key() or "", "請先選取專案", connection_status()
         try:
@@ -248,31 +481,63 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             connection_status(project.project_id),
         )
 
-    def ask_question(project_id: str | None, question: str, method: str, chat_model: str | None, response_type: str):
-        yield "", "⏳ 正在查詢 GraphRAG，完成後將顯示回答與 Evidence…", [], gr.Dropdown(choices=[]), "", {}, []
+    def ask_question(
+        project_id: str | None,
+        question: str,
+        method: str,
+        chat_model: str | None,
+        response_type: str,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        progress=gr.Progress(),
+    ):
+        hidden = gr.Group(visible=False)
         if not project_id:
-            yield "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, []
-            return
-        try:
-            query_result = querying.ask(
-                project_id, question, method, chat_model=chat_model, response_type=response_type
-            )
-        except ProjectError as exc:
-            yield "", f"❌ {exc}", [], gr.Dropdown(choices=[]), "", {}, []
-            return
+            return "", "❌ 請先選擇已完成建圖的專案", [], gr.Dropdown(choices=[]), "", {}, [], hidden
+        # querying.ask 沒有階段回報，改以背景執行緒搭配經過時間推估進度（上限 95%）
+        outcome: dict[str, object] = {}
+
+        def run_query() -> None:
+            try:
+                outcome["result"] = querying.ask(
+                    project_id, question, method, chat_model=chat_model, response_type=response_type,
+                    source="manual", reasoning_effort=reasoning_effort,
+                )
+            except Exception as exc:  # noqa: BLE001 - 交回主執行緒處理
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run_query, daemon=True)
+        started = time.monotonic()
+        worker.start()
+        while worker.is_alive():
+            elapsed = time.monotonic() - started
+            stage = "模型選擇查詢方法中" if method == "auto" and elapsed < 5 else "GraphRAG 檢索與生成回答中"
+            progress(min(0.95, 1 - math.exp(-elapsed / 30)), desc=f"⏳ {stage}…已經過 {elapsed:.0f} 秒")
+            worker.join(timeout=0.5)
+        progress(1.0, desc="完成")
+        if isinstance(outcome.get("error"), ProjectError):
+            return "", f"❌ {outcome['error']}", [], gr.Dropdown(choices=[]), "", {}, [], hidden
+        if "error" in outcome:
+            raise outcome["error"]
+        return query_result_outputs(outcome["result"])
+
+    def query_result_outputs(query_result):
+        hidden = gr.Group(visible=False)
+        method_label = QUERY_METHOD_LABELS.get(query_result.method, query_result.method)
+        if query_result.requested_method == "auto":
+            method_label = f"自動 → {method_label}"
         summary = (
-            f"狀態：{query_result.status}｜方法：{query_result.method}｜"
+            f"狀態：{query_result.status}｜方法：{method_label}｜"
             f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
         )
+        if query_result.routing_reason:
+            summary += f"\n\n**選擇原因：** {query_result.routing_reason}"
         if query_result.status == "FAILED":
-            yield "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, []
-            return
+            return "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, [], hidden
         evidence_values = [asdict(item) for item in query_result.evidence]
         evidence_rows = [
             [item.rank, item.evidence_id, item.document_id, item.page or "—", item.chunk_id or "—", item.score]
             for item in query_result.evidence
         ]
-        answer = query_result.answer
         if query_result.evidence:
             selected = query_result.evidence[0].evidence_id
             detail = evidence_markdown(selected, evidence_values)
@@ -283,14 +548,63 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             choices=[item.evidence_id for item in query_result.evidence],
             value=selected,
         )
-        yield (
-            answer,
+        return (
+            query_result.answer,
             f"✅ {summary}",
             evidence_rows,
             selector,
             detail,
             querying.context_summary(query_result.context),
             evidence_values,
+            gr.Group(visible=True),
+        )
+
+    def manual_query_history(project_id: str | None) -> list:
+        """Manual Q&A records, newest first; untagged legacy records are included."""
+        if not project_id:
+            return []
+        try:
+            records = querying.history(project_id)
+        except ProjectError:
+            return []
+        manual = [item for item in records if item.source in (None, "manual")]
+        return list(reversed(manual))[:QUERY_HISTORY_LIMIT]
+
+    def load_query_history(project_id: str | None):
+        records = manual_query_history(project_id)
+        rows = [
+            [
+                format_history_time(item.completed_at),
+                item.question if len(item.question) <= 60 else item.question[:60] + "…",
+                QUERY_METHOD_LABELS.get(item.method, item.method)
+                + ("（自動）" if item.requested_method == "auto" else ""),
+                item.status,
+                round(item.duration_seconds, 1),
+            ]
+            for item in records
+        ]
+        return rows, [item.query_id for item in records]
+
+    def format_history_time(value: str) -> str:
+        try:
+            return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return value
+
+    def select_query_history(project_id: str | None, query_ids: list[str], evt: gr.SelectData):
+        row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+        query_id = query_ids[row] if query_ids and 0 <= row < len(query_ids) else None
+        record = next(
+            (item for item in manual_query_history(project_id) if item.query_id == query_id), None
+        )
+        if record is None:
+            raise gr.Error("找不到這筆問答紀錄，請重新整理歷史清單")
+        method = record.requested_method or record.method
+        return (
+            record.question,
+            gr.update(value=method),
+            gr.update(value=record.response_type),
+            *query_result_outputs(record),
         )
 
     def evidence_markdown(evidence_id: str | None, evidence_values: list[dict[str, object]]) -> str:
@@ -594,6 +908,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 judged.judge_reason if judged else (
                     report.judge_error or question.error or "尚無評判結果"
                 ),
+                autoqa_strategy_cell(report.question_set, question),
             ])
         return rows
 
@@ -611,8 +926,48 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 evidence_docs, question.question, question.answer, question.reference_answer,
                 bool(judged and judged.is_correct),
                 judged.judge_reason if judged else "尚無評判結果",
+                autoqa_strategy_cell(question_set, question),
             ])
         return rows
+
+    def autoqa_strategy_cell(question_set, question):
+        if not question.routed_method:
+            return QUERY_METHOD_LABELS.get(question_set.method, question_set.method)
+        label = QUERY_METHOD_LABELS.get(question.routed_method, question.routed_method)
+        return f"自動 → {label}" + (f"：{question.routing_reason}" if question.routing_reason else "")
+
+    def autoqa_method_summary(question_set):
+        """Name the saved strategy; for auto, also count which strategy each question was routed to."""
+        if question_set.method != "auto":
+            return QUERY_METHOD_LABELS.get(question_set.method, question_set.method)
+        counts = {}
+        for item in question_set.questions:
+            if item.routed_method:
+                counts[item.routed_method] = counts.get(item.routed_method, 0) + 1
+        detail = "、".join(
+            f"{QUERY_METHOD_LABELS.get(method, method)} {count} 題" for method, count in counts.items()
+        )
+        return "自動" + (f"（{detail}）" if detail else "")
+
+    def autoqa_question_set_choices(project_id, selected_id):
+        if not project_id:
+            return gr.update(choices=[], value=None)
+        try:
+            saved_sets = question_sets.list(project_id)
+        except ProjectError:
+            return gr.update(choices=[], value=None)
+        choices = []
+        for item in saved_sets:
+            try:
+                created = datetime.fromisoformat(item.imported_at).astimezone().strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                created = item.imported_at
+            choices.append((
+                f"{item.name}｜{len(item.questions)} 題｜{created}｜{item.question_set_id[:8]}",
+                item.question_set_id,
+            ))
+        ids = {value for _label, value in choices}
+        return gr.update(choices=choices, value=selected_id if selected_id in ids else None)
 
     def autoqa_question_rows(question_set):
         rows = []
@@ -627,6 +982,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 format_autoqa_sources(answer_sources),
             ])
         return rows
+
+    def autoqa_rows_update(rows):
+        return gr.update(value=rows, visible=bool(rows))
 
     def format_autoqa_sources(evidence):
         return "；".join(
@@ -727,6 +1085,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question_source_evidence=question_sources,
                 answer_source_evidence=answer_sources,
                 source_documents=source_documents,
+                routed_method=old.routed_method,
+                routing_reason=old.routing_reason,
             ))
         return question_sets.update_questions(project_id, question_set_id, updated)
 
@@ -755,20 +1115,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             lines.append("**評判提醒：** " + report.judge_error)
         if report.generation_errors:
             lines.append("**部分 PDF 生題未完成：** " + "；".join(report.generation_errors))
+        lines.insert(2, "**檢索模式：** " + autoqa_method_summary(report.question_set))
         return "\n\n".join(lines)
 
-    def automatic_qa_saved_view(project_id):
+    def automatic_qa_saved_view(project_id, question_set_id=None):
         if not project_id:
-            return "請先於「專案設定」開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
+            return "請先於「專案與連線設定」開啟專案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
         try:
             saved_sets = question_sets.list(project_id)
             if not saved_sets:
-                return "此專案尚無已儲存的自動問答題目集", [], "", "", [], "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
-            question_set = saved_sets[0]
+                return "此專案尚無已儲存的自動問答題目集", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
+            question_set = next(
+                (item for item in saved_sets if item.question_set_id == question_set_id), saved_sets[0]
+            )
             judge = automatic_evaluation.last_result(project_id, question_set.question_set_id)
             retrieval = retrieval_evaluation.last_result(project_id, question_set.question_set_id)
         except ProjectError as exc:
-            return f"❌ 載入自動問答資料失敗：{exc}", [], "", "", [], "載入失敗。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
+            return f"❌ 載入自動問答資料失敗：{exc}", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "載入失敗。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
 
         judge_by_id = {item.question_id: item for item in judge.items} if judge else {}
         result_rows = automatic_qa_result_rows(question_set, judge)
@@ -781,12 +1144,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         correct = sum(item.is_correct for item in judge_by_id.values())
         if judge:
             summary = (
-                f"**最近題目集：** {question_set.name}｜**答對：** {correct}/{total} "
+                f"**題目集：** {question_set.name}｜**答對：** {correct}/{total} "
                 f"（{correct / total:.1%}）｜評判 {len(judge_by_id)}/{total} 題\n\n"
-                f"**檢索模式：** {question_set.method}｜**評判模型：** {judge.model}"
+                f"**檢索模式：** {autoqa_method_summary(question_set)}｜**評判模型：** {judge.model}"
             )
         else:
-            summary = f"**最近題目集：** {question_set.name}｜尚無已儲存的自動問答評判結果。"
+            summary = f"**題目集：** {question_set.name}｜尚無已儲存的自動問答評判結果。"
         if retrieval:
             summary += (
                 f"\n\n**Retrieval：** Evidence Hit Rate {retrieval.evidence_hit_rate:.1%}"
@@ -802,11 +1165,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
             summary += f"｜{retrieval.retrieval_metrics_status}"
         return (
-            f"✅ 已自動載入最近題目集「{question_set.name}」及已儲存的測試資料",
-            autoqa_question_rows(question_set),
+            (
+                f"✅ 已載入題目集「{question_set.name}」及已儲存的測試資料"
+                if question_set.question_set_id == question_set_id
+                else f"✅ 已自動載入最近題目集「{question_set.name}」及已儲存的測試資料"
+            ),
+            autoqa_rows_update(autoqa_question_rows(question_set)),
             question_set.question_set_id,
             summary,
-            result_rows,
+            autoqa_rows_update(result_rows),
             "✅ 已載入完成的回答，可以開始評測。" if answers_ready else "尚未生成完成所有回答。",
             gr.update(interactive=answers_ready),
             question_set.response_type,
@@ -815,7 +1182,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def experiment_view(project_id: str | None, message: str = ""):
         if not project_id:
             return (
-                message or "請先在「專案設定」開啟專案", [], [], [], [], [], 5,
+                message or "請先在「專案與連線設定」開啟專案", [], gr.update(value=[], visible=False),
+                gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), 5,
                 gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                 "尚未生成答案。", gr.update(interactive=False), "strict",
             )
@@ -891,6 +1259,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 "global": "Microsoft GraphRAG Global",
                 "drift": "Microsoft GraphRAG DRIFT",
                 "basic": "Microsoft GraphRAG Basic",
+                "auto": "自動（逐題選擇策略）",
             }
             summaries = [
                 [
@@ -927,6 +1296,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("actual_answer"), item.get("correct_answer"),
                     _experiment_grade_label(item.get("evaluation_result")) if item.get("evaluation_result") not in (None, "待評測") else "",
                     item.get("evaluation_reason") or item.get("error") or "",
+                    _experiment_strategy_cell(item, strategy_labels),
                 ]
                 for item in ordered_raw_results
                 if item.get("evaluation_result") not in (None, "待評測")
@@ -934,14 +1304,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             status = message or (
                 f"最近實驗狀態：{run.get('status', '尚未執行')}｜資料集：{run.get('question_set_name', '尚未匯入')}"
             )
+            # 摘要與逐題結果等評測完才顯示
+            evaluated = bool(results)
             return (
-                status, question_set_ids, question_rows, summaries, dataset_summaries,
-                results, state.get("max_concurrency", 5),
+                status, question_set_ids, gr.update(value=question_rows, visible=bool(question_rows)),
+                gr.update(value=summaries, visible=evaluated),
+                gr.update(value=dataset_summaries, visible=evaluated),
+                gr.update(value=results, visible=evaluated), state.get("max_concurrency", 5),
                 gr.update(choices=list(ALLOWED_CHAT_MODELS), value=state.get("judge_model", connections.get_chat_model())),
                 generation_status, gr.update(interactive=answers_ready), state.get("evaluation_mode", "strict"),
             )
         except ProjectError as exc:
-            return (f"❌ {exc}", [], [], [], [], [], 5,
+            return (f"❌ {exc}", [], gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), 5,
                     gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
                     "載入實驗狀態失敗。", gr.update(interactive=False), "strict")
 
@@ -958,22 +1332,56 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f'<span>已處理 {completed} / {total} 題</span><span>{percent}%｜{status}</span></div></div>'
         )
 
-    def experiment_progress_for_project(project_id: str | None) -> str:
+    def experiment_progress_update(completed: int, total: int, status: str, visible: bool = True):
+        """進度條只在開始生成答案後顯示。"""
+        return gr.update(value=experiment_progress_markup(completed, total, status), visible=visible)
+
+    hidden_progress = gr.update(visible=False)
+
+    def stream_with_progress(task, render):
+        """在背景執行 task(report)，每次 report(...) 時 yield render(...)，最後回傳 task 的結果。"""
+        updates: queue.Queue = queue.Queue()
+        with ThreadPoolExecutor(max_workers=1) as runner:
+            future = runner.submit(task, lambda *args: updates.put(args))
+            while not (future.done() and updates.empty()):
+                try:
+                    yield render(*updates.get(timeout=0.5))
+                except queue.Empty:
+                    continue
+            return future.result()
+
+    def experiment_evaluation_progress_for_project(project_id: str | None):
         if not project_id:
-            return experiment_progress_markup(0, 0, "請先開啟專案")
+            return hidden_progress
+        try:
+            run = retrieval_experiments.load(project_id).get("run")
+            if not isinstance(run, dict):
+                return hidden_progress
+            judged = sum(
+                RetrievalExperimentService._parse_grade(item.get("evaluation_result")) is not None
+                for item in run.get("results", [])
+            )
+            status = {"evaluating": "評測中", "completed": "評測完成", "stopped": "已停止"}.get(
+                str(run.get("status", ""))
+            )
+            if status is None or (not judged and status != "評測中"):
+                return hidden_progress
+            total = len(run.get("groups", [])) * int(run.get("question_count", 0))
+            return experiment_progress_update(judged, total, status)
+        except (ProjectError, TypeError, ValueError):
+            return hidden_progress
+
+    def experiment_progress_views(project_id: str | None):
+        return experiment_progress_for_project(project_id), experiment_evaluation_progress_for_project(project_id)
+
+    def experiment_progress_for_project(project_id: str | None):
+        if not project_id:
+            return experiment_progress_update(0, 0, "請先開啟專案", visible=False)
         try:
             state = retrieval_experiments.load(project_id)
             run = state.get("run")
             if not isinstance(run, dict):
-                question_set_ids = retrieval_experiments._normalize_question_set_ids(
-                    state.get("question_set_ids", state.get("question_set_id", ""))
-                )
-                question_count = sum(
-                    len(question_sets.get(project_id, item).questions) for item in question_set_ids
-                )
-                return experiment_progress_markup(
-                    0, len(state.get("groups", [])) * question_count, "尚未開始"
-                )
+                return experiment_progress_update(0, 0, "尚未開始", visible=False)
             status = {
                 "generating_answers": "答案生成中",
                 "answers_completed": "答案生成完成",
@@ -984,9 +1392,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 "running": "執行中",
             }.get(str(run.get("status", "")), "準備中")
             total = len(run.get("groups", [])) * int(run.get("question_count", 0))
-            return experiment_progress_markup(len(run.get("results", [])), total, status)
+            return experiment_progress_update(len(run.get("results", [])), total, status)
         except (ProjectError, TypeError, ValueError):
-            return experiment_progress_markup(0, 0, "尚未開始")
+            return experiment_progress_update(0, 0, "尚未開始", visible=False)
 
     def resolve_experiment_question_set_id(project_id: str, question_set_id: str | list[str] | None) -> list[str]:
         """Prefer the project's persisted datasets over stale/empty browser State."""
@@ -1164,15 +1572,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return f"✅ {group_id} Luna 推理深度已儲存", refresh_experiment_groups(revision)
 
     def update_model_method_compatibility(answer_model: str | None, method: str | None):
-        """Keep all supported models and query strategies selectable together."""
+        """Keep all supported models and query strategies, including auto, selectable together."""
         answer_model = answer_model or connections.get_chat_model()
         method = method or "local"
         return (
             gr.update(choices=list(ALLOWED_CHAT_MODELS), value=answer_model),
-            gr.update(
-                choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                value=method,
-            ),
+            gr.update(choices=QUERY_METHOD_CHOICES, value=method),
+        )
+
+    def update_query_method_compatibility(answer_model: str | None, method: str | None):
+        """Same as update_model_method_compatibility, keeping the single-query auto option."""
+        answer_model = answer_model or connections.get_chat_model()
+        return (
+            gr.update(choices=list(ALLOWED_CHAT_MODELS), value=answer_model),
+            gr.update(choices=QUERY_METHOD_CHOICES, value=method or "auto"),
         )
 
     def generate_retrieval_experiment_answers(
@@ -1182,20 +1595,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
             view[9] = gr.update(interactive=False)
-            yield (*view, experiment_progress_markup(0, 0, "請先開啟專案"))
+            yield (*view, experiment_progress_update(0, 0, "請先開啟專案", visible=False), hidden_progress)
             return
         try:
             question_set_id = resolve_experiment_question_set_id(project_id, question_set_id)
         except ProjectError as exc:
             view = list(experiment_view(project_id, f"❌ {exc}"))
             view[9] = gr.update(interactive=False)
-            yield (*view, experiment_progress_for_project(project_id))
+            yield (*view, *experiment_progress_views(project_id))
             return
         pending = list(experiment_view(project_id))
         pending[0] = "⏳ 正在依各實驗組策略檢索並生成答案…"
         pending[8] = "⏳ 答案生成中；完成前無法評測。"
         pending[9] = gr.update(interactive=False)
-        yield (*pending, experiment_progress_markup(0, 0, "準備開始"))
+        yield (*pending, experiment_progress_update(0, 0, "準備開始"), hidden_progress)
         try:
             state = retrieval_experiments.load(project_id)
             groups = [ExperimentGroup(**item) for item in state["groups"]]
@@ -1205,7 +1618,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             question_count = sum(len(question_sets.get(project_id, item).questions) for item in question_set_id)
             total = len(groups) * question_count
             pending[0] = f"⏳ 正在依各實驗組策略檢索並生成答案：0/{total} 題"
-            yield (*pending, experiment_progress_markup(0, total, "答案生成中"))
+            yield (*pending, experiment_progress_update(0, total, "答案生成中"), hidden_progress)
             progress_updates: queue.Queue = queue.Queue(maxsize=1)
 
             def publish_progress(run_update):
@@ -1243,13 +1656,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     progress_view[9] = gr.update(interactive=False)
                     yield (
                         *progress_view,
-                        experiment_progress_markup(completed, total, "答案生成中"),
+                        experiment_progress_update(completed, total, "答案生成中"),
+                        hidden_progress,
                     )
                 run = future.result()
         except (ProjectError, TypeError, ValueError, OSError) as exc:
             view = list(experiment_view(project_id, f"❌ 答案生成失敗：{exc}"))
             view[9] = gr.update(interactive=False)
-            yield (*view, experiment_progress_for_project(project_id))
+            yield (*view, *experiment_progress_views(project_id))
             return
         if run.status == "answers_completed":
             message = f"✅ 檢索並生成答案完成：{len(run.results)}/{len(groups) * run.question_count} 筆。"
@@ -1263,30 +1677,35 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             "answers_partial": "部分完成",
         }.get(run.status, "完成")
         yield (*experiment_view(project_id, message),
-               experiment_progress_markup(len(run.results), total, progress_status))
+               experiment_progress_update(len(run.results), total, progress_status), hidden_progress)
 
     def evaluate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
         judge_model: str | None, evaluation_mode: str | None,
+        judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ):
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
             view[9] = gr.update(interactive=False)
-            yield tuple(view)
+            yield (*view, hidden_progress)
             return
         try:
             question_set_id = resolve_experiment_question_set_id(project_id, question_set_id)
         except ProjectError as exc:
             view = list(experiment_view(project_id, f"❌ {exc}"))
             view[9] = gr.update(interactive=False)
-            yield tuple(view)
+            yield (*view, experiment_evaluation_progress_for_project(project_id))
             return
         pending = list(experiment_view(project_id))
         pending[0] = "⏳ 正在評測已保存的答案…"
         pending[9] = gr.update(interactive=False)
-        yield tuple(pending)
+        yield (*pending, experiment_progress_update(0, 0, "準備開始"))
+        total = 0
         try:
             state = retrieval_experiments.load(project_id)
+            total = len(state.get("groups", [])) * sum(
+                len(question_sets.get(project_id, item).questions) for item in question_set_id
+            )
             limit = int(concurrency)
             selected_judge_model = judge_model or str(state.get("judge_model", connections.get_chat_model()))
             retrieval_experiments.save_configuration(
@@ -1296,19 +1715,39 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 limit,
                 selected_judge_model,
             )
-            run = retrieval_experiments.evaluate_answers(
-                project_id,
-                question_set_id,
-                judge_model=selected_judge_model,
-                max_concurrency=limit,
-                evaluation_mode=evaluation_mode,
-            )
+            yield (*pending, experiment_progress_update(0, total, "評測中"))
+
+            def evaluate_task(report):
+                finished = [0]
+
+                def on_update(_run):
+                    finished[0] += 1
+                    report(finished[0])
+
+                return retrieval_experiments.evaluate_answers(
+                    project_id,
+                    question_set_id,
+                    judge_model=selected_judge_model,
+                    max_concurrency=limit,
+                    update_callback=on_update,
+                    evaluation_mode=evaluation_mode,
+                    judge_reasoning_effort=judge_reasoning_effort,
+                )
+
+            def render_evaluation(finished):
+                pending[0] = f"⏳ 正在評測已保存的答案：{finished}/{total} 筆"
+                return (*pending, experiment_progress_update(finished, total, "評測中"))
+
+            run = yield from stream_with_progress(evaluate_task, render_evaluation)
         except (ProjectError, TypeError, ValueError, OSError) as exc:
             view = list(experiment_view(project_id, f"❌ 評測失敗：{exc}"))
-            yield tuple(view)
+            yield (*view, experiment_evaluation_progress_for_project(project_id))
             return
         evaluated = sum(RetrievalExperimentService._parse_grade(item.evaluation_result) is not None for item in run.results)
-        yield experiment_view(project_id, f"✅ 評測完成：{evaluated}/{len(run.results)} 筆答案已評判。")
+        yield (
+            *experiment_view(project_id, f"✅ 評測完成：{evaluated}/{len(run.results)} 筆答案已評判。"),
+            experiment_progress_update(evaluated, len(run.results), "評測完成"),
+        )
 
     def stop_retrieval_experiment(project_id: str | None):
         if not project_id:
@@ -1367,42 +1806,77 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ 自動儲存失敗：{exc}"
         return "✅ 題目與來源已自動儲存至目前專案"
 
-    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method, progress=gr.Progress()):
+    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, generation_effort, method):
+        # 輸出最後三項依序為生題、回答、評測進度條；換題目後舊的回答與評測進度一併隱藏
         if not project_id:
-            return "❌ 請先開啟專案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+            yield ("❌ 請先開啟專案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。",
+                   gr.update(interactive=False), hidden_progress, hidden_progress, hidden_progress)
+            return
+        unchanged = (gr.update(),) * 6
+
+        def render_generation(fraction, description):
+            return ("⏳ 正在生成題目…", *unchanged,
+                    gr.update(value=task_progress_markup(fraction, "生題中", description), visible=True),
+                    hidden_progress, hidden_progress)
+
         try:
-            question_set = automatic_qa.generate_question_set(
-                project_id,
-                int(count),
-                parallel_generation,
-                generation_model,
-                method,
-                progress_callback=lambda fraction, description: progress(fraction, desc=description),
+            yield render_generation(0, "準備開始")
+            question_set = yield from stream_with_progress(
+                lambda report: automatic_qa.generate_question_set(
+                    project_id,
+                    int(count),
+                    parallel_generation,
+                    generation_model,
+                    method,
+                    reasoning_effort=generation_effort,
+                    progress_callback=report,
+                ),
+                render_generation,
             )
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
-        return (
+            yield ("❌ " + str(exc), autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。",
+                   gr.update(interactive=False), hidden_progress, hidden_progress, hidden_progress)
+            return
+        yield (
             f"✅ 已生成 {len(question_set.questions)} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。\n\n{question_set.description}",
-            autoqa_question_rows(question_set),
+            autoqa_rows_update(autoqa_question_rows(question_set)),
             question_set.question_set_id,
             "",
-            [],
+            autoqa_rows_update([]),
             "尚未生成回答。完成前不能評測。",
             gr.update(interactive=False),
+            gr.update(value=task_progress_markup(1, "生成完成", f"共 {len(question_set.questions)} 題"), visible=True),
+            hidden_progress,
+            hidden_progress,
         )
 
-    def generate_automatic_answers(project_id, question_set_id, rows, answer_model, method, concurrency, response_type):
+    def generate_automatic_answers(project_id, question_set_id, rows, answer_model, answer_effort, method, concurrency, response_type):
+        # 輸出最後兩項為回答與評測進度條；重新生成回答後舊的評測進度隱藏
         if not project_id or not question_set_id:
-            yield "❌ 請先生成或匯入題目集", "", [], gr.update(interactive=False)
+            yield ("❌ 請先生成或匯入題目集", "", autoqa_rows_update([]), gr.update(interactive=False),
+                   hidden_progress, hidden_progress)
             return
-        yield "⏳ 正在檢索並生成回答；完成前無法進行評測…", "", [], gr.update(interactive=False)
+        yield ("⏳ 正在檢索並生成回答；完成前無法進行評測…", "", autoqa_rows_update([]), gr.update(interactive=False),
+               experiment_progress_update(0, 0, "準備開始"), hidden_progress)
+
+        def render_answers(completed, total):
+            return (f"⏳ 正在檢索並生成回答：{completed}/{total} 題；完成前無法進行評測…",
+                    gr.update(), gr.update(), gr.update(),
+                    experiment_progress_update(completed, total, "回答生成中"), hidden_progress)
+
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
-            report = automatic_qa.answer_existing(
-                project_id, question_set_id, answer_model, method, int(concurrency), response_type
+            report = yield from stream_with_progress(
+                lambda progress: automatic_qa.answer_existing(
+                    project_id, question_set_id, answer_model, method, int(concurrency), response_type,
+                    reasoning_effort=answer_effort,
+                    progress_callback=progress,
+                ),
+                render_answers,
             )
         except (ProjectError, ValueError) as exc:
-            yield "❌ " + str(exc), "", [], gr.update(interactive=False)
+            yield ("❌ " + str(exc), "", autoqa_rows_update([]), gr.update(interactive=False),
+                   hidden_progress, hidden_progress)
             return
         ready = bool(report.question_set.questions) and all(
             item.status == "COMPLETED" and item.answer.strip()
@@ -1416,31 +1890,51 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             status = f"✅ 檢索並生成回答完成：{completed}/{len(report.question_set.questions)} 題。現在可以評測。"
         else:
             status = f"⚠️ 回答生成尚未全部完成：{completed}/{len(report.question_set.questions)} 題；請確認失敗題目後重試。"
+        total = len(report.question_set.questions)
         yield (
             status,
             f"回答模型：{answer_model}｜檢索模式：{method}｜回答格式：{response_type}｜尚未評測。",
-            [],
+            autoqa_rows_update([]),
             gr.update(interactive=ready),
+            experiment_progress_update(completed, total, "回答生成完成" if ready else "部分完成"),
+            hidden_progress,
         )
 
-    def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency, response_type):
+    def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, judge_effort, method, concurrency, response_type):
         if not project_id or not question_set_id:
-            return "❌ 請先生成或匯入題目集", "", []
+            yield "❌ 請先生成或匯入題目集", "", autoqa_rows_update([]), hidden_progress
+            return
+        yield "⏳ 正在評測回答…", gr.update(), gr.update(), experiment_progress_update(0, 0, "準備開始")
+
+        def render_judging(completed, total):
+            return (f"⏳ 正在評測回答：{completed}/{total} 題…", gr.update(), gr.update(),
+                    experiment_progress_update(completed, total, "評測中"))
+
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
-            report = automatic_qa.evaluate_existing(
-                project_id, question_set_id, answer_model, judge_model, method,
-                concurrency=int(concurrency),
-                response_type=response_type,
+            report = yield from stream_with_progress(
+                lambda progress: automatic_qa.evaluate_existing(
+                    project_id, question_set_id, answer_model, judge_model, method,
+                    concurrency=int(concurrency),
+                    response_type=response_type,
+                    reasoning_effort=judge_effort,
+                    progress_callback=progress,
+                ),
+                render_judging,
             )
         except (ProjectError, ValueError) as exc:
-            return "❌ " + str(exc), "", []
+            yield "❌ " + str(exc), "", autoqa_rows_update([]), hidden_progress
+            return
         status = "✅ 評測完成；可將評測等級編輯為 0（錯誤）、1（部分對）或 2（全對），全對率會自動更新。"
-        return status, automatic_qa_summary(report), automatic_qa_rows(report)
+        judged = len(report.judge.items) if report.judge else 0
+        yield (
+            status, automatic_qa_summary(report), autoqa_rows_update(automatic_qa_rows(report)),
+            experiment_progress_update(judged, len(report.question_set.questions), "評測完成" if report.judge else "評測失敗"),
+        )
 
     def autosave_automatic_qa_judgements(project_id, question_set_id, rows):
         if not project_id or not question_set_id:
-            return "請先完成評測", []
+            return "請先完成評測", autoqa_rows_update([])
         try:
             question_set = question_sets.get(project_id, question_set_id)
             if rows is None:
@@ -1461,7 +1955,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 project_id, question_set_id, decisions
             )
         except (ProjectError, TypeError, ValueError) as exc:
-            return f"❌ 評測結果儲存失敗：{exc}", []
+            return f"❌ 評測結果儲存失敗：{exc}", autoqa_rows_update([])
         total = len(question_set.questions)
         correct = result.correct_count
         summary = (
@@ -1485,26 +1979,42 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     if retrieval.document_hit_rate is not None else "｜Document Hit Rate 不可計算"
                 )
             summary += f"｜{retrieval.retrieval_metrics_status}"
-        return summary, automatic_qa_result_rows(question_set, result)
+        return summary, autoqa_rows_update(automatic_qa_result_rows(question_set, result))
 
     def import_automatic_question_set(project_id, uploaded):
         if not project_id or not uploaded:
-            return "❌ 請先開啟專案並選擇 JSON 題目集", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+            return "❌ 請先開啟專案並選擇 JSON 題目集", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False)
         source = uploaded if isinstance(uploaded, (str, Path)) else getattr(uploaded, "name", None)
         if not source:
-            return "❌ 無法讀取上傳檔案", [], "", "", [], "尚未生成回答。", gr.update(interactive=False)
+            return "❌ 無法讀取上傳檔案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。", gr.update(interactive=False)
         try:
             question_set = question_sets.import_file(project_id, source)
         except ProjectError as exc:
-            return "❌ " + str(exc), [], "", "", [], "匯入失敗。", gr.update(interactive=False)
+            return "❌ " + str(exc), autoqa_rows_update([]), "", "", autoqa_rows_update([]), "匯入失敗。", gr.update(interactive=False)
         return (
             "✅ 已匯入題目集「" + question_set.name + "」，可先編輯再測試。",
-            autoqa_question_rows(question_set),
+            autoqa_rows_update(autoqa_question_rows(question_set)),
             question_set.question_set_id,
             "",
-            [],
+            autoqa_rows_update([]),
             "尚未生成回答。",
             gr.update(interactive=False),
+        )
+
+    def current_question_set_markup(project_id, question_set_id):
+        if not project_id or not question_set_id:
+            return "**目前題目集：** 尚未載入；請先生成或匯入題目集"
+        try:
+            question_set = question_sets.get(project_id, question_set_id)
+        except ProjectError as exc:
+            return f"**目前題目集：** ❌ {exc}"
+        try:
+            created = datetime.fromisoformat(question_set.imported_at).astimezone().strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            created = question_set.imported_at
+        return (
+            f"**目前題目集：** {question_set.name}｜{len(question_set.questions)} 題｜"
+            f"建立於 {created}｜ID `{question_set.question_set_id[:8]}`"
         )
 
     def export_automatic_question_set(project_id, question_set_id, rows):
@@ -1744,6 +2254,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError:
             return {}
 
+    def project_details_view(project_id: str | None):
+        # 沒有專案資料時隱藏，避免顯示空白的 JSON 區塊
+        details = project_details(project_id)
+        return gr.JSON(value=details, visible=bool(details))
+
     def project_enabled_value(project_id: str | None) -> bool:
         try:
             return store.get(project_id).enabled if project_id else True
@@ -1751,6 +2266,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return True
 
     def update_project_enabled(project_id: str | None, enabled: bool):
+        project_id = selected_project_id(project_id)
         if not project_id:
             return "❌ 請先選擇專案", store.table_rows(), {}
         try:
@@ -1762,22 +2278,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def refresh_project_views(project_id: str | None, active_id: str | None):
         available_ids = {project.project_id for project in store.list()}
-        selected = project_id if project_id in available_ids else None
+        selected = project_id if project_id in available_ids or project_id == NEW_PROJECT_OPTION else None
         active = active_id if active_id in available_ids else None
-        choices = project_choices()
+        choices = project_selector_choices()
         return (
             store.table_rows(),
-            gr.Dropdown(choices=choices, value=selected, allow_custom_value=True),
+            gr.Dropdown(choices=choices, value=selected),
             project_details(selected),
             active,
             active_project_label(active),
         )
 
     def delete_project(project_id: str | None, confirmed: bool, active_id: str | None):
+        project_id = selected_project_id(project_id)
         if not project_id:
             return "❌ 請先選擇專案", *refresh_project_views(None, active_id), False
         if not confirmed:
-            return "❌ 請勾選刪除確認", *refresh_project_views(project_id, active_id), False
+            return "已取消刪除", *refresh_project_views(project_id, active_id), False
         try:
             store.delete(project_id)
         except ProjectError as exc:
@@ -1785,15 +2302,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         next_active = None if project_id == active_id else active_id
         return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None, next_active), False
 
-    def document_rows(project_id: str | None) -> list[list[str | int | None]]:
-        return [document_row(document) for document in documents.list_documents_if_available(project_id)]
-
-    def processing_option_rows(project_id: str | None) -> list[list[str | int | float]]:
-        if not project_id:
+    def processing_option_rows(
+        project_id: str | None,
+        targets: list[str] | None,
+        edited_rows: object | None = None,
+    ) -> list[list[str | int | float]]:
+        """Rows for the selected PDFs only; unsaved edits in `edited_rows` win over saved options."""
+        if not project_id or not targets:
             return []
-        saved = documents.processing_options(project_id)
+        selected = set(targets)
+        saved = {**documents.processing_options(project_id), **parse_processing_options(edited_rows)}
         rows: list[list[str | int | float]] = []
         for document in documents.list_documents_if_available(project_id):
+            if document.filename not in selected:
+                continue
             options = saved.get(document.filename, {})
             pages = document.pages or 0
             rows.append(
@@ -1827,9 +2349,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return options
 
     def document_view(project_id: str | None):
-        rows = document_rows(project_id)
-        choices = [row[0] for row in rows]
-        return rows, processing_option_rows(project_id), gr.Dropdown(choices=choices, value=None)
+        items = documents.list_documents_if_available(project_id)
+        choices = [*(item.filename for item in items), (UPLOAD_PDF_LABEL, UPLOAD_PDF_OPTION)]
+        # Preselect PDFs that still need preprocessing or are not in the current graph.
+        pending = [item.filename for item in items if not item.preprocessed or not item.indexed]
+        return (
+            gr.update(value=[document_row(item) for item in items], visible=bool(items)),
+            processing_option_rows(project_id, pending),
+            gr.Dropdown(choices=choices, value=pending, multiselect=True),
+            gr.update(visible=not items),
+        )
 
     def active_project_views(project_id: str | None):
         documents_view = document_view(project_id)
@@ -1842,54 +2371,321 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def import_documents(project_id: str | None, files: list[str] | None):
         if not project_id:
-            return "❌ 請先到「專案設定」開啟專案", [], [], gr.Dropdown(choices=[])
+            return "❌ 請先到「專案與連線設定」開啟專案", *document_view(None), gr.skip(), gr.skip()
         try:
-            imported = documents.import_pdfs(project_id, files or [])
+            documents.import_pdfs(project_id, files or [])
         except ProjectError as exc:
-            rows, settings, selector = document_view(project_id)
-            return f"❌ {exc}", rows, settings, selector
-        rows = [document_row(item) for item in imported]
+            return f"❌ {exc}", *document_view(project_id), gr.skip(), gr.skip()
+        return f"✅ 已匯入 {len(files or [])} 份 PDF", *document_view(project_id), gr.Group(visible=False), None
+
+    def toggle_pdf_upload(targets: list[str] | None):
+        """Picking the upload option opens the upload panel instead of staying selected."""
+        targets = targets or []
+        if UPLOAD_PDF_OPTION not in targets:
+            return gr.skip(), gr.skip()
+        return [target for target in targets if target != UPLOAD_PDF_OPTION], gr.Group(visible=True)
+
+    def documents_tab_visibility(project_id: str | None, targets: list[str] | None):
+        # Gradio drops hide updates sent while this tab is inactive (e.g. when opening a project
+        # from tab 0), so re-apply visibility whenever the tab is selected.
+        has_documents = bool(documents.list_documents_if_available(project_id))
+        has_targets = any(target != UPLOAD_PDF_OPTION for target in targets or [])
         return (
-            f"✅ 已匯入 {len(files or [])} 份 PDF",
-            rows,
-            processing_option_rows(project_id),
-            gr.Dropdown(choices=[row[0] for row in rows]),
+            gr.update(visible=has_documents),
+            gr.update(visible=not has_documents),
+            gr.Accordion(visible=has_targets),
         )
 
-    def preprocess_documents(project_id: str | None, option_rows: list[list[object]] | None):
-        if not project_id:
-            return "❌ 請先到「專案設定」開啟專案", [], [], gr.Dropdown(choices=[])
+    def processing_options_view(project_id: str | None, targets: list[str] | None, edited_rows):
+        targets = [target for target in targets or [] if target != UPLOAD_PDF_OPTION]
+        return processing_option_rows(project_id, targets, edited_rows), gr.Accordion(visible=bool(targets))
+
+    def preprocess_options(project_id: str, option_rows) -> dict[str, dict[str, object]]:
+        """Saved options for every PDF, overridden by the rows shown for the selected PDFs."""
+        existing = {item.filename for item in documents.list_documents_if_available(project_id)}
+        saved = {name: options for name, options in documents.processing_options(project_id).items() if name in existing}
+        return {**saved, **parse_processing_options(option_rows)}
+
+    def task_progress_markup(fraction: float, status: str, detail: str = "") -> str:
+        percent = round(min(max(fraction, 0.0), 1.0) * 100)
+        return (
+            '<div style="width:100%;padding:0.25rem 0">'
+            f'<progress value="{percent}" max="100" '
+            'style="width:100%;height:1rem;accent-color:var(--color-accent)"></progress>'
+            '<div style="display:flex;justify-content:space-between;gap:1rem">'
+            f'<span>{html.escape(detail)}</span><span>{percent}%｜{html.escape(status)}</span></div></div>'
+        )
+
+    def review_document_choices(project_id: str | None, current: str | None):
+        names = [item.filename for item in documents.list_documents_if_available(project_id) if item.preprocessed]
+        return gr.Dropdown(choices=names, value=current if current in names else (names[0] if names else None))
+
+    def filtered_reviews(project_id: str | None, filename: str | None, review_filter: str | None) -> list[PageReview]:
+        if not project_id or not filename:
+            return []
+        return [item for item in documents.page_reviews(project_id, filename) if review_matches(item, review_filter)]
+
+    def review_rows(reviews: list[PageReview]) -> list[list[object]]:
+        return [
+            [
+                item.page,
+                PAGE_SOURCE_LABELS[item.source],
+                "✅" if item.reviewed else "",
+                ("⚠️ 解析結果已變" if item.source_changed else "✏️") if item.edited else "",
+                len(item.text),
+            ]
+            for item in reviews
+        ]
+
+    def review_page_view(project_id: str | None, filename: str | None, page: object):
+        """Image, text and status line of one page."""
         try:
-            report = documents.preprocess(project_id, parse_processing_options(option_rows))
-        except (ProjectError, OSError, TypeError, ValueError) as exc:
-            rows, settings, selector = document_view(project_id)
-            return f"❌ {exc}", rows, settings, selector
+            page_number = int(page)
+            review = next(
+                (item for item in documents.page_reviews(project_id, filename) if item.page == page_number), None
+            ) if project_id and filename else None
+        except (TypeError, ValueError, ProjectError):
+            review = None
+        if review is None:
+            return None, "", ""
+        image = Image.open(io.BytesIO(documents.render_page_image(project_id, filename, review.page)))
+        flags = [f"**第 {review.page} 頁**", f"解析方式：{PAGE_SOURCE_LABELS[review.source]}"]
+        flags.append("✅ 已檢查" if review.reviewed else "⬜ 未檢查")
+        if review.edited:
+            flags.append("✏️ 已手動修改，重新前處理會保留")
+        if review.source_changed:
+            flags.append("⚠️ 修改後重新前處理過且解析結果已變，請確認修改是否仍正確")
+        if review.error:
+            flags.append(f"錯誤：{' '.join(review.error.split())[:200]}")
+        return image, review.text, "｜".join(flags)
+
+    def review_refresh(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        """Reload the page list, keeping the current page when it still matches the filter."""
+        try:
+            reviews = filtered_reviews(project_id, filename, review_filter)
+        except ProjectError as exc:
+            return [], None, None, "", f"❌ {exc}"
+        pages = [item.page for item in reviews]
+        try:
+            current = int(page)
+        except (TypeError, ValueError):
+            current = None
+        selected = current if current in pages else (pages[0] if pages else None)
+        return review_rows(reviews), selected, *review_page_view(project_id, filename, selected)
+
+    def review_select(project_id: str | None, filename: str | None, evt: gr.SelectData):
+        page = (evt.row_value or [None])[0]
+        return page, *review_page_view(project_id, filename, page)
+
+    def review_step(project_id: str | None, filename: str | None, review_filter: str | None, page: object, step: int):
+        try:
+            pages = [item.page for item in filtered_reviews(project_id, filename, review_filter)]
+        except ProjectError:
+            pages = []
+        if not pages:
+            return None, None, "", ""
+        try:
+            current = int(page)
+        except (TypeError, ValueError):
+            current = pages[0]
+        later = [number for number in pages if (number > current if step > 0 else number < current)]
+        target = (min(later) if step > 0 else max(later)) if later else current
+        return target, *review_page_view(project_id, filename, target)
+
+    def review_previous_page(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        return review_step(project_id, filename, review_filter, page, -1)
+
+    def review_next_page(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        return review_step(project_id, filename, review_filter, page, 1)
+
+    def review_save(project_id: str | None, filename: str | None, page: object, text: str | None, revert: bool = False):
+        if not project_id or not filename or page in (None, ""):
+            return "❌ 請先選擇 PDF 與頁面"
+        try:
+            if revert:
+                review = documents.revert_page_text(project_id, filename, int(page))
+                return f"✅ 第 {review.page} 頁已還原為解析結果；需重新建立 Graph 才會套用"
+            review = documents.save_page_text(project_id, filename, int(page), text or "")
+        except (ProjectError, ValueError) as exc:
+            return f"❌ {exc}"
+        edited = "，內容與解析結果不同，已標示為手動修改" if review.edited else ""
+        return f"✅ 第 {review.page} 頁已儲存並標示已檢查{edited}；需重新建立 Graph 才會套用"
+
+    def review_extract(
+        project_id: str | None, filename: str | None, page: object, use_vision: bool,
+        vision_model: str | None = None, vision_scope: str | None = None,
+        reasoning_effort: str = "none",
+    ):
+        """Extract the page again into the editor without saving it."""
+        if not project_id or not filename or page in (None, ""):
+            return gr.skip(), "❌ 請先選擇 PDF 與頁面"
+        try:
+            vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort) if use_vision else None
+            if use_vision and vision is None:
+                return gr.skip(), "❌ 請先在「前處理設定」選擇 Vision 模型"
+            text = documents.extract_page_text(project_id, filename, int(page), vision)
+        except Exception as exc:
+            return gr.skip(), f"❌ {exc}"
+        source = "Vision" if use_vision else "文字層"
+        return text, f"⏳ 已以{source}重新解析第 {int(page)} 頁，**尚未儲存**；確認後請按「儲存並標示已檢查」"
+
+    def vision_settings(project_id: str, model: str | None, scope: str | None, reasoning_effort: str = "none") -> VisionSettings | None:
+        if not model or model == VISION_DISABLED:
+            return None
+        api_key = connections.get_api_key(project_id)
+        if not api_key:
+            raise ProjectError("使用 Vision 前請先在「專案與連線設定」設定 API Key")
+        return VisionSettings(
+            model=model,
+            scope=scope or DEFAULT_VISION_SCOPE,
+            reasoning_effort=reasoning_effort,
+            api_base_url=connections.get_api_base_url(),
+            api_key=api_key,
+        )
+
+    def run_preprocess(project_id: str, option_rows, targets: list[str] | None, vision: VisionSettings | None = None):
+        """Run preprocessing in a worker thread, yielding progress markup until it returns the report."""
+        updates: queue.Queue[tuple[int, int, str]] = queue.Queue()
+        result_holder: list[object] = []
+        error_holder: list[Exception] = []
+
+        def worker_task() -> None:
+            try:
+                result_holder.append(
+                    documents.preprocess(
+                        project_id,
+                        preprocess_options(project_id, option_rows),
+                        filenames=targets or None,
+                        progress_callback=lambda done, total, name: updates.put((done, total, name)),
+                        vision=vision,
+                    )
+                )
+            except Exception as exc:
+                error_holder.append(exc)
+
+        worker = threading.Thread(target=worker_task, daemon=True)
+        worker.start()
+        yield task_progress_markup(0, "前處理中", "準備開啟 PDF…")
+        latest: tuple[int, int, str] | None = None
+        while worker.is_alive() or not updates.empty():
+            try:
+                latest = updates.get(timeout=0.25)
+                while not updates.empty():
+                    latest = updates.get_nowait()
+            except queue.Empty:
+                continue
+            done, total, name = latest
+            yield task_progress_markup(done / total if total else 0, "前處理中", f"{name}｜已處理 {done} / {total} 頁")
+        worker.join()
+        if error_holder:
+            raise error_holder[0]
+        return result_holder[0]
+
+    def preprocess_message(report) -> str:
         message = (
-            f"✅ 前處理完成：成功 {report.successful_pages} 頁、"
+            f"✅ 前處理完成（{report.documents} 份 PDF）：成功 {report.successful_pages} 頁、"
             f"無文字 {report.empty_pages} 頁、錯誤 {report.error_pages} 頁"
         )
-        rows, settings, selector = document_view(project_id)
-        return message, rows, settings, selector
+        if report.edited_pages:
+            message += f"；保留 {report.edited_pages} 頁手動修改（可在「逐頁檢查」篩選「已修改」）"
+        return f"{message}\n\n{vision_summary(report)}" if report.vision_model else message
 
-    def remove_document(project_id: str | None, filename: str | None, confirmed: bool):
-        if not project_id or not filename:
-            rows, settings, selector = document_view(project_id)
-            return "❌ 請先選擇 PDF", rows, settings, selector, False
-        if not confirmed:
-            rows, settings, selector = document_view(project_id)
-            return "❌ 請勾選移除確認", rows, settings, selector, False
-        try:
-            documents.remove_pdf(project_id, filename)
-        except ProjectError as exc:
-            rows, settings, selector = document_view(project_id)
-            return f"❌ {exc}", rows, settings, selector, False
-        rows, settings, selector = document_view(project_id)
-        return f"✅ 已移除 {filename}；請重新執行前處理與建圖", rows, settings, selector, False
+    def vision_summary(report) -> str:
+        summary = f"Vision（{report.vision_model}）解析 {report.vision_pages} 頁"
+        if report.vision_abort_reason:
+            reason = " ".join(report.vision_abort_reason.split())[:160]
+            return f"⚠️ {summary}，已中止：{reason}；{report.vision_fallback_pages} 頁改用文字層"
+        if report.vision_fallback_pages:
+            return f"⚠️ {summary}；{report.vision_fallback_pages} 頁解析失敗，改用文字層（詳見 processed/report.json）"
+        return f"{summary}，其餘頁面使用文字層"
 
-    def build_index(project_id: str | None, chat_model: str | None):
+    def preprocess_documents(
+        project_id: str | None,
+        option_rows: list[list[object]] | None,
+        targets: list[str] | None,
+        vision_model: str | None = None,
+        vision_scope: str | None = None,
+        reasoning_effort: str = "none",
+    ):
         if not project_id:
-            yield "❌ 請先到「專案設定」開啟專案", ""
+            yield "❌ 請先到「專案與連線設定」開啟專案", "", *document_view(None)
             return
+        try:
+            vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
+        except ProjectError as exc:
+            yield f"❌ {exc}", "", *document_view(project_id)
+            return
+        steps = run_preprocess(project_id, option_rows, targets, vision)
+        progress = ""
+        try:
+            while True:
+                progress = next(steps)
+                yield "⏳ 前處理執行中…", progress, gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        except StopIteration as finished:
+            report = finished.value
+        except (ProjectError, OSError, TypeError, ValueError) as exc:
+            yield f"❌ {exc}", progress, *document_view(project_id)
+            return
+        yield preprocess_message(report), task_progress_markup(1, "前處理完成", f"共 {report.pages} 頁"), *document_view(project_id)
+
+    def remove_documents(project_id: str | None, filenames: list[str] | None, confirmed: bool):
+        if not project_id or not filenames:
+            return "❌ 請先在「選擇要前處理／建圖的 PDF」選擇要刪除的 PDF", *document_view(project_id), False
+        if not confirmed:
+            return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), False
+        removed: list[str] = []
+        try:
+            for filename in filenames:
+                documents.remove_pdf(project_id, filename)
+                removed.append(filename)
+        except ProjectError as exc:
+            prefix = f"已刪除 {'、'.join(removed)}；" if removed else ""
+            return f"❌ {prefix}{exc}", *document_view(project_id), False
+        return f"✅ 已刪除 {'、'.join(removed)}；請重新建立 Graph", *document_view(project_id), False
+
+    def build_index(
+        project_id: str | None,
+        chat_model: str | None,
+        targets: list[str] | None = None,
+        option_rows: list[list[object]] | None = None,
+        vision_model: str | None = None,
+        vision_scope: str | None = None,
+        reasoning_effort: str = "none",
+        indexing_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+    ):
+        if not project_id:
+            yield "❌ 請先到「專案與連線設定」開啟專案", "", ""
+            return
+        try:
+            items = documents.list_documents(project_id)
+        except ProjectError as exc:
+            yield f"❌ {exc}", "", ""
+            return
+        # Selected PDFs that were never preprocessed are preprocessed first, then the whole graph is rebuilt.
+        pending = [item.filename for item in items if item.filename in set(targets or []) and not item.preprocessed]
+        progress = ""
+        if pending:
+            try:
+                vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
+            except ProjectError as exc:
+                yield f"❌ 前處理失敗：{exc}", "", progress
+                return
+            steps = run_preprocess(project_id, option_rows, pending, vision)
+            try:
+                while True:
+                    progress = next(steps)
+                    yield f"⏳ 建圖前先前處理：{'、'.join(pending)}", "", progress
+            except StopIteration:
+                pass
+            except (ProjectError, OSError, TypeError, ValueError) as exc:
+                yield f"❌ 前處理失敗：{exc}", "", progress
+                return
+            items = documents.list_documents(project_id)
+        excluded = [item.filename for item in items if not item.preprocessed]
+        if len(excluded) == len(items):
+            yield "❌ 沒有已前處理的 PDF，請先選擇 PDF 並執行前處理", "", progress
+            return
+        excluded_note = f"（未前處理、不納入圖譜：{'、'.join(excluded)}）" if excluded else ""
         chunks: queue.Queue[str] = queue.Queue()
         result_holder: list[object] = []
         error_holder: list[Exception] = []
@@ -1897,32 +2693,52 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         def run_index() -> None:
             try:
                 result_holder.append(
-                    indexing.build(project_id, log_callback=chunks.put, chat_model=chat_model)
+                    indexing.build(
+                        project_id, log_callback=chunks.put, chat_model=chat_model,
+                        reasoning_effort=indexing_reasoning_effort,
+                    )
                 )
             except Exception as exc:
                 error_holder.append(exc)
 
+        def index_progress(log: str, status: str = "建圖中") -> str:
+            state = parse_indexing_progress(log)
+            if not state.total_workflows:
+                return task_progress_markup(0, status, "初始化 GraphRAG…")
+            current = f"｜目前：{state.current_workflow}" if state.current_workflow else ""
+            return task_progress_markup(
+                state.fraction,
+                status,
+                f"已完成 {state.completed_workflows} / {state.total_workflows} 個 workflow{current}",
+            )
+
         worker = threading.Thread(target=run_index, daemon=True)
         worker.start()
         log = ""
-        yield f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）", log
+        running = f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）{excluded_note}"
+        yield running, log, index_progress(log)
         while worker.is_alive() or not chunks.empty():
             try:
                 log += chunks.get(timeout=0.25)
             except queue.Empty:
                 pass
-            yield f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）", log
+            yield running, log, index_progress(log)
         worker.join()
         if error_holder:
-            yield f"❌ {error_holder[0]}", log
+            yield f"❌ {error_holder[0]}", log, index_progress(log, "建圖失敗")
             return
         result = result_holder[0]
         icon = "✅" if result.status == "INDEXED" else "❌"
         summary = (
             f"{icon} {result.status}｜建圖模型：{chat_model or connections.get_chat_model()}｜"
-            f"耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}"
+            f"耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}{excluded_note}"
         )
-        yield summary, log
+        final_progress = (
+            task_progress_markup(1, "建圖完成", "所有 workflow 已完成")
+            if result.status == "INDEXED"
+            else index_progress(log, "建圖失敗")
+        )
+        yield summary, log, final_progress
 
     def create_project(
         project_id: str,
@@ -1940,7 +2756,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 description=description,
             )
         except ProjectError as exc:
-            selector = gr.Dropdown(choices=project_choices(), allow_custom_value=True)
+            selector = gr.Dropdown(choices=project_selector_choices())
             return (
                 f"❌ {exc}",
                 store.table_rows(),
@@ -1951,11 +2767,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 description,
                 selector,
                 {},
+                gr.Group(visible=True),
+                gr.Button(visible=False),
             )
         selector = gr.Dropdown(
-            choices=project_choices(),
+            choices=project_selector_choices(),
             value=project.project_id,
-            allow_custom_value=True,
         )
         return (
             f"✅ 已建立專案 {project.project_id}",
@@ -1967,6 +2784,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             "",
             selector,
             asdict(project),
+            gr.Group(visible=False),
+            gr.Button(visible=True),
         )
 
     with gr.Blocks(title="汽車維修 GraphRAG 管理後台") as demo:
@@ -1981,115 +2800,224 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         retrieval_project = active_project_id
         automatic_project = active_project_id
         sampling_project = active_project_id
-        with gr.Tab("0-0 專案設定"):
-            with gr.Row():
-                selected_project = gr.Dropdown(
-                    choices=project_choices(),
-                    label="專案",
-                    allow_custom_value=True,
-                )
-                open_project_button = gr.Button("開啟專案", variant="primary")
-            open_project_result = gr.Markdown()
-            selected_project_details = gr.JSON(label="專案資料")
-            project_table = gr.Dataframe(
-                headers=PROJECT_COLUMNS,
-                value=refresh_projects,
-                interactive=False,
-                datatype=["str", "str", "number", "str", "bool", "str"],
-                label="Projects",
-            )
-            with gr.Row():
-                refresh_button = gr.Button("重新整理")
-                project_enabled = gr.Checkbox(label="啟用一般使用者查詢", value=True)
-                update_project_enabled_button = gr.Button("更新啟用狀態")
-            project_activation_result = gr.Markdown()
-            gr.Markdown("## 建立新專案")
-            project_id = gr.Textbox(label="Project ID", placeholder="L33-SM3E")
-            display_name = gr.Textbox(label="顯示名稱", placeholder="L33 / SM3E")
-            with gr.Row():
-                vehicle_name = gr.Textbox(label="車型", placeholder="L33")
-                manual_version = gr.Textbox(label="手冊版本", placeholder="SM3E")
-            description = gr.Textbox(label="說明", lines=3)
-            create_button = gr.Button("建立專案", variant="primary")
+        with gr.Tab("0 專案與連線設定"):
+            with gr.Accordion("專案工作區", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Group():
+                    selected_project = gr.Dropdown(
+                        choices=project_selector_choices(),
+                        label="選擇專案",
+                        info="請選擇一項專案",
+                        value=None,
+                        allow_custom_value=False,
+                    )
+                    selected_project_details = gr.JSON(label="專案資料", visible=False, elem_classes="padded-block")
+                    project_enabled = gr.Checkbox(label="啟用一般使用者查詢", value=True)
+                    with gr.Row(elem_classes="button-row"):
+                        open_project_button = gr.Button("開啟專案", variant="primary", elem_classes="rounded-button")
+                        update_project_enabled_button = gr.Button("更新啟用狀態", elem_classes="rounded-button")
+                        delete_button = gr.Button("刪除專案", variant="stop", elem_classes="rounded-button")
+                    # 由刪除按鈕的確認對話框寫入，不顯示於畫面
+                    delete_confirmation = gr.Checkbox(visible=False)
+                open_project_result = gr.Markdown()
+                project_activation_result = gr.Markdown()
+
+            with gr.Group(visible=False) as new_project_group:
+                with gr.Accordion("建立新專案", open=True, elem_classes=["static-section", "bold-title"]):
+                    with gr.Group():
+                        project_id = gr.Textbox(label="Project ID", placeholder="L33-SM3E")
+                        display_name = gr.Textbox(label="顯示名稱", placeholder="L33 / SM3E")
+                        with gr.Row():
+                            vehicle_name = gr.Textbox(label="車型", placeholder="L33")
+                            manual_version = gr.Textbox(label="手冊版本", placeholder="SM3E")
+                        description = gr.Textbox(label="說明", lines=3)
+                        with gr.Row(elem_classes="button-row"):
+                            create_button = gr.Button("建立專案", variant="primary", elem_classes="rounded-button")
+            # 建立與刪除專案的結果
             result = gr.Markdown()
-            gr.Markdown("## 刪除專案")
-            delete_confirmation = gr.Checkbox(label="我確認要永久刪除選取的專案及其所有資料")
-            delete_button = gr.Button("刪除選取專案", variant="stop")
 
-        with gr.Tab("0-1 連線設定"):
-            gr.Markdown("## GraphRAG 共用連線設定")
-            gr.Markdown("API Base URL 與 API Key 由所有 Project 共用。")
-            connection_state = gr.Markdown(value=connection_status)
-            api_base_url = gr.Textbox(
-                label="API Base URL",
-                value=connections.get_api_base_url,
-                placeholder="https://api.openai.com/v1",
-            )
-            api_key = gr.Textbox(
-                label="API Key",
-                value=connections.get_api_key() or "",
-                type="password",
-                placeholder="輸入 API Key",
-            )
-            with gr.Row():
-                chat_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS),
-                    value=connections.get_chat_model,
-                    label="Chat 模型",
+            with gr.Accordion("專案清單", open=True, elem_classes=["static-section", "bold-title"]):
+                project_table = gr.Dataframe(
+                    headers=PROJECT_COLUMNS,
+                    value=refresh_projects,
+                    interactive=False,
+                    datatype=["str", "str", "number", "str", "bool", "str"],
+                    label="Projects",
                 )
-                embedding_model = gr.Dropdown(
-                    choices=list(ALLOWED_EMBEDDING_MODELS),
-                    value=connections.get_embedding_model,
-                    label="Embedding 模型",
-                )
-            gr.Markdown("Chat 模型預設為 `gpt-6-luna`；Embedding 模型預設為 `text-embedding-3-small`。")
-            with gr.Row():
-                test_connection_button = gr.Button("測試連線")
-                save_connection_button = gr.Button("儲存連線設定", variant="primary")
-            connection_result = gr.Markdown()
+                with gr.Row(elem_classes="button-row"):
+                    refresh_button = gr.Button("重新整理", elem_classes="rounded-button")
 
-        with gr.Tab("0-2 文件與建圖"):
-            uploaded_files = gr.File(file_count="multiple", file_types=[".pdf"], type="filepath", label="匯入 PDF")
+            with gr.Accordion(
+                "GraphRAG 共用連線設定（所有專案共用）",
+                open=True,
+                elem_classes=["static-section", "bold-title"],
+            ):
+                connection_state = gr.Markdown(value=connection_status)
+
+                with gr.Row():
+                    api_base_url = gr.Textbox(
+                        label="API Base URL",
+                        value=connections.get_api_base_url,
+                        placeholder="https://api.openai.com/v1",
+                    )
+                    api_key = gr.Textbox(
+                        label="API Key",
+                        value=connections.get_api_key() or "",
+                        type="password",
+                        placeholder="輸入 API Key",
+                    )
+
+                gr.Markdown("Chat 模型預設為 `gpt-6-luna`；Embedding 模型預設為 `text-embedding-3-small`。")
+                with gr.Row():
+                    chat_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS),
+                        value=connections.get_chat_model,
+                        label="Chat 模型",
+                    )
+                    embedding_model = gr.Dropdown(
+                        choices=list(ALLOWED_EMBEDDING_MODELS),
+                        value=connections.get_embedding_model,
+                        label="Embedding 模型",
+                    )
+
+                with gr.Row(elem_classes="button-row"):
+                    test_connection_button = gr.Button("測試連線", elem_classes="rounded-button")
+                    save_connection_button = gr.Button("儲存連線設定", variant="primary", elem_classes="rounded-button")
+                connection_result = gr.Markdown()
+
+        with gr.Tab("1 文件與建圖", interactive=False) as documents_tab:
+            document_empty_notice = gr.Markdown(
+                "⚠️ 目前檔案列表為空，請在「選擇要前處理／建圖的 PDF」選擇「+ 上傳 PDF...」匯入 PDF。"
+            )
+            document_table = gr.Dataframe(
+                headers=DOCUMENT_COLUMNS,
+                interactive=False,
+                datatype=["str", "number", "number", "str", "str", "str", "number", "number", "str"],
+                type="array",
+                # 約可顯示五筆，其餘以捲軸檢視
+                max_height=260,
+                visible=False,
+                label="Documents",
+            )
+            
             indexing_chat_model = gr.Dropdown(
                 choices=list(ALLOWED_CHAT_MODELS),
                 value=connections.get_chat_model,
                 label="建圖模型",
                 info="只套用於 GraphRAG 建圖；更換模型後按「建立 Graph」即可重新建圖。",
             )
+            indexing_reasoning_effort = gr.Dropdown(
+                choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                label="建圖推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+            )
+            indexing_chat_model.change(
+                lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                inputs=indexing_chat_model, outputs=indexing_reasoning_effort,
+            )
+            target_documents = gr.Dropdown(
+                label="選擇要前處理／建圖的 PDF",
+                multiselect=True,
+                info=(
+                    "預設選取尚未前處理或尚未建圖的 PDF。**「開始前處理」**只處理所選 PDF（未選則全部），其他 PDF 保留原結果；"
+                    "**「建立 Graph」**會先前處理所選但尚未前處理的 PDF，再以所有已前處理的 PDF 重建整個專案圖譜。"
+                    "選「**+ 上傳 PDF...」**可匯入新的 PDF。"
+                ),
+            )
+            with gr.Group(visible=False) as upload_pdf_group:
+                with gr.Accordion("上傳 PDF", open=True, elem_classes=["static-section", "bold-title"]):
+                    with gr.Group():
+                        uploaded_files = gr.File(
+                            file_count="multiple",
+                            file_types=[".pdf"],
+                            type="filepath",
+                            label="匯入 PDF",
+                            height=120,
+                        )
+                        with gr.Row(elem_classes=["button-row", "flush-row"]):
+                            upload_button = gr.Button("上傳", variant="primary", elem_classes="rounded-button")
+                            cancel_upload_button = gr.Button("取消", elem_classes="rounded-button")
             with gr.Row():
-                upload_button = gr.Button("上傳")
                 preprocess_button = gr.Button("開始前處理", variant="primary")
                 index_button = gr.Button("建立 Graph", variant="primary")
                 document_refresh_button = gr.Button("重新整理")
-            document_result = gr.Markdown()
-            document_table = gr.Dataframe(
-                headers=DOCUMENT_COLUMNS,
-                interactive=False,
-                datatype=["str", "number", "number", "str", "number", "number", "str"],
-                label="Documents",
-            )
-            processing_options_table = gr.Dataframe(
-                headers=PROCESSING_COLUMNS,
-                interactive=True,
-                datatype=["str", "number", "number", "number", "number", "number"],
-                type="array",
-                static_columns=[0, 1],
-                label="各 PDF 前處理設定（頁面索引從 0 開始，結束頁包含在範圍內）",
-            )
-            with gr.Row():
-                removable_pdf = gr.Dropdown(label="選擇要移除的 PDF")
-                remove_pdf_confirmation = gr.Checkbox(label="我確認要移除選取的 PDF")
-                remove_pdf_button = gr.Button("移除 PDF", variant="stop")
-            indexing_log = gr.Textbox(
-                label="建圖日誌",
-                lines=12,
-                interactive=False,
-                autoscroll=True,
-                elem_id="indexing-log",
-            )
+                remove_pdf_button = gr.Button("刪除所選 PDF", variant="stop")
+            # 由刪除按鈕的確認對話框寫入，不顯示於畫面
+            remove_pdf_confirmation = gr.Checkbox(visible=False)
+            
+            with gr.Accordion(
+                "前處理設定（所選 PDF）", open=False, visible=False, elem_classes="bold-title"
+            ) as processing_options_section:
+                with gr.Row():
+                    vision_model = gr.Dropdown(
+                        choices=VISION_MODEL_CHOICES,
+                        value=GPT6_LUNA_MODEL,
+                        label="Vision 模型",
+                        info="以 Vision 模型轉寫頁面影像：表格轉 Markdown、圖片與圖解改寫成文字描述，失敗的頁面改用文字層。會依頁數呼叫 API。",
+                    )
+                    vision_reasoning_effort = gr.Dropdown(
+                        choices=VISION_REASONING_EFFORT_CHOICES, value="none", label="推理深度",
+                        visible=True,
+                        info="僅 gpt-6-luna 支援；預設 none。",
+                    )
+                    vision_scope = gr.Dropdown(
+                        choices=VISION_SCOPE_CHOICES,
+                        value=DEFAULT_VISION_SCOPE,
+                        label="Vision 解析範圍",
+                        info="沒有文字層的頁面（例如掃描頁）一律送 Vision。",
+                    )
+                    vision_model.change(
+                        lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                        inputs=vision_model, outputs=vision_reasoning_effort,
+                    )
+                processing_options_table = gr.Dataframe(
+                    headers=PROCESSING_COLUMNS,
+                    interactive=True,
+                    datatype=["str", "number", "number", "number", "number", "number"],
+                    type="array",
+                    static_columns=[0, 1],
+                    label="頁面索引從 0 開始，結束頁包含在範圍內；設定在執行前處理後才會儲存",
+                )
 
-        with gr.Tab("0-3 問答測試"):
-            with gr.Row():
+            with gr.Group():
+                document_result = gr.Markdown(elem_classes="collapse-when-empty")
+                document_progress = gr.HTML(elem_classes="collapse-when-empty")
+                indexing_log = gr.Textbox(
+                    label="建圖日誌",
+                    lines=12,
+                    interactive=False,
+                    autoscroll=True,
+                    elem_id="indexing-log",
+                )
+
+            with gr.Accordion("逐頁檢查", open=False, elem_classes="bold-title"):
+                with gr.Row():
+                    review_document = gr.Dropdown(label="PDF（已前處理）", choices=[], scale=2)
+                    review_filter = gr.Dropdown(REVIEW_FILTERS, value="全部", label="篩選頁面", scale=1)
+                review_table = gr.Dataframe(
+                    headers=REVIEW_COLUMNS,
+                    interactive=False,
+                    type="array",
+                    max_height=260,
+                    label="點選列切換頁面",
+                )
+                with gr.Row(equal_height=True):
+                    review_previous = gr.Button("◀ 上一頁")
+                    review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
+                    review_next = gr.Button("下一頁 ▶")
+                review_info = gr.Markdown(elem_classes="collapse-when-empty")
+                with gr.Row(equal_height=True):
+                    review_image = gr.Image(type="pil", label="PDF 原頁", interactive=False, height=760)
+                    review_text = gr.Textbox(
+                        label="解析結果（可直接修改，此為送去建圖的文字）", lines=30, max_lines=40, interactive=True
+                    )
+                with gr.Row():
+                    review_save_button = gr.Button("儲存並標示已檢查", variant="primary")
+                    review_vision_button = gr.Button("重跑 Vision（本頁）")
+                    review_text_layer_button = gr.Button("改用文字層")
+                    review_revert_button = gr.Button("還原為解析結果")
+                review_status = gr.Markdown(elem_classes="collapse-when-empty")
+
+        with gr.Tab("2 問答測試", interactive=False) as query_tab:
+            with gr.Row(equal_height=True):
                 with gr.Column():
                     question = gr.Textbox(label="問題", lines=5)
                     query_chat_model = gr.Dropdown(
@@ -2097,10 +3025,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         value=connections.get_chat_model(),
                         label="本次回答模型",
                     )
+                    query_reasoning_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                        info="僅 gpt-6-luna 支援。",
+                    )
                     query_method = gr.Dropdown(
-                        choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                        value="local",
+                        choices=QUERY_METHOD_CHOICES,
+                        value="auto",
                         label="查詢方法",
+                        info="自動：由回答模型依問題類型選擇 Local／Global／DRIFT／Basic，並顯示選擇原因",
                     )
                     query_response_type = gr.Dropdown(
                         choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
@@ -2108,12 +3042,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="回答格式",
                     )
                     query_chat_model.input(
-                        update_model_method_compatibility,
+                        update_query_method_compatibility,
                         inputs=[query_chat_model, query_method],
                         outputs=[query_chat_model, query_method],
                     )
+                    query_chat_model.change(
+                        lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                        inputs=query_chat_model, outputs=query_reasoning_effort,
+                    )
                     query_method.input(
-                        update_model_method_compatibility,
+                        update_query_method_compatibility,
                         inputs=[query_chat_model, query_method],
                         outputs=[query_chat_model, query_method],
                     )
@@ -2125,119 +3063,204 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="系統回答（可編輯）",
                         lines=10,
                         interactive=True,
+                        elem_id="query-answer",
                     )
-                    query_summary = gr.Markdown(label="查詢資訊")
-            gr.Markdown("### Evidence 詳情")
-            query_evidence_state = gr.State([])
-            query_evidence_table = gr.Dataframe(
-                headers=EVIDENCE_COLUMNS,
-                interactive=False,
-                datatype=["number", "str", "str", "number", "str", "number"],
-                label="Top Evidence",
-            )
-            query_evidence_selector = gr.Dropdown(label="選取證據全文")
-            query_evidence_detail = gr.Markdown()
-            query_context = gr.JSON(label="原始 GraphRAG Query Context")
+                    query_summary = gr.Markdown(label="查詢資訊", elem_id="query-summary", elem_classes=["collapse-when-empty"])
+            
+            with gr.Group(visible=False) as query_evidence_group:
+                gr.Markdown("### Evidence 詳情")
+                query_evidence_state = gr.State([])
+                query_evidence_table = gr.Dataframe(
+                    headers=EVIDENCE_COLUMNS,
+                    interactive=False,
+                    datatype=["number", "str", "str", "number", "str", "number"],
+                    label="Top Evidence",
+                )
+                query_evidence_selector = gr.Dropdown(label="選取證據全文")
+                query_evidence_detail = gr.Markdown()
+                query_context = gr.JSON(label="原始 GraphRAG Query Context")
 
-        with gr.Tab("0-4 自動問答測試"):
+            with gr.Accordion("歷史紀錄", open=False):
+                query_history_ids = gr.State([])
+                with gr.Row():
+                    gr.Markdown(f"最近 {QUERY_HISTORY_LIMIT} 筆手動問答，點選一列可載回問題與回答")
+                    query_history_refresh = gr.Button("重新整理", size="sm", scale=0)
+                query_history_table = gr.Dataframe(
+                    headers=["時間", "問題", "方法", "狀態", "耗時（秒）"],
+                    datatype=["str", "str", "str", "str", "number"],
+                    column_widths=["18%", "52%", "14%", "8%", "8%"],
+                    interactive=False,
+                    wrap=True,
+                )
+
+        with gr.Tab("3 自動問答測試", interactive=False) as autoqa_tab:
             gr.Markdown(
-                "匯入或生成題目後，執行「檢索並生成回答」，全部完成後才能評測。"
+                "**流程：** ① 匯入或生成題目 → ② 檢索並生成回答 → ③ 評測回答。"
                 "回答會先保存但不顯示，評測完成後才顯示回答與判斷；系統會跨 PDF 去重。"
             )
-            with gr.Row():
-                autoqa_import_file = gr.File(label="匯入題目集 JSON", file_types=[".json"], type="filepath")
-                autoqa_import_button = gr.Button("匯入題目集")
-                autoqa_export_button = gr.Button("匯出目前題目集")
-                autoqa_json_export = gr.File(label="題目集 JSON（匯出）")
-            autoqa_result = gr.Markdown()
             autoqa_question_set_state = gr.State("")
-            with gr.Row():
-                autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
-                autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
-                autoqa_generation_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
-                )
-            autoqa_generate_button = gr.Button("生成題目", variant="primary")
-            gr.Markdown("### 回答設定")
-            with gr.Row():
-                autoqa_answer_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
-                )
-                autoqa_method = gr.Dropdown(
-                    choices=[("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")],
-                    value="local", label="檢索模式",
-                )
-                autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
-                autoqa_response_type = gr.Dropdown(
-                    choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
-                    value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
-                    label="回答格式",
-                )
-            autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
-            autoqa_answer_model.input(
-                update_model_method_compatibility,
-                inputs=[autoqa_answer_model, autoqa_method],
-                outputs=[autoqa_answer_model, autoqa_method],
-            )
-            autoqa_method.input(
-                update_model_method_compatibility,
-                inputs=[autoqa_answer_model, autoqa_method],
-                outputs=[autoqa_answer_model, autoqa_method],
-            )
-            autoqa_generation_status = gr.Markdown("尚未生成回答。完成前不能評測。")
-            gr.Markdown("### 評測設定")
-            with gr.Row():
-                autoqa_judge_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
-                )
-                autoqa_judge_concurrency = gr.Number(
-                    label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
-                )
-            autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
-            autoqa_questions_table = gr.Dataframe(
-                headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
-                interactive=True,
-                datatype=["str", "str", "str", "str", "str"],
-                column_widths=["8%", "22%", "18%", "26%", "26%"],
-                label="生成題目與來源（可直接編輯）",
-                wrap=True,
-            )
-            autoqa_summary = gr.Markdown()
-            autoqa_table = gr.Dataframe(
-                headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由"],
-                interactive=True,
-                datatype=["str", "str", "str", "str", "str", "bool", "str"],
-                column_widths=["7%", "11%", "16%", "23%", "20%", "8%", "15%"],
-                label="評測結果（勾選表示正確；修改後評判理由清空並自動重算正確率）",
-                wrap=True,
-            )
 
-        with gr.Tab("0-5 檢索實驗"):
+            with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
+                autoqa_question_set_selector = gr.Dropdown(
+                    label="選擇已存在的題目集",
+                    info="列出此專案所有已儲存的題目集（含「4 檢索實驗」匯入的題目集），選取後載入題目與已儲存的回答、評測",
+                    choices=[],
+                    interactive=True,
+                )
+                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        autoqa_import_file = gr.File(
+                            label="匯入題目集 JSON",
+                            file_types=[".json"],
+                            type="filepath",
+                            height=70,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        autoqa_import_button = gr.Button("匯入題目集")
+
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        autoqa_json_export = gr.File(
+                            label="題目集 JSON（按匯出後顯示）",
+                            height=70,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        autoqa_export_button = gr.Button("匯出目前題目集")
+
+                gr.Markdown("**或自動生成題目**")
+                with gr.Row(equal_height=True):
+                    autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
+                    autoqa_generation_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
+                    )
+                    autoqa_generation_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                    )
+                    autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                autoqa_generation_model.change(
+                    lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                    inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
+                )
+                autoqa_generate_button = gr.Button("生成題目", variant="primary")
+                autoqa_generate_progress = gr.HTML(label="題目生成進度", visible=False)
+                autoqa_result = gr.Markdown()
+                autoqa_questions_table = gr.Dataframe(
+                    headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
+                    interactive=True,
+                    datatype=["str", "str", "str", "str", "str"],
+                    column_widths=["8%", "22%", "18%", "26%", "26%"],
+                    label="生成題目與來源（可直接編輯）",
+                    wrap=True,
+                    visible=False,
+                )
+
+            with gr.Accordion("② 檢索並生成回答", open=True, elem_classes=["static-section", "bold-title"]):
+                autoqa_current_question_set = gr.Markdown(current_question_set_markup(None, ""))
+                with gr.Row():
+                    autoqa_answer_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
+                    )
+                    autoqa_answer_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                    )
+                    autoqa_method = gr.Dropdown(
+                        choices=QUERY_METHOD_CHOICES,
+                        value="local", label="檢索模式",
+                        info="自動：每題由回答模型選擇策略（多一次 LLM 呼叫）",
+                    )
+                    autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
+                    autoqa_response_type = gr.Dropdown(
+                        choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                        value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+                        label="回答格式",
+                    )
+                autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
+                autoqa_answer_progress = gr.HTML(label="檢索與回答進度", visible=False)
+                autoqa_answer_model.input(
+                    update_model_method_compatibility,
+                    inputs=[autoqa_answer_model, autoqa_method],
+                    outputs=[autoqa_answer_model, autoqa_method],
+                )
+                autoqa_answer_model.change(
+                    lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                    inputs=autoqa_answer_model, outputs=autoqa_answer_effort,
+                )
+                autoqa_method.input(
+                    update_model_method_compatibility,
+                    inputs=[autoqa_answer_model, autoqa_method],
+                    outputs=[autoqa_answer_model, autoqa_method],
+                )
+                autoqa_generation_status = gr.Markdown("尚未生成回答。完成前不能評測。")
+
+            with gr.Accordion("③ 評測回答", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row():
+                    autoqa_judge_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
+                    )
+                    autoqa_judge_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                    )
+                    autoqa_judge_concurrency = gr.Number(
+                        label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
+                    )
+                autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
+                autoqa_judge_model.change(
+                    lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                    inputs=autoqa_judge_model, outputs=autoqa_judge_effort,
+                )
+                autoqa_judge_progress = gr.HTML(label="回答評測進度", visible=False)
+                autoqa_summary = gr.Markdown()
+                autoqa_table = gr.Dataframe(
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由", "實際檢索策略"],
+                    interactive=True,
+                    datatype=["str", "str", "str", "str", "str", "bool", "str", "str"],
+                    column_widths=["6%", "10%", "15%", "21%", "18%", "7%", "13%", "10%"],
+                    label="評測結果（勾選表示正確；修改後評判理由清空並自動重算正確率）",
+                    wrap=True,
+                    visible=False,
+                )
+
+        with gr.Tab("4 檢索實驗", interactive=False) as experiment_tab:
             gr.Markdown(
-                "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
+                "**流程：** ① 匯入題目集 → ② 設定實驗組 → ③ 檢索並生成答案 → ④ 評測答案 → ⑤ 匯出結果。"
                 "以同一組實驗設定比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略；"
                 "執行與評測會涵蓋所有已匯入資料集，逐題結果會標示資料集。"
                 "來源排名只有在 GraphRAG 明確提供可靠排序時才計算；目前 API context 不保證依檢索相關度排序，因此會如實標示不可計算。"
             )
-            with gr.Row():
-                experiment_question_file = gr.File(
-                    label="選擇要取代目前資料集的 JSON 題目集", file_types=[".json"], type="filepath", file_count="multiple"
+            experiment_question_set_state = gr.State([])
+
+            with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
+                gr.Markdown(
+                    "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
+                    "題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；"
+                    "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。"
                 )
-                experiment_import_button = gr.Button("取代題目集")
-                experiment_question_set_state = gr.State([])
-            experiment_question_preview = gr.Dataframe(
-                headers=["資料集", "題號", "題目", "正確答案", "題目來源", "答案來源"],
-                interactive=False,
-                datatype=["str", "str", "str", "str", "str", "str"],
-                column_widths=["14%", "7%", "20%", "17%", "21%", "21%"],
-                label="目前匯入資料集與題目",
-                wrap=True,
-            )
-            gr.Markdown("題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。")
+                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        experiment_question_file = gr.File(
+                            label="選擇要取代目前資料集的 JSON 題目集",
+                            file_types=[".json"],
+                            type="filepath",
+                            file_count="multiple",
+                            height=50,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        experiment_import_button = gr.Button("取代題目集")
+                experiment_question_preview = gr.Dataframe(
+                    headers=["資料集", "題號", "題目", "正確答案", "題目來源", "答案來源"],
+                    interactive=False,
+                    datatype=["str", "str", "str", "str", "str", "str"],
+                    column_widths=["14%", "7%", "20%", "17%", "21%", "21%"],
+                    label="目前匯入資料集與題目",
+                    wrap=True,
+                    visible=False,
+                )
+
             experiment_group_revision = gr.State(0)
-            experiment_group_save_status = gr.Markdown()
-            with gr.Group():
-                gr.Markdown("### 實驗組清單")
+            with gr.Accordion("② 實驗組", open=True, elem_classes=["static-section", "bold-title"]):
+                experiment_group_save_status = gr.Markdown(elem_classes="collapse-when-empty")
                 @gr.render(inputs=[active_project_id, experiment_group_revision])
                 def render_experiment_group_cards(project_id: str | None, revision: int):
                     if not project_id:
@@ -2251,7 +3274,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     if not groups:
                         gr.Markdown("尚未新增實驗組。")
                         return
-                    strategy_choices = [("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic")]
+                    strategy_choices = [
+                        ("自動", EXPERIMENT_AUTO_METHOD),
+                        ("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic"),
+                    ]
                     for group in groups:
                         answer_model_value = group.get("answer_model", connections.get_chat_model())
                         method_value = group.get("method", "local")
@@ -2304,9 +3330,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                                     )
                                 else:
                                     reasoning_effort = None
-                            gr.Markdown("#### 此策略可調參數")
+                            if method_value == EXPERIMENT_AUTO_METHOD:
+                                gr.Markdown(
+                                    "自動：每題先由回答模型選擇 Local／Global／DRIFT／Basic（多一次 LLM 呼叫，"
+                                    "判斷失敗時改用 Local），再沿用本組該策略的參數。"
+                                    "要調整參數，請暫時切換到該策略修改後再切回「自動」。",
+                                    key=f"experiment-auto-note-{group_id}",
+                                )
+                            else:
+                                gr.Markdown("#### 此策略可調參數", key=f"experiment-params-title-{group_id}")
                             visible_specs = [
-                                item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS[method_value]
+                                item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS.get(method_value, ())
                                 if not (
                                     method_value == "global"
                                     and item[0].startswith("dynamic_search_")
@@ -2364,57 +3398,97 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             outputs=[experiment_group_save_status, experiment_group_revision],
                             key=f"experiment-group-remove-action-{group_id}",
                         )
-            experiment_add_group_button = gr.Button("新增實驗組")
-            with gr.Row():
-                experiment_judge_model = gr.Dropdown(
-                    choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
-                    label="全域評測模型（套用至所有實驗組）",
+                experiment_add_group_button = gr.Button("新增實驗組")
+
+            with gr.Accordion("③ 檢索並生成答案", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row():
+                    experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
+                with gr.Row():
+                    experiment_run_button = gr.Button("檢索並生成答案", variant="primary")
+                    experiment_stop_button = gr.Button("停止實驗", variant="stop")
+                experiment_generation_status = gr.Markdown("尚未生成答案。完成前不能評測。")
+                experiment_progress_bar = gr.HTML(
+                    value=experiment_progress_markup(0, 0, "尚未開始"),
+                    label="回答生成進度",
+                    visible=False,
                 )
-                experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
-                experiment_run_button = gr.Button("檢索並生成答案", variant="primary")
-                experiment_stop_button = gr.Button("停止實驗", variant="stop")
-            with gr.Row():
-                experiment_evaluation_mode = gr.Dropdown(
-                    choices=[("嚴格評分（目前規則）", "strict"), ("寬鬆評分（答案完整包含即正確）", "lenient")],
-                    value="strict",
-                    label="答案評分方式",
+
+            with gr.Accordion("④ 評測答案", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row():
+                    experiment_judge_model = gr.Dropdown(
+                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
+                        label="全域評測模型（套用至所有實驗組）",
+                    )
+                    experiment_judge_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="評測推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                    )
+                    experiment_judge_model.change(
+                        lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                        inputs=experiment_judge_model, outputs=experiment_judge_effort,
+                    )
+                    experiment_evaluation_mode = gr.Dropdown(
+                        choices=[("嚴格評分（目前規則）", "strict"), ("寬鬆評分（答案完整包含即正確）", "lenient")],
+                        value="strict",
+                        label="答案評分方式",
+                        info="寬鬆模式會使用評測模型做語意比對：涵蓋正解核心資訊即可；接受同義改寫與合理補充，不因答案較詳細而扣錯。",
+                    )
+                experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
+                experiment_evaluate_progress = gr.HTML(label="答案評測進度", visible=False)
+                experiment_status = gr.Markdown()
+                experiment_summary_table = gr.Dataframe(
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態"],
+                    interactive=False,
+                    datatype=["str"] * 16,
+                    label="實驗組摘要",
+                    wrap=True,
+                    visible=False,
                 )
-                gr.Markdown("寬鬆模式會使用評測模型做語意比對：涵蓋正解核心資訊即可；接受同義改寫與合理補充，不因答案較詳細而扣錯。")
-            experiment_generation_status = gr.Markdown("尚未生成答案。完成前不能評測。")
-            experiment_progress_bar = gr.HTML(
-                value=experiment_progress_markup(0, 0, "尚未開始"),
-                label="回答生成進度",
-            )
-            experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
-            experiment_status = gr.Markdown()
-            experiment_summary_table = gr.Dataframe(
-                headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態"],
-                interactive=False,
-                datatype=["str"] * 16,
-                label="實驗組摘要",
-                wrap=True,
-            )
-            experiment_dataset_summary_table = gr.Dataframe(
-                headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態"],
-                interactive=False,
-                datatype=["str"] * 16,
-                label="實驗組 × 題目集摘要",
-                wrap=True,
-            )
-            experiment_result_table = gr.Dataframe(
-                headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由"],
-                interactive=True,
-                datatype=["str"] * 9,
-                column_widths=["8%", "11%", "6%", "10%", "13%", "19%", "17%", "6%", "10%"],
-                label="逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）",
-                wrap=True,
-            )
-            gr.Markdown("### 匯出實驗結果")
-            with gr.Row():
+                experiment_dataset_summary_table = gr.Dataframe(
+                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態"],
+                    interactive=False,
+                    datatype=["str"] * 16,
+                    label="實驗組 × 題目集摘要",
+                    wrap=True,
+                    visible=False,
+                )
+                experiment_result_table = gr.Dataframe(
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略"],
+                    interactive=True,
+                    datatype=["str"] * 10,
+                    column_widths=["7%", "10%", "5%", "9%", "12%", "17%", "15%", "6%", "9%", "10%"],
+                    label="逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）",
+                    wrap=True,
+                    visible=False,
+                )
+
+            with gr.Accordion("⑤ 匯出實驗結果", open=True, elem_classes=["static-section", "bold-title"]):
+                with gr.Row(equal_height=True):
+                    experiment_summary_export_file = gr.File(label="精簡摘要 JSON")
+                    experiment_details_export_file = gr.File(label="逐題結果 JSON")
                 experiment_export_button = gr.Button("匯出兩種實驗結果 JSON")
-                experiment_summary_export_file = gr.File(label="精簡摘要 JSON")
-                experiment_details_export_file = gr.File(label="逐題結果 JSON")
-            experiment_export_status = gr.Markdown()
+                experiment_export_status = gr.Markdown()
+
+        with gr.Tab("5 3D 儀表板", interactive=False) as dashboard_tab:
+            dashboard_view = gr.HTML(dashboard_iframe(None, None))
+            dashboard_refresh_button = gr.Button("重新載入儀表板", elem_classes=["rounded-button"])
+            gr.Markdown(
+                "### 地圖說明\n"
+                "**地圖上對應的元素**\n"
+                "* **社群**：白色分區，左上角有標籤，點標籤就能選取。分區在畫面上太小時，標籤會自動隱藏，避免拉遠時疊在一起。\n"
+                "* **實體**：分區地塊上的小建築。高度代表連結度、占地代表出現次數、顏色代表類型。\n"
+                "* **未歸入社群的實體**：集中在「邊境」分區。\n"
+                "* **關係**：屋頂之間的藍色弧線和流動的光點。選取實體時，相關弧線和鄰近地塊會亮起來，上方插一根藍色圖釘。\n"
+                "* **最近問答**：沿著道路繞行的卡車，貨櫃色帶代表檢索方法。點卡車可以看那筆問答，例如它的耗時。\n"
+                "  \n"
+                "**畫面周圍的區塊**\n"
+                "* **導覽列**：可搜尋實體和社群，按 `/` 可以直接聚焦搜尋框；旁邊顯示專案名稱和建圖耗時。\n"
+                "* **KPI 卡**：實體、關係、社群、問答四張。\n"
+                "* **地圖控制**：放大、縮小、左右旋轉 45°、回到全景。\n"
+                "* **右側詳細卡**：沒選取時顯示總覽，選取後顯示該實體、社群或問答的細節。\n"
+                "* **右下分頁**：社群清單、類型篩選、問答紀錄。\n"
+                "* **左下「建圖流程」**：文件頁 → Chunk → 實體 → 關係 → 社群，各階段的數量，旁邊可以翻閱最近問答。\n"
+            )
 
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
@@ -2548,10 +3622,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generated_evidence = gr.JSON(label="引用來源與 Gold Evidence")
             generated_question_export = gr.File(label="Question Set JSON")
 
+        workspace_lock_outputs = [active_project_banner, documents_tab, query_tab, autoqa_tab, experiment_tab, dashboard_tab]
         refresh_button.click(
             refresh_project_views,
             inputs=[selected_project, active_project_id],
             outputs=[project_table, selected_project, selected_project_details, active_project_id, active_project_banner],
+        ).then(
+            workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
         ).then(
             experiment_view,
             inputs=active_project_id,
@@ -2560,21 +3637,32 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
-            experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
+            experiment_progress_views, inputs=active_project_id,
+            outputs=[experiment_progress_bar, experiment_evaluate_progress],
         )
         open_project_button.click(
             open_project,
             inputs=selected_project,
             outputs=[active_project_id, active_project_banner, selected_project_details, api_key, open_project_result, connection_state],
         ).then(
+            workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
+        ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, automatic_question_set, sampling_sections],
+            outputs=[document_table, processing_options_table, target_documents, document_empty_notice,
+                     automatic_question_set, sampling_sections],
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
+        ).then(
+            autoqa_question_set_choices,
+            inputs=[active_project_id, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
+        ).then(
+            lambda: (hidden_progress,) * 3,
+            outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
         ).then(
             experiment_view,
             inputs=active_project_id,
@@ -2583,12 +3671,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
-            experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
+            experiment_progress_views, inputs=active_project_id,
+            outputs=[experiment_progress_bar, experiment_evaluate_progress],
         )
         selected_project.change(
-            lambda project_id: (project_details(project_id), project_enabled_value(project_id)),
+            lambda project_id: (
+                project_details_view(selected_project_id(project_id)),
+                project_enabled_value(selected_project_id(project_id)),
+                gr.Group(visible=project_id == NEW_PROJECT_OPTION),
+                gr.Button(visible=project_id != NEW_PROJECT_OPTION),
+            ),
             inputs=selected_project,
-            outputs=[selected_project_details, project_enabled],
+            outputs=[selected_project_details, project_enabled, new_project_group, delete_button],
         )
         update_project_enabled_button.click(
             update_project_enabled,
@@ -2608,9 +3702,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 description,
                 selected_project,
                 selected_project_details,
+                new_project_group,
+                delete_button,
             ],
         )
         delete_button.click(
+            None,
+            inputs=selected_project,
+            outputs=delete_confirmation,
+            js="(project) => !project || confirm(`確定要永久刪除專案「${project}」及其所有資料嗎？此動作無法復原。`)",
+        ).then(
             delete_project,
             inputs=[selected_project, delete_confirmation, active_project_id],
             outputs=[
@@ -2623,14 +3724,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 delete_confirmation,
             ],
         ).then(
+            workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
+        ).then(
             active_project_views,
             inputs=active_project_id,
-            outputs=[document_table, processing_options_table, removable_pdf, automatic_question_set, sampling_sections],
+            outputs=[document_table, processing_options_table, target_documents, document_empty_notice,
+                     automatic_question_set, sampling_sections],
         ).then(
             automatic_qa_saved_view,
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
+        ).then(
+            autoqa_question_set_choices,
+            inputs=[active_project_id, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
+        ).then(
+            lambda: (hidden_progress,) * 3,
+            outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
         ).then(
             experiment_view,
             inputs=active_project_id,
@@ -2639,30 +3750,91 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
+        document_view_outputs = [document_table, processing_options_table, target_documents, document_empty_notice]
+        documents_tab.select(
+            documents_tab_visibility,
+            inputs=[document_project, target_documents],
+            outputs=[document_table, document_empty_notice, processing_options_section],
+        ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document)
+        review_inputs = [document_project, review_document, review_filter, review_page]
+        review_outputs = [review_table, review_page, review_image, review_text, review_info]
+        review_page_outputs = [review_image, review_text, review_info]
+        review_document.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
+        review_filter.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
+        review_page.submit(review_page_view, inputs=[document_project, review_document, review_page], outputs=review_page_outputs)
+        review_table.select(review_select, inputs=[document_project, review_document], outputs=[review_page, *review_page_outputs])
+        review_previous.click(review_previous_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
+        review_next.click(review_next_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
+        review_save_button.click(
+            review_save, inputs=[document_project, review_document, review_page, review_text], outputs=review_status,
+        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
+            document_view, inputs=document_project, outputs=document_view_outputs
+        )
+        review_revert_button.click(
+            lambda project_id, filename, page: review_save(project_id, filename, page, None, revert=True),
+            inputs=[document_project, review_document, review_page],
+            outputs=review_status,
+        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
+            document_view, inputs=document_project, outputs=document_view_outputs
+        )
+        review_vision_button.click(
+            lambda project_id, filename, page, model, scope, effort: review_extract(project_id, filename, page, True, model, scope, effort),
+            inputs=[document_project, review_document, review_page, vision_model, vision_scope, vision_reasoning_effort],
+            outputs=[review_text, review_status],
+        )
+        review_text_layer_button.click(
+            lambda project_id, filename, page: review_extract(project_id, filename, page, False),
+            inputs=[document_project, review_document, review_page],
+            outputs=[review_text, review_status],
+        )
+        target_documents.change(
+            processing_options_view,
+            inputs=[document_project, target_documents, processing_options_table],
+            outputs=[processing_options_table, processing_options_section],
+        )
+        target_documents.input(
+            toggle_pdf_upload,
+            inputs=target_documents,
+            outputs=[target_documents, upload_pdf_group],
+        )
         upload_button.click(
             import_documents,
             inputs=[document_project, uploaded_files],
-            outputs=[document_result, document_table, processing_options_table, removable_pdf],
+            outputs=[document_result, *document_view_outputs, upload_pdf_group, uploaded_files],
+        )
+        cancel_upload_button.click(
+            lambda: (gr.Group(visible=False), None),
+            outputs=[upload_pdf_group, uploaded_files],
         )
         preprocess_button.click(
             preprocess_documents,
-            inputs=[document_project, processing_options_table],
-            outputs=[document_result, document_table, processing_options_table, removable_pdf],
+            inputs=[document_project, processing_options_table, target_documents, vision_model, vision_scope, vision_reasoning_effort],
+            outputs=[document_result, document_progress, *document_view_outputs],
+        ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document).then(
+            review_refresh, inputs=review_inputs, outputs=review_outputs
         )
         index_button.click(
             build_index,
-            inputs=[document_project, indexing_chat_model],
-            outputs=[document_result, indexing_log],
-        )
+            inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope, vision_reasoning_effort, indexing_reasoning_effort],
+            outputs=[document_result, indexing_log, document_progress],
+        ).then(document_view, inputs=document_project, outputs=document_view_outputs)
         document_refresh_button.click(
             document_view,
             inputs=document_project,
-            outputs=[document_table, processing_options_table, removable_pdf],
+            outputs=document_view_outputs,
         )
         remove_pdf_button.click(
-            remove_document,
-            inputs=[document_project, removable_pdf, remove_pdf_confirmation],
-            outputs=[document_result, document_table, processing_options_table, removable_pdf, remove_pdf_confirmation],
+            None,
+            inputs=target_documents,
+            outputs=remove_pdf_confirmation,
+            js=(
+                "(files) => !files || files.length === 0 || "
+                "confirm(`確定要刪除以下 PDF 及其前處理結果嗎？此動作無法復原。\\n\\n${files.join('\\n')}`)"
+            ),
+        ).then(
+            remove_documents,
+            inputs=[document_project, target_documents, remove_pdf_confirmation],
+            outputs=[document_result, *document_view_outputs, remove_pdf_confirmation],
         )
         experiment_import_button.click(
             import_experiment_questions,
@@ -2672,7 +3844,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
-            experiment_progress_for_project, inputs=active_project_id, outputs=experiment_progress_bar,
+            experiment_progress_views, inputs=active_project_id,
+            outputs=[experiment_progress_bar, experiment_evaluate_progress],
         )
         experiment_add_group_button.click(
             add_experiment_group,
@@ -2701,16 +3874,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
                      experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode,
-                     experiment_progress_bar],
+                     experiment_progress_bar, experiment_evaluate_progress],
+            show_progress="hidden",
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
         experiment_evaluate_button.click(
             evaluate_retrieval_experiment_answers,
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model,
-                    experiment_evaluation_mode],
+                    experiment_evaluation_mode, experiment_judge_effort],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
                      experiment_max_concurrency, experiment_judge_model,
-                     experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
+                     experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode,
+                     experiment_evaluate_progress],
+            show_progress="hidden",
         )
         experiment_result_table.change(
             update_retrieval_experiment_judgments,
@@ -2732,12 +3908,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generate_automatic_qa,
             inputs=[
                 automatic_project, autoqa_questions_per_pdf, autoqa_parallel_generation,
-                autoqa_generation_model, autoqa_method,
+                autoqa_generation_model, autoqa_generation_effort, autoqa_method,
             ],
             outputs=[
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,
                 autoqa_summary, autoqa_table, autoqa_generation_status, autoqa_judge_button,
+                autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress,
             ],
+            show_progress="hidden",
         )
         autoqa_import_button.click(
             import_automatic_question_set,
@@ -2746,6 +3924,35 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,
                 autoqa_summary, autoqa_table, autoqa_generation_status, autoqa_judge_button,
             ],
+        ).then(
+            lambda: (hidden_progress,) * 3,
+            outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
+        )
+        autoqa_question_set_state.change(
+            current_question_set_markup,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=autoqa_current_question_set,
+            show_progress="hidden",
+        ).then(
+            autoqa_question_set_choices,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
+            show_progress="hidden",
+        )
+        autoqa_tab.select(
+            autoqa_question_set_choices,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
+            show_progress="hidden",
+        )
+        autoqa_question_set_selector.input(
+            automatic_qa_saved_view,
+            inputs=[automatic_project, autoqa_question_set_selector],
+            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
+                     autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
+        ).then(
+            lambda: (hidden_progress,) * 3,
+            outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
         )
         autoqa_questions_table.change(
             autosave_automatic_questions,
@@ -2756,19 +3963,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generate_automatic_answers,
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
-                autoqa_answer_model, autoqa_method, autoqa_answer_concurrency,
+                autoqa_answer_model, autoqa_answer_effort, autoqa_method, autoqa_answer_concurrency,
                 autoqa_response_type,
             ],
-            outputs=[autoqa_generation_status, autoqa_summary, autoqa_table, autoqa_judge_button],
+            outputs=[autoqa_generation_status, autoqa_summary, autoqa_table, autoqa_judge_button,
+                     autoqa_answer_progress, autoqa_judge_progress],
+            show_progress="hidden",
         )
         autoqa_judge_button.click(
             evaluate_automatic_answers,
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
-                autoqa_answer_model, autoqa_judge_model, autoqa_method, autoqa_judge_concurrency,
+                autoqa_answer_model, autoqa_judge_model, autoqa_judge_effort, autoqa_method, autoqa_judge_concurrency,
                 autoqa_response_type,
             ],
-            outputs=[autoqa_result, autoqa_summary, autoqa_table],
+            outputs=[autoqa_result, autoqa_summary, autoqa_table, autoqa_judge_progress],
+            show_progress="hidden",
         )
         autoqa_table.input(
             autosave_automatic_qa_judgements,
@@ -2781,8 +3991,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[autoqa_result, autoqa_json_export],
         )
         ask_button.click(
+            lambda: ("", "", gr.Group(visible=False)),
+            outputs=[query_answer, query_summary, query_evidence_group],
+            show_progress="hidden",
+        ).then(
             ask_question,
-            inputs=[query_project, question, query_method, query_chat_model, query_response_type],
+            inputs=[query_project, question, query_method, query_chat_model, query_response_type, query_reasoning_effort],
             outputs=[
                 query_answer,
                 query_summary,
@@ -2791,6 +4005,36 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail,
                 query_context,
                 query_evidence_state,
+                query_evidence_group,
+            ],
+        ).then(
+            load_query_history,
+            inputs=query_project,
+            outputs=[query_history_table, query_history_ids],
+            show_progress="hidden",
+        )
+        for history_trigger in (query_history_refresh.click, query_tab.select, active_project_id.change):
+            history_trigger(
+                load_query_history,
+                inputs=query_project,
+                outputs=[query_history_table, query_history_ids],
+                show_progress="hidden",
+            )
+        query_history_table.select(
+            select_query_history,
+            inputs=[query_project, query_history_ids],
+            outputs=[
+                question,
+                query_method,
+                query_response_type,
+                query_answer,
+                query_summary,
+                query_evidence_table,
+                query_evidence_selector,
+                query_evidence_detail,
+                query_context,
+                query_evidence_state,
+                query_evidence_group,
             ],
         )
         query_evidence_selector.input(
@@ -2799,7 +4043,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=query_evidence_detail,
         )
         clear_question_button.click(
-            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, []),
+            lambda: ("", "", "", [], gr.Dropdown(choices=[]), "", {}, [], gr.Group(visible=False)),
             outputs=[
                 question,
                 query_answer,
@@ -2809,6 +4053,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 query_evidence_detail,
                 query_context,
                 query_evidence_state,
+                query_evidence_group,
             ],
         )
         automatic_project_refresh.click(
@@ -2963,15 +4208,39 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             save_connection,
             inputs=[api_base_url, api_key, chat_model, embedding_model],
             outputs=[connection_result, api_base_url, api_key, chat_model, embedding_model],
-        ).then(connection_status, outputs=connection_state)
+        ).then(connection_status, outputs=connection_state).then(
+            workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
+        )
+        demo.load(workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs)
+        active_project_id.change(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
+        dashboard_refresh_button.click(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
     return demo
 
 
+def review_matches(review: PageReview, review_filter: str | None) -> bool:
+    return {
+        "未檢查": not review.reviewed,
+        "已修改": review.edited,
+        "Vision": review.source == "vision",
+        "文字層": review.source == "text",
+        "Vision 失敗": review.source == "fallback",
+        "空白／錯誤": review.source in {"empty", "error"},
+    }.get(review_filter or "全部", True)
+
+
 def document_row(document: DocumentInfo) -> list[str | int | None]:
+    if document.preprocessed:
+        preprocessed, indexed = "✅ 已完成", ("✅ 已建圖" if document.indexed else "⏳ 未建圖")
+    elif document.status == "ERROR":
+        preprocessed, indexed = "❌ 失敗", "—"
+    else:
+        preprocessed, indexed = "⏳ 未前處理", "—"
     return [
         document.filename,
         document.pages,
         document.size_bytes,
+        preprocessed,
+        indexed,
         document.status,
         document.empty_pages,
         document.error_pages,
@@ -2980,7 +4249,7 @@ def document_row(document: DocumentInfo) -> list[str | int | None]:
 
 
 def main() -> None:
-    create_app().queue(default_concurrency_limit=1).launch(js=INDEXING_LOG_AUTOSCROLL_JS)
+    create_app().queue(default_concurrency_limit=1).launch(js=INDEXING_LOG_AUTOSCROLL_JS, css=APP_CSS)
 
 
 if __name__ == "__main__":

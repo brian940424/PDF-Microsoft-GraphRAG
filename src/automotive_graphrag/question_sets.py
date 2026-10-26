@@ -46,6 +46,8 @@ class BatchQuestion:
     question_source_evidence: tuple[GoldEvidence, ...] = ()
     answer_source_evidence: tuple[GoldEvidence, ...] = ()
     source_documents: tuple[str, ...] = ()
+    routed_method: str = ""
+    routing_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +188,9 @@ class QuestionSetService:
                     question_source_evidence=item.question_source_evidence,
                     answer_source_evidence=item.answer_source_evidence,
                     source_documents=item.source_documents,
+                    # Auto queries report the strategy the router picked in ``method``.
+                    routed_method=result.method if result.requested_method == "auto" else "",
+                    routing_reason=(result.routing_reason or "") if result.requested_method == "auto" else "",
                 )
             )
         updated = self._replace(question_set, questions, method, response_type=response_type)
@@ -323,7 +328,7 @@ class QuestionSetService:
             current = self._replace(current, questions, method)
             self._write(current)
             try:
-                result = self.query_service.ask(project_id, item.question, method)
+                result = self.query_service.ask(project_id, item.question, method, source="question_set")
                 questions[index] = BatchQuestion(
                     question_id=item.question_id,
                     question=item.question,
@@ -425,7 +430,8 @@ class QuestionSetService:
         if not isinstance(value, dict):
             raise ProjectError("題目集根節點必須是 JSON object")
         errors: list[str] = []
-        unsupported_root_fields = set(value) - {"questions"}
+        # schema_version is added by Neo4j-DEMO's write_json; accepted and ignored.
+        unsupported_root_fields = set(value) - {"questions", "schema_version"}
         if unsupported_root_fields:
             errors.append("不支援的題目集欄位：" + ", ".join(sorted(unsupported_root_fields)))
         name = "匯入題目集"
@@ -508,7 +514,8 @@ class QuestionSetService:
             item_location = f"{location}[{index}]"
             if not isinstance(item, dict):
                 raise ProjectError(f"{item_location}：必須是 object")
-            unsupported = set(item) - {"document_name", "pages"}
+            # document_id is accepted for Neo4j-DEMO exports but ignored: its IDs are project-specific.
+            unsupported = set(item) - {"document_name", "pages", "document_id"}
             if unsupported:
                 raise ProjectError(f"{item_location}：不支援的欄位 " + ", ".join(sorted(unsupported)))
             document_name = item.get("document_name")

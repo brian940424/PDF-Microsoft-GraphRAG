@@ -34,7 +34,7 @@ def evidence(chunk_id: str, page: int) -> Evidence:
 
 
 class AnswerRunner:
-    def ask(self, project_id: str, question: str, method: str = "local") -> QueryResult:
+    def ask(self, project_id: str, question: str, method: str = "local", source: str | None = None) -> QueryResult:
         number = 1 if question == "問題一" else 2
         now = datetime.now(timezone.utc).isoformat()
         return QueryResult(
@@ -89,23 +89,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         source.write_text(
             json.dumps(
                 {
-                    "name": "自動評測集",
                     "questions": [
                         {
-                            "question_id": "Q001",
+                            "number": 1,
                             "question": "問題一",
-                            "reference_answer": "參考答案一",
-                            "gold_evidence": [
-                                {"document_id": "WW.pdf", "pages": [21], "chunk_ids": ["gold-1"]}
-                            ],
+                            "expected_answer": "參考答案一",
+                            "question_sources": [],
+                            "answer_sources": [{"document_name": "WW.pdf", "pages": [21]}],
                         },
                         {
-                            "question_id": "Q002",
+                            "number": 2,
                             "question": "問題二",
-                            "reference_answer": "參考答案二",
-                            "gold_evidence": [
-                                {"document_id": "WW.pdf", "pages": [22], "chunk_ids": ["gold-2"]}
-                            ],
+                            "expected_answer": "參考答案二",
+                            "question_sources": [],
+                            "answer_sources": [{"document_name": "WW.pdf", "pages": [22]}],
                         },
                     ],
                 },
@@ -128,12 +125,12 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         return {
             "items": [
                 {
-                    "question_id": "Q001",
+                    "question_id": "Q0001",
                     "result": "incorrect" if q1_score < 4 else "correct",
                     "reason": "第一題評語",
                 },
                 {
-                    "question_id": "Q002",
+                    "question_id": "Q0002",
                     "result": "correct",
                     "reason": "第二題評語",
                 },
@@ -162,7 +159,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
 
         ReviewService(self.store, self.question_sets).save(
-            "L33-SM3E", self.question_set_id, "Q001", "partially_correct", "人工抽查"
+            "L33-SM3E", self.question_set_id, "Q0001", "partially_correct", "人工抽查"
         )
         json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
         payload = json.loads(json_path.read_text(encoding="utf-8"))
@@ -178,7 +175,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
 
         result = service.evaluate_single_answer(
-            "L33-SM3E", "Q001", "問題一", "核心正確答案", "改寫後的回答與額外補充", "gpt-4o-mini",
+            "L33-SM3E", "Q0001", "問題一", "核心正確答案", "改寫後的回答與額外補充", "gpt-4o-mini",
             evaluation_mode="lenient",
         )
 
@@ -212,10 +209,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         rerun_prompt = next(
             prompt
             for _, _, _, prompt in judge.calls
-            if '"question_id": "Q001"' in prompt and "correct_answer" in prompt
+            if '"question_id": "Q0001"' in prompt and "correct_answer" in prompt
         )
-        self.assertIn("Q001", rerun_prompt)
-        self.assertNotIn("Q002", rerun_prompt)
+        self.assertIn("Q0001", rerun_prompt)
+        self.assertNotIn("Q0002", rerun_prompt)
         self.assertEqual(result.question_count, 2)
         self.assertTrue(result.items[0].is_correct)
         self.assertTrue(result.items[1].is_correct)
@@ -265,7 +262,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         service.evaluate("L33-SM3E", self.question_set_id)
 
         updated = service.update_manual_results(
-            "L33-SM3E", self.question_set_id, {"Q001": "正確", "Q002": "正確"}
+            "L33-SM3E", self.question_set_id, {"Q0001": "正確", "Q0002": "正確"}
         )
 
         self.assertEqual(updated.correct_count, 2)
@@ -314,7 +311,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             for component in app.blocks.values()
             if hasattr(component, "get_config")
         ])
-        ask_handler = next(fn for fn in app.fns.values() if fn.fn.__name__ == "ask_question")
+        ask_handler = next(fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "ask_question")
         self.assertEqual(len(ask_handler.inputs), 5)
         response_type_dropdowns = [
             component for component in app.blocks.values()
@@ -329,7 +326,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             for component in app.blocks.values()
             if hasattr(component, "get_config")
         }
-        self.assertTrue({"0-0 專案設定", "0-1 連線設定", "0-2 文件與建圖", "0-3 問答測試", "0-4 自動問答測試", "0-5 檢索實驗"}.issubset(tabs))
+        self.assertTrue({"0 專案與連線設定", "1 文件與建圖", "2 問答測試", "3 自動問答測試", "4 檢索實驗"}.issubset(tabs))
         self.assertNotIn("新題目集名稱", labels)
         self.assertNotIn("題目集內容（每題均包含問題與答案）", labels)
         self.assertNotIn("將目前問題與編輯後答案加入題目集", button_values)
