@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -58,6 +59,106 @@ class AgenticSearchTests(unittest.TestCase):
         self.assertEqual(result.method, "basic")
         self.assertEqual(result.answer, "規格為 15 A [E1]。")
 
+    def test_empty_evidence_stops_without_generating_an_answer(self) -> None:
+        responses = iter([
+            {"method": "basic", "query": "雨刷規格", "purpose": "尋找規格"},
+            {"sufficient": False, "gap": "缺少數值來源", "method": "local", "query": "雨刷規格手冊依據"},
+        ])
+        prompts: list[str] = []
+        searches = 0
+
+        def chat(_base: str, _key: str, _model: str, prompt: str) -> object:
+            prompts.append(prompt)
+            return next(responses)
+
+        def search(_method: str, _query: str) -> QueryExecution:
+            nonlocal searches
+            searches += 1
+            return QueryExecution(0, "未找到來源的生成摘要", "", {})
+
+        result = AgenticSearch(chat).run("雨刷規格？", "model", "https://api", "key", search)
+
+        self.assertEqual(searches, 2)
+        self.assertEqual(result.answer, "目前沒有取得可引用的來源證據，無法可靠回答此問題。")
+        self.assertIn("沒有可解析的 Evidence", result.stop_reason)
+        self.assertFalse(any(prompt.startswith("Answer the user's question") for prompt in prompts))
+
+    def test_duplicate_follow_up_is_suppressed(self) -> None:
+        responses = iter([
+            {"method": "basic", "query": "Tire pressure", "purpose": "取得規格"},
+            {"sufficient": False, "gap": "需要來源", "method": "basic", "query": " tire   pressure "},
+            {"answer": "請依手冊確認胎壓 [E1]。"},
+        ])
+        searches: list[str] = []
+
+        def search(method: str, _query: str) -> QueryExecution:
+            searches.append(method)
+            return QueryExecution(0, "手冊內容", "", {"sources": [{"id": "tu-1", "text": "胎壓依車型而定"}]})
+
+        result = AgenticSearch(lambda *_: next(responses)).run(
+            "胎壓是多少？", "model", "https://api", "key", search,
+        )
+
+        self.assertEqual(searches, ["basic"])
+        self.assertIn("重複", result.stop_reason)
+        self.assertEqual(result.context["agentic_metadata"]["search_step_count"], 1)
+
+    def test_conflicting_evidence_is_preserved_for_final_answer(self) -> None:
+        responses = iter([
+            {"method": "local", "query": "不同車型扭力", "purpose": "比對車型條件"},
+            {"sufficient": True, "gap": "", "method": "", "query": ""},
+            {"answer": "兩份手冊的扭力規格不同，須依車型區分 [E1][E2]。"},
+        ])
+        prompts: list[str] = []
+
+        def chat(_base: str, _key: str, _model: str, prompt: str) -> object:
+            prompts.append(prompt)
+            return next(responses)
+
+        def search(*_args) -> QueryExecution:
+            return QueryExecution(0, "", "", {"sources": [
+                {"id": "tu-a", "text": "車型 A：扭力 10 N·m"},
+                {"id": "tu-b", "text": "車型 B：扭力 14 N·m"},
+            ]})
+
+        result = AgenticSearch(chat).run("各車型的扭力？", "model", "https://api", "key", search)
+
+        final_prompt = prompts[-1]
+        self.assertIn("sources conflict", final_prompt)
+        self.assertIn("車型 A：扭力 10 N·m", final_prompt)
+        self.assertIn("車型 B：扭力 14 N·m", final_prompt)
+        self.assertIn("須依車型區分", result.answer)
+
+    def test_exhausted_budget_does_not_start_a_search(self) -> None:
+        search_calls = 0
+
+        def search(*_args) -> QueryExecution:
+            nonlocal search_calls
+            search_calls += 1
+            return QueryExecution(0, "答案", "", {})
+
+        with patch("automotive_graphrag.agentic_search.MAX_TOTAL_SECONDS", 0):
+            result = AgenticSearch(lambda *_: self.fail("planner must not run after budget expires")).run(
+                "問題", "model", "https://api", "key", search,
+            )
+
+        self.assertEqual(search_calls, 0)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("上限", result.stop_reason)
+
+    def test_search_executor_exception_returns_a_recorded_failure(self) -> None:
+        result = AgenticSearch(lambda *_: {
+            "method": "local", "query": "q", "purpose": "lookup",
+        }).run(
+            "q", "model", "https://api", "key",
+            lambda *_: (_ for _ in ()).throw(RuntimeError("worker unavailable")),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("搜尋執行失敗", result.stop_reason)
+        self.assertEqual(result.model_call_count, 1)
+        self.assertEqual(result.execution_metadata["search_step_count"], 0)
+
     def test_failed_optional_follow_up_keeps_successful_first_search(self) -> None:
         model_responses = iter([
             {"method": "local", "query": "主查詢", "purpose": "取得依據"},
@@ -79,7 +180,7 @@ class AgenticSearchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.model_call_count, 3)
         self.assertIsNone(result.estimated_cost_usd)
-        self.assertEqual(result.execution_metadata["prompt_version"], "agentic-v1")
+        self.assertEqual(result.execution_metadata["prompt_version"], "agentic-v2")
         self.assertEqual(result.execution_metadata["search_step_count"], 2)
         self.assertGreaterEqual(result.context["agentic_steps"][0]["duration_seconds"], 0)
         self.assertEqual(result.context["agentic_steps"][0]["evidence"][0]["source_type"], "text_unit")
@@ -138,7 +239,7 @@ class AgenticSearchTests(unittest.TestCase):
 
         self.assertEqual(calls, 1)
         self.assertEqual(result.method, "local")
-        self.assertEqual(result.answer, "Local 回答")
+        self.assertIn("無法可靠回答", result.answer)
         self.assertIn("回退 Local", result.stop_reason)
 
     def test_missing_api_key_skips_planner_and_uses_local(self) -> None:
@@ -146,14 +247,14 @@ class AgenticSearchTests(unittest.TestCase):
             "原始問題", "model", "https://api", None,
             lambda method, query: QueryExecution(0, f"{method}:{query}", "", {}),
         )
-        self.assertEqual(result.answer, "local:原始問題")
+        self.assertIn("無法可靠回答", result.answer)
         self.assertEqual(result.method, "local")
 
     def test_model_error_after_search_uses_graph_rag_answer(self) -> None:
         responses = iter([{"method": "local", "query": "q", "purpose": "p"}])
         result = AgenticSearch(lambda *_: next(responses)).run(
             "q", "model", "https://api", "key",
-            lambda *_: QueryExecution(0, "GraphRAG answer", "", {}),
+            lambda *_: QueryExecution(0, "GraphRAG answer", "", {"sources": [{"id": "tu1", "text": "supporting evidence"}]}),
         )
         self.assertEqual(result.answer, "GraphRAG answer")
         self.assertIn("改用 GraphRAG 原始回答", result.stop_reason)
