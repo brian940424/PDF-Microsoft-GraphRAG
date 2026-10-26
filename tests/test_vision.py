@@ -178,6 +178,22 @@ class PageNeedsVisionTests(unittest.TestCase):
 
         self.assertTrue(page_needs_vision(page, SCOPE_FIGURES, "Placed vector figure"))
 
+    def test_small_vector_page_edge_tab_is_not_an_illustration(self) -> None:
+        document = pymupdf.open()
+        page = document.new_page(width=612, height=792)
+        page.insert_text((72, 100), "Plain text page with a chapter tab", fontname="helv")
+        page.draw_rect(pymupdf.Rect(564, 453, 612, 485), color=(0, 0, 0), fill=(0, 0, 0))
+
+        self.assertFalse(page_needs_vision(page, SCOPE_FIGURES, "Plain text page with a chapter tab"))
+
+    def test_large_vector_illustration_touching_page_edge_is_kept(self) -> None:
+        document = pymupdf.open()
+        page = document.new_page(width=612, height=792)
+        page.insert_text((72, 100), "Edge illustration", fontname="helv")
+        page.draw_circle((560, 450), 70)
+
+        self.assertTrue(page_needs_vision(page, SCOPE_FIGURES, "Edge illustration"))
+
 
 class AnalyzePageTests(unittest.TestCase):
     settings = VisionSettings(model="gpt-6-luna", api_base_url="https://api.example/v1/", api_key="sk-test")

@@ -71,6 +71,10 @@ FIGURE_MIN_SIZE = 18.0
 # Unlike vector paths, a raster image is a direct figure signal. Keep small
 # icons and page artifacts out while admitting compact embedded illustrations.
 IMAGE_MIN_PAGE_AREA_RATIO = 0.001
+# Small vector marks flush to the paper edge are usually chapter tabs, crop
+# marks, or page furniture rather than illustrations.
+EDGE_DECORATION_MAX_PAGE_AREA_RATIO = 0.01
+PAGE_EDGE_TOLERANCE = 1.0
 # A table must have ruled top and bottom edges covering this share of its width;
 # callout leader lines around an illustration are often mistaken for a grid.
 TABLE_BORDER_COVERAGE = 0.9
@@ -302,6 +306,7 @@ def _figure_candidates(
         for kind, rects in found.items()
         for rect in rects
         if not rect.is_empty and body.contains((rect.tl + rect.br) / 2)
+        and not (kind == "drawing" and _is_small_page_edge_decoration(rect, page_rect))
         and (
             kind == "table"
             or (
@@ -311,6 +316,20 @@ def _figure_candidates(
             or (kind == "drawing" and min(rect.width, rect.height) >= FIGURE_MIN_SIZE)
         )
     ]
+
+
+def _is_small_page_edge_decoration(rect: pymupdf.Rect, page_rect: pymupdf.Rect) -> bool:
+    """Ignore small vector marks touching a page edge, such as chapter tabs."""
+    page_area = page_rect.width * page_rect.height
+    if page_area <= 0 or rect.width * rect.height >= page_area * EDGE_DECORATION_MAX_PAGE_AREA_RATIO:
+        return False
+    tolerance = PAGE_EDGE_TOLERANCE
+    return (
+        rect.x0 <= page_rect.x0 + tolerance
+        or rect.y0 <= page_rect.y0 + tolerance
+        or rect.x1 >= page_rect.x1 - tolerance
+        or rect.y1 >= page_rect.y1 - tolerance
+    )
 
 
 def _is_rule_drawing(drawing: dict[str, Any], page_width: float) -> bool:
