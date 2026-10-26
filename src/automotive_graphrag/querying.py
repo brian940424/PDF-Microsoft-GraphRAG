@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -173,6 +174,8 @@ class QueryService:
             except (ProjectError, OSError, ValueError) as exc:
                 context = dict(context)
                 context["_evidence_warning"] = str(exc)
+        if requested_method == AGENTIC_METHOD and answer:
+            answer = self._align_agentic_citations(answer, context, evidence)
         if result.returncode == 0 and not answer:
             error = "GraphRAG 未回傳回答"
         query_result = QueryResult(
@@ -225,6 +228,26 @@ class QueryService:
             "sections": sections,
             "message": "完整 Query Context 保留於後端查詢紀錄；前端僅顯示摘要以避免大型回應。",
         }
+
+    @staticmethod
+    def _align_agentic_citations(answer: str, context: dict[str, Any], evidence: tuple[Evidence, ...]) -> str:
+        """Map planner-visible citations to the Evidence IDs actually shown by the UI."""
+        source_by_citation: dict[str, str] = {}
+        for step in context.get("agentic_steps", []):
+            if not isinstance(step, dict):
+                continue
+            for item in step.get("evidence", []):
+                if isinstance(item, dict) and item.get("citation_id") and item.get("source_id"):
+                    source_by_citation[str(item["citation_id"])] = str(item["source_id"])
+        visible_id_by_source = {item.context_id: item.evidence_id for item in evidence if item.context_id}
+
+        def replace(match: re.Match[str]) -> str:
+            citation = match.group(1)
+            source_id = source_by_citation.get(citation)
+            visible_id = visible_id_by_source.get(source_id or "")
+            return f"[{visible_id}]" if visible_id else "[來源未映射]"
+
+        return re.sub(r"\[(E\d+)\]", replace, answer)
 
     @staticmethod
     def _result_from_dict(value: dict[str, Any]) -> QueryResult:

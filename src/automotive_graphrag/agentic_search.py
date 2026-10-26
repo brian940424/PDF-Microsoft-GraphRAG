@@ -234,6 +234,7 @@ class AgenticSearch:
                     evidence_id = f"E{next_evidence_id}"
                     evidence_id_by_source[source_id] = evidence_id
                     next_evidence_id += 1
+                item["citation_id"] = evidence_id
                 evidence.append({**item, "id": evidence_id})
             payload.append({"method": step["method"], "query": step["query"], "purpose": step["purpose"], "answer": step["answer"], "evidence": evidence})
         return json.dumps(payload, ensure_ascii=False)

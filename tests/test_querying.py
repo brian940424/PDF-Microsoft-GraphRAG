@@ -159,8 +159,8 @@ class QueryServiceTests(unittest.TestCase):
         runner = ContextQueryRunner()
         decision = AgenticDecision(
             "local", "根據手冊先檢查保險絲 [E1]。",
-            {"agentic_steps": [{"method": "local", "query": "保險絲檢查", "purpose": "尋找程序", "context": {"sources": [{"id": "7", "text": "來源"}]}}]},
-            ({"method": "local", "query": "保險絲檢查", "purpose": "尋找程序", "context": {"sources": [{"id": "7", "text": "來源"}]}},),
+            {"agentic_steps": [{"method": "local", "query": "保險絲檢查", "purpose": "尋找程序", "evidence": [{"citation_id": "E1", "source_id": "7"}], "context": {"sources": [{"id": "7", "text": "來源"}]}}]},
+            ({"method": "local", "query": "保險絲檢查", "purpose": "尋找程序", "evidence": [{"citation_id": "E1", "source_id": "7"}], "context": {"sources": [{"id": "7", "text": "來源"}]}},),
             "檢索證據足以回答",
         )
         agentic = FakeAgenticSearch(decision)
@@ -175,6 +175,21 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.routing_reason, "檢索證據足以回答")
         self.assertEqual(result.evidence[0].page, 25)
         self.assertIn("agentic_steps", result.context)
+
+    def test_agentic_citations_are_aligned_to_visible_evidence_ids(self) -> None:
+        context = {"agentic_steps": [{"evidence": [
+            {"citation_id": "E1", "source_id": "tu-1"},
+            {"citation_id": "E2", "source_id": "unmapped"},
+        ]}]}
+        visible = (Evidence(
+            evidence_id="E2", rank=2, context_id="tu-1", text_unit_id="full-tu-1",
+            chunk_id="chunk", section_id="section", section_name="section",
+            document_id="manual.pdf", page=12, block_id="block", text="evidence",
+        ),)
+
+        answer = QueryService._align_agentic_citations("依據 [E1]；另一處 [E2]。", context, visible)
+
+        self.assertEqual(answer, "依據 [E2]；另一處 [來源未映射]。")
 
     def test_history_without_routing_fields_still_loads(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)

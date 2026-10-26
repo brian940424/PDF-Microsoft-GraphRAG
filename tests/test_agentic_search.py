@@ -33,6 +33,10 @@ class AgenticSearchTests(unittest.TestCase):
         self.assertEqual(decision.answer, "先檢查保險絲規格 [E1]，再執行馬達檢查 [E2]。")
         self.assertEqual(len(decision.steps), 2)
         self.assertEqual(decision.returncode, 0)
+        self.assertEqual(
+            [row["citation_id"] for step in decision.context["agentic_steps"] for row in step["evidence"]],
+            ["E1", "E2"],
+        )
         self.assertIn("Retrieved results", model_prompts[1])
         self.assertTrue(model_prompts[2].startswith("Answer the user's question"))
 
