@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import re
 import string
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 
 
 def normalize_answer(text: str) -> str:
-    """Lowercase text and remove punctuation, English articles, and extra spaces."""
-    lowered = text.lower()
-    without_punctuation = "".join(char for char in lowered if char not in string.punctuation)
+    """Remove GraphRAG source citations, then apply MuSiQue/SQuAD normalization."""
+    without_source_citations = re.sub(
+        r"\[\s*data\s*:\s*sources?\s*\(\s*\d+(?:\s*[,;]\s*\d+)*\s*\)\s*\]",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    lowered = without_source_citations.lower()
+    without_punctuation = "".join(
+        char for char in lowered
+        if char not in string.punctuation and not unicodedata.category(char).startswith("P")
+    )
     without_articles = re.sub(r"\b(a|an|the)\b", " ", without_punctuation)
     return " ".join(without_articles.split())
 
