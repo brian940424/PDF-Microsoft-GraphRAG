@@ -3104,7 +3104,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 info="只套用於 GraphRAG 建圖；更換模型後按「建立 Graph」即可重新建圖。",
             )
             indexing_reasoning_effort = gr.Dropdown(
-                choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                choices=REASONING_EFFORT_CHOICES, value="low",
                 label="建圖推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
             )
             indexing_chat_model.change(
@@ -3152,9 +3152,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         info="以 Vision 模型轉寫頁面影像：表格轉 Markdown、圖片與圖解改寫成文字描述，失敗的頁面改用文字層。會依頁數呼叫 API。",
                     )
                     vision_reasoning_effort = gr.Dropdown(
-                        choices=VISION_REASONING_EFFORT_CHOICES, value="none", label="推理深度",
+                        choices=VISION_REASONING_EFFORT_CHOICES, value="low", label="推理深度",
                         visible=True,
-                        info="僅 gpt-6-luna 支援；預設 none。",
+                        info="僅 gpt-6-luna 支援；預設 low。",
                     )
                     vision_scope = gr.Dropdown(
                         choices=VISION_SCOPE_CHOICES,
