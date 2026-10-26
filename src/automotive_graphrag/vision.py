@@ -283,12 +283,18 @@ def _figure_candidates(
     if "image" in kinds:
         found["image"] = [pymupdf.Rect(info["bbox"]) & page_rect for info in page.get_image_info()]
     if "drawing" in kinds:
+        drawing_rects = []
+        for drawing in drawings:
+            if _is_rule_drawing(drawing, page_rect.width):
+                continue
+            # Placed-PDF/vector paths can have bounds far outside the page's
+            # clipping region. Clip each path before clustering, or an off-page
+            # path can pull a whole figure's merged center outside the page.
+            rect = pymupdf.Rect(drawing["rect"]) & page_rect
+            if not rect.is_empty and (rect.width > 0 or rect.height > 0):
+                drawing_rects.append(rect)
         found["drawing"] = _merge_nearby(
-            [
-                drawing["rect"] for drawing in drawings
-                if not _is_rule_drawing(drawing, page_rect.width)
-                and (drawing["rect"].width > 0 or drawing["rect"].height > 0)
-            ],
+            drawing_rects,
             FIGURE_CLUSTER_TOLERANCE,
         )
     return [

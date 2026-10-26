@@ -167,6 +167,17 @@ class PageNeedsVisionTests(unittest.TestCase):
 
         self.assertTrue(page_needs_vision(page, SCOPE_FIGURES, "Vector figure"))
 
+    def test_off_page_vector_paths_do_not_hide_an_on_page_figure(self) -> None:
+        document = pymupdf.open()
+        page = document.new_page(width=595, height=842)
+        page.insert_text((72, 100), "Placed vector figure", fontname="helv")
+        # Simulate a placed-PDF path whose source bounds extend left of its
+        # clipping region, alongside the visible part of the illustration.
+        page.draw_line((-500, 300), (143, 400))
+        page.draw_circle((260, 380), 100)
+
+        self.assertTrue(page_needs_vision(page, SCOPE_FIGURES, "Placed vector figure"))
+
 
 class AnalyzePageTests(unittest.TestCase):
     settings = VisionSettings(model="gpt-6-luna", api_base_url="https://api.example/v1/", api_key="sk-test")
