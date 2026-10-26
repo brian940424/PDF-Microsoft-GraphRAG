@@ -69,6 +69,7 @@ class QueryTabAutoStrategyTests(unittest.TestCase):
         self.assertEqual(len(method_dropdowns), 1)
         self.assertEqual(method_dropdowns[0]["value"], "auto")
         self.assertIn("auto", [value for _label, value in method_dropdowns[0]["choices"]])
+        self.assertIn("agentic", [value for _label, value in method_dropdowns[0]["choices"]])
         reasoning_dropdowns = [
             component.get_config()
             for component in app.blocks.values()

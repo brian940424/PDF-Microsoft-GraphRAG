@@ -84,7 +84,7 @@ SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "檢索證據", "Evidence Hit", "Evidence Precision", "Document Hit"]
 SAMPLE_COLUMNS = ["PDF", "Page", "Section", "Content Type", "Characters", "Chunk ID"]
 GENERATED_QUESTION_COLUMNS = ["Question ID", "Question", "Difficulty", "Status", "Sources"]
-QUERY_METHOD_LABELS = {"local": "Local", "global": "Global", "drift": "DRIFT", "basic": "Basic"}
+QUERY_METHOD_LABELS = {"local": "Local", "global": "Global", "drift": "DRIFT", "basic": "Basic", "agentic": "Agentic Search（實驗）"}
 PROJECT_STATUS_LABELS = {
     "EMPTY": "空專案",
     "UPLOADED": "已上傳",
@@ -96,7 +96,8 @@ PROJECT_STATUS_LABELS = {
     "FAILED": "失敗",
 }
 QUERY_HISTORY_LIMIT = 50
-QUERY_METHOD_CHOICES = [("自動", "auto")] + [(label, method) for method, label in QUERY_METHOD_LABELS.items()]
+STANDARD_QUERY_METHOD_CHOICES = [("自動", "auto")] + [(label, method) for method, label in QUERY_METHOD_LABELS.items() if method != "agentic"]
+QUERY_METHOD_CHOICES = [*STANDARD_QUERY_METHOD_CHOICES, (QUERY_METHOD_LABELS["agentic"], "agentic")]
 AUTOMATIC_EVALUATION_COLUMNS = [
     "Question ID",
     "判斷",
@@ -510,7 +511,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         worker.start()
         while worker.is_alive():
             elapsed = time.monotonic() - started
-            stage = "模型選擇查詢方法中" if method == "auto" and elapsed < 5 else "GraphRAG 檢索與生成回答中"
+            if method == "agentic":
+                stage = "Agentic Search 規劃與檢索中"
+            else:
+                stage = "模型選擇查詢方法中" if method == "auto" and elapsed < 5 else "GraphRAG 檢索與生成回答中"
             progress(min(0.95, 1 - math.exp(-elapsed / 30)), desc=f"⏳ {stage}…已經過 {elapsed:.0f} 秒")
             worker.join(timeout=0.5)
         progress(1.0, desc="完成")
@@ -530,7 +534,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
         )
         if query_result.routing_reason:
-            summary += f"\n\n**選擇原因：** {query_result.routing_reason}"
+            detail_label = "Agentic 搜尋狀態" if query_result.requested_method == "agentic" else "選擇原因"
+            summary += f"\n\n**{detail_label}：** {query_result.routing_reason}"
         if query_result.status == "FAILED":
             return "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, [], hidden
         evidence_values = [asdict(item) for item in query_result.evidence]
@@ -1577,7 +1582,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         method = method or "local"
         return (
             gr.update(choices=list(ALLOWED_CHAT_MODELS), value=answer_model),
-            gr.update(choices=QUERY_METHOD_CHOICES, value=method),
+            gr.update(choices=STANDARD_QUERY_METHOD_CHOICES, value=method),
         )
 
     def update_query_method_compatibility(answer_model: str | None, method: str | None):
@@ -3034,7 +3039,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         choices=QUERY_METHOD_CHOICES,
                         value="auto",
                         label="查詢方法",
-                        info="自動：由回答模型依問題類型選擇 Local／Global／DRIFT／Basic，並顯示選擇原因",
+                        info="自動：由模型依問題選擇單一 GraphRAG 方法。Agentic Search（實驗）可依證據缺口補搜一次，成本與效果仍在評估。",
                     )
                     query_response_type = gr.Dropdown(
                         choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
@@ -3165,7 +3170,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
                     )
                     autoqa_method = gr.Dropdown(
-                        choices=QUERY_METHOD_CHOICES,
+                        choices=STANDARD_QUERY_METHOD_CHOICES,
                         value="local", label="檢索模式",
                         info="自動：每題由回答模型選擇策略（多一次 LLM 呼叫）",
                     )

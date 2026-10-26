@@ -11,6 +11,7 @@ from unittest.mock import patch
 from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.evidence import Evidence, EvidenceService
+from automotive_graphrag.agentic_search import AgenticDecision
 from automotive_graphrag.querying import QueryExecution, QueryService
 from automotive_graphrag.source_metadata import SourceMetadata
 from automotive_graphrag.strategy_routing import StrategyDecision
@@ -65,6 +66,16 @@ class FakeRouter:
 class FailingEvidenceService:
     def from_context(self, project_id: str, context: dict[str, object]) -> list[Evidence]:
         raise ProjectError(f"找不到專案：{project_id}")
+
+
+class FakeAgenticSearch:
+    def __init__(self, decision: AgenticDecision) -> None:
+        self.decision = decision
+        self.calls = []
+
+    def run(self, question, model, api_base_url, api_key, search, reasoning_effort="medium"):
+        self.calls.append((question, model, api_base_url, api_key, reasoning_effort))
+        return self.decision
 
 
 class QueryServiceTests(unittest.TestCase):
@@ -143,6 +154,28 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.method, "basic")
         self.assertEqual(result.requested_method, "basic")
         self.assertIsNone(result.routing_reason)
+
+    def test_agentic_query_runs_through_orchestrator_and_records_search_plan(self) -> None:
+        runner = ContextQueryRunner()
+        decision = AgenticDecision(
+            "local", "根據手冊先檢查保險絲 [E1]。",
+            {"agentic_steps": [{"method": "local", "query": "保險絲檢查", "purpose": "尋找程序", "context": {"sources": [{"id": "7", "text": "來源"}]}}]},
+            ({"method": "local", "query": "保險絲檢查", "purpose": "尋找程序", "context": {"sources": [{"id": "7", "text": "來源"}]}},),
+            "檢索證據足以回答",
+        )
+        agentic = FakeAgenticSearch(decision)
+        service = QueryService(self.store, runner, self.connections, evidence_service=FakeEvidenceService(), agentic_search=agentic)
+
+        result = service.ask("L33-SM3E", "如何檢查保險絲？", method="agentic", chat_model="gpt-4.1-mini", reasoning_effort="high")
+
+        self.assertEqual(agentic.calls, [("如何檢查保險絲？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key", "high")])
+        self.assertEqual(runner.commands, [])
+        self.assertEqual(result.requested_method, "agentic")
+        self.assertEqual(result.method, "agentic")
+        self.assertEqual(result.answer, "根據手冊先檢查保險絲 [E1]。")
+        self.assertEqual(result.routing_reason, "檢索證據足以回答")
+        self.assertEqual(result.evidence[0].page, 25)
+        self.assertIn("agentic_steps", result.context)
 
     def test_history_without_routing_fields_still_loads(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)

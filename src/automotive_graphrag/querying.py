@@ -19,6 +19,7 @@ import pandas as pd
 import yaml
 
 from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, configure_completion_model
+from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 from .strategy_routing import StrategyRouter
@@ -26,6 +27,7 @@ from .strategy_routing import StrategyRouter
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
 AUTO_METHOD = "auto"
+AGENTIC_METHOD = "agentic"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,12 +69,14 @@ class QueryService:
         connection_settings: ConnectionSettings | None = None,
         evidence_service: EvidenceService | None = None,
         router: StrategyRouter | None = None,
+        agentic_search: AgenticSearch | None = None,
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
         self.evidence_service = evidence_service or EvidenceService(projects)
         self.router = router or StrategyRouter()
+        self.agentic_search = agentic_search or AgenticSearch()
         self._history_lock = threading.Lock()
 
     def ask(
@@ -93,7 +97,7 @@ class QueryService:
             raise ProjectError(f"專案狀態 {project.status} 尚未完成建圖，無法查詢")
         if not prompt:
             raise ProjectError("問題為必填")
-        if normalized_method not in QUERY_METHODS | {AUTO_METHOD}:
+        if normalized_method not in QUERY_METHODS | {AUTO_METHOD, AGENTIC_METHOD}:
             raise ProjectError(f"不支援的查詢方法：{method}")
         selected_model = chat_model or self.connection_settings.get_chat_model()
         if selected_model not in ALLOWED_CHAT_MODELS:
@@ -135,7 +139,26 @@ class QueryService:
             response_type,
             prompt,
         ]
-        result = self.runner(command)
+        if normalized_method == AGENTIC_METHOD:
+            def execute_search(search_method: str, search_question: str):
+                search_command = [
+                    sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
+                    "--method", search_method, "--response-type", response_type, search_question,
+                ]
+                return self.runner(search_command)
+
+            decision = self.agentic_search.run(
+                prompt,
+                selected_model,
+                self.connection_settings.get_api_base_url(),
+                self.connection_settings.get_api_key(project_id),
+                execute_search,
+                reasoning_effort,
+            )
+            result = QueryExecution(decision.returncode, decision.answer, decision.error or "", decision.context)
+            routing_reason = decision.stop_reason
+        else:
+            result = self.runner(command)
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -153,7 +176,7 @@ class QueryService:
             query_id=uuid.uuid4().hex,
             project_id=project_id,
             question=prompt,
-            method=normalized_method,
+            method=AGENTIC_METHOD if requested_method == AGENTIC_METHOD else normalized_method,
             status="COMPLETED" if error is None else "FAILED",
             answer=answer,
             error=error,
