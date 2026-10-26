@@ -43,6 +43,7 @@ from .retrieval_experiments import (
     DEFAULT_EXPERIMENT_RESPONSE_TYPE,
     EVIDENCE_METHODS,
     EXPERIMENT_AUTO_METHOD,
+    EXPERIMENT_AGENTIC_METHOD,
     EXPERIMENT_REASONING_EFFORT_OPTIONS,
     EXPERIMENT_RESPONSE_TYPE_OPTIONS,
     EXPERIMENT_STRATEGY_PARAMETER_SPECS,
@@ -275,6 +276,7 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
         "drift": "Microsoft GraphRAG DRIFT",
         "basic": "Microsoft GraphRAG Basic",
         "auto": "自動（逐題選擇策略）",
+        "agentic": "Agentic Search（實驗）",
     }
     raw_results = (run or {}).get("results", [])
     run_ids = list((run or {}).get("question_set_ids", []))
@@ -295,11 +297,11 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
             partial = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
             incorrect = sum(RetrievalExperimentService._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
             metric_samples = []
-            if method in EVIDENCE_METHODS or method == EXPERIMENT_AUTO_METHOD:
+            if method in EVIDENCE_METHODS or method in {EXPERIMENT_AUTO_METHOD, EXPERIMENT_AGENTIC_METHOD}:
                 for item in selected:
                     if item.get("status") == "failed":
                         continue
-                    if (item.get("routed_method") or item.get("method")) not in EVIDENCE_METHODS:
+                    if method == EXPERIMENT_AUTO_METHOD and (item.get("routed_method") or item.get("method")) not in EVIDENCE_METHODS:
                         continue
                     question = next((q for q in question_set.questions if q.question_id == item.get("question_id")), None)
                     if question is None:
@@ -311,11 +313,15 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                         result = RetrievalExperimentService._result_from_dict(item)
                     except (TypeError, ValueError, KeyError):
                         continue
+                    if method == EXPERIMENT_AGENTIC_METHOD and not any(
+                        evidence.source_type == "text_unit" for evidence in result.retrieved_evidence
+                    ):
+                        continue
                     metric_samples.append((result.retrieved_evidence, gold))
             metrics = compute_source_metrics(tuple(metric_samples)) if metric_samples else (None, None, None, 0)
             metric_status = (
                 "已計算（文件 ID／頁碼比對；逐題 precision 平均，無頁碼 Gold 排除）" if metric_samples else
-                "不可計算：Global 社群報告無法可靠映射" if method == "global" else
+                "不可計算：Global／Agentic 社群報告無法可靠映射" if method in {"global", EXPERIMENT_AGENTIC_METHOD} else
                 "不可計算：尚無可用來源證據"
             )
             rows.append([
@@ -342,6 +348,19 @@ def _experiment_strategy_cell(item, strategy_labels):
         return strategy_labels.get(method, method)
     reason = item.get("routing_reason") or ""
     return f"自動 → {strategy_labels.get(routed, routed)}" + (f"：{reason}" if reason else "")
+
+
+def _experiment_trace_cell(trace):
+    metadata = trace.get("agentic_metadata", {}) if isinstance(trace, dict) else {}
+    steps = trace.get("agentic_steps", []) if isinstance(trace, dict) else []
+    if not steps and not metadata:
+        return ""
+    step_text = "；".join(
+        f"{index}. {step.get('method', '未知')}：{step.get('query', '')}（Evidence {len(step.get('evidence', []))} 筆）"
+        for index, step in enumerate(steps, start=1) if isinstance(step, dict)
+    )
+    stop_reason = metadata.get("stop_reason", "") if isinstance(metadata, dict) else ""
+    return f"{step_text}｜停止：{stop_reason}" if stop_reason else step_text
 
 
 def _experiment_grade_label(value):
@@ -1265,6 +1284,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 "drift": "Microsoft GraphRAG DRIFT",
                 "basic": "Microsoft GraphRAG Basic",
                 "auto": "自動（逐題選擇策略）",
+                "agentic": "Agentic Search（實驗）",
             }
             summaries = [
                 [
@@ -1283,6 +1303,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     f"{item['document_hit_rate']:.1%}" if item.get("document_hit_rate") is not None else "不可計算",
                     item.get("no_evidence_question_count", 0),
                     item.get("retrieval_metrics_status", ""),
+                    f"{item['average_latency_seconds']:.2f}" if item.get("average_latency_seconds") is not None else "—",
+                    f"{item['p95_latency_seconds']:.2f}" if item.get("p95_latency_seconds") is not None else "—",
+                    f"{item['average_search_steps']:.2f}" if item.get("average_search_steps") is not None else "—",
+                    f"{item['average_agent_model_calls']:.2f}" if item.get("average_agent_model_calls") is not None else "—",
+                    "未知（無 Token 用量）",
                 ]
                 for item in run.get("groups", [])
             ]
@@ -1302,6 +1327,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     _experiment_grade_label(item.get("evaluation_result")) if item.get("evaluation_result") not in (None, "待評測") else "",
                     item.get("evaluation_reason") or item.get("error") or "",
                     _experiment_strategy_cell(item, strategy_labels),
+                    _experiment_trace_cell(item.get("execution_trace", {})),
                 ]
                 for item in ordered_raw_results
                 if item.get("evaluation_result") not in (None, "待評測")
@@ -3230,7 +3256,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         with gr.Tab("4 檢索實驗", interactive=False) as experiment_tab:
             gr.Markdown(
                 "**流程：** ① 匯入題目集 → ② 設定實驗組 → ③ 檢索並生成答案 → ④ 評測答案 → ⑤ 匯出結果。"
-                "以同一組實驗設定比較 Microsoft GraphRAG Local、Global、DRIFT、Basic 四種策略；"
+                "以同一組實驗設定比較 Microsoft GraphRAG Local、Global、DRIFT、Basic、Agentic Search 與自動策略；"
                 "執行與評測會涵蓋所有已匯入資料集，逐題結果會標示資料集。"
                 "來源排名只有在 GraphRAG 明確提供可靠排序時才計算；目前 API context 不保證依檢索相關度排序，因此會如實標示不可計算。"
             )
@@ -3281,6 +3307,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         return
                     strategy_choices = [
                         ("自動", EXPERIMENT_AUTO_METHOD),
+                        ("Agentic Search（實驗）", EXPERIMENT_AGENTIC_METHOD),
                         ("Local", "local"), ("Global", "global"), ("DRIFT", "drift"), ("Basic", "basic"),
                     ]
                     for group in groups:
@@ -3341,6 +3368,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                                     "判斷失敗時改用 Local），再沿用本組該策略的參數。"
                                     "要調整參數，請暫時切換到該策略修改後再切回「自動」。",
                                     key=f"experiment-auto-note-{group_id}",
+                                )
+                            elif method_value == EXPERIMENT_AGENTIC_METHOD:
+                                gr.Markdown(
+                                    "Agentic Search 會依證據缺口選擇 GraphRAG 方法，最多執行 2 次搜尋；"
+                                    "摘要將列出搜尋步驟、模型協調呼叫數與延遲。可切換至 Local／Global／DRIFT／Basic 調整各方法參數，再切回 Agentic。"
+                                    "Token 用量未由 adapter 回傳，因此成本標示未知。",
+                                    key=f"experiment-agentic-note-{group_id}",
                                 )
                             else:
                                 gr.Markdown("#### 此策略可調參數", key=f"experiment-params-title-{group_id}")
@@ -3442,9 +3476,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 experiment_evaluate_progress = gr.HTML(label="答案評測進度", visible=False)
                 experiment_status = gr.Markdown()
                 experiment_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態"],
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本"],
                     interactive=False,
-                    datatype=["str"] * 16,
+                    datatype=["str"] * 21,
                     label="實驗組摘要",
                     wrap=True,
                     visible=False,
@@ -3458,9 +3492,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     visible=False,
                 )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因"],
                     interactive=True,
-                    datatype=["str"] * 10,
+                    datatype=["str"] * 11,
                     column_widths=["7%", "10%", "5%", "9%", "12%", "17%", "15%", "6%", "9%", "10%"],
                     label="逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）",
                     wrap=True,

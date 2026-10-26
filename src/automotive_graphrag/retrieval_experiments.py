@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from typing import Callable, Sequence
 
 import yaml
 
+from .agentic_search import AgenticSearch
 from .automatic_evaluation import AutomaticEvaluationService
 from .connections import (
     ALLOWED_CHAT_MODELS,
@@ -31,12 +33,14 @@ from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
+from .querying import QueryExecution
 from .strategy_routing import StrategyRouter
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
 EXPERIMENT_AUTO_METHOD = "auto"
-EXPERIMENT_GROUP_METHODS = (*EXPERIMENT_METHODS, EXPERIMENT_AUTO_METHOD)
+EXPERIMENT_AGENTIC_METHOD = "agentic"
+EXPERIMENT_GROUP_METHODS = (*EXPERIMENT_METHODS, EXPERIMENT_AGENTIC_METHOD, EXPERIMENT_AUTO_METHOD)
 EVIDENCE_METHODS = frozenset({"local", "basic", "drift"})
 DEFAULT_EXPERIMENT_RESPONSE_TYPE = "Single Paragraph"
 EXPERIMENT_RESPONSE_TYPE_OPTIONS = (
@@ -156,6 +160,8 @@ class ExperimentQuestionResult:
     answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     routed_method: str = ""
     routing_reason: str = ""
+    execution_trace: dict[str, object] = field(default_factory=dict)
+    duration_seconds: float | None = None
 
     @property
     def effective_method(self) -> str:
@@ -185,6 +191,12 @@ class ExperimentGroupSummary:
     response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
     answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     strategy_parameters: dict[str, object] = field(default_factory=dict)
+    average_latency_seconds: float | None = None
+    p95_latency_seconds: float | None = None
+    average_search_steps: float | None = None
+    average_agent_model_calls: float | None = None
+    estimated_cost_usd: float | None = None
+    cost_status: str = "此適配器未提供 Token 用量，成本未知"
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +229,7 @@ class RetrievalExperimentService:
         judging: AutomaticEvaluationService,
         query_function: QueryFunction | None = None,
         router: StrategyRouter | None = None,
+        agentic_search: AgenticSearch | None = None,
     ) -> None:
         self.projects = projects
         self.question_sets = question_sets
@@ -224,6 +237,7 @@ class RetrievalExperimentService:
         self.judging = judging
         self.query_function = query_function or self._graphrag_query
         self.router = router or StrategyRouter()
+        self.agentic_search = agentic_search or AgenticSearch()
         self._lock = threading.RLock()
         self._stop_events: dict[str, threading.Event] = {}
 
@@ -916,6 +930,12 @@ class RetrievalExperimentService:
                     "evidence_precision": summary.get("evidence_precision"),
                     "document_hit_rate": summary.get("document_hit_rate"),
                     "no_evidence_question_count": summary.get("no_evidence_question_count", 0),
+                    "average_latency_seconds": summary.get("average_latency_seconds"),
+                    "p95_latency_seconds": summary.get("p95_latency_seconds"),
+                    "average_search_steps": summary.get("average_search_steps"),
+                    "average_agent_model_calls": summary.get("average_agent_model_calls"),
+                    "estimated_cost_usd": summary.get("estimated_cost_usd"),
+                    "cost_status": summary.get("cost_status"),
                 },
             })
         expected_count = sum(int(item.get("question_count", 0)) for item in run_groups)
@@ -946,6 +966,9 @@ class RetrievalExperimentService:
                 "evidence_hit_rate": self._average_metric(run_groups, "evidence_hit_rate"),
                 "evidence_precision": self._average_metric(run_groups, "evidence_precision"),
                 "document_hit_rate": self._average_metric(run_groups, "document_hit_rate"),
+                "average_latency_seconds": self._average_metric(run_groups, "average_latency_seconds"),
+                "estimated_cost_usd": None,
+                "cost_status": "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
             },
             "groups": group_rows,
             "datasets": [
@@ -992,6 +1015,7 @@ class RetrievalExperimentService:
             "global": "Microsoft GraphRAG Global",
             "drift": "Microsoft GraphRAG DRIFT",
             "basic": "Microsoft GraphRAG Basic",
+            "agentic": "Agentic Search（實驗）",
             "auto": "自動（回答模型逐題選擇 Microsoft GraphRAG 策略）",
         }.get(method)
 
@@ -1033,8 +1057,10 @@ class RetrievalExperimentService:
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
         dataset_id: str = "", dataset_name: str = "",
     ) -> ExperimentQuestionResult:
+        started_clock = time.monotonic()
         routed_method = routing_reason = ""
         method = group.method
+        execution_trace: dict[str, object] = {}
         try:
             if group.method == EXPERIMENT_AUTO_METHOD:
                 decision = self.router.route(
@@ -1045,20 +1071,79 @@ class RetrievalExperimentService:
                 )
                 method = routed_method = decision.method
                 routing_reason = decision.reason
-            query_arguments = (
-                project_id, question.question, method, group.answer_model, group.response_type,
-                group.answer_reasoning_effort,
-            )
-            parameters = inspect.signature(self.query_function).parameters.values()
-            accepts_strategy_parameters = any(
-                item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
-            ) or len(inspect.signature(self.query_function).parameters) >= 7
-            if accepts_strategy_parameters:
-                answer, context = self.query_function(
-                    *query_arguments, group.strategy_parameters.get(method, {})
+            if group.method == EXPERIMENT_AGENTIC_METHOD:
+                api_base = self.connections.get_api_base_url()
+                api_key = self.connections.get_api_key(project_id)
+
+                def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
+                    arguments = (
+                        project_id, search_question, search_method, group.answer_model,
+                        group.response_type, group.answer_reasoning_effort,
+                    )
+                    signature = inspect.signature(self.query_function)
+                    accepts_parameters = any(
+                        item.kind == inspect.Parameter.VAR_POSITIONAL
+                        for item in signature.parameters.values()
+                    ) or len(signature.parameters) >= 7
+                    kwargs = {}
+                    if "timeout_seconds" in signature.parameters:
+                        kwargs["timeout_seconds"] = timeout_seconds
+                    if accepts_parameters:
+                        answer_value, context_value = self.query_function(
+                            *arguments, group.strategy_parameters.get(search_method, {}), **kwargs
+                        )
+                    else:
+                        answer_value, context_value = self.query_function(*arguments, **kwargs)
+                    return QueryExecution(0, str(answer_value), "", context_value)
+
+                decision = self.agentic_search.run(
+                    question.question, group.answer_model, api_base, api_key,
+                    execute_search, group.answer_reasoning_effort,
                 )
+                method = EXPERIMENT_AGENTIC_METHOD
+                answer = decision.answer
+                context = dict(decision.context)
+                execution_trace = context
+                if decision.returncode != 0 and not answer.strip():
+                    failed = self._failed_result(
+                        group, question, judge_model,
+                        decision.error or decision.stop_reason, dataset_id, dataset_name,
+                    )
+                    return replace(
+                        failed,
+                        routing_reason=decision.stop_reason,
+                        execution_trace=execution_trace,
+                        duration_seconds=round(time.monotonic() - started_clock, 3),
+                    )
+                routing_reason = decision.stop_reason
+                step_contexts = [
+                    step.get("context", {}) for step in context.get("agentic_steps", [])
+                    if isinstance(step, dict) and isinstance(step.get("context"), dict)
+                ]
+                context["sources"] = [
+                    source for step_context in step_contexts
+                    for source in (step_context.get("sources") if isinstance(step_context.get("sources"), list) else [])
+                ]
+                context["reports"] = [
+                    report for step_context in step_contexts
+                    for report in (step_context.get("reports") if isinstance(step_context.get("reports"), list) else [])
+                ]
+                execution_trace = context
             else:
-                answer, context = self.query_function(*query_arguments)
+                query_arguments = (
+                    project_id, question.question, method, group.answer_model, group.response_type,
+                    group.answer_reasoning_effort,
+                )
+                parameters = inspect.signature(self.query_function).parameters.values()
+                accepts_strategy_parameters = any(
+                    item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
+                ) or len(inspect.signature(self.query_function).parameters) >= 7
+                if accepts_strategy_parameters:
+                    answer, context = self.query_function(
+                        *query_arguments, group.strategy_parameters.get(method, {})
+                    )
+                else:
+                    answer, context = self.query_function(*query_arguments)
         except Exception as exc:
             return replace(
                 self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name),
@@ -1067,7 +1152,7 @@ class RetrievalExperimentService:
         try:
             retrieved_evidence: tuple[Evidence, ...] = ()
             mapping_error = None
-            if method in EVIDENCE_METHODS:
+            if method in EVIDENCE_METHODS or method == EXPERIMENT_AGENTIC_METHOD:
                 try:
                     retrieved_evidence = self._resolved_evidence(project_id, context)
                     raw_sources = EvidenceService.source_records(context)
@@ -1088,7 +1173,11 @@ class RetrievalExperimentService:
             retrieval_status = (
                 f"不可計算：{mapping_error}" if mapping_error else
                 "已映射至原始文件／頁碼；不使用 context 順序作排名"
-                if method in EVIDENCE_METHODS else UNSUPPORTED_RETRIEVAL_METRICS
+                if method in EVIDENCE_METHODS or (
+                    method == EXPERIMENT_AGENTIC_METHOD
+                    and any(getattr(item, "source_type", "text_unit") == "text_unit" for item in retrieved_evidence)
+                )
+                else UNSUPPORTED_RETRIEVAL_METRICS
             )
             return ExperimentQuestionResult(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
@@ -1101,6 +1190,8 @@ class RetrievalExperimentService:
                 dataset_name=dataset_name,
                 routed_method=routed_method,
                 routing_reason=routing_reason,
+                execution_trace=execution_trace,
+                duration_seconds=round(time.monotonic() - started_clock, 3),
             )
         except Exception as exc:
             return replace(
@@ -1197,11 +1288,19 @@ class RetrievalExperimentService:
             incorrect = sum(self._parse_grade(item.evaluation_result) == 0 for item in judged)
             total = sum(len(question_set.questions) for question_set in question_sets)
             answered = sum(bool(item.actual_answer.strip()) for item in group_items)
-            if group.method in EVIDENCE_METHODS or group.method == EXPERIMENT_AUTO_METHOD:
+            if group.method in EVIDENCE_METHODS or group.method in {EXPERIMENT_AUTO_METHOD, EXPERIMENT_AGENTIC_METHOD}:
                 # Auto groups only score questions that were routed to an evidence-mapping strategy.
                 metric_results = [
                     item for item in group_items
-                    if item.status != "failed" and item.effective_method in EVIDENCE_METHODS
+                    if item.status != "failed"
+                    and (
+                        item.effective_method in EVIDENCE_METHODS
+                        if group.method == EXPERIMENT_AUTO_METHOD
+                        else group.method != EXPERIMENT_AGENTIC_METHOD or any(
+                            getattr(evidence, "source_type", "text_unit") == "text_unit"
+                            for evidence in item.retrieved_evidence
+                        )
+                    )
                     and not item.retrieval_metrics_status.startswith("不可計算：")
                 ]
                 metric_samples = []
@@ -1219,10 +1318,29 @@ class RetrievalExperimentService:
                 )
                 if metric_results and group.method == EXPERIMENT_AUTO_METHOD:
                     metrics_status += "；自動選擇 Global 的題目不計入"
+                elif group.method == EXPERIMENT_AGENTIC_METHOD and not metric_results:
+                    metrics_status = "不可計算：本組未取得可映射頁碼的 Text Unit Evidence；Community Report 不計入 Gold Evidence 指標"
             else:
                 evidence_hit_rate = evidence_precision = document_hit_rate = None
                 no_evidence_count = 0
                 metrics_status = UNSUPPORTED_RETRIEVAL_METRICS
+            durations = [item.duration_seconds for item in group_items if item.duration_seconds is not None]
+            sorted_durations = sorted(durations)
+            p95_latency = (
+                sorted_durations[max(0, math.ceil(0.95 * len(sorted_durations)) - 1)]
+                if sorted_durations else None
+            )
+            agentic_results = [item for item in group_items if item.execution_trace]
+            step_counts = [
+                float(item.execution_trace.get("agentic_metadata", {}).get("search_step_count", 0))
+                for item in agentic_results
+                if isinstance(item.execution_trace.get("agentic_metadata"), dict)
+            ]
+            model_calls = [
+                float(item.execution_trace.get("agentic_metadata", {}).get("model_call_count", 0))
+                for item in agentic_results
+                if isinstance(item.execution_trace.get("agentic_metadata"), dict)
+            ]
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 total, answered, correct, partial, incorrect,
@@ -1235,6 +1353,12 @@ class RetrievalExperimentService:
                     if group.method == EXPERIMENT_AUTO_METHOD
                     else dict(group.strategy_parameters.get(group.method, {}))
                 ),
+                sum(durations) / len(durations) if durations else None,
+                p95_latency,
+                sum(step_counts) / len(step_counts) if step_counts else None,
+                sum(model_calls) / len(model_calls) if model_calls else None,
+                None,
+                "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
@@ -1298,6 +1422,7 @@ class RetrievalExperimentService:
         response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         strategy_parameters: dict[str, object] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[str, dict[str, object]]:
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
@@ -1359,6 +1484,7 @@ class RetrievalExperimentService:
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=timeout_seconds,
             )
         try:
             response = json.loads(result.stdout)
