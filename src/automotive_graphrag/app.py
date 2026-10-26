@@ -11,7 +11,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -1147,6 +1147,40 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ))
         return question_sets.update_questions(project_id, question_set_id, updated)
 
+    def save_autoqa_result_edits(project_id, question_set_id, rows):
+        """Persist the editable question, system answer, and reference answer cells."""
+        if not project_id or not question_set_id or rows is None:
+            return
+        current = question_sets.get(project_id, question_set_id)
+        by_id = {item.question_id: item for item in current.questions}
+        if hasattr(rows, "itertuples"):
+            values = list(rows.itertuples(index=False, name=None))
+        else:
+            values = list(rows)
+        if not values:
+            return
+        updated = []
+        seen_ids = set()
+        for row in values:
+            if len(row) < 5:
+                raise ProjectError("評測結果表格欄位不完整")
+            question_id = str(row[0]).strip()
+            if question_id not in by_id:
+                raise ProjectError(f"題目集找不到題號：{question_id}")
+            if question_id in seen_ids:
+                raise ProjectError(f"評測結果表格含重複題號：{question_id}")
+            seen_ids.add(question_id)
+            old = by_id[question_id]
+            updated.append(replace(
+                old,
+                question=str(row[2] or "").strip(),
+                answer=str(row[3] or "").strip(),
+                reference_answer=str(row[4] or "").strip(),
+            ))
+        if seen_ids != set(by_id):
+            raise ProjectError("評測結果表格題目不完整，請重新載入後再評測")
+        question_sets.update_questions(project_id, question_set_id, updated)
+
     def automatic_qa_summary(report):
         total = len(report.question_set.questions)
         judged = {item.question_id: item for item in report.judge.items} if report.judge else {}
@@ -2047,7 +2081,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def evaluate_automatic_answers(
-        project_id, question_set_id, rows, answer_model, judge_model, judge_effort,
+        project_id, question_set_id, rows, result_rows, answer_model, judge_model, judge_effort,
         method, concurrency, response_type, enable_llm_judge=True, enable_classic_metrics=False,
     ):
         if not project_id or not question_set_id:
@@ -2061,6 +2095,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
+            save_autoqa_result_edits(project_id, question_set_id, result_rows)
             report = yield from stream_with_progress(
                 lambda progress: automatic_qa.evaluate_existing(
                     project_id, question_set_id, answer_model, judge_model, method,
@@ -2102,8 +2137,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 values = list(rows)
             known_ids = {question.question_id for question in question_set.questions}
             previous = automatic_evaluation.last_result(project_id, question_set_id)
+            save_autoqa_result_edits(project_id, question_set_id, values)
+            question_set = question_sets.get(project_id, question_set_id)
+            known_ids = {question.question_id for question in question_set.questions}
             if previous is not None and not previous.items:
-                return "LLM Judge 未啟用；整表編輯目前只暫存於畫面，沒有可保存的正確性判斷。"
+                return "LLM Judge 未啟用；題目與答案已保存，沒有可修改的正確性判斷。"
             decisions = {}
             for row in values:
                 if len(row) < 6 or str(row[0]).strip() not in known_ids:
@@ -4203,7 +4241,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         autoqa_judge_button.click(
             evaluate_automatic_answers,
             inputs=[
-                automatic_project, autoqa_question_set_state, autoqa_questions_table,
+                automatic_project, autoqa_question_set_state, autoqa_questions_table, autoqa_table,
                 autoqa_answer_model, autoqa_judge_model, autoqa_judge_effort, autoqa_method, autoqa_judge_concurrency,
                 autoqa_response_type, autoqa_enable_llm_judge, autoqa_enable_classic_metrics,
             ],

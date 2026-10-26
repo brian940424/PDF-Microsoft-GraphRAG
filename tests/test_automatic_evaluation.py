@@ -370,6 +370,41 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         ask_handler = next(fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "ask_question")
         # Single-query now also accepts the reasoning-effort control.
         self.assertEqual(len(ask_handler.inputs), 6)
+        ui_store = ProjectStore(self.root / "ui-projects")
+        ui_store.create(
+            project_id="EDIT-TEST",
+            display_name="Edit test",
+            vehicle_name="Edit test",
+            manual_version="1",
+        )
+        ui_question_sets = QuestionSetService(ui_store)
+        ui_question_set = ui_question_sets.create_with_questions(
+            "EDIT-TEST", "Edit test", [BatchQuestion(
+                question_id="Q0001", question="原問題", reference_answer="原正解",
+                status="COMPLETED", answer="原回答",
+            )],
+        )
+        autosave_results = next(
+            fn.fn for fn in app.fns.values()
+            if getattr(fn.fn, "__name__", "") == "autosave_automatic_qa_judgements"
+        )
+        autosave_results(
+            "EDIT-TEST", ui_question_set.question_set_id,
+            [["Q0001", "manual.pdf", "編輯後問題", "編輯後回答", "編輯後正解",
+              None, "reason", "Local", None, None]],
+        )
+        edited_question = ui_question_sets.get("EDIT-TEST", ui_question_set.question_set_id).questions[0]
+        self.assertEqual(edited_question.question, "編輯後問題")
+        self.assertEqual(edited_question.answer, "編輯後回答")
+        self.assertEqual(edited_question.reference_answer, "編輯後正解")
+        edited_answer_judge = FakeJudge([{
+            "items": [{"question_id": "Q0001", "result": "correct", "reason": "符合答案"}],
+        }])
+        AutomaticEvaluationService(
+            ui_store, ui_question_sets, ConnectionSettings(ui_store.root), edited_answer_judge,
+        ).evaluate("EDIT-TEST", ui_question_set.question_set_id, model="gpt-6-luna", concurrency=1)
+        self.assertIn("編輯後回答", edited_answer_judge.calls[0][3])
+        self.assertIn("編輯後正解", edited_answer_judge.calls[0][3])
         response_type_dropdowns = [
             component for component in app.blocks.values()
             if hasattr(component, "get_config")
