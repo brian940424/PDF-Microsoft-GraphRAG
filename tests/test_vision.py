@@ -143,6 +143,30 @@ class PageNeedsVisionTests(unittest.TestCase):
         self.assertTrue(page_needs_vision(page, SCOPE_FIGURES, "text"))
         self.assertFalse(page_needs_vision(page, SCOPE_FIGURES, "text", pymupdf.Rect(0, 200, 595, 842)))
 
+    def test_compact_raster_illustration_is_detected(self) -> None:
+        document = pymupdf.open()
+        page = document.new_page(width=595, height=842)
+        page.insert_text((72, 100), "Figure 1", fontname="helv")
+        pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 8, 8), False)
+        pixmap.clear_with(255)
+        page.insert_image(pymupdf.Rect(100, 300, 125, 325), stream=pixmap.tobytes("png"))
+
+        self.assertTrue(page_needs_vision(page, SCOPE_FIGURES, "Figure 1"))
+        # Image detections in ignored header/footer margins must still be excluded.
+        self.assertFalse(
+            page_needs_vision(page, SCOPE_FIGURES, "Figure 1", pymupdf.Rect(0, 400, 595, 842))
+        )
+
+    def test_nearby_small_vector_paths_are_combined_into_a_figure(self) -> None:
+        document = pymupdf.open()
+        page = document.new_page(width=595, height=842)
+        page.insert_text((72, 100), "Vector figure", fontname="helv")
+        for x in (100, 130, 160):
+            for y in (300, 330, 360):
+                page.draw_rect(pymupdf.Rect(x, y, x + 12, y + 12))
+
+        self.assertTrue(page_needs_vision(page, SCOPE_FIGURES, "Vector figure"))
+
 
 class AnalyzePageTests(unittest.TestCase):
     settings = VisionSettings(model="gpt-6-luna", api_base_url="https://api.example/v1/", api_key="sk-test")

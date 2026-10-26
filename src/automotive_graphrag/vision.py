@@ -65,8 +65,12 @@ _TRADITIONAL_CHARS = set("這個們來時為說國後發會對過還沒樣經開
 _SIMPLIFIED_CHARS = set("这个们来时为说国后发会对过还没样经开关门问间见话让认请设车机长东书业电动网线图页点击选单装")
 
 # Vector paths closer than this many points belong to the same illustration.
-FIGURE_CLUSTER_TOLERANCE = 12.0
-FIGURE_MIN_SIZE = 36.0
+# PDF generators often split one vector illustration into many nearby paths.
+FIGURE_CLUSTER_TOLERANCE = 24.0
+FIGURE_MIN_SIZE = 18.0
+# Unlike vector paths, a raster image is a direct figure signal. Keep small
+# icons and page artifacts out while admitting compact embedded illustrations.
+IMAGE_MIN_PAGE_AREA_RATIO = 0.001
 # A table must have ruled top and bottom edges covering this share of its width;
 # callout leader lines around an illustration are often mistaken for a grid.
 TABLE_BORDER_COVERAGE = 0.9
@@ -292,7 +296,14 @@ def _figure_candidates(
         for kind, rects in found.items()
         for rect in rects
         if not rect.is_empty and body.contains((rect.tl + rect.br) / 2)
-        and (kind == "table" or min(rect.width, rect.height) >= FIGURE_MIN_SIZE)
+        and (
+            kind == "table"
+            or (
+                kind == "image"
+                and rect.width * rect.height >= page_rect.width * page_rect.height * IMAGE_MIN_PAGE_AREA_RATIO
+            )
+            or (kind == "drawing" and min(rect.width, rect.height) >= FIGURE_MIN_SIZE)
+        )
     ]
 
 
