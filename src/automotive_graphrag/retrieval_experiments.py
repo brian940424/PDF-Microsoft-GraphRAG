@@ -30,6 +30,7 @@ from .connections import (
     configure_completion_model,
 )
 from .evidence import Evidence, EvidenceService
+from .evaluation.classic_metrics import exact_match_score, f1_score, metric_max_over_ground_truths
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
@@ -165,6 +166,8 @@ class ExperimentQuestionResult:
     answer_point_coverage_percent: float | None = None
     unsupported_claim_count: int | None = None
     refusal_correctness: str | None = None
+    answer_em: float | None = None
+    answer_f1: float | None = None
 
     @property
     def effective_method(self) -> str:
@@ -205,6 +208,8 @@ class ExperimentGroupSummary:
     average_unsupported_claim_count: float | None = None
     refusal_accuracy: float | None = None
     quality_reviewed_count: int = 0
+    average_answer_em: float | None = None
+    average_answer_f1: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +227,8 @@ class RetrievalExperimentRun:
     results: tuple[ExperimentQuestionResult, ...]
     question_set_ids: tuple[str, ...] = ()
     question_set_names: tuple[str, ...] = ()
+    enable_llm_judge: bool = True
+    enable_classic_metrics: bool = False
 
 
 QueryFunction = Callable[..., tuple[str, dict[str, object]]]
@@ -255,7 +262,8 @@ class RetrievalExperimentService:
             value = json.loads(self._path(project_id).read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {"groups": [], "question_set_id": "", "question_set_ids": [], "max_concurrency": 5,
-                    "judge_model": self.connections.get_chat_model(), "evaluation_mode": "strict", "run": None}
+                    "judge_model": self.connections.get_chat_model(), "evaluation_mode": "strict",
+                    "enable_llm_judge": True, "enable_classic_metrics": False, "run": None}
         except (OSError, json.JSONDecodeError) as exc:
             raise ProjectError("檢索實驗保存資料無法讀取") from exc
         value.setdefault("groups", [])
@@ -265,6 +273,8 @@ class RetrievalExperimentService:
         )
         value.setdefault("max_concurrency", 5)
         value.setdefault("evaluation_mode", "strict")
+        value.setdefault("enable_llm_judge", True)
+        value.setdefault("enable_classic_metrics", False)
         if value["evaluation_mode"] not in {"strict", "lenient"}:
             value["evaluation_mode"] = "strict"
         value.setdefault("run", None)
@@ -310,10 +320,14 @@ class RetrievalExperimentService:
                 partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
                 incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
                 total = int(group.get("question_count", len(group_results)))
+                judge_enabled = bool(run.get("enable_llm_judge", True))
                 updated = {
                     "correct_count": full, "partial_correct_count": partial,
-                    "incorrect_count": incorrect, "accuracy": full / total if total else None,
-                    "score_accuracy": (2 * full + partial) / (2 * total) if total else None,
+                    "incorrect_count": incorrect,
+                    "accuracy": full / total if total and judge_enabled else None,
+                    "score_accuracy": (2 * full + partial) / (2 * total) if total and judge_enabled else None,
+                    "average_answer_em": self._mean_present(item.get("answer_em") for item in group_results),
+                    "average_answer_f1": self._mean_present(item.get("answer_f1") for item in group_results),
                 }
                 if any(group.get(key) != field for key, field in updated.items()):
                     group.update(updated)
@@ -329,6 +343,8 @@ class RetrievalExperimentService:
         question_set_id: str | Sequence[str],
         max_concurrency: int,
         judge_model: str | None = None,
+        enable_llm_judge: bool | None = None,
+        enable_classic_metrics: bool | None = None,
     ) -> None:
         if not 1 <= max_concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
@@ -343,6 +359,10 @@ class RetrievalExperimentService:
         current["question_set_ids"] = question_set_ids
         current["question_set_id"] = question_set_ids[0] if question_set_ids else ""
         current["max_concurrency"] = max_concurrency
+        if enable_llm_judge is not None:
+            current["enable_llm_judge"] = bool(enable_llm_judge)
+        if enable_classic_metrics is not None:
+            current["enable_classic_metrics"] = bool(enable_classic_metrics)
         self._write(project_id, current)
 
     def set_evaluation_mode(self, project_id: str, evaluation_mode: str) -> dict[str, object]:
@@ -711,8 +731,12 @@ class RetrievalExperimentService:
         update_callback: UpdateFunction | None = None,
         evaluation_mode: str | None = None,
         judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        enable_llm_judge: bool = True,
+        enable_classic_metrics: bool = False,
     ) -> RetrievalExperimentRun:
         """Evaluate previously saved answers without repeating GraphRAG retrieval."""
+        if not enable_llm_judge and not enable_classic_metrics:
+            raise ProjectError("至少啟用一種評測方式")
         state = self.load(project_id)
         evaluation_mode = evaluation_mode or str(state.get("evaluation_mode", "strict"))
         if evaluation_mode not in {"strict", "lenient"}:
@@ -729,12 +753,14 @@ class RetrievalExperimentService:
         if not groups:
             raise ProjectError("請先新增至少一個實驗組")
         judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
-        if judge_model not in ALLOWED_CHAT_MODELS:
+        if enable_llm_judge and judge_model not in ALLOWED_CHAT_MODELS:
             raise ProjectError("全域評測模型不支援")
         concurrency = int(max_concurrency or state.get("max_concurrency", 5))
         if not 1 <= concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
         state["evaluation_mode"] = evaluation_mode
+        state["enable_llm_judge"] = enable_llm_judge
+        state["enable_classic_metrics"] = enable_classic_metrics
         self._write(project_id, state)
         question_sets = [self.question_sets.get(project_id, item) for item in question_set_ids]
         dataset_by_id = {item.question_set_id: item for item in question_sets}
@@ -770,6 +796,7 @@ class RetrievalExperimentService:
         self._persist_run(
             project_id, question_set_ids, groups, judge_model, concurrency,
             started_at, "evaluating", results, evaluation_mode=evaluation_mode,
+            enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
         )
         futures: dict[Future[ExperimentQuestionResult], tuple[ExperimentGroup, object, BatchQuestion]] = {}
         work_iter = iter(work)
@@ -783,7 +810,7 @@ class RetrievalExperimentService:
                     return
                 future = executor.submit(
                     self._evaluate_case, project_id, group, question, judge_model, result, evaluation_mode,
-                    judge_reasoning_effort,
+                    judge_reasoning_effort, enable_llm_judge, enable_classic_metrics,
                 )
                 futures[future] = (group, question_set, question)
 
@@ -804,6 +831,7 @@ class RetrievalExperimentService:
                     updated = self._persist_run(
                         project_id, question_set_ids, groups, judge_model, concurrency,
                         started_at, status, results, evaluation_mode=evaluation_mode,
+                        enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
                     )
                     if update_callback:
                         update_callback(updated)
@@ -815,6 +843,7 @@ class RetrievalExperimentService:
             self._persist_run(
                 project_id, question_set_ids, groups, judge_model, concurrency,
                 started_at, "stopped", results, evaluation_mode=evaluation_mode,
+                enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
             )
             raise
         finally:
@@ -826,6 +855,7 @@ class RetrievalExperimentService:
             project_id, question_set_ids, groups, judge_model, concurrency,
             started_at, run_status, results, datetime.now(timezone.utc).isoformat(),
             evaluation_mode=evaluation_mode,
+            enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
         )
 
     def stop(self, project_id: str) -> bool:
@@ -1044,6 +1074,8 @@ class RetrievalExperimentService:
                     "estimated_cost_usd": summary.get("estimated_cost_usd"),
                     "cost_status": summary.get("cost_status"),
                     "answer_point_coverage_percent": summary.get("answer_point_coverage_percent"),
+                    "average_answer_em": summary.get("average_answer_em"),
+                    "average_answer_f1": summary.get("average_answer_f1"),
                     "unsupported_answer_rate": summary.get("unsupported_answer_rate"),
                     "average_unsupported_claim_count": summary.get("average_unsupported_claim_count"),
                     "refusal_accuracy": summary.get("refusal_accuracy"),
@@ -1058,6 +1090,8 @@ class RetrievalExperimentService:
             "max_concurrent_requests": state.get("max_concurrency", 5),
             "evaluation": {
                 "judge_model": state.get("judge_model", ""),
+                "enable_llm_judge": run.get("enable_llm_judge", state.get("enable_llm_judge", True)),
+                "enable_classic_metrics": run.get("enable_classic_metrics", state.get("enable_classic_metrics", False)),
                 "mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
                 "judge_reasoning_effort": (
                     DEFAULT_REASONING_EFFORT
@@ -1068,6 +1102,11 @@ class RetrievalExperimentService:
             "summary": {
                 "question_count": expected_count,
                 "evaluated_count": evaluated_count,
+                "classic_evaluated_count": sum(
+                    isinstance(item.get("answer_em"), (int, float))
+                    and isinstance(item.get("answer_f1"), (int, float))
+                    for item in run_results
+                ),
                 "fully_correct_count": full_count,
                 "correct_count": full_count,
                 "partial_correct_count": partial_count,
@@ -1075,6 +1114,8 @@ class RetrievalExperimentService:
                 "fully_correct_total": f"{full_count} / {expected_count}",
                 "accuracy": full_count / expected_count if expected_count else None,
                 "score_accuracy": (2 * full_count + partial_count) / (2 * expected_count) if expected_count else None,
+                "average_answer_em": self._average_metric(run_results, "answer_em"),
+                "average_answer_f1": self._average_metric(run_results, "answer_f1"),
                 "evidence_hit_rate": self._average_metric(run_groups, "evidence_hit_rate"),
                 "evidence_precision": self._average_metric(run_groups, "evidence_precision"),
                 "document_hit_rate": self._average_metric(run_groups, "document_hit_rate"),
@@ -1097,6 +1138,8 @@ class RetrievalExperimentService:
             "project": payload["project"],
             "execution_status": run.get("status"),
             "evaluation_mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
+            "enable_llm_judge": run.get("enable_llm_judge", state.get("enable_llm_judge", True)),
+            "enable_classic_metrics": run.get("enable_classic_metrics", state.get("enable_classic_metrics", False)),
             "question_set_id": state.get("question_set_id", ""),
             "question_set_ids": run.get("question_set_ids", [run.get("question_set_id", "")]),
             "datasets": payload["datasets"],
@@ -1138,6 +1181,11 @@ class RetrievalExperimentService:
             if isinstance(group.get(field), (int, float)) and math.isfinite(float(group[field]))
         ]
         return sum(values) / len(values) if values else None
+
+    @staticmethod
+    def _mean_present(values) -> float | None:
+        numbers = [float(value) for value in values if isinstance(value, (int, float)) and math.isfinite(float(value))]
+        return sum(numbers) / len(numbers) if numbers else None
 
     @staticmethod
     def _parse_grade(value: object) -> int | None:
@@ -1320,31 +1368,61 @@ class RetrievalExperimentService:
         generated: ExperimentQuestionResult,
         evaluation_mode: str = "strict",
         judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        enable_llm_judge: bool = True,
+        enable_classic_metrics: bool = False,
     ) -> ExperimentQuestionResult:
-        try:
-            judged = self.judging.evaluate_single_answer_grade(
-                project_id, question.question_id, question.question,
-                question.reference_answer, generated.actual_answer, judge_model,
-                evaluation_mode=evaluation_mode,
-                reasoning_effort=judge_reasoning_effort,
-            )
-            return replace(
-                generated,
-                judge_model=judge_model,
-                evaluation_result=judged.score,
-                evaluation_reason=judged.judge_reason,
+        result = replace(
+            generated,
+            answer_em=None if not enable_classic_metrics else generated.answer_em,
+            answer_f1=None if not enable_classic_metrics else generated.answer_f1,
+        )
+        if enable_llm_judge:
+            try:
+                judged = self.judging.evaluate_single_answer_grade(
+                    project_id, question.question_id, question.question,
+                    question.reference_answer, generated.actual_answer, judge_model,
+                    evaluation_mode=evaluation_mode,
+                    reasoning_effort=judge_reasoning_effort,
+                )
+                result = replace(
+                    result,
+                    judge_model=judge_model,
+                    evaluation_result=judged.score,
+                    evaluation_reason=judged.judge_reason,
+                    status="completed",
+                    error=None,
+                )
+            except Exception as exc:
+                result = replace(
+                    result,
+                    judge_model=judge_model,
+                    evaluation_result="評判失敗",
+                    evaluation_reason=str(exc),
+                    status="evaluation_failed",
+                    error=str(exc),
+                )
+        else:
+            result = replace(
+                result,
+                judge_model="—",
+                evaluation_result="未啟用",
+                evaluation_reason="",
                 status="completed",
                 error=None,
             )
-        except Exception as exc:
-            return replace(
-                generated,
-                judge_model=judge_model,
-                evaluation_result="評判失敗",
-                evaluation_reason=str(exc),
-                status="evaluation_failed",
-                error=str(exc),
+
+        if enable_classic_metrics:
+            ground_truths = [question.reference_answer, *question.answer_aliases]
+            result = replace(
+                result,
+                answer_em=metric_max_over_ground_truths(
+                    exact_match_score, generated.actual_answer, ground_truths
+                ),
+                answer_f1=metric_max_over_ground_truths(
+                    f1_score, generated.actual_answer, ground_truths
+                ),
             )
+        return result
 
     def _failed_result(
         self, group: ExperimentGroup, question: BatchQuestion, judge_model: str, error: str,
@@ -1385,11 +1463,16 @@ class RetrievalExperimentService:
         results: dict[tuple[str, ...], ExperimentQuestionResult],
         completed_at: str | None = None,
         evaluation_mode: str | None = None,
+        enable_llm_judge: bool | None = None,
+        enable_classic_metrics: bool | None = None,
     ) -> RetrievalExperimentRun:
         question_set_ids = self._normalize_question_set_ids(question_set_id)
         question_sets = [self.question_sets.get(project_id, item) for item in question_set_ids]
         dataset_by_id = {item.question_set_id: item for item in question_sets}
         project = self.projects.get(project_id)
+        state = self.load(project_id)
+        enable_llm_judge = state.get("enable_llm_judge", True) if enable_llm_judge is None else enable_llm_judge
+        enable_classic_metrics = state.get("enable_classic_metrics", False) if enable_classic_metrics is None else enable_classic_metrics
         summaries = []
         result_items = tuple(results.values())
         for group in groups:
@@ -1461,11 +1544,13 @@ class RetrievalExperimentService:
                 }
                 for item in group_items
             ])
+            answer_em = self._mean_present(item.answer_em for item in group_items)
+            answer_f1 = self._mean_present(item.answer_f1 for item in group_items)
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 total, answered, correct, partial, incorrect,
-                correct / total if total else None,
-                (2 * correct + partial) / (2 * total) if total else None,
+                correct / total if total and enable_llm_judge else None,
+                (2 * correct + partial) / (2 * total) if total and enable_llm_judge else None,
                 evidence_hit_rate, evidence_precision, document_hit_rate,
                 no_evidence_count, metrics_status, group.response_type, group.answer_reasoning_effort,
                 (
@@ -1480,6 +1565,8 @@ class RetrievalExperimentService:
                 None,
                 "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
                 **quality_summary,
+                average_answer_em=answer_em,
+                average_answer_f1=answer_f1,
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
@@ -1488,14 +1575,16 @@ class RetrievalExperimentService:
             max_concurrency, sum(len(item.questions) for item in question_sets), started_at, completed_at,
             tuple(summaries), result_items, tuple(question_set_ids),
             tuple(item.name for item in question_sets),
+            bool(enable_llm_judge), bool(enable_classic_metrics),
         )
-        state = self.load(project_id)
         state["question_set_ids"] = question_set_ids
         state["question_set_id"] = question_set_ids[0] if question_set_ids else ""
         state["judge_model"] = judge_model
         run_value = asdict(run)
         if evaluation_mode is not None:
             run_value["evaluation_mode"] = evaluation_mode
+        run_value["enable_llm_judge"] = bool(enable_llm_judge)
+        run_value["enable_classic_metrics"] = bool(enable_classic_metrics)
         state["run"] = run_value
         self._write(project_id, state)
         return run

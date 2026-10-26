@@ -82,9 +82,9 @@ class QueryTabAutoStrategyTests(unittest.TestCase):
         handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
         _model, method_update = handlers["update_query_method_compatibility"]("gpt-4o-mini", "auto")
         self.assertEqual(method_update["value"], "auto")
-        _model, other_update = handlers["update_model_method_compatibility"]("gpt-4o-mini", "local")
+        _model, other_update = handlers["update_autoqa_model_method_compatibility"]("gpt-4o-mini", "local")
         self.assertEqual(other_update["value"], "local")
-        self.assertIn("auto", [value for _label, value in other_update["choices"]])
+        self.assertIn("agentic", [value for _label, value in other_update["choices"]])
 
 
 if __name__ == "__main__":

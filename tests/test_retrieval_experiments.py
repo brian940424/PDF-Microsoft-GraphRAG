@@ -116,6 +116,44 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(len(question.answer_source_evidence), 1)
         self.assertEqual(self.service.load("project")["question_set_id"], question_set.question_set_id)
 
+    def test_classic_only_scores_aliases_and_exports_per_question_and_average_metrics(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        first = replace(
+            question_set.questions[0],
+            reference_answer="主要答案以外的文字",
+            answer_aliases=("先確認設備已關閉，準備指定工具，並依序完成安全檢查。",),
+        )
+        self.question_sets.update_questions(
+            "project", question_set.question_set_id, (first, *question_set.questions[1:])
+        )
+        group = ExperimentGroup("G01", "實驗組1", "gpt-4o-mini", "local")
+        self.service.save_configuration(
+            "project", [group], question_set.question_set_id, 2, "gpt-4.1-mini"
+        )
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=2)
+
+        run = self.service.evaluate_answers(
+            "project", question_set.question_set_id,
+            enable_llm_judge=False, enable_classic_metrics=True,
+        )
+
+        self.assertEqual(self.service.judging.calls, [])
+        self.assertFalse(run.enable_llm_judge)
+        self.assertTrue(run.enable_classic_metrics)
+        self.assertEqual(run.results[0].answer_em, 1.0)
+        self.assertEqual(run.results[0].answer_f1, 1.0)
+        self.assertEqual(run.results[0].evaluation_result, "未啟用")
+        self.assertEqual(run.groups[0].average_answer_em, 1.0)
+        self.assertEqual(run.groups[0].average_answer_f1, 1.0)
+
+        summary_path, details_path = self.service.export("project")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        details = json.loads(details_path.read_text(encoding="utf-8"))
+        self.assertFalse(summary["evaluation"]["enable_llm_judge"])
+        self.assertTrue(summary["evaluation"]["enable_classic_metrics"])
+        self.assertEqual(summary["summary"]["average_answer_em"], 1.0)
+        self.assertEqual(details["question_results"][0]["answer_em"], 1.0)
+
     def test_failed_replacement_keeps_existing_sets_when_source_pages_are_empty(self):
         existing = self.service.import_question_set("project", self.question_file)
         invalid_file = self.root / "invalid-pages.json"
@@ -741,12 +779,17 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         self.assertIn("回答模型", labels)
         self.assertIn("答案評分方式", labels)
+        self.assertIn("啟用 LLM Judge", labels)
+        self.assertIn("啟用 EM／F1 傳統指標", labels)
         self.assertEqual(len(app.renderables), 1)
         self.assertIn("測試最大並行請求數", labels)
         self.assertIn("回答生成進度", labels)
         self.assertIn("實驗組摘要", labels)
         self.assertIn("實驗組 × 題目集摘要", labels)
-        self.assertIn("逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）", labels)
+        self.assertIn(
+            "逐題實驗結果（不執行模型評測也可手動編輯等級與品質欄位；拒答欄填正確／錯誤／不適用）",
+            labels,
+        )
         button_values = [
             component.get_config().get("value")
             for component in app.blocks.values()
@@ -783,13 +826,13 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertTrue(experiment_results["interactive"])
         self.assertEqual(
             experiment_results["column_widths"],
-            ["7%", "10%", "5%", "9%", "12%", "17%", "15%", "6%", "9%", "10%"],
+            ["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%", "4%", "4%"],
         )
         block_values = list(app.blocks.values())
         result_table_position = next(

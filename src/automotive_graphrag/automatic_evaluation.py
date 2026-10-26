@@ -16,6 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .evaluation.classic_metrics import (
+    exact_match_score,
+    f1_score,
+    metric_max_over_ground_truths,
+)
 from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, chat_completion_api_params
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
@@ -42,6 +47,13 @@ class AutomaticEvaluationGrade:
 
 
 @dataclass(frozen=True, slots=True)
+class ClassicMetricsItem:
+    question_id: str
+    answer_em: float
+    answer_f1: float
+
+
+@dataclass(frozen=True, slots=True)
 class AutomaticEvaluationResult:
     project_id: str
     question_set_id: str
@@ -52,6 +64,12 @@ class AutomaticEvaluationResult:
     question_count: int
     correct_count: int
     items: tuple[AutomaticEvaluationItem, ...]
+    classic_items: tuple[ClassicMetricsItem, ...] = ()
+    average_answer_em: float | None = None
+    average_answer_f1: float | None = None
+    enable_llm_judge: bool = True
+    enable_classic_metrics: bool = False
+    judge_error: str | None = None
 
 
 class AutomaticEvaluationService:
@@ -77,12 +95,16 @@ class AutomaticEvaluationService:
         concurrency: int = 3,
         progress_callback: Callable[[int, int], None] | None = None,
         reasoning_effort: str = "medium",
+        enable_llm_judge: bool = True,
+        enable_classic_metrics: bool = False,
     ) -> AutomaticEvaluationResult:
+        if not enable_llm_judge and not enable_classic_metrics:
+            raise ProjectError("至少啟用一種評測方式")
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("評測並行數必須介於 1 到 32")
         previous = self.last_result(project_id, question_set_id)
         selected_ids: set[str] | None = None
-        if only_previous_failures:
+        if only_previous_failures and enable_llm_judge:
             if previous is None:
                 raise ProjectError("尚無自動評測結果，無法只重跑失敗題")
             selected_ids = {item.question_id for item in previous.items if not item.is_correct}
@@ -106,45 +128,66 @@ class AutomaticEvaluationService:
         if not eligible:
             raise ProjectError("沒有已完成回答且包含正確答案的題目可供評判")
 
-        prompt = "\n\n---\n\n".join(self._build_prompt([item]) for item in eligible)
-        model = model or self.connections.get_chat_model()
-        if model not in ALLOWED_CHAT_MODELS:
+        model = (model or self.connections.get_chat_model()) if enable_llm_judge else "—"
+        if enable_llm_judge and model not in ALLOWED_CHAT_MODELS:
             raise ProjectError(f"不支援的評判模型：{model}")
-
+        prompt = (
+            "\n\n---\n\n".join(self._build_prompt([item]) for item in eligible)
+            if enable_llm_judge else ""
+        )
         judged_by_id: dict[str, AutomaticEvaluationItem] = {}
         failures: list[str] = []
-        if progress_callback:
+        if progress_callback and enable_llm_judge:
             progress_callback(0, len(eligible))
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {
-                pool.submit(
-                    self.evaluate_single_answer,
-                    project_id,
-                    item.question_id,
-                    item.question,
-                    item.reference_answer,
-                    item.answer,
-                    model,
-                    reasoning_effort=reasoning_effort,
-                ): item
-                for item in eligible
-            }
-            for future in as_completed(futures):
-                question = futures[future]
-                try:
-                    judged_by_id[question.question_id] = future.result()
-                except Exception as exc:
-                    failures.append(f"{question.question_id}: {exc}")
-                if progress_callback:
-                    progress_callback(len(judged_by_id) + len(failures), len(eligible))
-        if failures:
+        if enable_llm_judge:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = {
+                    pool.submit(
+                        self.evaluate_single_answer,
+                        project_id,
+                        item.question_id,
+                        item.question,
+                        item.reference_answer,
+                        item.answer,
+                        model,
+                        reasoning_effort=reasoning_effort,
+                    ): item
+                    for item in eligible
+                }
+                for future in as_completed(futures):
+                    question = futures[future]
+                    try:
+                        judged_by_id[question.question_id] = future.result()
+                    except Exception as exc:
+                        failures.append(f"{question.question_id}: {exc}")
+                    if progress_callback:
+                        progress_callback(len(judged_by_id) + len(failures), len(eligible))
+        if failures and not enable_classic_metrics:
             raise ProjectError("自動評測部分請求失敗：" + "；".join(failures))
-        judged = [judged_by_id[item.question_id] for item in eligible]
-        if selected_ids is not None and previous is not None:
-            judged_by_id = {item.question_id: item for item in judged}
-            items = tuple(judged_by_id.get(item.question_id, item) for item in previous.items)
+        if enable_llm_judge and selected_ids is not None and previous is not None:
+            items_by_id = {item.question_id: item for item in previous.items}
+            items_by_id.update(judged_by_id)
+            items = tuple(items_by_id.values())
         else:
-            items = tuple(judged)
+            items = tuple(
+                judged_by_id[item.question_id]
+                for item in eligible
+                if item.question_id in judged_by_id
+            ) if enable_llm_judge else ()
+        classic_items = tuple(
+            ClassicMetricsItem(
+                question_id=item.question_id,
+                answer_em=metric_max_over_ground_truths(
+                    exact_match_score, item.answer, [item.reference_answer, *item.answer_aliases]
+                ),
+                answer_f1=metric_max_over_ground_truths(
+                    f1_score, item.answer, [item.reference_answer, *item.answer_aliases]
+                ),
+            )
+            for item in eligible
+        ) if enable_classic_metrics else ()
+        if progress_callback and not enable_llm_judge:
+            progress_callback(len(eligible), len(eligible))
         result = AutomaticEvaluationResult(
             project_id=project_id,
             question_set_id=question_set_id,
@@ -155,6 +198,12 @@ class AutomaticEvaluationService:
             question_count=len(items),
             correct_count=sum(item.is_correct for item in items),
             items=items,
+            classic_items=classic_items,
+            average_answer_em=(sum(item.answer_em for item in classic_items) / len(classic_items) if classic_items else None),
+            average_answer_f1=(sum(item.answer_f1 for item in classic_items) / len(classic_items) if classic_items else None),
+            enable_llm_judge=enable_llm_judge,
+            enable_classic_metrics=enable_classic_metrics,
+            judge_error=("自動評測部分請求失敗：" + "；".join(failures)) if failures else None,
         )
         self._write(result)
         return result
@@ -267,9 +316,20 @@ class AutomaticEvaluationService:
                     "judge_reason": item.get("judge_reason", "舊版評測結果；請重新評判"),
                 }
             migrated_items.append(AutomaticEvaluationItem(**item))
+        raw_classic_items = value.pop("classic_items", [])
+        classic_items = tuple(ClassicMetricsItem(**item) for item in raw_classic_items)
         allowed_fields = set(AutomaticEvaluationResult.__dataclass_fields__) - {"items"}
         value = {key: field for key, field in value.items() if key in allowed_fields}
         value.setdefault("correct_count", sum(item.is_correct for item in migrated_items))
+        value["classic_items"] = classic_items
+        value.setdefault(
+            "average_answer_em",
+            sum(item.answer_em for item in classic_items) / len(classic_items) if classic_items else None,
+        )
+        value.setdefault(
+            "average_answer_f1",
+            sum(item.answer_f1 for item in classic_items) / len(classic_items) if classic_items else None,
+        )
         value["items"] = tuple(migrated_items)
         return AutomaticEvaluationResult(**value)
 
@@ -307,6 +367,12 @@ class AutomaticEvaluationService:
             question_count=len(items),
             correct_count=sum(item.is_correct for item in items),
             items=tuple(items),
+            classic_items=result.classic_items,
+            average_answer_em=result.average_answer_em,
+            average_answer_f1=result.average_answer_f1,
+            enable_llm_judge=result.enable_llm_judge,
+            enable_classic_metrics=result.enable_classic_metrics,
+            judge_error=result.judge_error,
         )
         self._write(updated)
         return updated
@@ -329,19 +395,52 @@ class AutomaticEvaluationService:
         review_by_id = {item.question_id: item for item in reviews}
         payload = asdict(result)
         payload["human_reviews"] = [asdict(item) for item in reviews if item.human_label is not None]
+        judge_by_id = {item.question_id: item for item in result.items}
+        classic_by_id = {item.question_id: item for item in result.classic_items}
+        payload["question_results"] = [
+            {
+                "question_id": question_id,
+                "is_correct": judge_by_id[question_id].is_correct if question_id in judge_by_id else None,
+                "judge_reason": judge_by_id[question_id].judge_reason if question_id in judge_by_id else "",
+                "answer_em": classic_by_id[question_id].answer_em if question_id in classic_by_id else None,
+                "answer_f1": classic_by_id[question_id].answer_f1 if question_id in classic_by_id else None,
+            }
+            for question_id in dict.fromkeys([*judge_by_id, *classic_by_id])
+        ]
+        payload["summary"] = {
+            "question_count": result.question_count,
+            "judge_evaluated_count": len(result.items),
+            "correct_count": result.correct_count,
+            "average_answer_em": result.average_answer_em,
+            "average_answer_f1": result.average_answer_f1,
+            "enable_llm_judge": result.enable_llm_judge,
+            "enable_classic_metrics": result.enable_classic_metrics,
+        }
         self._atomic_text(json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         buffer = io.StringIO(newline="")
         fieldnames = [
             *AutomaticEvaluationItem.__dataclass_fields__,
+            "answer_em",
+            "answer_f1",
             "human_label",
             "reviewer_note",
             "reviewed_at",
         ]
         writer = csv.DictWriter(buffer, fieldnames=fieldnames)
         writer.writeheader()
-        for item in result.items:
-            row = asdict(item)
-            review = review_by_id.get(item.question_id)
+        judge_by_id = {item.question_id: item for item in result.items}
+        classic_by_id = {item.question_id: item for item in result.classic_items}
+        for question_id in dict.fromkeys([*judge_by_id, *classic_by_id]):
+            item = judge_by_id.get(question_id)
+            classic = classic_by_id.get(question_id)
+            row = asdict(item) if item else {
+                "question_id": question_id,
+                "is_correct": None,
+                "judge_reason": "",
+            }
+            row["answer_em"] = classic.answer_em if classic else None
+            row["answer_f1"] = classic.answer_f1 if classic else None
+            review = review_by_id.get(question_id)
             row.update(
                 {
                     "human_label": review.human_label if review else None,

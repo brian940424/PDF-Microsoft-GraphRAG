@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -170,6 +171,55 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["reviewer_note"], "人工抽查")
 
+    def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
+        question_set = self.question_sets.get("L33-SM3E", self.question_set_id)
+        questions = tuple(
+            replace(item, answer_aliases=(item.answer,)) for item in question_set.questions
+        )
+        self.question_sets.update_questions("L33-SM3E", self.question_set_id, questions)
+        judge = FakeJudge([])
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+
+        result = service.evaluate(
+            "L33-SM3E", self.question_set_id,
+            enable_llm_judge=False, enable_classic_metrics=True,
+        )
+
+        self.assertEqual(judge.calls, [])
+        self.assertEqual(result.items, ())
+        self.assertEqual([item.answer_em for item in result.classic_items], [1.0, 1.0])
+        self.assertEqual([item.answer_f1 for item in result.classic_items], [1.0, 1.0])
+        self.assertEqual(result.average_answer_em, 1.0)
+        self.assertEqual(result.average_answer_f1, 1.0)
+        self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
+
+        json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertFalse(payload["enable_llm_judge"])
+        self.assertTrue(payload["enable_classic_metrics"])
+        self.assertEqual(payload["classic_items"][0]["answer_em"], 1.0)
+        self.assertEqual(payload["question_results"][0]["answer_em"], 1.0)
+        self.assertEqual(payload["summary"]["average_answer_f1"], 1.0)
+        with csv_path.open(encoding="utf-8", newline="") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["answer_em"], "1.0")
+
+    def test_classic_scores_survive_llm_judge_failures_when_both_are_enabled(self) -> None:
+        class FailingJudge:
+            def __call__(self, *args, **kwargs):
+                raise RuntimeError("judge offline")
+
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, FailingJudge())
+        result = service.evaluate(
+            "L33-SM3E", self.question_set_id,
+            enable_llm_judge=True, enable_classic_metrics=True,
+        )
+        self.assertTrue(result.enable_llm_judge)
+        self.assertTrue(result.enable_classic_metrics)
+        self.assertEqual(len(result.classic_items), 2)
+        self.assertIn("judge offline", result.judge_error or "")
+
     def test_lenient_single_answer_uses_prompt_that_accepts_paraphrases_and_extras(self) -> None:
         judge = FakeJudge([self.judged(5)])
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
@@ -298,7 +348,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(sum(label == "回答格式" for label in labels), 1)
         compatibility_handler = next(
             fn.fn for fn in app.fns.values()
-            if getattr(fn.fn, "__name__", "") == "update_model_method_compatibility"
+            if getattr(fn.fn, "__name__", "") == "update_autoqa_model_method_compatibility"
         )
         model_update, method_update = compatibility_handler("gpt-6-luna", "local")
         self.assertIn("drift", [value for _label, value in method_update["choices"]])

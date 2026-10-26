@@ -5,7 +5,9 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from automotive_graphrag.automatic_evaluation import AutomaticEvaluationService
 from automotive_graphrag.automatic_qa import AutomaticQATestService
+from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.question_generation import GeneratedQuestion
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
@@ -106,6 +108,39 @@ class ConcurrentGeneration:
 
 
 class AutomaticQATests(unittest.TestCase):
+    def test_evaluate_existing_supports_classic_only_without_judge_requests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "projects")
+            store.create(project_id="TEST", display_name="Test", vehicle_name="Vehicle", manual_version="Version")
+            store.update_status("TEST", "INDEXED")
+            sets = QuestionSetService(store)
+            question_set = sets.create_with_questions(
+                "TEST", "automatic", [BatchQuestion("Q0001", "問題", "回答")]
+            )
+            query = ConcurrentQuery()
+            connections = ConnectionSettings(store.root)
+            judging = AutomaticEvaluationService(
+                store, sets, connections,
+                client=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Judge should not run")),
+            )
+            service = AutomaticQATestService(
+                store, object(), object(), query, sets, judging, NoRetrieval()
+            )
+            service.answer_existing(
+                "TEST", question_set.question_set_id, "gpt-4o-mini", "local", 1
+            )
+
+            report = service.evaluate_existing(
+                "TEST", question_set.question_set_id, "gpt-4o-mini", "gpt-4o-mini", "local",
+                enable_llm_judge=False, enable_classic_metrics=True,
+            )
+
+            self.assertIsNotNone(report.judge)
+            self.assertEqual(report.judge.items, ())
+            self.assertEqual(report.judge.average_answer_em, 1.0)
+            self.assertEqual(report.judge.average_answer_f1, 1.0)
+            self.assertEqual(len(query.models), 1)
+
     def test_luna_can_run_and_evaluate_with_drift(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = ProjectStore(Path(temporary) / "projects")
