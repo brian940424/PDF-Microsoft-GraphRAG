@@ -100,7 +100,10 @@ class IndexingService:
     def initialize(self, project_id: str) -> Path:
         return self._initialize(project_id, self.chat_model)
 
-    def _initialize(self, project_id: str, chat_model_override: str | None) -> Path:
+    def _initialize(
+        self, project_id: str, chat_model_override: str | None,
+        reasoning_effort: str = "medium",
+    ) -> Path:
         self.connection_settings.apply_to_environment(project_id)
         chat_model = chat_model_override or self.chat_model or self.connection_settings.get_chat_model()
         embedding_model = self.embedding_model or self.connection_settings.get_embedding_model()
@@ -128,7 +131,7 @@ class IndexingService:
             raise ProjectError("GraphRAG 初始化後未產生 settings.yaml")
         self._configure_jsonl_input(settings)
         self._configure_api_base(settings, self.connection_settings.get_api_base_url())
-        self._configure_models(settings, chat_model, embedding_model)
+        self._configure_models(settings, chat_model, embedding_model, reasoning_effort)
         self._sync_input(project_path, graph_root)
         return settings
 
@@ -137,6 +140,7 @@ class IndexingService:
         project_id: str,
         log_callback: Callable[[str], None] | None = None,
         chat_model: str | None = None,
+        reasoning_effort: str = "medium",
     ) -> IndexingResult:
         project = self.projects.get(project_id)
         if project.status not in {"READY", "STALE", "FAILED", "INDEXED"}:
@@ -157,7 +161,7 @@ class IndexingService:
             self._active_log = log_path
             self._active_log.write_text("", encoding="utf-8")
             self._log_callback = log_callback
-            self._initialize(project_id, chat_model)
+            self._initialize(project_id, chat_model, reasoning_effort)
             indexed_documents = self._processed_documents(project_path)
             self.projects.update_status(project_id, "INDEXING")
             if backup.exists():
@@ -312,10 +316,13 @@ class IndexingService:
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
 
     @staticmethod
-    def _configure_models(settings_path: Path, chat_model: str, embedding_model: str) -> None:
+    def _configure_models(
+        settings_path: Path, chat_model: str, embedding_model: str,
+        reasoning_effort: str = "medium",
+    ) -> None:
         value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
         for model in value.get("completion_models", {}).values():
-            configure_completion_model(model, chat_model)
+            configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
             model["model"] = embedding_model
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))

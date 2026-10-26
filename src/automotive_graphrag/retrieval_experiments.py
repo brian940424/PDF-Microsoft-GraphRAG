@@ -688,6 +688,7 @@ class RetrievalExperimentService:
         max_concurrency: int | None = None,
         update_callback: UpdateFunction | None = None,
         evaluation_mode: str | None = None,
+        judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ) -> RetrievalExperimentRun:
         """Evaluate previously saved answers without repeating GraphRAG retrieval."""
         state = self.load(project_id)
@@ -759,7 +760,8 @@ class RetrievalExperimentService:
                 except StopIteration:
                     return
                 future = executor.submit(
-                    self._evaluate_case, project_id, group, question, judge_model, result, evaluation_mode
+                    self._evaluate_case, project_id, group, question, judge_model, result, evaluation_mode,
+                    judge_reasoning_effort,
                 )
                 futures[future] = (group, question_set, question)
 
@@ -1114,12 +1116,14 @@ class RetrievalExperimentService:
         judge_model: str,
         generated: ExperimentQuestionResult,
         evaluation_mode: str = "strict",
+        judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ) -> ExperimentQuestionResult:
         try:
             judged = self.judging.evaluate_single_answer_grade(
                 project_id, question.question_id, question.question,
                 question.reference_answer, generated.actual_answer, judge_model,
                 evaluation_mode=evaluation_mode,
+                reasoning_effort=judge_reasoning_effort,
             )
             return replace(
                 generated,

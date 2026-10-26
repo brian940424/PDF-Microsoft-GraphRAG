@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import io
 import json
 import os
@@ -23,7 +24,7 @@ from .reviews import ReviewService
 
 PROMPT_VERSION = "answer-match-judge-v2"
 JUDGMENT_RESULTS = {"correct", "incorrect"}
-JudgeClient = Callable[[str, str, str, str], object]
+JudgeClient = Callable[..., object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,7 @@ class AutomaticEvaluationService:
         model: str | None = None,
         concurrency: int = 3,
         progress_callback: Callable[[int, int], None] | None = None,
+        reasoning_effort: str = "medium",
     ) -> AutomaticEvaluationResult:
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("評測並行數必須介於 1 到 32")
@@ -123,6 +125,7 @@ class AutomaticEvaluationService:
                     item.reference_answer,
                     item.answer,
                     model,
+                    reasoning_effort=reasoning_effort,
                 ): item
                 for item in eligible
             }
@@ -165,6 +168,7 @@ class AutomaticEvaluationService:
         system_answer: str,
         model: str,
         evaluation_mode: str = "strict",
+        reasoning_effort: str = "medium",
     ) -> AutomaticEvaluationItem:
         """Judge one answer without retrieval evidence or shared question-set mutation."""
         if model not in ALLOWED_CHAT_MODELS:
@@ -180,9 +184,11 @@ class AutomaticEvaluationService:
         prompt = self._build_prompt([case], evaluation_mode)
         api_key = self.connections.apply_to_environment(project_id)
         try:
-            response = self.client(
-                self.connections.get_api_base_url(), api_key, model, prompt
-            )
+            args = (self.connections.get_api_base_url(), api_key, model, prompt)
+            if "reasoning_effort" in inspect.signature(self.client).parameters:
+                response = self.client(*args, reasoning_effort=reasoning_effort)
+            else:
+                response = self.client(*args)
         except ProjectError:
             raise
         except Exception as exc:
@@ -192,6 +198,7 @@ class AutomaticEvaluationService:
     def evaluate_single_answer_grade(
         self, project_id: str, question_id: str, question: str, correct_answer: str,
         system_answer: str, model: str, evaluation_mode: str = "strict",
+        reasoning_effort: str = "medium",
     ) -> AutomaticEvaluationGrade:
         """Three-level evaluation for retrieval experiments only (0 incorrect, 1 partial, 2 full)."""
         if model not in ALLOWED_CHAT_MODELS:
@@ -202,7 +209,11 @@ class AutomaticEvaluationService:
         prompt = self._build_grade_prompt(case, evaluation_mode)
         api_key = self.connections.apply_to_environment(project_id)
         try:
-            response = self.client(self.connections.get_api_base_url(), api_key, model, prompt)
+            args = (self.connections.get_api_base_url(), api_key, model, prompt)
+            if "reasoning_effort" in inspect.signature(self.client).parameters:
+                response = self.client(*args, reasoning_effort=reasoning_effort)
+            else:
+                response = self.client(*args)
         except ProjectError:
             raise
         except Exception as exc:
@@ -416,13 +427,13 @@ class AutomaticEvaluationService:
         return result
 
     @staticmethod
-    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str) -> object:
+    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str = "medium") -> object:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         }
-        payload.update(chat_completion_api_params(model, 4000))
+        payload.update(chat_completion_api_params(model, 4000, reasoning_effort))
         request = urllib.request.Request(
             f"{api_base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),

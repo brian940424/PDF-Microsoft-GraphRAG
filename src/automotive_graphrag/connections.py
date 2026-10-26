@@ -29,14 +29,16 @@ DEFAULT_CHAT_MODEL = GPT6_LUNA_MODEL
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 
 
-def chat_completion_api_params(model: str, max_tokens: int) -> dict[str, object]:
+def chat_completion_api_params(
+    model: str, max_tokens: int, reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+) -> dict[str, object]:
     """Return parameters compatible with the selected model's Chat Completions API."""
     if model == GPT6_LUNA_MODEL:
         # GPT-6 reasoning requests use max_completion_tokens and reject sampling
         # parameters such as temperature/top_p when reasoning is enabled.
         return {
             "max_completion_tokens": max_tokens,
-            "reasoning_effort": DEFAULT_REASONING_EFFORT,
+            "reasoning_effort": reasoning_effort,
         }
     return {"temperature": 0, "max_tokens": max_tokens}
 

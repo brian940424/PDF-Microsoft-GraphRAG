@@ -42,7 +42,10 @@ class FakeJudge:
         reason = f"寬鬆評分 model={model}" if evaluation_mode == "lenient" else f"model={model}"
         return AutomaticEvaluationItem(question_id, is_correct, reason)
 
-    def evaluate_single_answer_grade(self, project_id, question_id, question, correct, actual, model, evaluation_mode="strict"):
+    def evaluate_single_answer_grade(
+        self, project_id, question_id, question, correct, actual, model,
+        evaluation_mode="strict", reasoning_effort="medium",
+    ):
         self.calls.append((project_id, question_id, question, correct, actual, model, evaluation_mode))
         score = 2 if actual == correct else (1 if actual and correct and actual in correct else 0)
         if evaluation_mode == "lenient" and self.lenient_result is not None:

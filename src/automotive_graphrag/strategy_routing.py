@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import urllib.error
 import urllib.request
@@ -39,19 +40,26 @@ class StrategyDecision:
     reason: str
 
 
-ChatFunction = Callable[[str, str, str, str], object]
+ChatFunction = Callable[..., object]
 
 
 class StrategyRouter:
     def __init__(self, chat: ChatFunction | None = None) -> None:
         self.chat = chat or self._openai_chat
 
-    def route(self, question: str, model: str, api_base_url: str, api_key: str | None) -> StrategyDecision:
+    def route(
+        self, question: str, model: str, api_base_url: str, api_key: str | None,
+        reasoning_effort: str = "medium",
+    ) -> StrategyDecision:
         """Return the selected method, falling back to Local instead of failing the query."""
         if not api_key:
             return self._fallback("尚未設定 API Key")
         try:
-            response = self.chat(api_base_url, api_key, model, ROUTING_PROMPT.format(question=question))
+            args = (api_base_url, api_key, model, ROUTING_PROMPT.format(question=question))
+            if "reasoning_effort" in inspect.signature(self.chat).parameters:
+                response = self.chat(*args, reasoning_effort=reasoning_effort)
+            else:
+                response = self.chat(*args)
             return self._parse_response(response)
         except ProjectError as exc:
             return self._fallback(str(exc))
@@ -71,13 +79,13 @@ class StrategyRouter:
         return StrategyDecision(FALLBACK_METHOD, f"自動判斷失敗（{detail}），改用預設 Local")
 
     @staticmethod
-    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str) -> object:
+    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str = "medium") -> object:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         }
-        payload.update(chat_completion_api_params(model, 2000))
+        payload.update(chat_completion_api_params(model, 2000, reasoning_effort))
         request = urllib.request.Request(
             f"{api_base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),

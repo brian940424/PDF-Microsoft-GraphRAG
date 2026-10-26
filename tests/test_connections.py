@@ -117,6 +117,10 @@ class ConnectionSettingsTests(unittest.TestCase):
             {"max_completion_tokens": 4000, "reasoning_effort": "medium"},
         )
         self.assertEqual(
+            chat_completion_api_params("gpt-6-luna", 4000, "high"),
+            {"max_completion_tokens": 4000, "reasoning_effort": "high"},
+        )
+        self.assertEqual(
             chat_completion_api_params("gpt-4o-mini", 4000),
             {"temperature": 0, "max_tokens": 4000},
         )

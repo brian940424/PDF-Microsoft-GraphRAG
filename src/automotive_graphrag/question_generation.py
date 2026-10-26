@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -23,7 +24,7 @@ from .source_sampling import SourceSample, SourceSampleBatch, SourceSamplingServ
 
 DIFFICULTIES = {"simple", "medium", "cross_section"}
 GENERATION_STATUSES = {"pending_review", "approved", "rejected"}
-GenerationClient = Callable[[str, str, str, str], object]
+GenerationClient = Callable[..., object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +126,7 @@ class QuestionGenerationService:
         model: str,
         maximum_source_characters: int = 1500,
         excluded_questions: Sequence[str] = (),
+        reasoning_effort: str = "medium",
     ) -> tuple[GeneratedQuestion, ...]:
         if question_count < 1:
             raise ProjectError("每份 PDF 生成題數必須是正整數")
@@ -163,12 +165,11 @@ class QuestionGenerationService:
             )
         api_key = self.connections.apply_to_environment(project_id)
         try:
-            response = self.client(
-                self.connections.get_api_base_url(),
-                api_key,
-                model,
-                prompt,
-            )
+            args = (self.connections.get_api_base_url(), api_key, model, prompt)
+            if "reasoning_effort" in inspect.signature(self.client).parameters:
+                response = self.client(*args, reasoning_effort=reasoning_effort)
+            else:
+                response = self.client(*args)
         except ProjectError:
             raise
         except Exception as exc:
@@ -414,13 +415,13 @@ class QuestionGenerationService:
         )
 
     @staticmethod
-    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str) -> object:
+    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str = "medium") -> object:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         }
-        payload.update(chat_completion_api_params(model, 4000))
+        payload.update(chat_completion_api_params(model, 4000, reasoning_effort))
         request = urllib.request.Request(
             f"{api_base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),

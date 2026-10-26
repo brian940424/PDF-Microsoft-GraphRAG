@@ -83,6 +83,7 @@ class QueryService:
         chat_model: str | None = None,
         response_type: str = "Single Paragraph",
         source: str | None = None,
+        reasoning_effort: str = "medium",
     ) -> QueryResult:
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
@@ -106,6 +107,7 @@ class QueryService:
             self.connection_settings.get_api_base_url(),
             selected_model,
             self.connection_settings.get_embedding_model(),
+            reasoning_effort,
         )
         started = datetime.now(timezone.utc)
         started_clock = time.monotonic()
@@ -117,6 +119,7 @@ class QueryService:
                 selected_model,
                 self.connection_settings.get_api_base_url(),
                 self.connection_settings.get_api_key(project_id),
+                reasoning_effort,
             )
             normalized_method, routing_reason = decision.method, decision.reason
         command = [
@@ -295,6 +298,7 @@ class QueryService:
         api_base_url: str,
         chat_model: str,
         embedding_model: str,
+        reasoning_effort: str = "medium",
     ) -> None:
         try:
             value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
@@ -304,7 +308,7 @@ class QueryService:
             for model in value.get(section, {}).values():
                 model["api_base"] = api_base_url
         for model in value.get("completion_models", {}).values():
-            configure_completion_model(model, chat_model)
+            configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
             model["model"] = embedding_model
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")

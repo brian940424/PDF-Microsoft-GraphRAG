@@ -165,10 +165,25 @@ class AnalyzePageTests(unittest.TestCase):
         payload = json.loads(request.data)
         self.assertEqual(request.full_url, "https://api.example/v1/chat/completions")
         self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertEqual(payload["temperature"], 0)
         self.assertIn("written in Traditional Chinese", payload["messages"][0]["content"])
         self.assertIn("Do not transcribe page numbers", payload["messages"][0]["content"])
         self.assertEqual(payload["messages"][1]["content"][1]["image_url"]["url"], "data:image/png;base64,aW1n")
         self.assertEqual(text, "雨刷規格\n\n| 項目 | 值 |\n|---|---|\n| 電壓 | 12V |\n\n連桿位於馬達右側")
+
+    def test_selected_reasoning_effort_is_sent_without_sampling_temperature(self) -> None:
+        content = {"page_number": 1, "content": [{"type": "text", "data": "text"}]}
+        response = {"choices": [{"message": {"content": json.dumps(content)}}]}
+        settings = VisionSettings(
+            model="gpt-6-luna", reasoning_effort="high",
+            api_base_url="https://api.example/v1", api_key="sk-test",
+        )
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(response).encode()
+            analyze_page("aW1n", 1, None, settings)
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(payload["reasoning_effort"], "high")
+        self.assertNotIn("temperature", payload)
 
     def test_authentication_error_aborts(self) -> None:
         error = urllib.error.HTTPError("url", 401, "Unauthorized", {}, io.BytesIO(b"invalid key"))

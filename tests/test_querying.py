@@ -195,6 +195,15 @@ class QueryServiceTests(unittest.TestCase):
         self.assertNotIn("temperature", model["call_args"])
         self.assertNotIn("top_p", model["call_args"])
 
+    def test_gpt6_query_uses_selected_reasoning_effort(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+
+        service.ask("L33-SM3E", "測試 GPT-6 深度", chat_model="gpt-6-luna", reasoning_effort="high")
+
+        settings = yaml.safe_load((self.graph_root / "settings.yaml").read_text())
+        model = settings["completion_models"]["default_completion_model"]
+        self.assertEqual(model["call_args"]["reasoning_effort"], "high")
+
     def test_gpt6_drift_uses_compatible_entrypoint(self) -> None:
         service = QueryService(self.store, connection_settings=self.connections)
 

@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterable
 
 import pymupdf
 
-from .connections import ALLOWED_CHAT_MODELS, GPT6_LUNA_MODEL
+from .connections import ALLOWED_CHAT_MODELS, GPT6_LUNA_MODEL, REASONING_EFFORT_OPTIONS
 from .projects import ProjectError
 
 
@@ -41,6 +41,7 @@ SCOPE_TABLES = "tables"
 SCOPE_DIAGRAMS = "diagrams"
 VISION_SCOPES = (SCOPE_FIGURES, SCOPE_TABLES, SCOPE_DIAGRAMS, SCOPE_ALL)
 DEFAULT_VISION_SCOPE = SCOPE_FIGURES
+VISION_REASONING_EFFORT_OPTIONS = ("none", *REASONING_EFFORT_OPTIONS)
 FIGURE_KINDS = ("table", "image", "drawing")
 DIAGRAM_KINDS = ("image", "drawing")
 SCOPE_KINDS: dict[str, tuple[str, ...]] = {
@@ -81,6 +82,7 @@ class VisionSettings:
     api_base_url: str = ""
     api_key: str = ""
     max_workers: int = DEFAULT_VISION_CONCURRENCY
+    reasoning_effort: str = "none"
 
     def __post_init__(self) -> None:
         if self.model not in ALLOWED_VISION_MODELS:
@@ -89,6 +91,8 @@ class VisionSettings:
             raise ProjectError(f"不支援的 Vision 解析範圍：{self.scope}")
         if self.max_workers < 1:
             raise ProjectError("Vision 並行數必須大於 0")
+        if self.reasoning_effort not in VISION_REASONING_EFFORT_OPTIONS:
+            raise ProjectError("不支援的 Vision 推理深度")
 
 
 class VisionAbort(Exception):
@@ -167,10 +171,11 @@ def analyze_page(image_base64: str, page_number: int, language: str | None, sett
         "response_format": {"type": "json_object"},
         # Transcription rarely benefits from reasoning; GPT-6 reasoning requests
         # only accept temperature when the effort is none.
-        "temperature": 0,
     }
     if settings.model == GPT6_LUNA_MODEL:
-        payload["reasoning_effort"] = "none"
+        payload["reasoning_effort"] = settings.reasoning_effort
+    if settings.model != GPT6_LUNA_MODEL or settings.reasoning_effort == "none":
+        payload["temperature"] = 0
     response = _post_json(f"{settings.api_base_url.rstrip('/')}/chat/completions", payload, settings.api_key)
     try:
         content = response["choices"][0]["message"]["content"]

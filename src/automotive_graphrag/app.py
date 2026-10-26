@@ -50,7 +50,7 @@ from .retrieval_experiments import (
     RetrievalExperimentService,
 )
 from .source_sampling import SourceSample, SourceSamplingService
-from .vision import ALLOWED_VISION_MODELS, DEFAULT_VISION_SCOPE, SCOPE_ALL, SCOPE_DIAGRAMS, SCOPE_FIGURES, SCOPE_TABLES, VisionSettings
+from .vision import ALLOWED_VISION_MODELS, DEFAULT_VISION_SCOPE, SCOPE_ALL, SCOPE_DIAGRAMS, SCOPE_FIGURES, SCOPE_TABLES, VISION_REASONING_EFFORT_OPTIONS, VisionSettings
 
 
 NEW_PROJECT_OPTION = "__new_project__"
@@ -77,6 +77,8 @@ VISION_SCOPE_CHOICES = [
     ("只讀圖表（僅含圖片或向量圖的頁面）", SCOPE_DIAGRAMS),
     ("全部頁面", SCOPE_ALL),
 ]
+REASONING_EFFORT_CHOICES = [(value, value) for value in ("low", "medium", "high")]
+VISION_REASONING_EFFORT_CHOICES = [(value, value) for value in VISION_REASONING_EFFORT_OPTIONS]
 EVIDENCE_COLUMNS = ["Context 順序", "Evidence ID", "來源／文件", "頁碼", "Chunk ID", "Score"]
 SOURCE_COLUMNS = ["PDF", "Page", "Chunk ID", "Section", "Text"]
 RETRIEVAL_COLUMNS = ["題號", "Gold Evidence", "檢索證據", "Evidence Hit", "Evidence Precision", "Document Hit"]
@@ -485,6 +487,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         method: str,
         chat_model: str | None,
         response_type: str,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         progress=gr.Progress(),
     ):
         hidden = gr.Group(visible=False)
@@ -496,7 +499,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         def run_query() -> None:
             try:
                 outcome["result"] = querying.ask(
-                    project_id, question, method, chat_model=chat_model, response_type=response_type, source="manual"
+                    project_id, question, method, chat_model=chat_model, response_type=response_type,
+                    source="manual", reasoning_effort=reasoning_effort,
                 )
             except Exception as exc:  # noqa: BLE001 - 交回主執行緒處理
                 outcome["error"] = exc
@@ -1678,6 +1682,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def evaluate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
         judge_model: str | None, evaluation_mode: str | None,
+        judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ):
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
@@ -1726,6 +1731,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     max_concurrency=limit,
                     update_callback=on_update,
                     evaluation_mode=evaluation_mode,
+                    judge_reasoning_effort=judge_reasoning_effort,
                 )
 
             def render_evaluation(finished):
@@ -1800,7 +1806,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ 自動儲存失敗：{exc}"
         return "✅ 題目與來源已自動儲存至目前專案"
 
-    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, method):
+    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, generation_effort, method):
         # 輸出最後三項依序為生題、回答、評測進度條；換題目後舊的回答與評測進度一併隱藏
         if not project_id:
             yield ("❌ 請先開啟專案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。",
@@ -1822,6 +1828,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     parallel_generation,
                     generation_model,
                     method,
+                    reasoning_effort=generation_effort,
                     progress_callback=report,
                 ),
                 render_generation,
@@ -1843,7 +1850,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             hidden_progress,
         )
 
-    def generate_automatic_answers(project_id, question_set_id, rows, answer_model, method, concurrency, response_type):
+    def generate_automatic_answers(project_id, question_set_id, rows, answer_model, answer_effort, method, concurrency, response_type):
         # 輸出最後兩項為回答與評測進度條；重新生成回答後舊的評測進度隱藏
         if not project_id or not question_set_id:
             yield ("❌ 請先生成或匯入題目集", "", autoqa_rows_update([]), gr.update(interactive=False),
@@ -1862,6 +1869,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             report = yield from stream_with_progress(
                 lambda progress: automatic_qa.answer_existing(
                     project_id, question_set_id, answer_model, method, int(concurrency), response_type,
+                    reasoning_effort=answer_effort,
                     progress_callback=progress,
                 ),
                 render_answers,
@@ -1892,7 +1900,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             hidden_progress,
         )
 
-    def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, method, concurrency, response_type):
+    def evaluate_automatic_answers(project_id, question_set_id, rows, answer_model, judge_model, judge_effort, method, concurrency, response_type):
         if not project_id or not question_set_id:
             yield "❌ 請先生成或匯入題目集", "", autoqa_rows_update([]), hidden_progress
             return
@@ -1909,6 +1917,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     project_id, question_set_id, answer_model, judge_model, method,
                     concurrency=int(concurrency),
                     response_type=response_type,
+                    reasoning_effort=judge_effort,
                     progress_callback=progress,
                 ),
                 render_judging,
@@ -2505,12 +2514,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def review_extract(
         project_id: str | None, filename: str | None, page: object, use_vision: bool,
         vision_model: str | None = None, vision_scope: str | None = None,
+        reasoning_effort: str = "none",
     ):
         """Extract the page again into the editor without saving it."""
         if not project_id or not filename or page in (None, ""):
             return gr.skip(), "❌ 請先選擇 PDF 與頁面"
         try:
-            vision = vision_settings(project_id, vision_model, vision_scope) if use_vision else None
+            vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort) if use_vision else None
             if use_vision and vision is None:
                 return gr.skip(), "❌ 請先在「前處理設定」選擇 Vision 模型"
             text = documents.extract_page_text(project_id, filename, int(page), vision)
@@ -2519,7 +2529,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         source = "Vision" if use_vision else "文字層"
         return text, f"⏳ 已以{source}重新解析第 {int(page)} 頁，**尚未儲存**；確認後請按「儲存並標示已檢查」"
 
-    def vision_settings(project_id: str, model: str | None, scope: str | None) -> VisionSettings | None:
+    def vision_settings(project_id: str, model: str | None, scope: str | None, reasoning_effort: str = "none") -> VisionSettings | None:
         if not model or model == VISION_DISABLED:
             return None
         api_key = connections.get_api_key(project_id)
@@ -2528,6 +2538,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return VisionSettings(
             model=model,
             scope=scope or DEFAULT_VISION_SCOPE,
+            reasoning_effort=reasoning_effort,
             api_base_url=connections.get_api_base_url(),
             api_key=api_key,
         )
@@ -2594,12 +2605,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         targets: list[str] | None,
         vision_model: str | None = None,
         vision_scope: str | None = None,
+        reasoning_effort: str = "none",
     ):
         if not project_id:
             yield "❌ 請先到「專案與連線設定」開啟專案", "", *document_view(None)
             return
         try:
-            vision = vision_settings(project_id, vision_model, vision_scope)
+            vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
         except ProjectError as exc:
             yield f"❌ {exc}", "", *document_view(project_id)
             return
@@ -2638,6 +2650,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         option_rows: list[list[object]] | None = None,
         vision_model: str | None = None,
         vision_scope: str | None = None,
+        reasoning_effort: str = "none",
+        indexing_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ):
         if not project_id:
             yield "❌ 請先到「專案與連線設定」開啟專案", "", ""
@@ -2652,7 +2666,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         progress = ""
         if pending:
             try:
-                vision = vision_settings(project_id, vision_model, vision_scope)
+                vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
             except ProjectError as exc:
                 yield f"❌ 前處理失敗：{exc}", "", progress
                 return
@@ -2679,7 +2693,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         def run_index() -> None:
             try:
                 result_holder.append(
-                    indexing.build(project_id, log_callback=chunks.put, chat_model=chat_model)
+                    indexing.build(
+                        project_id, log_callback=chunks.put, chat_model=chat_model,
+                        reasoning_effort=indexing_reasoning_effort,
+                    )
                 )
             except Exception as exc:
                 error_holder.append(exc)
@@ -2888,6 +2905,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 label="建圖模型",
                 info="只套用於 GraphRAG 建圖；更換模型後按「建立 Graph」即可重新建圖。",
             )
+            indexing_reasoning_effort = gr.Dropdown(
+                choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                label="建圖推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+            )
+            indexing_chat_model.change(
+                lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                inputs=indexing_chat_model, outputs=indexing_reasoning_effort,
+            )
             target_documents = gr.Dropdown(
                 label="選擇要前處理／建圖的 PDF",
                 multiselect=True,
@@ -2928,11 +2953,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="Vision 模型",
                         info="以 Vision 模型轉寫頁面影像：表格轉 Markdown、圖片與圖解改寫成文字描述，失敗的頁面改用文字層。會依頁數呼叫 API。",
                     )
+                    vision_reasoning_effort = gr.Dropdown(
+                        choices=VISION_REASONING_EFFORT_CHOICES, value="none", label="推理深度",
+                        visible=True,
+                        info="僅 gpt-6-luna 支援；預設 none。",
+                    )
                     vision_scope = gr.Dropdown(
                         choices=VISION_SCOPE_CHOICES,
                         value=DEFAULT_VISION_SCOPE,
                         label="Vision 解析範圍",
                         info="沒有文字層的頁面（例如掃描頁）一律送 Vision。",
+                    )
+                    vision_model.change(
+                        lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                        inputs=vision_model, outputs=vision_reasoning_effort,
                     )
                 processing_options_table = gr.Dataframe(
                     headers=PROCESSING_COLUMNS,
@@ -2991,6 +3025,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         value=connections.get_chat_model(),
                         label="本次回答模型",
                     )
+                    query_reasoning_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                        info="僅 gpt-6-luna 支援。",
+                    )
                     query_method = gr.Dropdown(
                         choices=QUERY_METHOD_CHOICES,
                         value="auto",
@@ -3006,6 +3045,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         update_query_method_compatibility,
                         inputs=[query_chat_model, query_method],
                         outputs=[query_chat_model, query_method],
+                    )
+                    query_chat_model.change(
+                        lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                        inputs=query_chat_model, outputs=query_reasoning_effort,
                     )
                     query_method.input(
                         update_query_method_compatibility,
@@ -3089,7 +3132,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     autoqa_generation_model = gr.Dropdown(
                         choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="生題模型"
                     )
+                    autoqa_generation_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                    )
                     autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                autoqa_generation_model.change(
+                    lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                    inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
+                )
                 autoqa_generate_button = gr.Button("生成題目", variant="primary")
                 autoqa_generate_progress = gr.HTML(label="題目生成進度", visible=False)
                 autoqa_result = gr.Markdown()
@@ -3109,6 +3160,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     autoqa_answer_model = gr.Dropdown(
                         choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="回答模型"
                     )
+                    autoqa_answer_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                    )
                     autoqa_method = gr.Dropdown(
                         choices=QUERY_METHOD_CHOICES,
                         value="local", label="檢索模式",
@@ -3127,6 +3182,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     inputs=[autoqa_answer_model, autoqa_method],
                     outputs=[autoqa_answer_model, autoqa_method],
                 )
+                autoqa_answer_model.change(
+                    lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                    inputs=autoqa_answer_model, outputs=autoqa_answer_effort,
+                )
                 autoqa_method.input(
                     update_model_method_compatibility,
                     inputs=[autoqa_answer_model, autoqa_method],
@@ -3139,10 +3198,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     autoqa_judge_model = gr.Dropdown(
                         choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
                     )
+                    autoqa_judge_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                    )
                     autoqa_judge_concurrency = gr.Number(
                         label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
                     )
                 autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
+                autoqa_judge_model.change(
+                    lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                    inputs=autoqa_judge_model, outputs=autoqa_judge_effort,
+                )
                 autoqa_judge_progress = gr.HTML(label="回答評測進度", visible=False)
                 autoqa_summary = gr.Markdown()
                 autoqa_table = gr.Dataframe(
@@ -3351,6 +3418,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     experiment_judge_model = gr.Dropdown(
                         choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
                         label="全域評測模型（套用至所有實驗組）",
+                    )
+                    experiment_judge_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="評測推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                    )
+                    experiment_judge_model.change(
+                        lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                        inputs=experiment_judge_model, outputs=experiment_judge_effort,
                     )
                     experiment_evaluation_mode = gr.Dropdown(
                         choices=[("嚴格評分（目前規則）", "strict"), ("寬鬆評分（答案完整包含即正確）", "lenient")],
@@ -3703,8 +3778,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             document_view, inputs=document_project, outputs=document_view_outputs
         )
         review_vision_button.click(
-            lambda project_id, filename, page, model, scope: review_extract(project_id, filename, page, True, model, scope),
-            inputs=[document_project, review_document, review_page, vision_model, vision_scope],
+            lambda project_id, filename, page, model, scope, effort: review_extract(project_id, filename, page, True, model, scope, effort),
+            inputs=[document_project, review_document, review_page, vision_model, vision_scope, vision_reasoning_effort],
             outputs=[review_text, review_status],
         )
         review_text_layer_button.click(
@@ -3733,14 +3808,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         preprocess_button.click(
             preprocess_documents,
-            inputs=[document_project, processing_options_table, target_documents, vision_model, vision_scope],
+            inputs=[document_project, processing_options_table, target_documents, vision_model, vision_scope, vision_reasoning_effort],
             outputs=[document_result, document_progress, *document_view_outputs],
         ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document).then(
             review_refresh, inputs=review_inputs, outputs=review_outputs
         )
         index_button.click(
             build_index,
-            inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope],
+            inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope, vision_reasoning_effort, indexing_reasoning_effort],
             outputs=[document_result, indexing_log, document_progress],
         ).then(document_view, inputs=document_project, outputs=document_view_outputs)
         document_refresh_button.click(
@@ -3805,7 +3880,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         experiment_evaluate_button.click(
             evaluate_retrieval_experiment_answers,
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model,
-                    experiment_evaluation_mode],
+                    experiment_evaluation_mode, experiment_judge_effort],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
                      experiment_max_concurrency, experiment_judge_model,
@@ -3833,7 +3908,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generate_automatic_qa,
             inputs=[
                 automatic_project, autoqa_questions_per_pdf, autoqa_parallel_generation,
-                autoqa_generation_model, autoqa_method,
+                autoqa_generation_model, autoqa_generation_effort, autoqa_method,
             ],
             outputs=[
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,
@@ -3888,7 +3963,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generate_automatic_answers,
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
-                autoqa_answer_model, autoqa_method, autoqa_answer_concurrency,
+                autoqa_answer_model, autoqa_answer_effort, autoqa_method, autoqa_answer_concurrency,
                 autoqa_response_type,
             ],
             outputs=[autoqa_generation_status, autoqa_summary, autoqa_table, autoqa_judge_button,
@@ -3899,7 +3974,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             evaluate_automatic_answers,
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
-                autoqa_answer_model, autoqa_judge_model, autoqa_method, autoqa_judge_concurrency,
+                autoqa_answer_model, autoqa_judge_model, autoqa_judge_effort, autoqa_method, autoqa_judge_concurrency,
                 autoqa_response_type,
             ],
             outputs=[autoqa_result, autoqa_summary, autoqa_table, autoqa_judge_progress],
@@ -3921,7 +3996,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             show_progress="hidden",
         ).then(
             ask_question,
-            inputs=[query_project, question, query_method, query_chat_model, query_response_type],
+            inputs=[query_project, question, query_method, query_chat_model, query_response_type, query_reasoning_effort],
             outputs=[
                 query_answer,
                 query_summary,

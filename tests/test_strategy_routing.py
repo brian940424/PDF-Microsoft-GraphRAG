@@ -69,6 +69,12 @@ class QueryTabAutoStrategyTests(unittest.TestCase):
         self.assertEqual(len(method_dropdowns), 1)
         self.assertEqual(method_dropdowns[0]["value"], "auto")
         self.assertIn("auto", [value for _label, value in method_dropdowns[0]["choices"]])
+        reasoning_dropdowns = [
+            component.get_config()
+            for component in app.blocks.values()
+            if hasattr(component, "get_config") and component.get_config().get("label") == "推理深度"
+        ]
+        self.assertGreaterEqual(len(reasoning_dropdowns), 7)
 
         handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
         _model, method_update = handlers["update_query_method_compatibility"]("gpt-4o-mini", "auto")

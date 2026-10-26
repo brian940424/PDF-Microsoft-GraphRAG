@@ -19,14 +19,19 @@ class ConcurrentQuery:
         self.maximum_active = 0
         self.models = []
         self.response_types = []
+        self.reasoning_efforts = []
         self.lock = threading.Lock()
 
-    def ask(self, project_id, question, method="local", chat_model=None, response_type="Single Paragraph", source=None):
+    def ask(
+        self, project_id, question, method="local", chat_model=None,
+        response_type="Single Paragraph", source=None, reasoning_effort="medium",
+    ):
         with self.lock:
             self.active += 1
             self.maximum_active = max(self.maximum_active, self.active)
             self.models.append(chat_model)
             self.response_types.append(response_type)
+            self.reasoning_efforts.append(reasoning_effort)
         time.sleep(0.02)
         with self.lock:
             self.active -= 1
@@ -120,11 +125,13 @@ class AutomaticQATests(unittest.TestCase):
             report = service.answer_existing(
                 "TEST", question_set.question_set_id, "gpt-6-luna", "drift", 1,
                 "List of 3-7 Points",
+                reasoning_effort="high",
             )
             self.assertEqual(report.answer_model, "gpt-6-luna")
             self.assertEqual(report.question_set.questions[0].status, "COMPLETED")
             self.assertEqual(query.models, ["gpt-6-luna"])
             self.assertEqual(query.response_types, ["List of 3-7 Points"])
+            self.assertEqual(query.reasoning_efforts, ["high"])
             self.assertEqual(report.question_set.response_type, "List of 3-7 Points")
 
             report = service.evaluate_existing(
