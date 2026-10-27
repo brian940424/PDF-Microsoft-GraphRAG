@@ -339,6 +339,8 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
             )
             average_answer_em = RetrievalExperimentService._mean_present(item.get("answer_em") for item in selected)
             average_answer_f1 = RetrievalExperimentService._mean_present(item.get("answer_f1") for item in selected)
+            average_term_hit = RetrievalExperimentService._mean_present(item.get("answer_term_hit") for item in selected)
+            average_term_coverage = RetrievalExperimentService._mean_present(item.get("answer_term_coverage") for item in selected)
             rows.append([
                 group.get("name", group_id),
                 f"{question_set.name} ({question_set.question_set_id[:8]})",
@@ -358,6 +360,8 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 quality_reviewed,
                 f"{average_answer_em:.1%}" if average_answer_em is not None else "—",
                 f"{average_answer_f1:.1%}" if average_answer_f1 is not None else "—",
+                f"{average_term_hit:.1%}" if average_term_hit is not None else "—",
+                f"{average_term_coverage:.1%}" if average_term_coverage is not None else "—",
             ])
     return rows
 
@@ -962,6 +966,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_strategy_cell(report.question_set, question),
                 classic[question.question_id].answer_em if question.question_id in classic else None,
                 classic[question.question_id].answer_f1 if question.question_id in classic else None,
+                classic[question.question_id].answer_term_hit if question.question_id in classic else None,
+                classic[question.question_id].answer_term_coverage if question.question_id in classic else None,
             ])
         return rows
 
@@ -983,6 +989,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_strategy_cell(question_set, question),
                 classic[question_id].answer_em if question_id in classic else None,
                 classic[question_id].answer_f1 if question_id in classic else None,
+                classic[question_id].answer_term_hit if question_id in classic else None,
+                classic[question_id].answer_term_coverage if question_id in classic else None,
             ])
         return rows
 
@@ -1198,6 +1206,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 + (format(report.judge.average_answer_em, ".1%") if report.judge.average_answer_em is not None else "—")
                 + "｜Average F1 "
                 + (format(report.judge.average_answer_f1, ".1%") if report.judge.average_answer_f1 is not None else "—")
+                + "｜Term Hit "
+                + (format(report.judge.average_answer_term_hit, ".1%") if report.judge.average_answer_term_hit is not None else "—")
+                + "｜Term Coverage "
+                + (format(report.judge.average_answer_term_coverage, ".1%") if report.judge.average_answer_term_coverage is not None else "—")
             )
         lines.append("**模型：** 生題 " + report.generation_model + "｜回答 " + report.answer_model)
         if report.retrieval:
@@ -1260,6 +1272,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             summary += (
                 f"｜Average F1 {judge.average_answer_f1:.1%}"
                 if judge.average_answer_f1 is not None else "｜Average F1 —"
+            )
+            summary += (
+                f"｜Term Hit {judge.average_answer_term_hit:.1%}"
+                if judge.average_answer_term_hit is not None else "｜Term Hit —"
+            )
+            summary += (
+                f"｜Term Coverage {judge.average_answer_term_coverage:.1%}"
+                if judge.average_answer_term_coverage is not None else "｜Term Coverage —"
             )
         if retrieval:
             summary += (
@@ -1410,6 +1430,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("quality_reviewed_count", 0),
                     f"{item['average_answer_em']:.1%}" if item.get("average_answer_em") is not None else "—",
                     f"{item['average_answer_f1']:.1%}" if item.get("average_answer_f1") is not None else "—",
+                    f"{item['average_answer_term_hit']:.1%}" if item.get("average_answer_term_hit") is not None else "—",
+                    f"{item['average_answer_term_coverage']:.1%}" if item.get("average_answer_term_coverage") is not None else "—",
                 ]
                 for item in run.get("groups", [])
             ]
@@ -1435,6 +1457,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     _quality_annotation_label(item.get("refusal_correctness")),
                     f"{item['answer_em']:.1%}" if item.get("answer_em") is not None else "",
                     f"{item['answer_f1']:.1%}" if item.get("answer_f1") is not None else "",
+                    f"{item['answer_term_hit']:.1%}" if item.get("answer_term_hit") is not None else "",
+                    f"{item['answer_term_coverage']:.1%}" if item.get("answer_term_coverage") is not None else "",
                 ]
                 for item in ordered_raw_results
                 if str(item.get("actual_answer", "") or "").strip()
@@ -3394,7 +3418,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             with gr.Accordion("③ 評測回答", open=True, elem_classes=["static-section", "bold-title"]):
                 with gr.Row():
                     autoqa_enable_llm_judge = gr.Checkbox(label="啟用 LLM Judge", value=True)
-                    autoqa_enable_classic_metrics = gr.Checkbox(label="啟用 EM／F1 傳統指標", value=False)
+                    autoqa_enable_classic_metrics = gr.Checkbox(label="啟用程式化答案指標（EM／F1／詞項）", value=False)
                 with gr.Row():
                     autoqa_judge_model = gr.Dropdown(
                         choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
@@ -3423,10 +3447,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_progress = gr.HTML(label="回答評測進度", visible=False)
                 autoqa_summary = gr.Markdown()
                 autoqa_table = gr.Dataframe(
-                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由", "實際檢索策略", "Answer EM", "Answer F1"],
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "判斷", "評判理由", "實際檢索策略", "Answer EM", "Answer F1", "Answer Term Hit", "Answer Term Coverage"],
                     interactive=True,
-                    datatype=["str", "str", "str", "str", "str", "bool", "str", "str", "number", "number"],
-                    column_widths=["5%", "9%", "13%", "19%", "15%", "6%", "11%", "9%", "6%", "6%"],
+                    datatype=["str", "str", "str", "str", "str", "bool", "str", "str", "number", "number", "number", "number"],
+                    column_widths=["5%", "9%", "13%", "19%", "15%", "6%", "11%", "9%", "5%", "5%", "6%", "7%"],
                     label="評測結果（暫時開放整表編輯；判斷欄會保存，其餘欄位只暫存於目前畫面）",
                     wrap=True,
                     visible=False,
@@ -3637,7 +3661,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="啟用 LLM Judge", value=True,
                     )
                     experiment_enable_classic_metrics = gr.Checkbox(
-                        label="啟用 EM／F1 傳統指標", value=False,
+                        label="啟用程式化答案指標（EM／F1／詞項）", value=False,
                     )
                 with gr.Row():
                     experiment_judge_model = gr.Dropdown(
@@ -3675,26 +3699,26 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     "無根據主張數只計回答中沒有來源支持的事實主張；拒答欄僅對預期無答案題填「正確」或「錯誤」，其餘填「不適用」。"
                 )
                 experiment_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1"],
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * 28,
+                    datatype=["str"] * 30,
                     label="實驗組摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_dataset_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1"],
+                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * 23,
+                    datatype=["str"] * 25,
                     label="實驗組 × 題目集摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1", "Answer Term Hit", "Answer Term Coverage"],
                     interactive=True,
-                    datatype=["str"] * 16,
-                    column_widths=["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%", "4%", "4%"],
+                    datatype=["str"] * 18,
+                    column_widths=["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%", "4%", "4%", "5%", "6%"],
                     label="逐題實驗結果（不執行模型評測也可手動編輯等級與品質欄位；拒答欄填正確／錯誤／不適用）",
                     wrap=True,
                     visible=False,

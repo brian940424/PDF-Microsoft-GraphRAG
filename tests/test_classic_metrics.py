@@ -2,6 +2,7 @@ import pytest
 
 from automotive_graphrag.evaluation.classic_metrics import (
     calculate_corpus_metrics,
+    answer_term_scores,
     exact_match_score,
     f1_score,
     metric_max_over_ground_truths,
@@ -45,6 +46,22 @@ def test_f1_scores_chinese_partial_overlap_by_character():
     ) == 1.0
 
 
+def test_answer_term_hit_and_coverage_for_english_words():
+    assert answer_term_scores("I have big penis", "big penis") == (1.0, 1.0)
+    assert answer_term_scores("I like penis", "big penis") == (0.0, 0.5)
+    assert answer_term_scores("penmanship", "penis") == (0.0, 0.0)
+
+
+def test_answer_term_hit_and_coverage_for_mixed_chinese_and_english():
+    assert answer_term_scores("引擎過熱，engine is hot", "引擎 engine") == (1.0, 1.0)
+    assert answer_term_scores("引擎已啟動", "引擎 engine") == (0.0, pytest.approx(2 / 3))
+
+
+def test_answer_term_scores_ignore_citations_and_empty_expected_answers():
+    assert answer_term_scores("big [Data: Sources (12)]", "big") == (1.0, 1.0)
+    assert answer_term_scores("anything", "!!!") == (0.0, 0.0)
+
+
 def test_empty_answers_follow_musique_no_answer_behavior():
     assert f1_score("", "the") == 1.0
     assert f1_score("", "answer") == 0.0
@@ -74,11 +91,16 @@ def test_corpus_metrics_pairs_by_id_and_uses_aliases():
     assert calculate_corpus_metrics(predictions, ground_truths) == {
         "answer_em": 0.5,
         "answer_f1": pytest.approx(5 / 6),
+        "answer_term_hit": 1.0,
+        "answer_term_coverage": 1.0,
     }
 
 
 def test_corpus_metrics_returns_zero_for_empty_corpus():
-    assert calculate_corpus_metrics([], []) == {"answer_em": 0.0, "answer_f1": 0.0}
+    assert calculate_corpus_metrics([], []) == {
+        "answer_em": 0.0, "answer_f1": 0.0,
+        "answer_term_hit": 0.0, "answer_term_coverage": 0.0,
+    }
 
 
 @pytest.mark.parametrize(

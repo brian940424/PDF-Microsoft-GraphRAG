@@ -189,8 +189,12 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(result.items, ())
         self.assertEqual([item.answer_em for item in result.classic_items], [1.0, 1.0])
         self.assertEqual([item.answer_f1 for item in result.classic_items], [1.0, 1.0])
+        self.assertEqual([item.answer_term_hit for item in result.classic_items], [1.0, 1.0])
+        self.assertEqual([item.answer_term_coverage for item in result.classic_items], [1.0, 1.0])
         self.assertEqual(result.average_answer_em, 1.0)
         self.assertEqual(result.average_answer_f1, 1.0)
+        self.assertEqual(result.average_answer_term_hit, 1.0)
+        self.assertEqual(result.average_answer_term_coverage, 1.0)
         self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
 
         json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
@@ -199,11 +203,14 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertTrue(payload["enable_classic_metrics"])
         self.assertEqual(payload["classic_items"][0]["answer_em"], 1.0)
         self.assertEqual(payload["question_results"][0]["answer_em"], 1.0)
+        self.assertEqual(payload["question_results"][0]["answer_term_coverage"], 1.0)
         self.assertEqual(payload["summary"]["average_answer_f1"], 1.0)
+        self.assertEqual(payload["summary"]["average_answer_term_hit"], 1.0)
         with csv_path.open(encoding="utf-8", newline="") as source:
             rows = list(csv.DictReader(source))
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["answer_em"], "1.0")
+        self.assertEqual(rows[0]["answer_term_hit"], "1.0")
 
     def test_classic_scores_survive_llm_judge_failures_when_both_are_enabled(self) -> None:
         class FailingJudge:

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 from .evaluation.classic_metrics import (
+    answer_term_scores,
     exact_match_score,
     f1_score,
     metric_max_over_ground_truths,
@@ -51,6 +52,8 @@ class ClassicMetricsItem:
     question_id: str
     answer_em: float
     answer_f1: float
+    answer_term_hit: float | None = None
+    answer_term_coverage: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,8 @@ class AutomaticEvaluationResult:
     classic_items: tuple[ClassicMetricsItem, ...] = ()
     average_answer_em: float | None = None
     average_answer_f1: float | None = None
+    average_answer_term_hit: float | None = None
+    average_answer_term_coverage: float | None = None
     enable_llm_judge: bool = True
     enable_classic_metrics: bool = False
     judge_error: str | None = None
@@ -183,6 +188,14 @@ class AutomaticEvaluationService:
                 answer_f1=metric_max_over_ground_truths(
                     f1_score, item.answer, [item.reference_answer, *item.answer_aliases]
                 ),
+                answer_term_hit=metric_max_over_ground_truths(
+                    lambda prediction, truth: answer_term_scores(prediction, truth)[0],
+                    item.answer, [item.reference_answer, *item.answer_aliases],
+                ),
+                answer_term_coverage=metric_max_over_ground_truths(
+                    lambda prediction, truth: answer_term_scores(prediction, truth)[1],
+                    item.answer, [item.reference_answer, *item.answer_aliases],
+                ),
             )
             for item in eligible
         ) if enable_classic_metrics else ()
@@ -201,6 +214,8 @@ class AutomaticEvaluationService:
             classic_items=classic_items,
             average_answer_em=(sum(item.answer_em for item in classic_items) / len(classic_items) if classic_items else None),
             average_answer_f1=(sum(item.answer_f1 for item in classic_items) / len(classic_items) if classic_items else None),
+            average_answer_term_hit=(sum(item.answer_term_hit for item in classic_items) / len(classic_items) if classic_items else None),
+            average_answer_term_coverage=(sum(item.answer_term_coverage for item in classic_items) / len(classic_items) if classic_items else None),
             enable_llm_judge=enable_llm_judge,
             enable_classic_metrics=enable_classic_metrics,
             judge_error=("自動評測部分請求失敗：" + "；".join(failures)) if failures else None,
@@ -330,6 +345,14 @@ class AutomaticEvaluationService:
             "average_answer_f1",
             sum(item.answer_f1 for item in classic_items) / len(classic_items) if classic_items else None,
         )
+        value.setdefault(
+            "average_answer_term_hit",
+            self._mean_present(item.answer_term_hit for item in classic_items),
+        )
+        value.setdefault(
+            "average_answer_term_coverage",
+            self._mean_present(item.answer_term_coverage for item in classic_items),
+        )
         value["items"] = tuple(migrated_items)
         return AutomaticEvaluationResult(**value)
 
@@ -377,6 +400,11 @@ class AutomaticEvaluationService:
         self._write(updated)
         return updated
 
+    @staticmethod
+    def _mean_present(values) -> float | None:
+        present = [value for value in values if value is not None]
+        return sum(present) / len(present) if present else None
+
     def clear_result(self, project_id: str, question_set_id: str) -> None:
         path = self._path(project_id, question_set_id)
         try:
@@ -404,6 +432,8 @@ class AutomaticEvaluationService:
                 "judge_reason": judge_by_id[question_id].judge_reason if question_id in judge_by_id else "",
                 "answer_em": classic_by_id[question_id].answer_em if question_id in classic_by_id else None,
                 "answer_f1": classic_by_id[question_id].answer_f1 if question_id in classic_by_id else None,
+                "answer_term_hit": classic_by_id[question_id].answer_term_hit if question_id in classic_by_id else None,
+                "answer_term_coverage": classic_by_id[question_id].answer_term_coverage if question_id in classic_by_id else None,
             }
             for question_id in dict.fromkeys([*judge_by_id, *classic_by_id])
         ]
@@ -413,6 +443,8 @@ class AutomaticEvaluationService:
             "correct_count": result.correct_count,
             "average_answer_em": result.average_answer_em,
             "average_answer_f1": result.average_answer_f1,
+            "average_answer_term_hit": result.average_answer_term_hit,
+            "average_answer_term_coverage": result.average_answer_term_coverage,
             "enable_llm_judge": result.enable_llm_judge,
             "enable_classic_metrics": result.enable_classic_metrics,
         }
@@ -422,6 +454,8 @@ class AutomaticEvaluationService:
             *AutomaticEvaluationItem.__dataclass_fields__,
             "answer_em",
             "answer_f1",
+            "answer_term_hit",
+            "answer_term_coverage",
             "human_label",
             "reviewer_note",
             "reviewed_at",
@@ -440,6 +474,8 @@ class AutomaticEvaluationService:
             }
             row["answer_em"] = classic.answer_em if classic else None
             row["answer_f1"] = classic.answer_f1 if classic else None
+            row["answer_term_hit"] = classic.answer_term_hit if classic else None
+            row["answer_term_coverage"] = classic.answer_term_coverage if classic else None
             review = review_by_id.get(question_id)
             row.update(
                 {

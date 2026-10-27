@@ -30,7 +30,7 @@ from .connections import (
     configure_completion_model,
 )
 from .evidence import Evidence, EvidenceService
-from .evaluation.classic_metrics import exact_match_score, f1_score, metric_max_over_ground_truths
+from .evaluation.classic_metrics import answer_term_scores, exact_match_score, f1_score, metric_max_over_ground_truths
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
@@ -168,6 +168,8 @@ class ExperimentQuestionResult:
     refusal_correctness: str | None = None
     answer_em: float | None = None
     answer_f1: float | None = None
+    answer_term_hit: float | None = None
+    answer_term_coverage: float | None = None
 
     @property
     def effective_method(self) -> str:
@@ -210,6 +212,8 @@ class ExperimentGroupSummary:
     quality_reviewed_count: int = 0
     average_answer_em: float | None = None
     average_answer_f1: float | None = None
+    average_answer_term_hit: float | None = None
+    average_answer_term_coverage: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +332,8 @@ class RetrievalExperimentService:
                     "score_accuracy": (2 * full + partial) / (2 * total) if total and judge_enabled else None,
                     "average_answer_em": self._mean_present(item.get("answer_em") for item in group_results),
                     "average_answer_f1": self._mean_present(item.get("answer_f1") for item in group_results),
+                    "average_answer_term_hit": self._mean_present(item.get("answer_term_hit") for item in group_results),
+                    "average_answer_term_coverage": self._mean_present(item.get("answer_term_coverage") for item in group_results),
                 }
                 if any(group.get(key) != field for key, field in updated.items()):
                     group.update(updated)
@@ -1076,6 +1082,8 @@ class RetrievalExperimentService:
                     "answer_point_coverage_percent": summary.get("answer_point_coverage_percent"),
                     "average_answer_em": summary.get("average_answer_em"),
                     "average_answer_f1": summary.get("average_answer_f1"),
+                    "average_answer_term_hit": summary.get("average_answer_term_hit"),
+                    "average_answer_term_coverage": summary.get("average_answer_term_coverage"),
                     "unsupported_answer_rate": summary.get("unsupported_answer_rate"),
                     "average_unsupported_claim_count": summary.get("average_unsupported_claim_count"),
                     "refusal_accuracy": summary.get("refusal_accuracy"),
@@ -1116,6 +1124,8 @@ class RetrievalExperimentService:
                 "score_accuracy": (2 * full_count + partial_count) / (2 * expected_count) if expected_count else None,
                 "average_answer_em": self._average_metric(run_results, "answer_em"),
                 "average_answer_f1": self._average_metric(run_results, "answer_f1"),
+                "average_answer_term_hit": self._average_metric(run_results, "answer_term_hit"),
+                "average_answer_term_coverage": self._average_metric(run_results, "answer_term_coverage"),
                 "evidence_hit_rate": self._average_metric(run_groups, "evidence_hit_rate"),
                 "evidence_precision": self._average_metric(run_groups, "evidence_precision"),
                 "document_hit_rate": self._average_metric(run_groups, "document_hit_rate"),
@@ -1375,6 +1385,8 @@ class RetrievalExperimentService:
             generated,
             answer_em=None if not enable_classic_metrics else generated.answer_em,
             answer_f1=None if not enable_classic_metrics else generated.answer_f1,
+            answer_term_hit=None if not enable_classic_metrics else generated.answer_term_hit,
+            answer_term_coverage=None if not enable_classic_metrics else generated.answer_term_coverage,
         )
         if enable_llm_judge:
             try:
@@ -1420,6 +1432,14 @@ class RetrievalExperimentService:
                 ),
                 answer_f1=metric_max_over_ground_truths(
                     f1_score, generated.actual_answer, ground_truths
+                ),
+                answer_term_hit=metric_max_over_ground_truths(
+                    lambda prediction, truth: answer_term_scores(prediction, truth)[0],
+                    generated.actual_answer, ground_truths,
+                ),
+                answer_term_coverage=metric_max_over_ground_truths(
+                    lambda prediction, truth: answer_term_scores(prediction, truth)[1],
+                    generated.actual_answer, ground_truths,
                 ),
             )
         return result
@@ -1546,6 +1566,8 @@ class RetrievalExperimentService:
             ])
             answer_em = self._mean_present(item.answer_em for item in group_items)
             answer_f1 = self._mean_present(item.answer_f1 for item in group_items)
+            answer_term_hit = self._mean_present(item.answer_term_hit for item in group_items)
+            answer_term_coverage = self._mean_present(item.answer_term_coverage for item in group_items)
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 total, answered, correct, partial, incorrect,
@@ -1567,6 +1589,8 @@ class RetrievalExperimentService:
                 **quality_summary,
                 average_answer_em=answer_em,
                 average_answer_f1=answer_f1,
+                average_answer_term_hit=answer_term_hit,
+                average_answer_term_coverage=answer_term_coverage,
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(

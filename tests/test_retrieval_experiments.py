@@ -142,9 +142,13 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertTrue(run.enable_classic_metrics)
         self.assertEqual(run.results[0].answer_em, 1.0)
         self.assertEqual(run.results[0].answer_f1, 1.0)
+        self.assertEqual(run.results[0].answer_term_hit, 1.0)
+        self.assertEqual(run.results[0].answer_term_coverage, 1.0)
         self.assertEqual(run.results[0].evaluation_result, "未啟用")
         self.assertEqual(run.groups[0].average_answer_em, 1.0)
         self.assertEqual(run.groups[0].average_answer_f1, 1.0)
+        self.assertEqual(run.groups[0].average_answer_term_hit, 1.0)
+        self.assertEqual(run.groups[0].average_answer_term_coverage, 1.0)
 
         summary_path, details_path = self.service.export("project")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -152,7 +156,9 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertFalse(summary["evaluation"]["enable_llm_judge"])
         self.assertTrue(summary["evaluation"]["enable_classic_metrics"])
         self.assertEqual(summary["summary"]["average_answer_em"], 1.0)
+        self.assertEqual(summary["summary"]["average_answer_term_hit"], 1.0)
         self.assertEqual(details["question_results"][0]["answer_em"], 1.0)
+        self.assertEqual(details["question_results"][0]["answer_term_coverage"], 1.0)
 
     def test_failed_replacement_keeps_existing_sets_when_source_pages_are_empty(self):
         existing = self.service.import_question_set("project", self.question_file)
@@ -780,7 +786,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertIn("回答模型", labels)
         self.assertIn("答案評分方式", labels)
         self.assertIn("啟用 LLM Judge", labels)
-        self.assertIn("啟用 EM／F1 傳統指標", labels)
+        self.assertIn("啟用程式化答案指標（EM／F1／詞項）", labels)
         self.assertEqual(len(app.renderables), 1)
         self.assertIn("測試最大並行請求數", labels)
         self.assertIn("回答生成進度", labels)
@@ -826,13 +832,13 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1", "Answer Term Hit", "Answer Term Coverage"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertTrue(experiment_results["interactive"])
         self.assertEqual(
             experiment_results["column_widths"],
-            ["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%", "4%", "4%"],
+            ["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%", "4%", "4%", "5%", "6%"],
         )
         block_values = list(app.blocks.values())
         result_table_position = next(
