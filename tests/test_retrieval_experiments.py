@@ -830,6 +830,20 @@ class RetrievalExperimentTests(unittest.TestCase):
         experiment_results = next(
             config for config in component_configs if str(config.get("label", "")).startswith("逐題實驗結果")
         )
+        experiment_summary = next(
+            config for config in component_configs if config.get("label") == "實驗組摘要"
+        )
+        dataset_summary = next(
+            config for config in component_configs if config.get("label") == "實驗組 × 題目集摘要"
+        )
+        self.assertEqual(
+            experiment_summary["headers"][10:15],
+            ["得分正確率", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+        )
+        self.assertEqual(
+            dataset_summary["headers"][11:16],
+            ["得分正確率", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+        )
         self.assertEqual(
             experiment_results["headers"],
             ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1", "Answer Term Hit", "Answer Term Coverage"],

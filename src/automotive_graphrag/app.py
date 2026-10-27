@@ -349,6 +349,10 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 len(question_set.questions), answered, len(judged), correct, partial, incorrect,
                 f"{correct / len(question_set.questions):.1%}" if question_set.questions else "—",
                 f"{(2 * correct + partial) / (2 * len(question_set.questions)):.1%}" if question_set.questions else "—",
+                f"{average_answer_em:.1%}" if average_answer_em is not None else "—",
+                f"{average_answer_f1:.1%}" if average_answer_f1 is not None else "—",
+                f"{average_term_hit:.1%}" if average_term_hit is not None else "—",
+                f"{average_term_coverage:.1%}" if average_term_coverage is not None else "—",
                 f"{metrics[0]:.1%}" if metrics[0] is not None else "不可計算",
                 f"{metrics[1]:.1%}" if metrics[1] is not None else "不可計算",
                 f"{metrics[2]:.1%}" if metrics[2] is not None else "不可計算",
@@ -358,10 +362,6 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 f"{sum(unsupported_counts) / len(unsupported_counts):.2f}" if unsupported_counts else "未標註",
                 f"{sum(value == 'correct' for value in scored_refusals) / len(scored_refusals):.1%}" if scored_refusals else "未標註",
                 quality_reviewed,
-                f"{average_answer_em:.1%}" if average_answer_em is not None else "—",
-                f"{average_answer_f1:.1%}" if average_answer_f1 is not None else "—",
-                f"{average_term_hit:.1%}" if average_term_hit is not None else "—",
-                f"{average_term_coverage:.1%}" if average_term_coverage is not None else "—",
             ])
     return rows
 
@@ -1413,6 +1413,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("correct_count"), item.get("partial_correct_count"), item.get("incorrect_count"),
                     f"{item['accuracy']:.1%}" if item.get("accuracy") is not None else "—",
                     f"{item['score_accuracy']:.1%}" if item.get("score_accuracy") is not None else "—",
+                    f"{item['average_answer_em']:.1%}" if item.get("average_answer_em") is not None else "—",
+                    f"{item['average_answer_f1']:.1%}" if item.get("average_answer_f1") is not None else "—",
+                    f"{item['average_answer_term_hit']:.1%}" if item.get("average_answer_term_hit") is not None else "—",
+                    f"{item['average_answer_term_coverage']:.1%}" if item.get("average_answer_term_coverage") is not None else "—",
                     f"{item['evidence_hit_rate']:.1%}" if item.get("evidence_hit_rate") is not None else "不可計算",
                     f"{item['evidence_precision']:.1%}" if item.get("evidence_precision") is not None else "不可計算",
                     f"{item['document_hit_rate']:.1%}" if item.get("document_hit_rate") is not None else "不可計算",
@@ -1428,10 +1432,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     f"{item['average_unsupported_claim_count']:.2f}" if item.get("average_unsupported_claim_count") is not None else "未標註",
                     f"{item['refusal_accuracy']:.1%}" if item.get("refusal_accuracy") is not None else "未標註",
                     item.get("quality_reviewed_count", 0),
-                    f"{item['average_answer_em']:.1%}" if item.get("average_answer_em") is not None else "—",
-                    f"{item['average_answer_f1']:.1%}" if item.get("average_answer_f1") is not None else "—",
-                    f"{item['average_answer_term_hit']:.1%}" if item.get("average_answer_term_hit") is not None else "—",
-                    f"{item['average_answer_term_coverage']:.1%}" if item.get("average_answer_term_coverage") is not None else "—",
                 ]
                 for item in run.get("groups", [])
             ]
@@ -3699,7 +3699,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     "無根據主張數只計回答中沒有來源支持的事實主張；拒答欄僅對預期無答案題填「正確」或「錯誤」，其餘填「不適用」。"
                 )
                 experiment_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（全域）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數"],
                     interactive=False,
                     datatype=["str"] * 30,
                     label="實驗組摘要",
@@ -3707,7 +3707,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     visible=False,
                 )
                 experiment_dataset_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數"],
                     interactive=False,
                     datatype=["str"] * 25,
                     label="實驗組 × 題目集摘要",
