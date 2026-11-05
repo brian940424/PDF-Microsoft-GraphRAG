@@ -395,6 +395,45 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(summary.evidence_precision, 1.0)
         self.assertEqual(summary.document_hit_rate, 1.0)
 
+    def test_cited_source_score_is_combined_with_judge_grade(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        question = question_set.questions[0]
+        gold = question.answer_source_evidence[0]
+        cited = Evidence(
+            evidence_id="E1", rank=1, context_id="7", text_unit_id="tu-7",
+            chunk_id="chunk-7", section_id="section", section_name="Section",
+            document_id=gold.document_id, page=gold.pages[0] + 1, block_id="block", text="gold source",
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        # The answer differs from the reference, so FakeJudge grades it 0 while its citation hits.
+        self.service.query_function = lambda *args: (
+            "錯誤的回答 [Data: Sources (7)]", {"sources": [{"id": "7", "text": "source"}]}
+        )
+        with patch.object(self.service, "_resolved_evidence", return_value=(cited,)):
+            generated = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+        evaluated = self.service._evaluate_case("project", group, question, "gpt-4.1-mini", generated)
+        self.assertEqual(evaluated.evaluation_result, 0)
+        self.assertEqual(evaluated.source_score, 1.0)
+        self.assertIn("來源分數 : 100%", _experiment_judge_cell(asdict(evaluated)))
+
+        run = self.service._persist_run(
+            "project", question_set.question_set_id, [group], "gpt-4.1-mini", 1,
+            "started", "completed", {(group.group_id, question.question_id): evaluated},
+        )
+        summary = run.groups[0]
+        self.assertEqual(summary.score_accuracy, 0.0)
+        self.assertEqual(summary.average_source_score, 1.0)
+        # Two questions in the set; only Q0001 is evaluated: (0.9 * 0 + 0.1 * 1) / 2.
+        self.assertEqual(summary.combined_score_accuracy, 0.05)
+
+        self.service.update_manual_judgments("project", [("Local", "Q0001", 2)])
+        group_value = self.service.load("project")["run"]["groups"][0]
+        self.assertEqual(group_value["combined_score_accuracy"], 0.5)
+        payload = json.loads(self.service.export("project")[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["evaluation"]["source_weight"], 0.1)
+        self.assertEqual(payload["groups"][0]["summary"]["average_source_score"], 1.0)
+        self.assertEqual(payload["summary"]["combined_score_accuracy"], 0.5)
+
     def test_auto_group_routes_each_question_and_uses_routed_strategy_parameters(self):
         question_set = self.service.import_question_set("project", self.question_file)
         question = question_set.questions[0]

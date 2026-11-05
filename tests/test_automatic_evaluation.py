@@ -544,6 +544,62 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "並行數必須介於 1 到 32"):
             service.evaluate("L33-SM3E", self.question_set_id, concurrency=0)
 
+    def test_combined_score_mixes_judge_and_cited_source_scores(self) -> None:
+        class CitingRunner(AnswerRunner):
+            def ask(self, *args, **kwargs):
+                result = super().ask(*args, **kwargs)
+                return replace(result, answer=result.answer + " [Data: Sources (1)]")
+
+        question_sets = QuestionSetService(self.store, CitingRunner())
+        question_sets.run("L33-SM3E", self.question_set_id)
+        service = AutomaticEvaluationService(
+            self.store, question_sets, self.connections, FakeJudge([self.judged()])
+        )
+
+        result = service.evaluate("L33-SM3E", self.question_set_id)
+
+        # Both answers cite the gold page; Q1 is judged incorrect, Q2 correct.
+        self.assertEqual([item.source_score for item in result.items], [1.0, 1.0])
+        self.assertEqual([item.combined_score for item in result.items], [0.1, 1.0])
+        self.assertEqual(result.source_weight, 0.1)
+        self.assertEqual(result.average_source_score, 1.0)
+        self.assertEqual(result.average_combined_score, 0.55)
+        self.assertEqual(result.correct_count, 1)  # correctness still follows the judge only
+
+        updated = service.update_manual_results("L33-SM3E", self.question_set_id, {"Q0001": 1})
+        self.assertEqual(updated.items[0].combined_score, 1.0)
+        self.assertEqual(updated.average_combined_score, 1.0)
+
+        weighted = service.evaluate("L33-SM3E", self.question_set_id, source_weight=0.5)
+        self.assertEqual(weighted.items[0].combined_score, 0.5)
+        with self.assertRaisesRegex(ProjectError, "0 到 1"):
+            service.evaluate("L33-SM3E", self.question_set_id, source_weight=2)
+
+        json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["summary"]["average_combined_score"], 0.75)
+        with csv_path.open(encoding="utf-8", newline="") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual(rows[0]["source_score"], "1.0")
+
+    def test_uncited_answers_score_zero_source_and_legacy_records_fall_back(self) -> None:
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, FakeJudge([self.judged()])
+        )
+        result = service.evaluate("L33-SM3E", self.question_set_id)
+        self.assertEqual([item.source_score for item in result.items], [0.0, 0.0])
+        self.assertEqual(result.average_combined_score, 0.45)
+
+        path = service._path("L33-SM3E", self.question_set_id)
+        legacy = json.loads(path.read_text(encoding="utf-8"))
+        legacy.pop("average_combined_score")
+        for item in legacy["items"]:
+            item.pop("source_score")
+            item.pop("combined_score")
+        path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        loaded = service.last_result("L33-SM3E", self.question_set_id)
+        self.assertEqual(loaded.average_combined_score, loaded.average_score)
+
     def test_manual_score_edit_overrides_average_and_keeps_judge_scores(self) -> None:
         service = AutomaticEvaluationService(
             self.store, self.question_sets, self.connections, FakeJudge([self.judged()])
@@ -634,7 +690,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertFalse(result_table.get_config().get("interactive"))
         self.assertEqual(
             result_table.get_config()["headers"],
-            ["題號", "來源文件", "題目", "系統回答", "正確答案", "平均分數", "各評審分數", "實際檢索策略"],
+            ["題號", "來源文件", "題目", "系統回答", "正確答案", "LLM 分數", "來源分數", "綜合分數", "各評審分數", "實際檢索策略"],
         )
         self.assertIn("只重跑前次答錯題目", labels)
         self.assertIn("自動評測 JSON", labels)

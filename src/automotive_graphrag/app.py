@@ -450,6 +450,8 @@ def _experiment_judge_cell(item) -> str:
     ]
     if item.get("manual_override"):
         lines.append("* 人工修改得分")
+    if isinstance(item.get("source_score"), (int, float)):
+        lines.append(f"* 來源分數 : {_score_percent(item['source_score'])}")
     return "\n".join(lines)
 
 
@@ -1168,6 +1170,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question_id,
                 evidence_docs, question.question, question.answer, question.reference_answer,
                 _score_percent(judged.score) if judged else "",
+                (_score_percent(judged.source_score) if judged.source_score is not None else "不適用") if judged else "",
+                _score_percent(judged.final_score) if judged else "",
                 autoqa_judge_scores(judged, judge.model) if judged else ("未啟用 LLM Judge" if not judge.enable_llm_judge else "尚無評判結果"),
                 autoqa_strategy_cell(question_set, question),
             ])
@@ -1298,11 +1302,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         items = []
         if judge and judge.enable_llm_judge:
-            score = f"**{_score_percent(judge.average_score)}**" if judge.average_score is not None else "—"
+            score = _score_percent(judge.average_score) if judge.average_score is not None else "—"
+            combined = (
+                f"**{_score_percent(judge.average_combined_score)}**"
+                if judge.average_combined_score is not None else "—"
+            )
+            source = (
+                _score_percent(judge.average_source_score) if judge.average_source_score is not None else "不適用"
+            )
+            items.append(
+                f"- **綜合分數：** {combined}（LLM {1 - judge.source_weight:.0%}＋來源 {judge.source_weight:.0%}；"
+                "無來源標註或無頁碼來源的題目只計 LLM）"
+            )
             items.append(
                 f"- **LLM Judge：** 平均分數 {score}（評判 {len(judge.items)}/{total} 題）｜"
                 f"評審 {judge_model_label(judge.model)}"
             )
+            items.append(f"- **引用來源：** 平均來源分數 {source}（回答引用頁 vs. 題目集答案來源，容許 ±1 頁）")
             panel = _judge_panel_markup(judge.judge_average_scores, judge.disagreement_count)
             if panel:
                 items.append(f"- **評審比較：** {panel}")
@@ -1651,6 +1667,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("correct_count"), item.get("partial_correct_count"), item.get("incorrect_count"),
                     f"{item['accuracy']:.1%}" if item.get("accuracy") is not None else "—",
                     f"{item['score_accuracy']:.1%}" if item.get("score_accuracy") is not None else "—",
+                    f"{item['average_source_score']:.1%}" if item.get("average_source_score") is not None else "不適用",
+                    f"{item['combined_score_accuracy']:.1%}" if item.get("combined_score_accuracy") is not None else "—",
                     f"{item['evidence_hit_rate']:.1%}" if item.get("evidence_hit_rate") is not None else "不可計算",
                     f"{item['evidence_precision']:.1%}" if item.get("evidence_precision") is not None else "不可計算",
                     f"{item['document_hit_rate']:.1%}" if item.get("document_hit_rate") is not None else "不可計算",
@@ -3711,10 +3729,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_progress = gr.HTML(label="回答評測進度", visible=False)
                 autoqa_summary = gr.Markdown()
                 autoqa_table = gr.Dataframe(
-                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "平均分數", "各評審分數", "實際檢索策略"],
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "LLM 分數", "來源分數", "綜合分數", "各評審分數", "實際檢索策略"],
                     interactive=False,
-                    datatype=["str", "str", "str", "str", "str", "str", "markdown", "str"],
-                    column_widths=["5%", "8%", "15%", "22%", "15%", "6%", "14%", "15%"],
+                    datatype=["str", "str", "str", "str", "str", "str", "str", "str", "markdown", "str"],
+                    column_widths=["5%", "8%", "13%", "20%", "13%", "6%", "6%", "6%", "12%", "11%"],
                     label="模型評測結果概覽",
                     wrap=True,
                     visible=False,
@@ -4006,9 +4024,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     "無根據主張數只計回答中沒有來源支持的事實主張；拒答欄僅對預期無答案題填「正確」或「錯誤」，其餘填「不適用」。"
                 )
                 experiment_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "來源分數", "綜合得分率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * 30,
+                    datatype=["str"] * 32,
                     label="實驗組摘要",
                     wrap=True,
                     visible=False,

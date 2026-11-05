@@ -41,6 +41,7 @@ from .connections import (
 )
 from .evidence import Evidence, EvidenceService
 from .evaluation.classic_metrics import answer_term_scores, exact_match_score, f1_score, metric_max_over_ground_truths
+from .evaluation.source_scoring import DEFAULT_SOURCE_WEIGHT, combined_score, source_score
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
@@ -182,6 +183,7 @@ class ExperimentQuestionResult:
     manual_override: bool = False
     answer_term_hit: float | None = None
     answer_term_coverage: float | None = None
+    source_score: float | None = None
 
     @property
     def effective_method(self) -> str:
@@ -228,6 +230,8 @@ class ExperimentGroupSummary:
     judge_disagreement_count: int = 0
     average_answer_term_hit: float | None = None
     average_answer_term_coverage: float | None = None
+    average_source_score: float | None = None
+    combined_score_accuracy: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +251,7 @@ class RetrievalExperimentRun:
     question_set_names: tuple[str, ...] = ()
     enable_llm_judge: bool = True
     enable_classic_metrics: bool = False
+    source_weight: float = DEFAULT_SOURCE_WEIGHT
 
 
 QueryFunction = Callable[..., tuple[str, dict[str, object]]]
@@ -304,6 +309,30 @@ class RetrievalExperimentService:
         full = sum(grade == 2 for grade in grades)
         incorrect = sum(grade == 0 for grade in grades)
         return full, len(grades) - full - incorrect, incorrect, float(sum(grades))
+
+    @classmethod
+    def _source_stats(
+        cls, items, total: int, weight: float = DEFAULT_SOURCE_WEIGHT,
+    ) -> tuple[float | None, float | None]:
+        """Average cited-source score and the combined (judge 0–2 → 0–1, mixed with source) accuracy.
+
+        ``items`` are result dicts or ``ExperimentQuestionResult`` objects; questions without a
+        judge grade contribute 0 to the combined accuracy, like ``score_accuracy``.
+        """
+        def value(item, key):
+            return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+
+        sources = [value(item, "source_score") for item in items]
+        combined_sum = 0.0
+        for item in items:
+            grade = cls._parse_grade(value(item, "evaluation_result"))
+            if grade is not None:
+                combined_sum += combined_score(grade / 2, value(item, "source_score"), weight)
+        average_source = cls._mean_present(sources)
+        return (
+            round(average_source, 4) if average_source is not None else None,
+            round(combined_sum / total, 4) if total else None,
+        )
 
     def load(self, project_id: str) -> dict[str, object]:
         self.projects.get(project_id)
@@ -369,6 +398,9 @@ class RetrievalExperimentService:
                 )
                 total = int(group.get("question_count", len(group_results)))
                 judge_enabled = bool(run.get("enable_llm_judge", True))
+                average_source, combined_accuracy = self._source_stats(
+                    group_results, total, float(run.get("source_weight", DEFAULT_SOURCE_WEIGHT)),
+                )
                 updated = {
                     "correct_count": full, "partial_correct_count": partial,
                     "incorrect_count": incorrect,
@@ -378,6 +410,8 @@ class RetrievalExperimentService:
                     "average_answer_f1": self._mean_present(item.get("answer_f1") for item in group_results),
                     "average_answer_term_hit": self._mean_present(item.get("answer_term_hit") for item in group_results),
                     "average_answer_term_coverage": self._mean_present(item.get("answer_term_coverage") for item in group_results),
+                    "average_source_score": average_source,
+                    "combined_score_accuracy": combined_accuracy if judge_enabled else None,
                 }
                 if any(group.get(key) != field for key, field in updated.items()):
                     group.update(updated)
@@ -964,9 +998,14 @@ class RetrievalExperimentService:
                     item.get("evaluation_result") for item in group_results
                 )
                 total = int(group.get("question_count", len(group_results)))
+                average_source, combined_accuracy = self._source_stats(
+                    group_results, total, float(run.get("source_weight", DEFAULT_SOURCE_WEIGHT)),
+                )
                 group.update(correct_count=full, partial_correct_count=partial, incorrect_count=incorrect,
                              accuracy=full / total if total else None,
-                             score_accuracy=score_sum / (2 * total) if total else None)
+                             score_accuracy=score_sum / (2 * total) if total else None,
+                             average_source_score=average_source,
+                             combined_score_accuracy=combined_accuracy)
             self._write(project_id, state)
         return run
 
@@ -1118,6 +1157,8 @@ class RetrievalExperimentService:
                     "fully_correct_total": f"{group_correct} / {group_total}",
                     "accuracy": group_correct / group_total if group_total else None,
                     "score_accuracy": group_score / (2 * group_total) if group_total else None,
+                    "average_source_score": summary.get("average_source_score"),
+                    "combined_score_accuracy": summary.get("combined_score_accuracy"),
                     "judge_average_scores": summary.get("judge_average_scores", {}),
                     "judge_disagreement_count": summary.get("judge_disagreement_count", 0),
                     "evidence_hit_rate": summary.get("evidence_hit_rate"),
@@ -1153,6 +1194,7 @@ class RetrievalExperimentService:
                 "enable_llm_judge": run.get("enable_llm_judge", state.get("enable_llm_judge", True)),
                 "enable_classic_metrics": run.get("enable_classic_metrics", state.get("enable_classic_metrics", False)),
                 "mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
+                "source_weight": run.get("source_weight", DEFAULT_SOURCE_WEIGHT),
                 "judge_reasoning_effort": (
                     DEFAULT_REASONING_EFFORT
                     if self._supports_judge_reasoning(state.get("judge_model"))
@@ -1174,6 +1216,10 @@ class RetrievalExperimentService:
                 "fully_correct_total": f"{full_count} / {expected_count}",
                 "accuracy": full_count / expected_count if expected_count else None,
                 "score_accuracy": score_total / (2 * expected_count) if expected_count else None,
+                "average_source_score": self._average_metric(run_results, "source_score"),
+                "combined_score_accuracy": self._source_stats(
+                    run_results, expected_count, float(run.get("source_weight", DEFAULT_SOURCE_WEIGHT)),
+                )[1],
                 "average_answer_em": self._average_metric(run_results, "answer_em"),
                 "average_answer_f1": self._average_metric(run_results, "answer_f1"),
                 "average_answer_term_hit": self._average_metric(run_results, "answer_term_hit"),
@@ -1455,6 +1501,10 @@ class RetrievalExperimentService:
             answer_f1=None if not enable_classic_metrics else generated.answer_f1,
             answer_term_hit=None if not enable_classic_metrics else generated.answer_term_hit,
             answer_term_coverage=None if not enable_classic_metrics else generated.answer_term_coverage,
+            source_score=source_score(
+                generated.actual_answer, generated.retrieved_evidence,
+                question.answer_source_evidence or question.gold_evidence,
+            ),
         )
         if enable_llm_judge:
             # Every judge gets the identical grading prompt; judges run one after another so the
@@ -1650,6 +1700,7 @@ class RetrievalExperimentService:
             answer_f1 = self._mean_present(item.answer_f1 for item in group_items)
             answer_term_hit = self._mean_present(item.answer_term_hit for item in group_items)
             answer_term_coverage = self._mean_present(item.answer_term_coverage for item in group_items)
+            average_source, combined_accuracy = self._source_stats(group_items, total)
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 total, answered, correct, partial, incorrect,
@@ -1675,6 +1726,8 @@ class RetrievalExperimentService:
                 judge_disagreement_count=disagreements,
                 average_answer_term_hit=answer_term_hit,
                 average_answer_term_coverage=answer_term_coverage,
+                average_source_score=average_source,
+                combined_score_accuracy=combined_accuracy if enable_llm_judge else None,
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(

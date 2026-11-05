@@ -22,6 +22,12 @@ from .evaluation.classic_metrics import (
     f1_score,
     metric_max_over_ground_truths,
 )
+from .evaluation.source_scoring import (
+    DEFAULT_SOURCE_WEIGHT,
+    combined_score,
+    source_score,
+    validate_source_weight,
+)
 from .connections import (
     ALLOWED_CHAT_MODELS,
     GPT6_LUNA_MODEL,
@@ -64,6 +70,10 @@ class AutomaticEvaluationItem:
     judges: tuple[JudgeScore, ...] = ()
     average_score: float | None = None
     manual: bool = False
+    source_score: float | None = None
+    """Cited-source vs gold answer-source score (0–1); None when not applicable."""
+    combined_score: float | None = None
+    """Weighted judge score and source score (0–1); equals ``score`` when the source score is N/A."""
 
     @property
     def score(self) -> float:
@@ -71,6 +81,11 @@ class AutomaticEvaluationItem:
         if self.average_score is not None:
             return self.average_score
         return 1.0 if self.is_correct else 0.0
+
+    @property
+    def final_score(self) -> float:
+        """Combined score, falling back to the judge score for records without one."""
+        return self.combined_score if self.combined_score is not None else self.score
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +127,9 @@ class AutomaticEvaluationResult:
     average_score: float | None = None
     judge_average_scores: dict[str, float] = field(default_factory=dict)
     disagreement_count: int = 0
+    source_weight: float = DEFAULT_SOURCE_WEIGHT
+    average_source_score: float | None = None
+    average_combined_score: float | None = None
 
 
 def average_judge_score(judges: Sequence[JudgeScore]) -> float | None:
@@ -225,11 +243,17 @@ class AutomaticEvaluationService:
         reasoning_effort: str = "medium",
         enable_llm_judge: bool = True,
         enable_classic_metrics: bool = False,
+        source_weight: float = DEFAULT_SOURCE_WEIGHT,
     ) -> AutomaticEvaluationResult:
         """Judge saved answers; with several models every judge scores each question and the
-        question score is the average of the judges that succeeded."""
+        question score is the average of the judges that succeeded. The combined score mixes
+        that judge score with the cited-source score by ``source_weight``."""
         if not enable_llm_judge and not enable_classic_metrics:
             raise ProjectError("至少啟用一種評測方式")
+        try:
+            source_weight = validate_source_weight(source_weight)
+        except ValueError as exc:
+            raise ProjectError(str(exc)) from exc
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("評測並行數必須介於 1 到 32")
         previous = self.last_result(project_id, question_set_id)
@@ -313,19 +337,23 @@ class AutomaticEvaluationService:
                         f"{question.question_id}（{'、'.join(judge_model_label(item.model) for item in failed)}）"
                     )
                 average = average_judge_score(judges)
+                source = self._question_source_score(question)
                 judged_by_id[question.question_id] = AutomaticEvaluationItem(
                     question_id=question.question_id,
                     is_correct=average >= 0.5,
                     judge_reason=combined_judge_reason(judges),
                     judges=judges,
                     average_score=average,
+                    source_score=source,
+                    combined_score=combined_score(average, source, source_weight),
                 )
         if failures and not enable_classic_metrics:
             raise ProjectError("自動評測部分請求失敗：" + "；".join(failures))
         if enable_llm_judge and selected_ids is not None and previous is not None:
             items_by_id = {item.question_id: item for item in previous.items}
             items_by_id.update(judged_by_id)
-            items = tuple(items_by_id.values())
+            # Carried-over items are re-weighted so every question uses this run's source weight.
+            items = tuple(self._with_combined(item, source_weight) for item in items_by_id.values())
         else:
             items = tuple(
                 judged_by_id[item.question_id]
@@ -382,9 +410,25 @@ class AutomaticEvaluationService:
             average_score=self._average_item_score(items),
             judge_average_scores=judge_averages,
             disagreement_count=disagreements,
+            source_weight=source_weight,
+            average_source_score=self._mean_present(item.source_score for item in items),
+            average_combined_score=self._average_final_score(items),
         )
         self._write(result)
         return result
+
+    @staticmethod
+    def _question_source_score(question: BatchQuestion) -> float | None:
+        gold = question.answer_source_evidence or question.gold_evidence
+        return source_score(question.answer, question.retrieved_evidence, gold)
+
+    @staticmethod
+    def _with_combined(item: AutomaticEvaluationItem, weight: float) -> AutomaticEvaluationItem:
+        return replace(item, combined_score=combined_score(item.score, item.source_score, weight))
+
+    @staticmethod
+    def _average_final_score(items: Sequence[AutomaticEvaluationItem]) -> float | None:
+        return round(sum(item.final_score for item in items) / len(items), 4) if items else None
 
     def validate_judge_models(self, value: object) -> tuple[str, ...]:
         models = parse_judge_models(value) or (self.connections.get_chat_model(),)
@@ -514,6 +558,9 @@ class AutomaticEvaluationService:
         value["models"] = tuple(value.get("models") or parse_judge_models(value.get("model")))
         if value.get("average_score") is None and value.get("enable_llm_judge", True):
             value["average_score"] = self._average_item_score(migrated_items)
+        if value.get("average_combined_score") is None and value.get("enable_llm_judge", True):
+            # Records written before source scoring: combined equals the judge score.
+            value["average_combined_score"] = self._average_final_score(migrated_items)
         if "judge_average_scores" not in value:
             value["judge_average_scores"], value["disagreement_count"] = judge_panel_summary(
                 migrated_items, lambda item: item.judges
@@ -539,13 +586,16 @@ class AutomaticEvaluationService:
             if abs(score - item.score) < 0.005:
                 items.append(item)
                 continue
-            items.append(replace(item, is_correct=score >= 0.5, average_score=score, manual=True))
+            items.append(self._with_combined(
+                replace(item, is_correct=score >= 0.5, average_score=score, manual=True), result.source_weight
+            ))
         updated = replace(
             result,
             question_count=len(items),
             correct_count=sum(item.is_correct for item in items),
             items=tuple(items),
             average_score=self._average_item_score(items),
+            average_combined_score=self._average_final_score(items),
         )
         self._write(updated)
         return updated
@@ -594,6 +644,8 @@ class AutomaticEvaluationService:
                 "question_id": question_id,
                 "is_correct": judge_by_id[question_id].is_correct if question_id in judge_by_id else None,
                 "average_score": judge_by_id[question_id].score if question_id in judge_by_id else None,
+                "source_score": judge_by_id[question_id].source_score if question_id in judge_by_id else None,
+                "combined_score": judge_by_id[question_id].final_score if question_id in judge_by_id else None,
                 "manual": judge_by_id[question_id].manual if question_id in judge_by_id else False,
                 "judges": [asdict(judge) for judge in judge_by_id[question_id].judges] if question_id in judge_by_id else [],
                 "judge_reason": judge_by_id[question_id].judge_reason if question_id in judge_by_id else "",
@@ -610,6 +662,9 @@ class AutomaticEvaluationService:
             "correct_count": result.correct_count,
             "judge_models": list(result.models),
             "average_score": result.average_score,
+            "source_weight": result.source_weight,
+            "average_source_score": result.average_source_score,
+            "average_combined_score": result.average_combined_score,
             "judge_average_scores": result.judge_average_scores,
             "disagreement_count": result.disagreement_count,
             "average_answer_em": result.average_answer_em,
@@ -626,7 +681,7 @@ class AutomaticEvaluationService:
             for column in (f"judge_score:{judge_model}", f"judge_reason:{judge_model}")
         ]
         fieldnames = [
-            "question_id", "is_correct", "average_score", "manual", "judge_reason",
+            "question_id", "is_correct", "average_score", "source_score", "combined_score", "manual", "judge_reason",
             *judge_columns,
             "answer_em",
             "answer_f1",
@@ -647,6 +702,8 @@ class AutomaticEvaluationService:
                 "question_id": question_id,
                 "is_correct": item.is_correct if item else None,
                 "average_score": item.score if item else None,
+                "source_score": item.source_score if item else None,
+                "combined_score": item.final_score if item else None,
                 "manual": item.manual if item else False,
                 "judge_reason": item.judge_reason if item else "",
             }
