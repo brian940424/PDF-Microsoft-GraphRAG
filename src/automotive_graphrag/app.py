@@ -3547,17 +3547,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 with gr.Row():
                     autoqa_enable_llm_judge = gr.Checkbox(label="啟用 LLM Judge", value=True)
                     autoqa_enable_classic_metrics = gr.Checkbox(label="啟用 EM／F1 傳統指標", value=False)
+                
+                autoqa_judge_model = gr.Dropdown(
+                    choices=judge_model_choices(), value=[connections.get_chat_model()], label="評測模型（評審）",
+                    multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
+                )
+                
                 with gr.Row():
-                    autoqa_judge_model = gr.Dropdown(
-                        choices=judge_model_choices(), value=[connections.get_chat_model()], label="評測模型（評審）",
-                        multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
-                    )
                     autoqa_judge_effort = gr.Dropdown(
                         choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
                         label="推理深度", visible=judge_supports_reasoning(connections.get_chat_model()),
+                        info="僅套用到所有支援推理深度的評審，不支援的照常評分、不受影響"
                     )
                     autoqa_judge_concurrency = gr.Number(
-                        label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
+                        label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0,
+                        info="同時送出的評測請求上限（題數 × 評審數會排隊執行）；調高較快，但容易碰到供應商速率限制（HTTP 429）",
                     )
                 autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
                 autoqa_judge_model.change(
