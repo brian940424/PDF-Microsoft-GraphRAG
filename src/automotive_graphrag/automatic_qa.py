@@ -277,8 +277,10 @@ class AutomaticQATestService:
         retrieval = None
         retrieval_error = None
         try:
+            # Score the evidence of the strategy that produced the saved answers; the page's
+            # method selector may have been reset (e.g. to Local) since answers were generated.
             retrieval = self.retrieval.evaluate(
-                project_id, question_set_id, top_k=top_k, method=method
+                project_id, question_set_id, top_k=top_k, method=question_set.method or method
             )
         except ProjectError as exc:
             retrieval_error = str(exc)

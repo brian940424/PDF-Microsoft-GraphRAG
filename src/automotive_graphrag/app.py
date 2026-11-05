@@ -1090,13 +1090,56 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         reason = item.judge_reason
         return f"（人工修改平均分數）\n{reason}" if item.manual else reason
 
-    def autoqa_judge_score_markup(judge) -> str:
-        """Overall average score (0–1) plus the per-judge breakdown for a judge panel."""
-        if judge.average_score is None:
-            return "—"
-        text = f"{judge.average_score:.2f}"
-        panel = _judge_panel_markup(judge.judge_average_scores, judge.disagreement_count)
-        return text + (f"｜{panel}" if panel else "")
+    def autoqa_summary_markup(question_set, judge, retrieval=None, retrieval_error=None,
+                              answer_model=None, generation_model=None, notes=()) -> str:
+        """One layout for every ③ summary: a title line, then one bullet per metric group."""
+        total = len(question_set.questions)
+        title = (
+            f"**題目集：** {question_set.name}（{total} 題）｜"
+            f"**檢索模式：** {autoqa_method_summary(question_set)}"
+        )
+        items = []
+        if judge and judge.enable_llm_judge:
+            score = f"**{judge.average_score:.2f}**" if judge.average_score is not None else "—"
+            items.append(
+                f"- **LLM Judge：** 平均分數 {score}（0–1，評判 {len(judge.items)}/{total} 題）｜"
+                f"評審 {judge_model_label(judge.model)}"
+            )
+            panel = _judge_panel_markup(judge.judge_average_scores, judge.disagreement_count)
+            if panel:
+                items.append(f"- **評審比較：** {panel}")
+        if judge and judge.enable_classic_metrics:
+            em = f"{judge.average_answer_em:.1%}" if judge.average_answer_em is not None else "—"
+            f1 = f"{judge.average_answer_f1:.1%}" if judge.average_answer_f1 is not None else "—"
+            items.append(f"- **傳統指標：** Average EM {em}｜Average F1 {f1}")
+        if retrieval:
+            metrics = (retrieval.evidence_hit_rate, retrieval.evidence_precision, retrieval.document_hit_rate)
+            if all(value is None for value in metrics):
+                status = retrieval.retrieval_metrics_status
+                if status.startswith("不可計算："):
+                    status = f"不可計算（{status.removeprefix('不可計算：')}）"
+                items.append(f"- **Retrieval：** {status}")
+            else:
+                show = lambda value: f"{value:.1%}" if value is not None else "不可計算"
+                latency = (
+                    f"｜平均延遲 {retrieval.average_latency_seconds:.2f}s"
+                    if retrieval.average_latency_seconds is not None else ""
+                )
+                items.append(
+                    f"- **Retrieval：** Evidence Hit Rate {show(metrics[0])}｜"
+                    f"Evidence Precision {show(metrics[1])}｜Document Hit Rate {show(metrics[2])}{latency}"
+                )
+        elif retrieval_error:
+            items.append(f"- **Retrieval：** {retrieval_error}")
+        models = [f"生題 {generation_model}"] if generation_model and generation_model != "—" else []
+        if answer_model:
+            models.append(f"回答 {answer_model}")
+        if models:
+            items.append("- **模型：** " + "｜".join(models))
+        if not judge:
+            items.append("- 尚無已儲存的評判結果")
+        items.extend(f"- **提醒：** {note}" for note in notes if note)
+        return title + ("\n\n" + "\n".join(items) if items else "")
 
     def autoqa_strategy_cell(question_set, question):
         if not question.routed_method:
@@ -1294,40 +1337,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         question_sets.update_questions(project_id, question_set_id, updated)
 
     def automatic_qa_summary(report):
-        total = len(report.question_set.questions)
-        judged = {item.question_id: item for item in report.judge.items} if report.judge else {}
-        lines = ["**題目集：** " + report.question_set.name + " (" + report.question_set.question_set_id + ")"]
-        if report.judge and report.judge.enable_llm_judge:
-            lines.append(
-                "**LLM Judge：** 平均分數 " + autoqa_judge_score_markup(report.judge)
-                + "｜評判 " + str(len(judged)) + "/" + str(total)
-                + " 題｜模型 " + judge_model_label(report.judge.model)
-            )
-        if report.judge and report.judge.enable_classic_metrics:
-            lines.append(
-                "**傳統指標：** Average EM "
-                + (format(report.judge.average_answer_em, ".1%") if report.judge.average_answer_em is not None else "—")
-                + "｜Average F1 "
-                + (format(report.judge.average_answer_f1, ".1%") if report.judge.average_answer_f1 is not None else "—")
-            )
-        lines.append("**模型：** 生題 " + report.generation_model + "｜回答 " + report.answer_model)
-        if report.retrieval:
-            result = report.retrieval
-            lines.append(
-                "**Retrieval：** Evidence Hit Rate " + (format(result.evidence_hit_rate, ".1%") if result.evidence_hit_rate is not None else "不可計算")
-                + "｜Evidence Precision " + (format(result.evidence_precision, ".1%") if result.evidence_precision is not None else "不可計算")
-                + "｜Document Hit Rate " + (format(result.document_hit_rate, ".1%") if result.document_hit_rate is not None else "不可計算")
-                + "｜" + result.retrieval_metrics_status
-                + "｜平均延遲 " + format(result.average_latency_seconds or 0, ".2f") + "s"
-            )
-        elif report.retrieval_error:
-            lines.append("**Retrieval 指標：** " + report.retrieval_error)
-        if report.judge_error or (report.judge and report.judge.judge_error):
-            lines.append("**評判提醒：** " + (report.judge_error or report.judge.judge_error))
+        notes = [report.judge_error or (report.judge.judge_error if report.judge else None)]
         if report.generation_errors:
-            lines.append("**部分 PDF 生題未完成：** " + "；".join(report.generation_errors))
-        lines.insert(2, "**檢索模式：** " + autoqa_method_summary(report.question_set))
-        return "\n\n".join(lines)
+            notes.append("部分 PDF 生題未完成：" + "；".join(report.generation_errors))
+        return autoqa_summary_markup(
+            report.question_set, report.judge, report.retrieval, report.retrieval_error,
+            answer_model=report.answer_model, generation_model=report.generation_model, notes=notes,
+        )
 
     def automatic_qa_saved_view(project_id, question_set_id=None):
         if not project_id:
@@ -1344,47 +1360,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             return f"❌ 載入自動問答資料失敗：{exc}", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "載入失敗。", gr.update(interactive=False), DEFAULT_EXPERIMENT_RESPONSE_TYPE
 
-        judge_by_id = {item.question_id: item for item in judge.items} if judge else {}
         result_rows = automatic_qa_result_rows(question_set, judge)
         answers_ready = bool(question_set.questions) and all(
             item.status == "COMPLETED" and item.answer.strip()
             for item in question_set.questions
         )
 
-        total = len(question_set.questions)
-        if judge and judge.enable_llm_judge:
-            summary = (
-                f"**題目集：** {question_set.name}｜**平均分數：** {autoqa_judge_score_markup(judge)}"
-                f"｜評判 {len(judge_by_id)}/{total} 題\n\n"
-                f"**檢索模式：** {autoqa_method_summary(question_set)}｜**評判模型：** {judge_model_label(judge.model)}"
-            )
-        elif judge:
-            summary = f"**題目集：** {question_set.name}｜**檢索模式：** {autoqa_method_summary(question_set)}"
-        else:
-            summary = f"**題目集：** {question_set.name}｜尚無已儲存的自動問答評判結果。"
-        if judge and judge.enable_classic_metrics:
-            summary += (
-                f"\n\n**傳統指標：** Average EM {judge.average_answer_em:.1%}"
-                if judge.average_answer_em is not None else "\n\n**傳統指標：** Average EM —"
-            )
-            summary += (
-                f"｜Average F1 {judge.average_answer_f1:.1%}"
-                if judge.average_answer_f1 is not None else "｜Average F1 —"
-            )
-        if retrieval:
-            summary += (
-                f"\n\n**Retrieval：** Evidence Hit Rate {retrieval.evidence_hit_rate:.1%}"
-                if retrieval.evidence_hit_rate is not None else "\n\n**Retrieval：** 指標不可計算"
-            )
-            if retrieval.evidence_hit_rate is not None:
-                summary += (
-                    f"｜Evidence Precision {retrieval.evidence_precision:.1%}" if retrieval.evidence_precision is not None else "｜Evidence Precision 不可計算"
-                )
-                summary += (
-                    f"｜Document Hit Rate {retrieval.document_hit_rate:.1%}"
-                    if retrieval.document_hit_rate is not None else "｜Document Hit Rate 不可計算"
-                )
-            summary += f"｜{retrieval.retrieval_metrics_status}"
+        summary = autoqa_summary_markup(
+            question_set, judge, retrieval, notes=[judge.judge_error if judge else None]
+        )
         return (
             (
                 f"✅ 已載入題目集「{question_set.name}」及已儲存的測試資料"
@@ -2273,28 +2257,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
         except (ProjectError, TypeError, ValueError) as exc:
             return f"❌ 評測結果儲存失敗：{exc}；目前表格內容仍留在畫面。"
-        total = len(question_set.questions)
-        summary = (
-            f"**題目集：** {question_set.name}｜**平均分數：** {autoqa_judge_score_markup(result)}"
-            f"｜評測 {len(result.items)}/{total} 題\n\n"
-            f"**評測模型：** {judge_model_label(result.model)}｜人工修改的平均分數已保存（各評審原始分數不變）；其餘欄位編輯暫存於目前畫面"
+        summary = autoqa_summary_markup(
+            question_set, result, retrieval_evaluation.last_result(project_id, question_set_id),
+            notes=["人工修改的平均分數已保存（各評審原始分數不變）；其餘欄位編輯只暫存於目前畫面"],
         )
-        retrieval = retrieval_evaluation.last_result(project_id, question_set_id)
-        if retrieval:
-            summary += (
-                f"\n\n**Retrieval：** Evidence Hit Rate "
-                f"{retrieval.evidence_hit_rate:.1%}" if retrieval.evidence_hit_rate is not None
-                else "\n\n**Retrieval：** 指標不可計算"
-            )
-            if retrieval.evidence_hit_rate is not None:
-                summary += (
-                    f"｜Evidence Precision {retrieval.evidence_precision:.1%}" if retrieval.evidence_precision is not None else "｜Evidence Precision 不可計算"
-                )
-                summary += (
-                    f"｜Document Hit Rate {retrieval.document_hit_rate:.1%}"
-                    if retrieval.document_hit_rate is not None else "｜Document Hit Rate 不可計算"
-                )
-            summary += f"｜{retrieval.retrieval_metrics_status}"
         return summary
 
     def import_automatic_question_set(project_id, uploaded):
