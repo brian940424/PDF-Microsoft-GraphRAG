@@ -548,9 +548,13 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         result_table = next(
             component for component in app.blocks.values()
             if hasattr(component, "get_config")
-            and (component.get_config().get("label") or "").startswith("評測結果（暫時開放整表編輯")
+            and (component.get_config().get("label") or "").startswith("模型評測結果")
         )
-        self.assertTrue(result_table.get_config().get("interactive"))
+        self.assertFalse(result_table.get_config().get("interactive"))
+        self.assertEqual(
+            result_table.get_config()["headers"],
+            ["題號", "來源文件", "題目", "系統回答", "正確答案", "平均分數（0–1）", "各評審分數", "實際檢索策略"],
+        )
         self.assertIn("只重跑前次答錯題目", labels)
         self.assertIn("自動評測 JSON", labels)
         self.assertIn("檢索並生成回答", button_values)

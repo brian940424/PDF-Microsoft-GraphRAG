@@ -141,6 +141,32 @@ class AutomaticQATests(unittest.TestCase):
             self.assertEqual(report.judge.average_answer_f1, 1.0)
             self.assertEqual(len(query.models), 1)
 
+    def test_evaluate_existing_scores_retrieval_with_strategy_that_produced_answers(self):
+        class RecordingRetrieval:
+            def __init__(self):
+                self.methods = []
+
+            def evaluate(self, project_id, question_set_id, top_k=5, method="local"):
+                self.methods.append(method)
+                raise ProjectError("recorded")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "projects")
+            store.create(project_id="TEST", display_name="Test", vehicle_name="Vehicle", manual_version="Version")
+            store.update_status("TEST", "INDEXED")
+            sets = QuestionSetService(store)
+            question_set = sets.create_with_questions("TEST", "automatic", [BatchQuestion("Q0001", "問題", "回答")])
+            retrieval = RecordingRetrieval()
+            service = AutomaticQATestService(
+                store, object(), object(), ConcurrentQuery(), sets, NoJudge(), retrieval
+            )
+            service.answer_existing("TEST", question_set.question_set_id, "gpt-4o-mini", "auto", 1)
+
+            # The page selector was reset to Local after reloading, but answers came from auto.
+            service.evaluate_existing("TEST", question_set.question_set_id, "gpt-4o-mini", "gpt-4o-mini", "local")
+
+            self.assertEqual(retrieval.methods, ["auto"])
+
     def test_luna_can_run_and_evaluate_with_drift(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = ProjectStore(Path(temporary) / "projects")

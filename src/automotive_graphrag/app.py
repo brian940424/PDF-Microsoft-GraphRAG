@@ -18,7 +18,7 @@ from pathlib import Path
 import gradio as gr
 from PIL import Image
 
-from .automatic_evaluation import AutomaticEvaluationService
+from .automatic_evaluation import AutomaticEvaluationService, JudgeScore
 from .automatic_qa import AutomaticQATestService
 from .connections import (
     ALLOWED_CHAT_MODELS,
@@ -1041,7 +1041,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def automatic_qa_rows(report):
         judges = {item.question_id: item for item in report.judge.items} if report.judge else {}
-        classic = {item.question_id: item for item in report.judge.classic_items} if report.judge else {}
         rows = []
         for question in report.question_set.questions:
             judged = judges.get(question.question_id)
@@ -1056,12 +1055,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question.answer,
                 question.reference_answer,
                 judged.score if judged else None,
-                autoqa_judge_reason(judged) if judged else (
+                autoqa_judge_scores(judged, report.judge.model) if judged else (
                     report.judge_error or question.error or ("未啟用 LLM Judge" if report.judge and not report.judge.enable_llm_judge else "尚無評判結果")
                 ),
                 autoqa_strategy_cell(report.question_set, question),
-                classic[question.question_id].answer_em if question.question_id in classic else None,
-                classic[question.question_id].answer_f1 if question.question_id in classic else None,
             ])
         return rows
 
@@ -1070,7 +1067,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return []
         questions = {item.question_id: item for item in question_set.questions}
         judges = {item.question_id: item for item in judge.items}
-        classic = {item.question_id: item for item in judge.classic_items}
         rows = []
         for question_id, question in questions.items():
             judged = judges.get(question_id)
@@ -1079,16 +1075,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question_id,
                 evidence_docs, question.question, question.answer, question.reference_answer,
                 judged.score if judged else None,
-                autoqa_judge_reason(judged) if judged else ("未啟用 LLM Judge" if not judge.enable_llm_judge else "尚無評判結果"),
+                autoqa_judge_scores(judged, judge.model) if judged else ("未啟用 LLM Judge" if not judge.enable_llm_judge else "尚無評判結果"),
                 autoqa_strategy_cell(question_set, question),
-                classic[question_id].answer_em if question_id in classic else None,
-                classic[question_id].answer_f1 if question_id in classic else None,
             ])
         return rows
 
-    def autoqa_judge_reason(item) -> str:
-        reason = item.judge_reason
-        return f"（人工修改平均分數）\n{reason}" if item.manual else reason
+    def autoqa_judge_scores(item, panel_model) -> str:
+        """Markdown bullet list of each judge's score; reasons stay in the JSON／CSV export."""
+        judges = item.judges or (JudgeScore(str(panel_model), 1.0 if item.is_correct else 0.0),)
+        lines = [
+            f"* {judge_model_label(judge.model)} : {judge.score:g}" if judge.score is not None
+            else f"* {judge_model_label(judge.model)} : 失敗"
+            for judge in judges
+        ]
+        if item.manual:
+            lines.append("* 人工修改平均分數")
+        return "\n".join(lines)
 
     def autoqa_summary_markup(question_set, judge, retrieval=None, retrieval_error=None,
                               answer_model=None, generation_model=None, notes=()) -> str:
@@ -3546,11 +3548,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_progress = gr.HTML(label="回答評測進度", visible=False)
                 autoqa_summary = gr.Markdown()
                 autoqa_table = gr.Dataframe(
-                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "平均分數（0–1）", "各評審分數與理由", "實際檢索策略", "Answer EM", "Answer F1"],
-                    interactive=True,
-                    datatype=["str", "str", "str", "str", "str", "number", "str", "str", "number", "number"],
-                    column_widths=["5%", "8%", "12%", "17%", "14%", "6%", "16%", "8%", "7%", "7%"],
-                    label="評測結果（暫時開放整表編輯；平均分數會以人工值保存，其餘欄位只暫存於目前畫面）",
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "平均分數（0–1）", "各評審分數", "實際檢索策略"],
+                    interactive=False,
+                    datatype=["str", "str", "str", "str", "str", "number", "markdown", "str"],
+                    column_widths=["5%", "9%", "15%", "22%", "18%", "7%", "14%", "10%"],
+                    label="模型評測結果（暫時開放整表編輯；平均分數會以人工值保存，其餘欄位只暫存於目前畫面）",
                     wrap=True,
                     visible=False,
                 )
