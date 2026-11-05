@@ -293,7 +293,33 @@ def litellm_alias(model: str) -> str:
     return model.removeprefix(LITELLM_MODEL_PREFIX)
 
 
+MAX_JUDGE_MODELS = 5
+
+
+def parse_judge_models(value: object) -> tuple[str, ...]:
+    """Normalize one judge model, a list, or the comma-joined form saved in results."""
+    if value is None:
+        return ()
+    items = value.split(",") if isinstance(value, str) else list(value) if isinstance(value, (list, tuple)) else [value]
+    result: list[str] = []
+    for item in items:
+        model = str(item).strip()
+        if model and model != "—" and model not in result:
+            result.append(model)
+    return tuple(result)
+
+
+def format_judge_models(models: object) -> str:
+    """Saved form of a judge panel; a single judge keeps its plain model ID."""
+    return ", ".join(parse_judge_models(models))
+
+
 def judge_model_label(model: object) -> str:
+    models = parse_judge_models(model)
+    if len(models) > 1:
+        return "、".join(judge_model_label(item) for item in models)
+    if models:
+        model = models[0]
     if is_litellm_model(model):
         return f"LiteLLM／{litellm_alias(str(model))}"
     return str(model) if model is not None else ""

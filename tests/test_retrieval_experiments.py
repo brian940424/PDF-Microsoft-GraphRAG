@@ -494,7 +494,10 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(local_group["accuracy"], 0.0)
         self.assertEqual(local_group["score_accuracy"], 0.25)
         self.assertEqual(edited_result["evaluation_result"], 0)
-        self.assertEqual(edited_result["evaluation_reason"], "")
+        # Manual edits override the question score but keep the judge's own verdict.
+        self.assertTrue(edited_result["manual_override"])
+        self.assertEqual(edited_result["evaluation_reason"], "model=gpt-4.1-mini")
+        self.assertEqual([item["model"] for item in edited_result["judge_scores"]], ["gpt-4.1-mini"])
         updated_summary, updated_details = self.service.export("project")
         updated_summary = json.loads(updated_summary.read_text(encoding="utf-8"))
         updated_details = json.loads(updated_details.read_text(encoding="utf-8"))
@@ -548,6 +551,63 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(len(judge.calls), 1)
         self.assertEqual(len(self.calls), 1, "evaluation must not repeat GraphRAG retrieval")
         self.assertEqual(self.service.load("project")["run"]["status"], "completed")
+
+    def test_judge_panel_averages_grades_and_keeps_each_judge_score(self):
+        class PanelJudge:
+            def __init__(self):
+                self.calls = []
+
+            def evaluate_single_answer_grade(self, project_id, question_id, question, correct, actual, model,
+                                             evaluation_mode="strict", reasoning_effort="medium"):
+                self.calls.append((question_id, question, correct, actual, model, evaluation_mode))
+                if model == "gpt-6-luna" and question_id == "Q2":
+                    raise ProjectError("timeout")
+                score = {"gpt-4o-mini": 2, "gpt-4.1-mini": 1, "gpt-6-luna": 2}[model]
+                return SimpleNamespace(question_id=question_id, score=score, judge_reason=f"{model} 理由")
+
+        judge = PanelJudge()
+        self.service.judging = judge
+        question_set = self.question_sets.create_with_questions(
+            "project", "panel", [BatchQuestion("Q1", "問題一", "答案一"), BatchQuestion("Q2", "問題二", "答案二")]
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        panel = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-6-luna"]
+        self.service.save_configuration("project", [group], question_set.question_set_id, 1, panel)
+        self.assertEqual(self.service.load("project")["judge_model"], "gpt-4o-mini, gpt-4.1-mini, gpt-6-luna")
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=1)
+
+        run = self.service.evaluate_answers("project", question_set.question_set_id, judge_model=panel, max_concurrency=1)
+
+        # Same grading inputs for every judge; only the model differs.
+        self.assertEqual(len({call[:4] + (call[5],) for call in judge.calls if call[0] == "Q1"}), 1)
+        self.assertEqual(len(judge.calls), 6)
+        first, second = sorted(run.results, key=lambda item: item.question_id)
+        self.assertAlmostEqual(first.evaluation_result, 1.6667)
+        self.assertEqual([item.score for item in first.judge_scores], [2.0, 1.0, 2.0])
+        self.assertEqual(second.evaluation_result, 1.5)
+        self.assertIsNone(second.judge_scores[2].score)
+        self.assertIn("gpt-6-luna：失敗｜timeout", second.evaluation_reason)
+        summary = run.groups[0]
+        self.assertEqual((summary.correct_count, summary.partial_correct_count, summary.incorrect_count), (0, 2, 0))
+        self.assertAlmostEqual(summary.score_accuracy, (1.6667 + 1.5) / 4, places=4)
+        self.assertEqual(summary.judge_average_scores, {"gpt-4o-mini": 2.0, "gpt-4.1-mini": 1.0, "gpt-6-luna": 2.0})
+        self.assertEqual(summary.judge_disagreement_count, 2)
+
+        # Re-saving the displayed table value (two decimals) is not treated as a manual edit.
+        self.service.update_manual_judgments("project", [("Local", "Q1", "1.67")])
+        saved = next(item for item in self.service.load("project")["run"]["results"] if item["question_id"] == "Q1")
+        self.assertFalse(saved.get("manual_override"))
+        self.service.update_manual_judgments("project", [("Local", "Q1", "2")])
+        saved = next(item for item in self.service.load("project")["run"]["results"] if item["question_id"] == "Q1")
+        self.assertTrue(saved["manual_override"])
+        self.assertEqual(saved["evaluation_result"], 2)
+        self.assertEqual([item["score"] for item in saved["judge_scores"]], [2.0, 1.0, 2.0])
+
+        _summary_path, details_path = self.service.export("project")
+        details = json.loads(details_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(details["question_results"][0]["judge_scores"]), 3)
+        with self.assertRaisesRegex(ProjectError, "最多選擇 5"):
+            self.service.save_configuration("project", [group], question_set.question_set_id, 1, [*panel, *(f"x{i}" for i in range(3))])
 
     def test_lenient_evaluation_uses_lenient_judge_prompt_and_persists_mode(self):
         judge = FakeJudge(lenient_result=True)
@@ -846,7 +906,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2，多評審為平均）", "各評審分數與理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertTrue(experiment_results["interactive"])

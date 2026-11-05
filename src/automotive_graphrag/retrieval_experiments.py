@@ -20,14 +20,24 @@ from typing import Callable, Sequence
 import yaml
 
 from .agentic_search import AgenticSearch
-from .automatic_evaluation import AutomaticEvaluationService
+from .automatic_evaluation import (
+    AutomaticEvaluationService,
+    JudgeScore,
+    average_judge_score,
+    combined_judge_reason,
+    judge_panel_summary,
+    judge_scores_from_dicts,
+)
 from .connections import (
     ALLOWED_CHAT_MODELS,
     DEFAULT_REASONING_EFFORT,
     GPT6_LUNA_MODEL,
     REASONING_EFFORT_OPTIONS,
     ConnectionSettings,
+    MAX_JUDGE_MODELS,
     configure_completion_model,
+    format_judge_models,
+    parse_judge_models,
 )
 from .evidence import Evidence, EvidenceService
 from .evaluation.classic_metrics import exact_match_score, f1_score, metric_max_over_ground_truths
@@ -168,6 +178,8 @@ class ExperimentQuestionResult:
     refusal_correctness: str | None = None
     answer_em: float | None = None
     answer_f1: float | None = None
+    judge_scores: tuple[JudgeScore, ...] = ()
+    manual_override: bool = False
 
     @property
     def effective_method(self) -> str:
@@ -210,6 +222,8 @@ class ExperimentGroupSummary:
     quality_reviewed_count: int = 0
     average_answer_em: float | None = None
     average_answer_f1: float | None = None
+    judge_average_scores: dict[str, float] = field(default_factory=dict)
+    judge_disagreement_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,8 +275,31 @@ class RetrievalExperimentService:
         return supports(model) if callable(supports) else model in ALLOWED_CHAT_MODELS
 
     def _supports_judge_reasoning(self, model: object) -> bool:
+        """True when any model of the judge panel accepts reasoning_effort."""
         supports = getattr(self.judging, "supports_judge_reasoning", None)
-        return supports(model) if callable(supports) else model == GPT6_LUNA_MODEL
+        return any(
+            supports(item) if callable(supports) else item == GPT6_LUNA_MODEL
+            for item in parse_judge_models(model)
+        )
+
+    def _validate_judge_models(self, value: object) -> str:
+        """Validate a judge panel and return its saved comma-joined form."""
+        models = parse_judge_models(value)
+        if not models:
+            raise ProjectError("請至少選擇一個評測模型")
+        if len(models) > MAX_JUDGE_MODELS:
+            raise ProjectError(f"評測模型最多選擇 {MAX_JUDGE_MODELS} 個")
+        if not all(self._supports_judge_model(item) for item in models):
+            raise ProjectError("全域評測模型不支援")
+        return format_judge_models(models)
+
+    @classmethod
+    def _grade_counts(cls, values) -> tuple[int, int, int, float]:
+        """Full (2), partial (between 0 and 2) and incorrect (0) counts plus the score sum."""
+        grades = [grade for grade in (cls._parse_grade(value) for value in values) if grade is not None]
+        full = sum(grade == 2 for grade in grades)
+        incorrect = sum(grade == 0 for grade in grades)
+        return full, len(grades) - full - incorrect, incorrect, float(sum(grades))
 
     def load(self, project_id: str) -> dict[str, object]:
         self.projects.get(project_id)
@@ -323,17 +360,16 @@ class RetrievalExperimentService:
                     migrated = True
             for group in run.get("groups", []):
                 group_results = [item for item in run.get("results", []) if item.get("group_id") == group.get("group_id")]
-                judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
-                full = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
-                partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
-                incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
+                full, partial, incorrect, score_sum = self._grade_counts(
+                    item.get("evaluation_result") for item in group_results
+                )
                 total = int(group.get("question_count", len(group_results)))
                 judge_enabled = bool(run.get("enable_llm_judge", True))
                 updated = {
                     "correct_count": full, "partial_correct_count": partial,
                     "incorrect_count": incorrect,
                     "accuracy": full / total if total and judge_enabled else None,
-                    "score_accuracy": (2 * full + partial) / (2 * total) if total and judge_enabled else None,
+                    "score_accuracy": score_sum / (2 * total) if total and judge_enabled else None,
                     "average_answer_em": self._mean_present(item.get("answer_em") for item in group_results),
                     "average_answer_f1": self._mean_present(item.get("answer_f1") for item in group_results),
                 }
@@ -360,9 +396,7 @@ class RetrievalExperimentService:
         current = self.load(project_id)
         current["groups"] = [asdict(group) for group in groups]
         if judge_model is not None:
-            if not self._supports_judge_model(judge_model):
-                raise ProjectError("全域評測模型不支援")
-            current["judge_model"] = judge_model
+            current["judge_model"] = self._validate_judge_models(judge_model)
         question_set_ids = self._normalize_question_set_ids(question_set_id)
         current["question_set_ids"] = question_set_ids
         current["question_set_id"] = question_set_ids[0] if question_set_ids else ""
@@ -614,9 +648,9 @@ class RetrievalExperimentService:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
         self._validate_groups(groups)
         state = self.load(project_id)
-        judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
-        if not self._supports_judge_model(judge_model):
-            raise ProjectError("全域評測模型不支援")
+        judge_model = self._validate_judge_models(
+            judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
+        )
         project = self.projects.get(project_id)
         question_set_ids = self._normalize_question_set_ids(question_set_id)
         if not question_set_ids:
@@ -761,8 +795,9 @@ class RetrievalExperimentService:
         if not groups:
             raise ProjectError("請先新增至少一個實驗組")
         judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
-        if enable_llm_judge and not self._supports_judge_model(judge_model):
-            raise ProjectError("全域評測模型不支援")
+        judge_model = (
+            self._validate_judge_models(judge_model) if enable_llm_judge else format_judge_models(judge_model)
+        )
         concurrency = int(max_concurrency or state.get("max_concurrency", 5))
         if not 1 <= concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
@@ -904,23 +939,28 @@ class RetrievalExperimentService:
                 next_result = score
                 if item.get("evaluation_result") == "評判失敗":
                     continue
-                if item.get("evaluation_result") != next_result:
+                current = self._parse_grade(item.get("evaluation_result"))
+                # Fractional averages are shown with two decimals; an untouched cell is not an edit.
+                if current is None or abs(current - next_result) >= 0.005:
                     item["evaluation_result"] = next_result
-                    item["evaluation_reason"] = ""
+                    if item.get("judge_scores"):
+                        # Keep each judge's own score and reason; only the question score is overridden.
+                        item["manual_override"] = True
+                    else:
+                        item["evaluation_reason"] = ""
                     item["error"] = None
                     item["status"] = "completed"
                     changed = True
         if changed:
             for group in run.get("groups", []):
                 group_results = [item for item in results if item.get("group_id") == group.get("group_id")]
-                judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
-                full = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
-                partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
-                incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
+                full, partial, incorrect, score_sum = self._grade_counts(
+                    item.get("evaluation_result") for item in group_results
+                )
                 total = int(group.get("question_count", len(group_results)))
                 group.update(correct_count=full, partial_correct_count=partial, incorrect_count=incorrect,
                              accuracy=full / total if total else None,
-                             score_accuracy=(2 * full + partial) / (2 * total) if total else None)
+                             score_accuracy=score_sum / (2 * total) if total else None)
             self._write(project_id, state)
         return run
 
@@ -1035,17 +1075,18 @@ class RetrievalExperimentService:
         run_results = run.get("results", [])
         group_rows = []
         evaluated_count = full_count = partial_count = incorrect_count = 0
+        score_total = 0.0
         for summary in run_groups:
             group_results = [item for item in run_results if item.get("group_id") == summary.get("group_id")]
-            judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
-            group_correct = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
-            group_partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
-            group_incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
-            group_evaluated = len(judged)
+            group_correct, group_partial, group_incorrect, group_score = self._grade_counts(
+                item.get("evaluation_result") for item in group_results
+            )
+            group_evaluated = group_correct + group_partial + group_incorrect
             evaluated_count += group_evaluated
             full_count += group_correct
             partial_count += group_partial
             incorrect_count += group_incorrect
+            score_total += group_score
             group_total = int(summary.get("question_count", len(group_results)))
             group_rows.append({
                 "name": summary.get("group_name"),
@@ -1070,7 +1111,9 @@ class RetrievalExperimentService:
                     "incorrect_count": group_incorrect,
                     "fully_correct_total": f"{group_correct} / {group_total}",
                     "accuracy": group_correct / group_total if group_total else None,
-                    "score_accuracy": (2 * group_correct + group_partial) / (2 * group_total) if group_total else None,
+                    "score_accuracy": group_score / (2 * group_total) if group_total else None,
+                    "judge_average_scores": summary.get("judge_average_scores", {}),
+                    "judge_disagreement_count": summary.get("judge_disagreement_count", 0),
                     "evidence_hit_rate": summary.get("evidence_hit_rate"),
                     "evidence_precision": summary.get("evidence_precision"),
                     "document_hit_rate": summary.get("document_hit_rate"),
@@ -1098,6 +1141,7 @@ class RetrievalExperimentService:
             "max_concurrent_requests": state.get("max_concurrency", 5),
             "evaluation": {
                 "judge_model": state.get("judge_model", ""),
+                "judge_models": list(parse_judge_models(state.get("judge_model", ""))),
                 "enable_llm_judge": run.get("enable_llm_judge", state.get("enable_llm_judge", True)),
                 "enable_classic_metrics": run.get("enable_classic_metrics", state.get("enable_classic_metrics", False)),
                 "mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
@@ -1121,7 +1165,7 @@ class RetrievalExperimentService:
                 "incorrect_count": incorrect_count,
                 "fully_correct_total": f"{full_count} / {expected_count}",
                 "accuracy": full_count / expected_count if expected_count else None,
-                "score_accuracy": (2 * full_count + partial_count) / (2 * expected_count) if expected_count else None,
+                "score_accuracy": score_total / (2 * expected_count) if expected_count else None,
                 "average_answer_em": self._average_metric(run_results, "answer_em"),
                 "average_answer_f1": self._average_metric(run_results, "answer_f1"),
                 "evidence_hit_rate": self._average_metric(run_groups, "evidence_hit_rate"),
@@ -1196,21 +1240,28 @@ class RetrievalExperimentService:
         return sum(numbers) / len(numbers) if numbers else None
 
     @staticmethod
-    def _parse_grade(value: object) -> int | None:
+    def _parse_grade(value: object) -> int | float | None:
+        """Question grade on the 0–2 scale; a judge-panel average may be fractional."""
         if isinstance(value, bool):
             return 2 if value else 0
-        if isinstance(value, int) and value in {0, 1, 2}:
-            return value
+        if isinstance(value, (int, float)):
+            if not math.isfinite(value) or not 0 <= value <= 2:
+                return None
+            return int(value) if float(value).is_integer() else round(float(value), 4)
         text = str(value or "").strip()
         legacy = {"正確": 2, "全對": 2, "錯誤": 0, "部分對": 1}
         if text in legacy:
             return legacy[text]
-        if text in {"0", "1", "2"}:
-            return int(text)
         for prefix, score in (("0 ", 0), ("1 ", 1), ("2 ", 2)):
             if text.startswith(prefix):
                 return score
-        return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(number) or not 0 <= number <= 2:
+            return None
+        return int(number) if number.is_integer() else round(number, 4)
 
     def _run_case(
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
@@ -1385,29 +1436,45 @@ class RetrievalExperimentService:
             answer_f1=None if not enable_classic_metrics else generated.answer_f1,
         )
         if enable_llm_judge:
-            try:
-                judged = self.judging.evaluate_single_answer_grade(
-                    project_id, question.question_id, question.question,
-                    question.reference_answer, generated.actual_answer, judge_model,
-                    evaluation_mode=evaluation_mode,
-                    reasoning_effort=judge_reasoning_effort,
+            # Every judge gets the identical grading prompt; judges run one after another so the
+            # case still occupies a single slot of the experiment's concurrency limit.
+            judges = []
+            for model in parse_judge_models(judge_model):
+                try:
+                    judged = self.judging.evaluate_single_answer_grade(
+                        project_id, question.question_id, question.question,
+                        question.reference_answer, generated.actual_answer, model,
+                        evaluation_mode=evaluation_mode,
+                        reasoning_effort=judge_reasoning_effort,
+                    )
+                    judges.append(JudgeScore(model, float(judged.score), judged.judge_reason))
+                except Exception as exc:
+                    judges.append(JudgeScore(model, None, "", str(exc)))
+            average = average_judge_score(judges)
+            if average is None:
+                error = "；".join(
+                    (f"{item.model}: " if len(judges) > 1 else "") + str(item.error) for item in judges
                 )
-                result = replace(
-                    result,
-                    judge_model=judge_model,
-                    evaluation_result=judged.score,
-                    evaluation_reason=judged.judge_reason,
-                    status="completed",
-                    error=None,
-                )
-            except Exception as exc:
                 result = replace(
                     result,
                     judge_model=judge_model,
                     evaluation_result="評判失敗",
-                    evaluation_reason=str(exc),
+                    evaluation_reason=error,
                     status="evaluation_failed",
-                    error=str(exc),
+                    error=error,
+                    judge_scores=tuple(judges),
+                    manual_override=False,
+                )
+            else:
+                result = replace(
+                    result,
+                    judge_model=judge_model,
+                    evaluation_result=self._parse_grade(average),
+                    evaluation_reason=combined_judge_reason(judges),
+                    status="completed",
+                    error=None,
+                    judge_scores=tuple(judges),
+                    manual_override=False,
                 )
         else:
             result = replace(
@@ -1485,10 +1552,8 @@ class RetrievalExperimentService:
         result_items = tuple(results.values())
         for group in groups:
             group_items = [item for item in result_items if item.group_id == group.group_id]
-            judged = [item for item in group_items if self._parse_grade(item.evaluation_result) is not None]
-            correct = sum(self._parse_grade(item.evaluation_result) == 2 for item in judged)
-            partial = sum(self._parse_grade(item.evaluation_result) == 1 for item in judged)
-            incorrect = sum(self._parse_grade(item.evaluation_result) == 0 for item in judged)
+            correct, partial, incorrect, score_sum = self._grade_counts(item.evaluation_result for item in group_items)
+            judge_averages, disagreements = judge_panel_summary(group_items, lambda item: item.judge_scores)
             total = sum(len(question_set.questions) for question_set in question_sets)
             answered = sum(bool(item.actual_answer.strip()) for item in group_items)
             if group.method in EVIDENCE_METHODS or group.method in {EXPERIMENT_AUTO_METHOD, EXPERIMENT_AGENTIC_METHOD}:
@@ -1558,7 +1623,7 @@ class RetrievalExperimentService:
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 total, answered, correct, partial, incorrect,
                 correct / total if total and enable_llm_judge else None,
-                (2 * correct + partial) / (2 * total) if total and enable_llm_judge else None,
+                score_sum / (2 * total) if total and enable_llm_judge else None,
                 evidence_hit_rate, evidence_precision, document_hit_rate,
                 no_evidence_count, metrics_status, group.response_type, group.answer_reasoning_effort,
                 (
@@ -1575,6 +1640,8 @@ class RetrievalExperimentService:
                 **quality_summary,
                 average_answer_em=answer_em,
                 average_answer_f1=answer_f1,
+                judge_average_scores=judge_averages,
+                judge_disagreement_count=disagreements,
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
@@ -1625,6 +1692,7 @@ class RetrievalExperimentService:
     def _result_from_dict(value: dict[str, object]) -> ExperimentQuestionResult:
         data = dict(value)
         data.setdefault("retrieved_evidence", [])
+        data["judge_scores"] = judge_scores_from_dicts(data.get("judge_scores"))
         data["retrieved_evidence"] = tuple(
             item if isinstance(item, Evidence) else Evidence(**item)
             for item in data["retrieved_evidence"]

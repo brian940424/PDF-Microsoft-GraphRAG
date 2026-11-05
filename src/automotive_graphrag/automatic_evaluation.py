@@ -11,10 +11,10 @@ import tempfile
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from .evaluation.classic_metrics import (
     exact_match_score,
@@ -27,7 +27,11 @@ from .connections import (
     ConnectionSettings,
     JudgeConnectionSettings,
     JudgeEndpoint,
+    MAX_JUDGE_MODELS,
+    format_judge_models,
     is_litellm_model,
+    judge_model_label,
+    parse_judge_models,
     judge_completion_api_params,
     litellm_alias,
 )
@@ -42,10 +46,30 @@ JudgeClient = Callable[..., object]
 
 
 @dataclass(frozen=True, slots=True)
+class JudgeScore:
+    """One judge model's verdict for one question; ``score`` is None when the request failed."""
+
+    model: str
+    score: float | None
+    reason: str = ""
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AutomaticEvaluationItem:
     question_id: str
     is_correct: bool
     judge_reason: str
+    judges: tuple[JudgeScore, ...] = ()
+    average_score: float | None = None
+    manual: bool = False
+
+    @property
+    def score(self) -> float:
+        """Question score (0–1): judge average, or the manual override when edited."""
+        if self.average_score is not None:
+            return self.average_score
+        return 1.0 if self.is_correct else 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +103,61 @@ class AutomaticEvaluationResult:
     enable_llm_judge: bool = True
     enable_classic_metrics: bool = False
     judge_error: str | None = None
+    models: tuple[str, ...] = ()
+    average_score: float | None = None
+    judge_average_scores: dict[str, float] = field(default_factory=dict)
+    disagreement_count: int = 0
+
+
+def average_judge_score(judges: Sequence[JudgeScore]) -> float | None:
+    scores = [item.score for item in judges if item.score is not None]
+    return round(sum(scores) / len(scores), 4) if scores else None
+
+
+def combined_judge_reason(judges: Sequence[JudgeScore], score_format: Callable[[float], str] = lambda value: f"{value:g}") -> str:
+    """Single judge keeps its plain reason; a panel lists each model's score and reason."""
+    if len(judges) == 1 and judges[0].score is not None:
+        return judges[0].reason
+    return "\n".join(
+        f"{judge_model_label(item.model)}：{score_format(item.score)}｜{item.reason}"
+        if item.score is not None
+        else f"{judge_model_label(item.model)}：失敗｜{item.error or ''}"
+        for item in judges
+    )
+
+
+def judge_panel_summary(items: Sequence[object], judges_of: Callable[[object], Sequence[JudgeScore]]) -> tuple[dict[str, float], int]:
+    """Per-judge average score and the number of questions where successful judges disagree."""
+    totals: dict[str, list[float]] = {}
+    disagreements = 0
+    for item in items:
+        scores = []
+        for judge in judges_of(item):
+            if judge.score is None:
+                continue
+            totals.setdefault(judge.model, []).append(judge.score)
+            scores.append(judge.score)
+        if len(set(scores)) > 1:
+            disagreements += 1
+    return {model: round(sum(values) / len(values), 4) for model, values in totals.items()}, disagreements
+
+
+def judge_scores_from_dicts(values: object) -> tuple[JudgeScore, ...]:
+    if not isinstance(values, (list, tuple)):
+        return ()
+    result = []
+    for value in values:
+        if isinstance(value, JudgeScore):
+            result.append(value)
+        elif isinstance(value, dict) and isinstance(value.get("model"), str):
+            score = value.get("score")
+            result.append(JudgeScore(
+                value["model"],
+                float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
+                str(value.get("reason") or ""),
+                value.get("error") if isinstance(value.get("error"), str) else None,
+            ))
+    return tuple(result)
 
 
 class AutomaticEvaluationService:
@@ -135,13 +214,15 @@ class AutomaticEvaluationService:
         question_set_id: str,
         rerun_answers: bool = False,
         only_previous_failures: bool = False,
-        model: str | None = None,
+        model: str | Sequence[str] | None = None,
         concurrency: int = 3,
         progress_callback: Callable[[int, int], None] | None = None,
         reasoning_effort: str = "medium",
         enable_llm_judge: bool = True,
         enable_classic_metrics: bool = False,
     ) -> AutomaticEvaluationResult:
+        """Judge saved answers; with several models every judge scores each question and the
+        question score is the average of the judges that succeeded."""
         if not enable_llm_judge and not enable_classic_metrics:
             raise ProjectError("至少啟用一種評測方式")
         if concurrency < 1 or concurrency > 32:
@@ -172,18 +253,20 @@ class AutomaticEvaluationService:
         if not eligible:
             raise ProjectError("沒有已完成回答且包含正確答案的題目可供評判")
 
-        model = (model or self.connections.get_chat_model()) if enable_llm_judge else "—"
-        if enable_llm_judge and not self.supports_judge_model(model):
-            raise ProjectError(self._unsupported_model_message(model))
+        models = self.validate_judge_models(model) if enable_llm_judge else ()
         prompt = (
             "\n\n---\n\n".join(self._build_prompt([item]) for item in eligible)
             if enable_llm_judge else ""
         )
         judged_by_id: dict[str, AutomaticEvaluationItem] = {}
         failures: list[str] = []
+        partial_failures: list[str] = []
+        total_calls = len(eligible) * len(models)
         if progress_callback and enable_llm_judge:
-            progress_callback(0, len(eligible))
+            progress_callback(0, total_calls)
         if enable_llm_judge:
+            verdicts: dict[str, dict[str, JudgeScore]] = {item.question_id: {} for item in eligible}
+            finished = 0
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 futures = {
                     pool.submit(
@@ -193,19 +276,45 @@ class AutomaticEvaluationService:
                         item.question,
                         item.reference_answer,
                         item.answer,
-                        model,
+                        judge_model,
                         reasoning_effort=reasoning_effort,
-                    ): item
+                    ): (item, judge_model)
                     for item in eligible
+                    for judge_model in models
                 }
                 for future in as_completed(futures):
-                    question = futures[future]
+                    question, judge_model = futures[future]
                     try:
-                        judged_by_id[question.question_id] = future.result()
+                        single = future.result()
+                        verdicts[question.question_id][judge_model] = JudgeScore(
+                            judge_model, 1.0 if single.is_correct else 0.0, single.judge_reason
+                        )
                     except Exception as exc:
-                        failures.append(f"{question.question_id}: {exc}")
+                        verdicts[question.question_id][judge_model] = JudgeScore(judge_model, None, "", str(exc))
+                    finished += 1
                     if progress_callback:
-                        progress_callback(len(judged_by_id) + len(failures), len(eligible))
+                        progress_callback(finished, total_calls)
+            for question in eligible:
+                judges = tuple(verdicts[question.question_id][judge_model] for judge_model in models)
+                failed = [item for item in judges if item.score is None]
+                if len(failed) == len(judges):
+                    failures.append(f"{question.question_id}: " + "；".join(
+                        (f"{judge_model_label(item.model)} " if len(judges) > 1 else "") + str(item.error)
+                        for item in failed
+                    ))
+                    continue
+                if failed:
+                    partial_failures.append(
+                        f"{question.question_id}（{'、'.join(judge_model_label(item.model) for item in failed)}）"
+                    )
+                average = average_judge_score(judges)
+                judged_by_id[question.question_id] = AutomaticEvaluationItem(
+                    question_id=question.question_id,
+                    is_correct=average >= 0.5,
+                    judge_reason=combined_judge_reason(judges),
+                    judges=judges,
+                    average_score=average,
+                )
         if failures and not enable_classic_metrics:
             raise ProjectError("自動評測部分請求失敗：" + "；".join(failures))
         if enable_llm_judge and selected_ids is not None and previous is not None:
@@ -232,11 +341,17 @@ class AutomaticEvaluationService:
         ) if enable_classic_metrics else ()
         if progress_callback and not enable_llm_judge:
             progress_callback(len(eligible), len(eligible))
+        judge_messages = []
+        if failures:
+            judge_messages.append("自動評測部分請求失敗：" + "；".join(failures))
+        if partial_failures:
+            judge_messages.append("部分評審失敗，該題只平均成功的評審：" + "、".join(partial_failures))
+        judge_averages, disagreements = judge_panel_summary(items, lambda item: item.judges)
         result = AutomaticEvaluationResult(
             project_id=project_id,
             question_set_id=question_set_id,
             evaluated_at=datetime.now(timezone.utc).isoformat(),
-            model=model,
+            model=format_judge_models(models) if enable_llm_judge else "—",
             prompt_version=PROMPT_VERSION,
             judge_prompt=prompt,
             question_count=len(items),
@@ -247,10 +362,27 @@ class AutomaticEvaluationService:
             average_answer_f1=(sum(item.answer_f1 for item in classic_items) / len(classic_items) if classic_items else None),
             enable_llm_judge=enable_llm_judge,
             enable_classic_metrics=enable_classic_metrics,
-            judge_error=("自動評測部分請求失敗：" + "；".join(failures)) if failures else None,
+            judge_error="\n".join(judge_messages) or None,
+            models=models,
+            average_score=self._average_item_score(items),
+            judge_average_scores=judge_averages,
+            disagreement_count=disagreements,
         )
         self._write(result)
         return result
+
+    def validate_judge_models(self, value: object) -> tuple[str, ...]:
+        models = parse_judge_models(value) or (self.connections.get_chat_model(),)
+        if len(models) > MAX_JUDGE_MODELS:
+            raise ProjectError(f"評測模型最多選擇 {MAX_JUDGE_MODELS} 個")
+        for item in models:
+            if not self.supports_judge_model(item):
+                raise ProjectError(self._unsupported_model_message(item))
+        return models
+
+    @staticmethod
+    def _average_item_score(items: Sequence[AutomaticEvaluationItem]) -> float | None:
+        return round(sum(item.score for item in items) / len(items), 4) if items else None
 
     def evaluate_single_answer(
         self,
@@ -338,6 +470,8 @@ class AutomaticEvaluationService:
                     "is_correct": item.get("answer_score", 0) >= 4,
                     "judge_reason": item.get("judge_reason", "舊版評測結果；請重新評判"),
                 }
+            item = {key: value for key, value in item.items() if key in AutomaticEvaluationItem.__dataclass_fields__}
+            item["judges"] = judge_scores_from_dicts(item.get("judges"))
             migrated_items.append(AutomaticEvaluationItem(**item))
         raw_classic_items = value.pop("classic_items", [])
         classic_items = tuple(ClassicMetricsItem(**item) for item in raw_classic_items)
@@ -354,12 +488,19 @@ class AutomaticEvaluationService:
             sum(item.answer_f1 for item in classic_items) / len(classic_items) if classic_items else None,
         )
         value["items"] = tuple(migrated_items)
+        value["models"] = tuple(value.get("models") or parse_judge_models(value.get("model")))
+        if value.get("average_score") is None and value.get("enable_llm_judge", True):
+            value["average_score"] = self._average_item_score(migrated_items)
+        if "judge_average_scores" not in value:
+            value["judge_average_scores"], value["disagreement_count"] = judge_panel_summary(
+                migrated_items, lambda item: item.judges
+            )
         return AutomaticEvaluationResult(**value)
 
     def update_manual_results(
-        self, project_id: str, question_set_id: str, decisions: dict[str, str]
+        self, project_id: str, question_set_id: str, decisions: dict[str, object]
     ) -> AutomaticEvaluationResult:
-        """Save manual correctness edits and clear stale judge reasons for changed decisions."""
+        """Save manual question scores (0–1) as an override; each judge's own scores stay intact."""
         result = self.last_result(project_id, question_set_id)
         if result is None:
             raise ProjectError("尚無評測結果可供修改")
@@ -368,37 +509,37 @@ class AutomaticEvaluationService:
             raise ProjectError("評測結果找不到題號：" + ", ".join(sorted(unknown)))
         items = []
         for item in result.items:
-            decision = decisions.get(item.question_id)
-            if decision is None:
+            if item.question_id not in decisions:
                 items.append(item)
                 continue
-            if decision not in {"正確", "錯誤"}:
-                raise ProjectError(f"{item.question_id} 的判斷只能是「正確」或「錯誤」")
-            is_correct = decision == "正確"
-            items.append(AutomaticEvaluationItem(
-                question_id=item.question_id,
-                is_correct=is_correct,
-                judge_reason="" if is_correct != item.is_correct else item.judge_reason,
-            ))
-        updated = AutomaticEvaluationResult(
-            project_id=result.project_id,
-            question_set_id=result.question_set_id,
-            evaluated_at=result.evaluated_at,
-            model=result.model,
-            prompt_version=result.prompt_version,
-            judge_prompt=result.judge_prompt,
+            score = self._parse_manual_score(item.question_id, decisions[item.question_id])
+            if abs(score - item.score) < 0.005:
+                items.append(item)
+                continue
+            items.append(replace(item, is_correct=score >= 0.5, average_score=score, manual=True))
+        updated = replace(
+            result,
             question_count=len(items),
             correct_count=sum(item.is_correct for item in items),
             items=tuple(items),
-            classic_items=result.classic_items,
-            average_answer_em=result.average_answer_em,
-            average_answer_f1=result.average_answer_f1,
-            enable_llm_judge=result.enable_llm_judge,
-            enable_classic_metrics=result.enable_classic_metrics,
-            judge_error=result.judge_error,
+            average_score=self._average_item_score(items),
         )
         self._write(updated)
         return updated
+
+    @staticmethod
+    def _parse_manual_score(question_id: str, value: object) -> float:
+        if value in {"正確", True}:
+            return 1.0
+        if value in {"錯誤", False}:
+            return 0.0
+        try:
+            score = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ProjectError(f"{question_id} 的平均分數必須是 0 到 1 的數字") from exc
+        if not 0 <= score <= 1:
+            raise ProjectError(f"{question_id} 的平均分數必須介於 0 到 1")
+        return round(score, 4)
 
     def clear_result(self, project_id: str, question_set_id: str) -> None:
         path = self._path(project_id, question_set_id)
@@ -424,6 +565,9 @@ class AutomaticEvaluationService:
             {
                 "question_id": question_id,
                 "is_correct": judge_by_id[question_id].is_correct if question_id in judge_by_id else None,
+                "average_score": judge_by_id[question_id].score if question_id in judge_by_id else None,
+                "manual": judge_by_id[question_id].manual if question_id in judge_by_id else False,
+                "judges": [asdict(judge) for judge in judge_by_id[question_id].judges] if question_id in judge_by_id else [],
                 "judge_reason": judge_by_id[question_id].judge_reason if question_id in judge_by_id else "",
                 "answer_em": classic_by_id[question_id].answer_em if question_id in classic_by_id else None,
                 "answer_f1": classic_by_id[question_id].answer_f1 if question_id in classic_by_id else None,
@@ -434,6 +578,10 @@ class AutomaticEvaluationService:
             "question_count": result.question_count,
             "judge_evaluated_count": len(result.items),
             "correct_count": result.correct_count,
+            "judge_models": list(result.models),
+            "average_score": result.average_score,
+            "judge_average_scores": result.judge_average_scores,
+            "disagreement_count": result.disagreement_count,
             "average_answer_em": result.average_answer_em,
             "average_answer_f1": result.average_answer_f1,
             "enable_llm_judge": result.enable_llm_judge,
@@ -441,8 +589,13 @@ class AutomaticEvaluationService:
         }
         self._atomic_text(json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         buffer = io.StringIO(newline="")
+        judge_columns = [
+            column for judge_model in result.models
+            for column in (f"judge_score:{judge_model}", f"judge_reason:{judge_model}")
+        ]
         fieldnames = [
-            *AutomaticEvaluationItem.__dataclass_fields__,
+            "question_id", "is_correct", "average_score", "manual", "judge_reason",
+            *judge_columns,
             "answer_em",
             "answer_f1",
             "human_label",
@@ -456,11 +609,17 @@ class AutomaticEvaluationService:
         for question_id in dict.fromkeys([*judge_by_id, *classic_by_id]):
             item = judge_by_id.get(question_id)
             classic = classic_by_id.get(question_id)
-            row = asdict(item) if item else {
+            row = {
                 "question_id": question_id,
-                "is_correct": None,
-                "judge_reason": "",
+                "is_correct": item.is_correct if item else None,
+                "average_score": item.score if item else None,
+                "manual": item.manual if item else False,
+                "judge_reason": item.judge_reason if item else "",
             }
+            for judge in (item.judges if item else ()):
+                if f"judge_score:{judge.model}" in judge_columns:
+                    row[f"judge_score:{judge.model}"] = judge.score
+                    row[f"judge_reason:{judge.model}"] = judge.reason or judge.error or ""
             row["answer_em"] = classic.answer_em if classic else None
             row["answer_f1"] = classic.answer_f1 if classic else None
             review = review_by_id.get(question_id)

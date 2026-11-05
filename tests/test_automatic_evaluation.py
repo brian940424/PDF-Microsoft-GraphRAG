@@ -208,6 +208,100 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         service.evaluate("L33-SM3E", self.question_set_id, model="gpt-4o-mini")
         self.assertEqual(openai_judge.calls[0][:3], ("https://api.openai.com/v1", "test-key", "gpt-4o-mini"))
 
+    def test_judge_panel_scores_every_question_with_each_model_and_averages(self) -> None:
+        verdicts = {
+            ("gpt-4.1-mini", "Q0001"): "correct", ("gpt-4.1-mini", "Q0002"): "correct",
+            ("litellm:claude-judge", "Q0001"): "incorrect", ("litellm:claude-judge", "Q0002"): "correct",
+            ("litellm:gemini-flash", "Q0002"): "correct",
+        }
+        prompts: dict[str, set[str]] = {}
+        lock = threading.Lock()
+
+        def client(_url, _key, model, prompt, reasoning_effort="medium"):
+            question_id = json.loads(prompt.split("評測案例：", 1)[1])[0]["question_id"]
+            with lock:
+                prompts.setdefault(question_id, set()).add(prompt)
+            if (model, question_id) not in verdicts:
+                raise RuntimeError("proxy timeout")
+            return {"items": [{"question_id": question_id, "result": verdicts[(model, question_id)], "reason": model}]}
+
+        judge_connections = JudgeConnectionSettings(self.store.root)
+        judge_connections.save("http://localhost:4000", "sk", ["claude-judge", "gemini-flash"])
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, client, judge_connections=judge_connections
+        )
+        progress: list[tuple[int, int]] = []
+        panel = ["gpt-4.1-mini", "litellm:claude-judge", "litellm:gemini-flash"]
+        result = service.evaluate(
+            "L33-SM3E", self.question_set_id, model=panel, progress_callback=lambda *args: progress.append(args)
+        )
+
+        # Every judge receives exactly the same grading prompt for a question.
+        self.assertEqual({question_id: len(values) for question_id, values in prompts.items()}, {"Q0001": 1, "Q0002": 1})
+        self.assertEqual(progress[-1], (6, 6))
+        self.assertEqual(result.models, tuple(panel))
+        self.assertEqual(result.model, "gpt-4.1-mini, litellm:claude-judge, litellm:gemini-flash")
+        first, second = result.items
+        self.assertEqual([judge.score for judge in first.judges], [1.0, 0.0, None])
+        self.assertEqual(first.judges[2].error, "答案評判 API 呼叫失敗：proxy timeout")
+        self.assertEqual(first.score, 0.5)
+        self.assertEqual(second.score, 1.0)
+        self.assertEqual(result.average_score, 0.75)
+        self.assertEqual(
+            result.judge_average_scores,
+            {"gpt-4.1-mini": 1.0, "litellm:claude-judge": 0.5, "litellm:gemini-flash": 1.0},
+        )
+        self.assertEqual(result.disagreement_count, 1)
+        self.assertIn("部分評審失敗", result.judge_error)
+        self.assertIn("LiteLLM／gemini-flash：失敗", first.judge_reason)
+        self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
+
+        _json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
+        rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+        self.assertEqual(rows[0]["average_score"], "0.5")
+        self.assertEqual(rows[0]["judge_score:litellm:claude-judge"], "0.0")
+        self.assertEqual(rows[0]["judge_reason:litellm:gemini-flash"], "答案評判 API 呼叫失敗：proxy timeout")
+
+        with self.assertRaisesRegex(ProjectError, "最多選擇 5"):
+            service.evaluate("L33-SM3E", self.question_set_id, model=["gpt-4o-mini", *(f"m{i}" for i in range(5))])
+
+    def test_question_fails_only_when_every_judge_fails(self) -> None:
+        def client(_url, _key, model, prompt):
+            question_id = json.loads(prompt.split("評測案例：", 1)[1])[0]["question_id"]
+            if question_id == "Q0001":
+                raise RuntimeError(f"{model} down")
+            return {"items": [{"question_id": question_id, "result": "correct", "reason": "ok"}]}
+
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, client)
+        with self.assertRaisesRegex(ProjectError, "Q0001: gpt-4o-mini .*gpt-4.1-mini"):
+            service.evaluate("L33-SM3E", self.question_set_id, model="gpt-4o-mini, gpt-4.1-mini")
+
+    def test_single_judge_result_matches_previous_format_and_legacy_file_loads(self) -> None:
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, FakeJudge([self.judged()])
+        )
+        result = service.evaluate("L33-SM3E", self.question_set_id, model="gpt-4o-mini")
+        self.assertEqual(result.model, "gpt-4o-mini")
+        self.assertEqual([item.judge_reason for item in result.items], ["第一題評語", "第二題評語"])
+        self.assertEqual(result.average_score, 0.5)
+        self.assertEqual(result.judge_average_scores, {"gpt-4o-mini": 0.5})
+        self.assertEqual(result.disagreement_count, 0)
+
+        path = service._path("L33-SM3E", self.question_set_id)
+        legacy = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("models", "average_score", "judge_average_scores", "disagreement_count"):
+            legacy.pop(key)
+        legacy["items"] = [
+            {"question_id": "Q0001", "is_correct": False, "judge_reason": "舊"},
+            {"question_id": "Q0002", "is_correct": True, "judge_reason": "舊"},
+        ]
+        path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        loaded = service.last_result("L33-SM3E", self.question_set_id)
+        self.assertEqual(loaded.models, ("gpt-4o-mini",))
+        self.assertEqual(loaded.average_score, 0.5)
+        self.assertEqual([item.score for item in loaded.items], [0.0, 1.0])
+        self.assertEqual(loaded.items[0].judges, ())
+
     def test_litellm_reasoning_effort_is_only_sent_when_model_supports_it(self) -> None:
         judge_connections = JudgeConnectionSettings(self.store.root)
         judge_connections.save("http://localhost:4000", "sk", ["claude-judge", "plain"], ["claude-judge"])
@@ -409,21 +503,29 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "並行數必須介於 1 到 32"):
             service.evaluate("L33-SM3E", self.question_set_id, concurrency=0)
 
-    def test_manual_judgement_edit_clears_stale_reason_and_recalculates_count(self) -> None:
+    def test_manual_score_edit_overrides_average_and_keeps_judge_scores(self) -> None:
         service = AutomaticEvaluationService(
             self.store, self.question_sets, self.connections, FakeJudge([self.judged()])
         )
-        service.evaluate("L33-SM3E", self.question_set_id)
+        original = service.evaluate("L33-SM3E", self.question_set_id)
 
         updated = service.update_manual_results(
-            "L33-SM3E", self.question_set_id, {"Q0001": "正確", "Q0002": "正確"}
+            "L33-SM3E", self.question_set_id, {"Q0001": "正確", "Q0002": 1}
         )
 
         self.assertEqual(updated.correct_count, 2)
         self.assertTrue(updated.items[0].is_correct)
-        self.assertEqual(updated.items[0].judge_reason, "")
+        self.assertTrue(updated.items[0].manual)
+        self.assertEqual(updated.items[0].score, 1.0)
+        # The judge's own verdict and reason are kept; only the question score is overridden.
+        self.assertEqual(updated.items[0].judges, original.items[0].judges)
+        self.assertEqual(updated.items[0].judge_reason, "第一題評語")
         self.assertTrue(updated.items[1].is_correct)
+        self.assertFalse(updated.items[1].manual)
         self.assertEqual(updated.items[1].judge_reason, "第二題評語")
+        self.assertEqual(updated.average_score, 1.0)
+        with self.assertRaisesRegex(ProjectError, "0 到 1"):
+            service.update_manual_results("L33-SM3E", self.question_set_id, {"Q0001": 2})
         self.assertEqual(
             service.last_result("L33-SM3E", self.question_set_id),
             updated,

@@ -16,6 +16,8 @@ from automotive_graphrag.connections import (
     configure_completion_model,
     judge_completion_api_params,
     judge_model_label,
+    format_judge_models,
+    parse_judge_models,
     parse_litellm_model_list,
     parse_litellm_reasoning_models,
 )
@@ -275,6 +277,14 @@ class JudgeConnectionSettingsTests(unittest.TestCase):
             judge_completion_api_params("litellm:claude", 4000, "none")
         self.assertEqual(judge_model_label("litellm:claude-judge"), "LiteLLM／claude-judge")
         self.assertEqual(judge_model_label("gpt-4.1-mini"), "gpt-4.1-mini")
+
+    def test_judge_panel_ids_round_trip_through_saved_string(self) -> None:
+        self.assertEqual(parse_judge_models("gpt-4o-mini, litellm:claude , gpt-4o-mini"), ("gpt-4o-mini", "litellm:claude"))
+        self.assertEqual(parse_judge_models(["gpt-4o-mini", "", "litellm:claude"]), ("gpt-4o-mini", "litellm:claude"))
+        self.assertEqual(parse_judge_models("—"), ())
+        self.assertEqual(format_judge_models(["gpt-4o-mini"]), "gpt-4o-mini")
+        self.assertEqual(judge_model_label("gpt-4o-mini, litellm:claude"), "gpt-4o-mini、LiteLLM／claude")
+        self.assertEqual(judge_model_label(["litellm:claude"]), "LiteLLM／claude")
 
 
 if __name__ == "__main__":
