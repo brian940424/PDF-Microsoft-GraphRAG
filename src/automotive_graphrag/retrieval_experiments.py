@@ -1255,6 +1255,15 @@ class RetrievalExperimentService:
         for prefix, score in (("0 ", 0), ("1 ", 1), ("2 ", 2)):
             if text.startswith(prefix):
                 return score
+        if "%" in text:
+            # Percent display of the 0–2 grade, e.g. "83.3%" or "100%（全對）".
+            try:
+                number = float(text.split("%", 1)[0]) / 50
+            except ValueError:
+                return None
+            if not math.isfinite(number) or not 0 <= number <= 2:
+                return None
+            return int(number) if number.is_integer() else round(number, 4)
         try:
             number = float(text)
         except ValueError:

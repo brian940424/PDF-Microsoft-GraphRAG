@@ -11,7 +11,7 @@ import yaml
 import numpy as np
 import gradio as gr
 
-from automotive_graphrag.app import _experiment_dataset_summary_rows, _sort_experiment_results, create_app
+from automotive_graphrag.app import _experiment_dataset_summary_rows, _experiment_grade_label, _sort_experiment_results, create_app
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationItem, AutomaticEvaluationService
 from automotive_graphrag.connections import ConnectionSettings, DEFAULT_REASONING_EFFORT, JudgeConnectionSettings
 from automotive_graphrag.evidence import Evidence
@@ -594,6 +594,13 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(summary.judge_disagreement_count, 2)
 
         # Re-saving the displayed table value (two decimals) is not treated as a manual edit.
+        self.assertEqual(_experiment_grade_label(first.evaluation_result), "83.3%")
+        self.assertEqual(_experiment_grade_label(2), "100%（全對）")
+        self.assertEqual(RetrievalExperimentService._parse_grade("100%（全對）"), 2)
+        self.assertEqual(RetrievalExperimentService._parse_grade("50%（部分對）"), 1)
+        self.service.update_manual_judgments("project", [("Local", "Q1", "83.3%")])
+        saved = next(item for item in self.service.load("project")["run"]["results"] if item["question_id"] == "Q1")
+        self.assertFalse(saved.get("manual_override"))
         self.service.update_manual_judgments("project", [("Local", "Q1", "1.67")])
         saved = next(item for item in self.service.load("project")["run"]["results"] if item["question_id"] == "Q1")
         self.assertFalse(saved.get("manual_override"))
@@ -867,7 +874,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertIn("實驗組摘要", labels)
         self.assertIn("實驗組 × 題目集摘要", labels)
         self.assertIn(
-            "逐題實驗結果（不執行模型評測也可手動編輯等級與品質欄位；拒答欄填正確／錯誤／不適用）",
+            "逐題實驗結果（不執行模型評測也可手動編輯得分與品質欄位；得分可填百分比或 0／1／2；拒答欄填正確／錯誤／不適用）",
             labels,
         )
         button_values = [
@@ -906,7 +913,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2，多評審為平均）", "各評審分數與理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數與理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertTrue(experiment_results["interactive"])

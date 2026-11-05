@@ -394,19 +394,41 @@ def _quality_annotation_label(value):
     return {"correct": "正確", "incorrect": "錯誤", "not_applicable": "不適用"}.get(value, "")
 
 
+def _score_percent(value, scale: float = 1) -> str:
+    """Display a score on a 0–``scale`` range as a percentage; stored values stay unchanged."""
+    percent = float(value) / scale * 100
+    return f"{percent:.1f}".rstrip("0").rstrip(".") + "%"
+
+
 def _experiment_grade_label(value):
     score = RetrievalExperimentService._parse_grade(value)
-    if isinstance(score, float):
-        return f"{score:.2f}"
-    return {0: "0 錯誤", 1: "1 部分對", 2: "2 全對"}.get(score, value or "")
+    if score is None:
+        return value or ""
+    label = {0: "錯誤", 1: "部分對", 2: "全對"}.get(score)
+    return _score_percent(score, 2) + (f"（{label}）" if label and not isinstance(score, float) else "")
 
 
-def _judge_panel_markup(averages, disagreements, score_format="{:.2f}") -> str:
+def _judge_panel_markup(averages, disagreements, scale: float = 1) -> str:
     """Per-judge average scores; empty for a single judge, whose average is the overall score."""
     if not isinstance(averages, dict) or len(averages) < 2:
         return ""
-    scores = "、".join(f"{judge_model_label(model)} {score_format.format(score)}" for model, score in averages.items())
+    scores = "、".join(f"{judge_model_label(model)} {_score_percent(score, scale)}" for model, score in averages.items())
     return f"各評審平均 {scores}｜評審不一致 {int(disagreements or 0)} 題"
+
+
+def _experiment_judge_cell(item) -> str:
+    """Judge-panel results render each judge's score as a percentage; one judge shows its reason."""
+    judges = item.get("judge_scores") or []
+    prefix = "（人工修改得分）\n" if item.get("manual_override") else ""
+    if len(judges) < 2:
+        return prefix + (item.get("evaluation_reason") or item.get("error") or "")
+    lines = [
+        f"{judge_model_label(judge.get('model'))}：{_score_percent(judge['score'], 2)}｜{judge.get('reason') or ''}"
+        if isinstance(judge.get("score"), (int, float))
+        else f"{judge_model_label(judge.get('model'))}：失敗｜{judge.get('error') or ''}"
+        for judge in judges if isinstance(judge, dict)
+    ]
+    return prefix + "\n".join(lines)
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -1054,7 +1076,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question.question,
                 question.answer,
                 question.reference_answer,
-                judged.score if judged else None,
+                _score_percent(judged.score) if judged else "",
                 autoqa_judge_scores(judged, report.judge.model) if judged else (
                     report.judge_error or question.error or ("未啟用 LLM Judge" if report.judge and not report.judge.enable_llm_judge else "尚無評判結果")
                 ),
@@ -1074,7 +1096,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             rows.append([
                 question_id,
                 evidence_docs, question.question, question.answer, question.reference_answer,
-                judged.score if judged else None,
+                _score_percent(judged.score) if judged else "",
                 autoqa_judge_scores(judged, judge.model) if judged else ("未啟用 LLM Judge" if not judge.enable_llm_judge else "尚無評判結果"),
                 autoqa_strategy_cell(question_set, question),
             ])
@@ -1084,7 +1106,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         """Markdown bullet list of each judge's score; reasons stay in the JSON／CSV export."""
         judges = item.judges or (JudgeScore(str(panel_model), 1.0 if item.is_correct else 0.0),)
         lines = [
-            f"* {judge_model_label(judge.model)} : {judge.score:g}" if judge.score is not None
+            f"* {judge_model_label(judge.model)} : {_score_percent(judge.score)}" if judge.score is not None
             else f"* {judge_model_label(judge.model)} : 失敗"
             for judge in judges
         ]
@@ -1102,9 +1124,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         items = []
         if judge and judge.enable_llm_judge:
-            score = f"**{judge.average_score:.2f}**" if judge.average_score is not None else "—"
+            score = f"**{_score_percent(judge.average_score)}**" if judge.average_score is not None else "—"
             items.append(
-                f"- **LLM Judge：** 平均分數 {score}（0–1，評判 {len(judge.items)}/{total} 題）｜"
+                f"- **LLM Judge：** 平均分數 {score}（評判 {len(judge.items)}/{total} 題）｜"
                 f"評審 {judge_model_label(judge.model)}"
             )
             panel = _judge_panel_markup(judge.judge_average_scores, judge.disagreement_count)
@@ -1489,8 +1511,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     ", ".join(item.get("source_documents", [])), item.get("question"),
                     item.get("actual_answer"), item.get("correct_answer"),
                     _experiment_grade_label(item.get("evaluation_result")) if item.get("evaluation_result") not in (None, "待評測") else "",
-                    ("（人工修改等級）\n" if item.get("manual_override") else "")
-                    + (item.get("evaluation_reason") or item.get("error") or ""),
+                    _experiment_judge_cell(item),
                     _experiment_strategy_cell(item, strategy_labels),
                     _experiment_trace_cell(item.get("execution_trace", {})),
                     f"{item['answer_point_coverage_percent']:.1f}" if item.get("answer_point_coverage_percent") is not None else "",
@@ -1509,10 +1530,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             panel_lines = [
                 f"{item.get('group_name')}：{panel}"
                 for item in run.get("groups", [])
-                if (panel := _judge_panel_markup(item.get("judge_average_scores"), item.get("judge_disagreement_count")))
+                if (panel := _judge_panel_markup(item.get("judge_average_scores"), item.get("judge_disagreement_count"), scale=2))
             ]
             if panel_lines:
-                status += "\n\n**評審分數（0–2）：** " + "；".join(panel_lines)
+                status += "\n\n**評審分數：** " + "；".join(panel_lines)
             # 摘要與逐題結果等評測完才顯示
             evaluated = bool(results)
             return (
@@ -3478,7 +3499,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_table = gr.Dataframe(
                     headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "平均分數", "各評審分數", "實際檢索策略"],
                     interactive=False,
-                    datatype=["str", "str", "str", "str", "str", "number", "markdown", "str"],
+                    datatype=["str", "str", "str", "str", "str", "str", "markdown", "str"],
                     column_widths=["4%", "8%", "15%", "25%", "15%", "6%", "12%", "15%"],
                     label="模型評測結果概覽",
                     wrap=True,
@@ -3745,11 +3766,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     visible=False,
                 )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2，多評審為平均）", "各評審分數與理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數與理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
                     interactive=True,
                     datatype=["str"] * 16,
                     column_widths=["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%", "4%", "4%"],
-                    label="逐題實驗結果（不執行模型評測也可手動編輯等級與品質欄位；拒答欄填正確／錯誤／不適用）",
+                    label="逐題實驗結果（不執行模型評測也可手動編輯得分與品質欄位；得分可填百分比或 0／1／2；拒答欄填正確／錯誤／不適用）",
                     wrap=True,
                     visible=False,
                 )
