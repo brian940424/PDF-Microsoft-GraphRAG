@@ -271,3 +271,271 @@ class ConnectionSettings:
             return ConnectionTestResult(False, f"OpenAI API 回應 HTTP {exc.code}")
         except (urllib.error.URLError, TimeoutError, OSError):
             return ConnectionTestResult(False, "無法連線至 OpenAI API")
+
+
+
+LITELLM_PROVIDER = "litellm"
+LITELLM_MODEL_PREFIX = f"{LITELLM_PROVIDER}:"
+LITELLM_API_KEY_ENVIRONMENT_VARIABLE = "LITELLM_API_KEY"
+DEFAULT_LITELLM_API_BASE_URL = "http://localhost:4000"
+
+
+def is_litellm_model(model: object) -> bool:
+    return isinstance(model, str) and model.startswith(LITELLM_MODEL_PREFIX) and len(model) > len(LITELLM_MODEL_PREFIX)
+
+
+def litellm_model_id(alias: str) -> str:
+    """Saved judge-model ID for a LiteLLM proxy alias; the prefix keeps it apart from OpenAI names."""
+    return f"{LITELLM_MODEL_PREFIX}{alias}"
+
+
+def litellm_alias(model: str) -> str:
+    return model.removeprefix(LITELLM_MODEL_PREFIX)
+
+
+def judge_model_label(model: object) -> str:
+    if is_litellm_model(model):
+        return f"LiteLLM／{litellm_alias(str(model))}"
+    return str(model) if model is not None else ""
+
+
+def judge_completion_api_params(
+    model: str, max_tokens: int, reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
+) -> dict[str, object]:
+    """Chat Completions parameters for a judge model on OpenAI or the LiteLLM proxy.
+
+    ``reasoning_effort`` is ``None`` when the LiteLLM model does not support reasoning,
+    so the parameter is never sent and the proxy cannot reject the request for it.
+    """
+    if is_litellm_model(model):
+        if reasoning_effort is None:
+            return {"temperature": 0, "max_tokens": max_tokens}
+        if reasoning_effort not in REASONING_EFFORT_OPTIONS:
+            raise ProjectError("不支援的評測推理深度")
+        # Thinking tokens share the output budget on several providers, so no token
+        # cap is sent to avoid truncating the JSON verdict.
+        return {"reasoning_effort": reasoning_effort}
+    return chat_completion_api_params(model, max_tokens, reasoning_effort or DEFAULT_REASONING_EFFORT)
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeEndpoint:
+    api_base_url: str
+    api_key: str
+    supports_reasoning: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeConnectionTestResult:
+    success: bool
+    message: str
+    models: tuple[str, ...] = ()
+    reasoning_models: tuple[str, ...] = ()
+
+
+JudgeConnectionTester = Callable[[str, str], JudgeConnectionTestResult]
+
+
+class JudgeConnectionSettings:
+    """Persist the LiteLLM proxy used for judge models, separate from the GraphRAG connection.
+
+    Provider keys stay in the LiteLLM proxy configuration; only the proxy URL and its
+    master or virtual key are stored here.
+    """
+
+    def __init__(self, project_root: str | Path, tester: JudgeConnectionTester | None = None) -> None:
+        self.path = Path(project_root) / ".judge_connection.json"
+        self.tester = tester or self._test_litellm
+
+    def get_api_base_url(self) -> str:
+        value = self._read()
+        if value is None or not value.get("api_base_url"):
+            return DEFAULT_LITELLM_API_BASE_URL
+        return ConnectionSettings._validate_api_base_url(value["api_base_url"])
+
+    def get_api_key(self) -> str | None:
+        value = self._read()
+        if value is not None:
+            key = value.get("api_key")
+            if isinstance(key, str) and key.strip():
+                return key.strip()
+        key = os.environ.get(LITELLM_API_KEY_ENVIRONMENT_VARIABLE, "").strip()
+        if key and not ConnectionSettings._is_placeholder_key(key):
+            return key
+        return None
+
+    def masked_api_key(self) -> str:
+        key = self.get_api_key()
+        return f"已設定（••••{key[-4:]}）" if key else "尚未設定"
+
+    def get_models(self) -> tuple[str, ...]:
+        """Saved LiteLLM aliases (without the ``litellm:`` prefix)."""
+        value = self._read()
+        if value is None or "models" not in value:
+            return ()
+        return self.parse_models(value["models"])
+
+    def get_reasoning_models(self) -> tuple[str, ...]:
+        value = self._read()
+        if value is None or "reasoning_models" not in value:
+            return ()
+        models = set(self.get_models())
+        return tuple(model for model in self.parse_models(value["reasoning_models"]) if model in models)
+
+    def is_configured(self) -> bool:
+        try:
+            return bool(self.get_models())
+        except ProjectError:
+            return False
+
+    def available_models(self) -> tuple[str, ...]:
+        """Judge-model IDs (``litellm:<alias>``) selectable in the UI; empty until saved."""
+        try:
+            return tuple(litellm_model_id(model) for model in self.get_models())
+        except ProjectError:
+            return ()
+
+    def supports_reasoning(self, model: object) -> bool:
+        if not is_litellm_model(model):
+            return False
+        try:
+            return litellm_alias(str(model)) in self.get_reasoning_models()
+        except ProjectError:
+            return False
+
+    def endpoint_for(self, model: str) -> JudgeEndpoint:
+        if not is_litellm_model(model):
+            raise ProjectError(f"不支援的評判模型：{model}")
+        alias = litellm_alias(model)
+        if alias not in self.get_models():
+            raise ProjectError(f"評測模型不在評測模型設定的清單：{alias}")
+        return JudgeEndpoint(
+            self.get_api_base_url(), self.get_api_key() or "", alias in self.get_reasoning_models()
+        )
+
+    def save(
+        self, api_base_url: str, api_key: str, models: object, reasoning_models: object = (),
+    ) -> None:
+        base_url = ConnectionSettings._validate_api_base_url(api_base_url or DEFAULT_LITELLM_API_BASE_URL)
+        key = (api_key or "").strip()
+        if not key:
+            value = self._read() or {}
+            saved = value.get("api_key")
+            key = saved.strip() if isinstance(saved, str) else ""
+        if "\n" in key or "\r" in key:
+            raise ProjectError("API Key 格式不正確")
+        selected = self.parse_models(models)
+        if not selected:
+            raise ProjectError("請至少選擇一個評測模型")
+        reasoning = [model for model in self.parse_models(reasoning_models) if model in selected]
+        payload: dict[str, object] = {
+            "provider": LITELLM_PROVIDER, "api_base_url": base_url,
+            "models": list(selected), "reasoning_models": reasoning,
+        }
+        if key:
+            payload["api_key"] = key
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary_name = tempfile.mkstemp(dir=self.path.parent, prefix=".judge-connection-", suffix=".json")
+        try:
+            os.fchmod(handle, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as temporary:
+                json.dump(payload, temporary)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, self.path)
+            os.chmod(self.path, 0o600)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+
+    def test(self, api_base_url: str | None = None, api_key: str | None = None) -> JudgeConnectionTestResult:
+        base_url = (
+            ConnectionSettings._validate_api_base_url(api_base_url) if api_base_url else self.get_api_base_url()
+        )
+        key = api_key.strip() if api_key and api_key.strip() else (self.get_api_key() or "")
+        return self.tester(base_url, key)
+
+    @staticmethod
+    def parse_models(value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            items = value.replace("\n", ",").split(",")
+        elif isinstance(value, (list, tuple)):
+            items = list(value)
+        else:
+            raise ProjectError("評測模型清單格式錯誤")
+        result: list[str] = []
+        for item in items:
+            if not isinstance(item, str):
+                raise ProjectError("評測模型清單格式錯誤")
+            model = litellm_alias(item.strip())
+            if any(character.isspace() for character in model):
+                raise ProjectError(f"評測模型別名不可包含空白：{model}")
+            if model and model not in result:
+                result.append(model)
+        return tuple(result)
+
+    def _read(self) -> dict[str, object] | None:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ProjectError("評測模型設定無法讀取") from exc
+        if not isinstance(value, dict):
+            raise ProjectError("評測模型設定格式錯誤")
+        return value
+
+    @staticmethod
+    def _get_json(url: str, api_key: str) -> object:
+        headers = {"User-Agent": "automotive-graphrag/0.1"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+
+    @classmethod
+    def _test_litellm(cls, api_base_url: str, api_key: str) -> JudgeConnectionTestResult:
+        models_url = f"{api_base_url}/models" if api_base_url.endswith("/v1") else f"{api_base_url}/v1/models"
+        try:
+            body = cls._get_json(models_url, api_key)
+        except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                return JudgeConnectionTestResult(False, f"LiteLLM Key 驗證失敗（HTTP {exc.code}）")
+            return JudgeConnectionTestResult(False, f"LiteLLM proxy 回應 HTTP {exc.code}")
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            return JudgeConnectionTestResult(False, "無法連線至 LiteLLM proxy")
+        models = parse_litellm_model_list(body)
+        try:
+            info = cls._get_json(f"{api_base_url}/model/info", api_key)
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            info = None
+        reasoning = parse_litellm_reasoning_models(info)
+        listed = f"；可用模型別名：{', '.join(models)}" if models else "；proxy 未回傳任何模型別名"
+        return JudgeConnectionTestResult(
+            True, f"LiteLLM proxy 連線成功{listed}", models, tuple(model for model in reasoning if model in models)
+        )
+
+
+def parse_litellm_model_list(body: object) -> tuple[str, ...]:
+    """Model aliases from an OpenAI-style ``/v1/models`` response."""
+    items = body.get("data") if isinstance(body, dict) else None
+    return tuple(sorted({
+        str(item["id"]) for item in items or []
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+    }))
+
+
+def parse_litellm_reasoning_models(body: object) -> tuple[str, ...]:
+    """Aliases whose LiteLLM ``/model/info`` entry reports ``model_info.supports_reasoning``."""
+    items = body.get("data") if isinstance(body, dict) else None
+    result: set[str] = set()
+    for item in items or []:
+        if not isinstance(item, dict) or not isinstance(item.get("model_name"), str):
+            continue
+        info = item.get("model_info")
+        if isinstance(info, dict) and info.get("supports_reasoning") is True:
+            result.add(item["model_name"])
+    return tuple(sorted(result))

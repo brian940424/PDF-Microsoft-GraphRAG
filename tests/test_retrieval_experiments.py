@@ -13,7 +13,7 @@ import gradio as gr
 
 from automotive_graphrag.app import _experiment_dataset_summary_rows, _sort_experiment_results, create_app
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationItem, AutomaticEvaluationService
-from automotive_graphrag.connections import ConnectionSettings, DEFAULT_REASONING_EFFORT
+from automotive_graphrag.connections import ConnectionSettings, DEFAULT_REASONING_EFFORT, JudgeConnectionSettings
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.question_sets import BatchQuestion, QuestionSetService
@@ -82,6 +82,26 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.question_file = self.root / "questions.json"
         example = Path(__file__).parents[1] / "docs" / "檢索實驗格式範例.json"
         self.question_file.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def test_litellm_judge_model_requires_judge_connection(self):
+        judge_connections = JudgeConnectionSettings(self.projects.root)
+        service = RetrievalExperimentService(
+            self.projects, self.question_sets, self.connections,
+            AutomaticEvaluationService(
+                self.projects, self.question_sets, self.connections, judge_connections=judge_connections
+            ),
+            query_function=lambda *args: ("", {}),
+        )
+        groups = [ExperimentGroup(group_id="G01", name="G01", answer_model="gpt-4.1-mini", method="local")]
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(ProjectError, "全域評測模型不支援"):
+                service.save_configuration("project", groups, "question-set-id", 2, "litellm:claude-judge")
+            judge_connections.save("http://localhost:4000", "sk-litellm", ["claude-judge"], ["claude-judge"])
+            service.save_configuration("project", groups, "question-set-id", 2, "litellm:claude-judge")
+            self.assertTrue(service._supports_judge_reasoning("litellm:claude-judge"))
+            judge_connections.save("http://localhost:4000", "", ["claude-judge"], [])
+            self.assertFalse(service._supports_judge_reasoning("litellm:claude-judge"))
+        self.assertEqual(service.load("project")["judge_model"], "litellm:claude-judge")
 
     def test_experiment_results_sort_by_group_then_question_set_order(self):
         groups = [{"group_id": "G01"}, {"group_id": "G02"}]

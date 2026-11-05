@@ -256,6 +256,14 @@ class RetrievalExperimentService:
         self._lock = threading.RLock()
         self._stop_events: dict[str, threading.Event] = {}
 
+    def _supports_judge_model(self, model: object) -> bool:
+        supports = getattr(self.judging, "supports_judge_model", None)
+        return supports(model) if callable(supports) else model in ALLOWED_CHAT_MODELS
+
+    def _supports_judge_reasoning(self, model: object) -> bool:
+        supports = getattr(self.judging, "supports_judge_reasoning", None)
+        return supports(model) if callable(supports) else model == GPT6_LUNA_MODEL
+
     def load(self, project_id: str) -> dict[str, object]:
         self.projects.get(project_id)
         try:
@@ -352,7 +360,7 @@ class RetrievalExperimentService:
         current = self.load(project_id)
         current["groups"] = [asdict(group) for group in groups]
         if judge_model is not None:
-            if judge_model not in ALLOWED_CHAT_MODELS:
+            if not self._supports_judge_model(judge_model):
                 raise ProjectError("全域評測模型不支援")
             current["judge_model"] = judge_model
         question_set_ids = self._normalize_question_set_ids(question_set_id)
@@ -607,7 +615,7 @@ class RetrievalExperimentService:
         self._validate_groups(groups)
         state = self.load(project_id)
         judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
-        if judge_model not in ALLOWED_CHAT_MODELS:
+        if not self._supports_judge_model(judge_model):
             raise ProjectError("全域評測模型不支援")
         project = self.projects.get(project_id)
         question_set_ids = self._normalize_question_set_ids(question_set_id)
@@ -753,7 +761,7 @@ class RetrievalExperimentService:
         if not groups:
             raise ProjectError("請先新增至少一個實驗組")
         judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
-        if enable_llm_judge and judge_model not in ALLOWED_CHAT_MODELS:
+        if enable_llm_judge and not self._supports_judge_model(judge_model):
             raise ProjectError("全域評測模型不支援")
         concurrency = int(max_concurrency or state.get("max_concurrency", 5))
         if not 1 <= concurrency <= 32:
@@ -1095,7 +1103,7 @@ class RetrievalExperimentService:
                 "mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
                 "judge_reasoning_effort": (
                     DEFAULT_REASONING_EFFORT
-                    if state.get("judge_model") == GPT6_LUNA_MODEL
+                    if self._supports_judge_reasoning(state.get("judge_model"))
                     else None
                 ),
             },

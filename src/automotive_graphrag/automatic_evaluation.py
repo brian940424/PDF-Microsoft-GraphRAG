@@ -21,7 +21,16 @@ from .evaluation.classic_metrics import (
     f1_score,
     metric_max_over_ground_truths,
 )
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, chat_completion_api_params
+from .connections import (
+    ALLOWED_CHAT_MODELS,
+    GPT6_LUNA_MODEL,
+    ConnectionSettings,
+    JudgeConnectionSettings,
+    JudgeEndpoint,
+    is_litellm_model,
+    judge_completion_api_params,
+    litellm_alias,
+)
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .reviews import ReviewService
@@ -79,11 +88,46 @@ class AutomaticEvaluationService:
         question_sets: QuestionSetService | None = None,
         connections: ConnectionSettings | None = None,
         client: JudgeClient | None = None,
+        judge_connections: JudgeConnectionSettings | None = None,
     ) -> None:
         self.projects = projects
         self.question_sets = question_sets or QuestionSetService(projects)
         self.connections = connections or ConnectionSettings(projects.root)
+        self.judge_connections = judge_connections or JudgeConnectionSettings(projects.root)
         self.client = client or self._openai_chat
+
+    def judge_model_choices(self) -> tuple[str, ...]:
+        """OpenAI judge models plus LiteLLM proxy aliases once the judge connection is saved."""
+        return (*ALLOWED_CHAT_MODELS, *self.judge_connections.available_models())
+
+    def supports_judge_model(self, model: object) -> bool:
+        if model in ALLOWED_CHAT_MODELS:
+            return True
+        return is_litellm_model(model) and model in self.judge_connections.available_models()
+
+    def supports_judge_reasoning(self, model: object) -> bool:
+        """Whether a reasoning_effort selector applies to this judge model."""
+        return model == GPT6_LUNA_MODEL or self.judge_connections.supports_reasoning(model)
+
+    def _judge_endpoint(self, project_id: str, model: str) -> JudgeEndpoint:
+        if model in ALLOWED_CHAT_MODELS:
+            api_key = self.connections.apply_to_environment(project_id)
+            return JudgeEndpoint(self.connections.get_api_base_url(), api_key, model == GPT6_LUNA_MODEL)
+        return self.judge_connections.endpoint_for(model)
+
+    def _call_judge(self, project_id: str, model: str, prompt: str, reasoning_effort: str) -> object:
+        endpoint = self._judge_endpoint(project_id, model)
+        # LiteLLM models that do not report reasoning support never receive reasoning_effort.
+        effort = reasoning_effort if endpoint.supports_reasoning or model in ALLOWED_CHAT_MODELS else None
+        try:
+            args = (endpoint.api_base_url, endpoint.api_key, model, prompt)
+            if "reasoning_effort" in inspect.signature(self.client).parameters:
+                return self.client(*args, reasoning_effort=effort)
+            return self.client(*args)
+        except ProjectError:
+            raise
+        except Exception as exc:
+            raise ProjectError(f"答案評判 API 呼叫失敗：{exc}") from exc
 
     def evaluate(
         self,
@@ -129,8 +173,8 @@ class AutomaticEvaluationService:
             raise ProjectError("沒有已完成回答且包含正確答案的題目可供評判")
 
         model = (model or self.connections.get_chat_model()) if enable_llm_judge else "—"
-        if enable_llm_judge and model not in ALLOWED_CHAT_MODELS:
-            raise ProjectError(f"不支援的評判模型：{model}")
+        if enable_llm_judge and not self.supports_judge_model(model):
+            raise ProjectError(self._unsupported_model_message(model))
         prompt = (
             "\n\n---\n\n".join(self._build_prompt([item]) for item in eligible)
             if enable_llm_judge else ""
@@ -220,8 +264,8 @@ class AutomaticEvaluationService:
         reasoning_effort: str = "medium",
     ) -> AutomaticEvaluationItem:
         """Judge one answer without retrieval evidence or shared question-set mutation."""
-        if model not in ALLOWED_CHAT_MODELS:
-            raise ProjectError(f"不支援的評判模型：{model}")
+        if not self.supports_judge_model(model):
+            raise ProjectError(self._unsupported_model_message(model))
         if evaluation_mode not in {"strict", "lenient"}:
             raise ProjectError("不支援的評分方式")
         case = BatchQuestion(
@@ -231,17 +275,7 @@ class AutomaticEvaluationService:
             answer=system_answer,
         )
         prompt = self._build_prompt([case], evaluation_mode)
-        api_key = self.connections.apply_to_environment(project_id)
-        try:
-            args = (self.connections.get_api_base_url(), api_key, model, prompt)
-            if "reasoning_effort" in inspect.signature(self.client).parameters:
-                response = self.client(*args, reasoning_effort=reasoning_effort)
-            else:
-                response = self.client(*args)
-        except ProjectError:
-            raise
-        except Exception as exc:
-            raise ProjectError(f"答案評判 API 呼叫失敗：{exc}") from exc
+        response = self._call_judge(project_id, model, prompt, reasoning_effort)
         return self._parse_response(response, [case])[0]
 
     def evaluate_single_answer_grade(
@@ -250,28 +284,17 @@ class AutomaticEvaluationService:
         reasoning_effort: str = "medium",
     ) -> AutomaticEvaluationGrade:
         """Three-level evaluation for retrieval experiments only (0 incorrect, 1 partial, 2 full)."""
-        if model not in ALLOWED_CHAT_MODELS:
-            raise ProjectError(f"不支援的評判模型：{model}")
+        if not self.supports_judge_model(model):
+            raise ProjectError(self._unsupported_model_message(model))
         if evaluation_mode not in {"strict", "lenient"}:
             raise ProjectError("不支援的評分方式")
         case = BatchQuestion(question_id, question, correct_answer, answer=system_answer)
         prompt = self._build_grade_prompt(case, evaluation_mode)
-        api_key = self.connections.apply_to_environment(project_id)
-        try:
-            args = (self.connections.get_api_base_url(), api_key, model, prompt)
-            if "reasoning_effort" in inspect.signature(self.client).parameters:
-                response = self.client(*args, reasoning_effort=reasoning_effort)
-            else:
-                response = self.client(*args)
-        except ProjectError:
-            raise
-        except Exception as exc:
-            raise ProjectError(f"答案評判 API 呼叫失敗：{exc}") from exc
+        response = self._call_judge(project_id, model, prompt, reasoning_effort)
         if isinstance(response, str):
-            try:
-                response = json.loads(response)
-            except json.JSONDecodeError as exc:
-                raise ProjectError("三段評測結果不是有效 JSON") from exc
+            response = extract_json_object(response)
+            if response is None:
+                raise ProjectError("三段評測結果不是有效 JSON")
         raw = response.get("item") if isinstance(response, dict) else None
         if not isinstance(raw, dict) or raw.get("question_id") != question_id:
             raise ProjectError("三段評測結果缺少正確的 question_id")
@@ -491,10 +514,9 @@ class AutomaticEvaluationService:
         response: object, questions: list[BatchQuestion]
     ) -> list[AutomaticEvaluationItem]:
         if isinstance(response, str):
-            try:
-                response = json.loads(response)
-            except json.JSONDecodeError as exc:
-                raise ProjectError("自動評測結果不是有效 JSON") from exc
+            response = extract_json_object(response)
+            if response is None:
+                raise ProjectError("自動評測結果不是有效 JSON")
         if not isinstance(response, dict) or not isinstance(response.get("items"), list):
             raise ProjectError("自動評測結果缺少 items 陣列")
         raw_items = response["items"]
@@ -525,31 +547,59 @@ class AutomaticEvaluationService:
             seen.add(question_id)
         return result
 
+    def _unsupported_model_message(self, model: object) -> str:
+        if is_litellm_model(model) and not self.judge_connections.is_configured():
+            return "尚未完成 LiteLLM 評測模型設定，請先到「0 專案與連線設定」儲存評測模型"
+        if is_litellm_model(model):
+            return f"評測模型不在 LiteLLM 評測模型設定的清單：{litellm_alias(str(model))}"
+        return f"不支援的評判模型：{model}"
+
     @staticmethod
-    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str = "medium") -> object:
-        payload = {
-            "model": model,
+    def _openai_chat(
+        api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str | None = "medium",
+    ) -> object:
+        litellm = is_litellm_model(model)
+        payload: dict[str, object] = {
+            "model": litellm_alias(model) if litellm else model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         }
-        payload.update(chat_completion_api_params(model, 4000, reasoning_effort))
-        request = urllib.request.Request(
-            f"{api_base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
+        payload.update(judge_completion_api_params(model, 4000, reasoning_effort))
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        def post(body: dict[str, object]) -> dict[str, object]:
+            request = urllib.request.Request(
+                f"{api_base_url}/chat/completions",
+                data=json.dumps(body).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
             with urllib.request.urlopen(request, timeout=120) as response:
-                value = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
+
+        try:
+            try:
+                value = post(payload)
+            except urllib.error.HTTPError as exc:
+                # Some providers behind LiteLLM reject JSON mode; retry once without it
+                # and recover the JSON object from the plain-text reply.
+                if not litellm or exc.code != 400:
+                    raise
+                value = post({key: item for key, item in payload.items() if key != "response_format"})
         except urllib.error.HTTPError as exc:
             raise ProjectError(f"自動評測 API 回應 HTTP {exc.code}") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ProjectError("自動評測 API 無法連線或回應格式錯誤") from exc
         try:
-            return json.loads(value["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            content = value["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
             raise ProjectError("自動評測 API 回應缺少有效 JSON 內容") from exc
+        parsed = extract_json_object(content) if isinstance(content, str) else None
+        if parsed is None:
+            raise ProjectError("自動評測 API 回應缺少有效 JSON 內容")
+        return parsed
 
     def _path(self, project_id: str, question_set_id: str) -> Path:
         self.question_sets.get(project_id, question_set_id)
@@ -573,3 +623,27 @@ class AutomaticEvaluationService:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+
+def extract_json_object(text: str) -> dict[str, object] | None:
+    """Parse a JSON object, falling back to the first object embedded in plain text.
+
+    Models without JSON mode may wrap the verdict in prose or Markdown code fences.
+    """
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict):
+        return value
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            value, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            value = None
+        if isinstance(value, dict):
+            return value
+        start = text.find("{", start + 1)
+    return None

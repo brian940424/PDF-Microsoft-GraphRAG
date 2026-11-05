@@ -4,13 +4,15 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from automotive_graphrag.app import create_app
-from automotive_graphrag.automatic_evaluation import AutomaticEvaluationService, PROMPT_VERSION
-from automotive_graphrag.connections import ConnectionSettings
+from automotive_graphrag.automatic_evaluation import AutomaticEvaluationService, PROMPT_VERSION, extract_json_object
+from automotive_graphrag.connections import ConnectionSettings, JudgeConnectionSettings
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
@@ -170,6 +172,108 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             rows = list(csv.DictReader(source))
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["reviewer_note"], "人工抽查")
+
+    def test_litellm_judge_uses_judge_connection_and_records_model(self) -> None:
+        judge = FakeJudge([self.judged()])
+        judge_connections = JudgeConnectionSettings(self.store.root)
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, judge, judge_connections=judge_connections
+        )
+        self.assertNotIn("litellm:claude-judge", service.judge_model_choices())
+        with self.assertRaisesRegex(ProjectError, "LiteLLM"):
+            service.evaluate("L33-SM3E", self.question_set_id, model="litellm:claude-judge")
+        self.assertEqual(judge.calls, [])
+
+        judge_connections.save("http://localhost:4000", "sk-litellm", ["claude-judge"])
+        self.assertEqual(
+            service.judge_model_choices(),
+            ("gpt-4o-mini", "gpt-4.1-mini", "gpt-6-luna", "litellm:claude-judge"),
+        )
+        result = service.evaluate("L33-SM3E", self.question_set_id, model="litellm:claude-judge")
+
+        self.assertEqual(result.model, "litellm:claude-judge")
+        self.assertEqual(
+            {(url, key, model) for url, key, model, _prompt in judge.calls},
+            {("http://localhost:4000", "sk-litellm", "litellm:claude-judge")},
+        )
+        grade_judge = lambda *_args, **_kwargs: {"item": {"question_id": "Q0001", "result": 2, "reason": "ok"}}
+        service.client = grade_judge
+        grade = service.evaluate_single_answer_grade(
+            "L33-SM3E", "Q0001", "問題一", "參考答案一", "系統答案1", "litellm:claude-judge"
+        )
+        self.assertEqual(grade.score, 2)
+
+        openai_judge = FakeJudge([self.judged()])
+        service.client = openai_judge
+        service.evaluate("L33-SM3E", self.question_set_id, model="gpt-4o-mini")
+        self.assertEqual(openai_judge.calls[0][:3], ("https://api.openai.com/v1", "test-key", "gpt-4o-mini"))
+
+    def test_litellm_reasoning_effort_is_only_sent_when_model_supports_it(self) -> None:
+        judge_connections = JudgeConnectionSettings(self.store.root)
+        judge_connections.save("http://localhost:4000", "sk", ["claude-judge", "plain"], ["claude-judge"])
+        efforts: list[tuple[str, object]] = []
+
+        def client(_url, _key, model, _prompt, reasoning_effort="medium"):
+            efforts.append((model, reasoning_effort))
+            return {"item": {"question_id": "Q0001", "result": 1, "reason": "partial"}}
+
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, client, judge_connections=judge_connections
+        )
+        self.assertTrue(service.supports_judge_reasoning("litellm:claude-judge"))
+        self.assertFalse(service.supports_judge_reasoning("litellm:plain"))
+        self.assertTrue(service.supports_judge_reasoning("gpt-6-luna"))
+        for model in ("litellm:claude-judge", "litellm:plain"):
+            service.evaluate_single_answer_grade("L33-SM3E", "Q0001", "問", "答", "系統", model, reasoning_effort="high")
+        self.assertEqual(efforts, [("litellm:claude-judge", "high"), ("litellm:plain", None)])
+
+    def test_plain_text_judge_reply_extracts_first_json_object(self) -> None:
+        reply = '判定如下：\n```json\n{"item": {"question_id": "Q0001", "result": 2, "reason": "ok"}}\n```'
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, lambda *_args, **_kwargs: reply
+        )
+        grade = service.evaluate_single_answer_grade("L33-SM3E", "Q0001", "問", "答", "系統", "gpt-4o-mini")
+        self.assertEqual(grade.score, 2)
+        self.assertIsNone(extract_json_object("no json {here"))
+        self.assertEqual(extract_json_object('x {"a": {"b": 1}} y'), {"a": {"b": 1}})
+
+    def test_litellm_chat_strips_prefix_and_retries_without_json_mode(self) -> None:
+        bodies: list[dict] = []
+
+        class Response:
+            def __init__(self, value: dict) -> None:
+                self.value = value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(self.value).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            body = json.loads(request.data.decode("utf-8"))
+            bodies.append(body)
+            if "response_format" in body:
+                raise urllib.error.HTTPError(request.full_url, 400, "bad", {}, None)
+            return Response({"choices": [{"message": {"content": 'Sure: {"items": []} done'}}]})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            value = AutomaticEvaluationService._openai_chat(
+                "http://localhost:4000", "", "litellm:plain", "prompt", reasoning_effort=None
+            )
+        self.assertEqual(value, {"items": []})
+        self.assertEqual([body["model"] for body in bodies], ["plain", "plain"])
+        self.assertNotIn("reasoning_effort", bodies[0])
+        self.assertNotIn("response_format", bodies[1])
+
+        bodies.clear()
+        with patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaisesRegex(ProjectError, "HTTP 400"):
+                AutomaticEvaluationService._openai_chat("https://api.openai.com/v1", "k", "gpt-4o-mini", "p")
+        self.assertEqual(len(bodies), 1)
 
     def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
         question_set = self.question_sets.get("L33-SM3E", self.question_set_id)

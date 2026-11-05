@@ -9,8 +9,15 @@ from automotive_graphrag.connections import (
     ALLOWED_CHAT_MODELS,
     ConnectionSettings,
     ConnectionTestResult,
+    DEFAULT_LITELLM_API_BASE_URL,
+    JudgeConnectionSettings,
+    JudgeConnectionTestResult,
     chat_completion_api_params,
     configure_completion_model,
+    judge_completion_api_params,
+    judge_model_label,
+    parse_litellm_model_list,
+    parse_litellm_reasoning_models,
 )
 from automotive_graphrag.projects import ProjectError
 
@@ -141,6 +148,133 @@ class ConnectionSettingsTests(unittest.TestCase):
 
         configure_completion_model(model_config, "gpt-4o-mini")
         self.assertEqual(model_config["call_args"], {"max_tokens": 1200})
+
+
+
+class JudgeConnectionSettingsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.project_root = Path(self.temporary_directory.name) / "projects"
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_unconfigured_litellm_offers_no_models(self) -> None:
+        settings = JudgeConnectionSettings(self.project_root)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(settings.is_configured())
+            self.assertEqual(settings.available_models(), ())
+            self.assertEqual(settings.get_api_base_url(), DEFAULT_LITELLM_API_BASE_URL)
+            with self.assertRaisesRegex(ProjectError, "清單"):
+                settings.endpoint_for("litellm:claude-judge")
+
+    def test_saved_litellm_settings_are_separate_from_graphrag_connection(self) -> None:
+        ConnectionSettings(self.project_root).save("https://api.openai.com/v1", "sk-openai")
+        settings = JudgeConnectionSettings(self.project_root)
+        with patch.dict(os.environ, {}, clear=True):
+            settings.save(
+                "http://localhost:4000/", "sk-litellm-9876",
+                ["claude-judge", "gemini-flash", "claude-judge", "litellm:gpt-4o-mini"],
+                ["claude-judge", "unknown"],
+            )
+            reloaded = JudgeConnectionSettings(self.project_root)
+            self.assertEqual(
+                reloaded.available_models(),
+                ("litellm:claude-judge", "litellm:gemini-flash", "litellm:gpt-4o-mini"),
+            )
+            self.assertEqual(reloaded.get_reasoning_models(), ("claude-judge",))
+            endpoint = reloaded.endpoint_for("litellm:claude-judge")
+            self.assertEqual(endpoint.api_base_url, "http://localhost:4000")
+            self.assertEqual(endpoint.api_key, "sk-litellm-9876")
+            self.assertTrue(endpoint.supports_reasoning)
+            self.assertFalse(reloaded.endpoint_for("litellm:gemini-flash").supports_reasoning)
+            self.assertTrue(reloaded.supports_reasoning("litellm:claude-judge"))
+            self.assertFalse(reloaded.supports_reasoning("claude-judge"))
+            self.assertEqual(reloaded.masked_api_key(), "已設定（••••9876）")
+            self.assertNotIn("GRAPHRAG_API_KEY", os.environ)
+            with self.assertRaisesRegex(ProjectError, "清單"):
+                reloaded.endpoint_for("litellm:unlisted")
+            with self.assertRaisesRegex(ProjectError, "不支援"):
+                reloaded.endpoint_for("gpt-4o-mini")
+        self.assertEqual(stat.S_IMODE(settings.path.stat().st_mode), 0o600)
+        self.assertEqual(ConnectionSettings(self.project_root).get_api_key(), "sk-openai")
+
+    def test_blank_key_on_save_keeps_existing_key_and_key_is_optional(self) -> None:
+        settings = JudgeConnectionSettings(self.project_root)
+        with patch.dict(os.environ, {}, clear=True):
+            settings.save(DEFAULT_LITELLM_API_BASE_URL, "sk-first", ["a"])
+            settings.save(DEFAULT_LITELLM_API_BASE_URL, "", "b")
+            self.assertEqual(settings.get_api_key(), "sk-first")
+            self.assertEqual(settings.get_models(), ("b",))
+            other = JudgeConnectionSettings(Path(self.temporary_directory.name) / "other")
+            other.save(DEFAULT_LITELLM_API_BASE_URL, "", ["open-proxy"])
+            self.assertEqual(other.endpoint_for("litellm:open-proxy").api_key, "")
+
+    def test_environment_key_is_used_when_no_saved_key(self) -> None:
+        settings = JudgeConnectionSettings(self.project_root)
+        with patch.dict(os.environ, {"LITELLM_API_KEY": "sk-env"}, clear=True):
+            settings.save(DEFAULT_LITELLM_API_BASE_URL, "", ["claude-judge"])
+            self.assertEqual(settings.endpoint_for("litellm:claude-judge").api_key, "sk-env")
+            self.assertNotIn("api_key", settings.path.read_text(encoding="utf-8"))
+
+    def test_save_rejects_invalid_values(self) -> None:
+        settings = JudgeConnectionSettings(self.project_root)
+        with self.assertRaisesRegex(ProjectError, "至少"):
+            settings.save(DEFAULT_LITELLM_API_BASE_URL, "k", " , ")
+        with self.assertRaisesRegex(ProjectError, "空白"):
+            settings.save(DEFAULT_LITELLM_API_BASE_URL, "k", ["bad model"])
+        with self.assertRaisesRegex(ProjectError, "HTTP"):
+            settings.save("ftp://proxy", "k", ["a"])
+        self.assertFalse(settings.path.exists())
+
+    def test_connection_test_uses_unsaved_values(self) -> None:
+        tested: list[tuple[str, str]] = []
+        settings = JudgeConnectionSettings(
+            self.project_root,
+            tester=lambda url, key: tested.append((url, key)) or JudgeConnectionTestResult(True, "ok", ("a",)),
+        )
+        result = settings.test("http://proxy.test:4000/", "sk-unsaved")
+        self.assertTrue(result.success)
+        self.assertEqual(result.models, ("a",))
+        self.assertEqual(tested, [("http://proxy.test:4000", "sk-unsaved")])
+        self.assertFalse(settings.path.exists())
+
+    def test_litellm_test_lists_aliases_and_reasoning_support(self) -> None:
+        responses = {
+            "http://proxy:4000/v1/models": {"data": [{"id": "gemini-flash"}, {"id": "claude-judge"}]},
+            "http://proxy:4000/model/info": {"data": [
+                {"model_name": "claude-judge", "model_info": {"supports_reasoning": True}},
+                {"model_name": "gemini-flash", "model_info": {"supports_reasoning": None}},
+                {"model_name": "not-listed", "model_info": {"supports_reasoning": True}},
+            ]},
+        }
+        requested: list[tuple[str, str | None]] = []
+
+        def fake_get_json(url: str, api_key: str) -> object:
+            requested.append((url, api_key))
+            return responses[url]
+
+        with patch.object(JudgeConnectionSettings, "_get_json", staticmethod(fake_get_json)):
+            result = JudgeConnectionSettings(self.project_root).test("http://proxy:4000", "sk-x")
+        self.assertTrue(result.success)
+        self.assertEqual(result.models, ("claude-judge", "gemini-flash"))
+        self.assertEqual(result.reasoning_models, ("claude-judge",))
+        self.assertEqual([url for url, _key in requested], list(responses))
+        self.assertEqual(parse_litellm_model_list({"data": [{"id": ""}, "x"]}), ())
+        self.assertEqual(parse_litellm_reasoning_models(None), ())
+
+    def test_litellm_judge_params_only_send_reasoning_when_supported(self) -> None:
+        self.assertEqual(judge_completion_api_params("litellm:claude", 4000, "high"), {"reasoning_effort": "high"})
+        self.assertEqual(
+            judge_completion_api_params("litellm:gemini", 4000, None), {"temperature": 0, "max_tokens": 4000}
+        )
+        self.assertEqual(
+            judge_completion_api_params("gpt-4o-mini", 4000, "high"), chat_completion_api_params("gpt-4o-mini", 4000)
+        )
+        with self.assertRaises(ProjectError):
+            judge_completion_api_params("litellm:claude", 4000, "none")
+        self.assertEqual(judge_model_label("litellm:claude-judge"), "LiteLLM／claude-judge")
+        self.assertEqual(judge_model_label("gpt-4.1-mini"), "gpt-4.1-mini")
 
 
 if __name__ == "__main__":

@@ -24,8 +24,11 @@ from .connections import (
     ALLOWED_CHAT_MODELS,
     ALLOWED_EMBEDDING_MODELS,
     DEFAULT_REASONING_EFFORT,
+    DEFAULT_LITELLM_API_BASE_URL,
     GPT6_LUNA_MODEL,
     ConnectionSettings,
+    JudgeConnectionSettings,
+    judge_model_label,
 )
 from .dashboard3d import dashboard_iframe
 from .documents import DocumentInfo, DocumentService, PageReview
@@ -406,7 +409,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     retrieval_evaluation = RetrievalEvaluationService(store, question_sets)
     source_sampling = SourceSamplingService(store)
     question_generation = QuestionGenerationService(store, source_sampling, connections)
-    automatic_evaluation = AutomaticEvaluationService(store, question_sets, connections)
+    judge_connections = JudgeConnectionSettings(store.root)
+    automatic_evaluation = AutomaticEvaluationService(
+        store, question_sets, connections, judge_connections=judge_connections
+    )
     retrieval_experiments = RetrievalExperimentService(
         store, question_sets, connections, automatic_evaluation
     )
@@ -433,6 +439,81 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             chat_model,
             embedding_model,
         )
+
+    def judge_model_choices() -> list[tuple[str, str]]:
+        try:
+            models = list(automatic_evaluation.judge_model_choices())
+        except ProjectError:
+            models = list(ALLOWED_CHAT_MODELS)
+        return [(judge_model_label(model), model) for model in models]
+
+    def judge_model_update(value: object = None):
+        choices = judge_model_choices()
+        values = {model for _label, model in choices}
+        selected = value if value in values else connections.get_chat_model()
+        return gr.update(choices=choices, value=selected)
+
+    def judge_supports_reasoning(model: object) -> bool:
+        try:
+            return automatic_evaluation.supports_judge_reasoning(model)
+        except ProjectError:
+            return model == GPT6_LUNA_MODEL
+
+    def judge_connection_status() -> str:
+        try:
+            models = judge_connections.get_models()
+            reasoning = set(judge_connections.get_reasoning_models())
+            key = judge_connections.masked_api_key()
+            base_url = judge_connections.get_api_base_url()
+        except ProjectError as exc:
+            return f"❌ {exc}"
+        ready = (
+            "已啟用，評測模型選單會列出下列 LiteLLM 模型" if models
+            else "尚未啟用，評測模型選單只列出 OpenAI 模型"
+        )
+        listed = "、".join(
+            f"`{model}`{'（支援推理深度）' if model in reasoning else ''}" for model in models
+        ) or "（無）"
+        return f"**目前狀態**：{ready}。Base URL `{base_url}`；LiteLLM Key {key}；模型 {listed}"
+
+    def judge_settings_values() -> tuple[str, str, list[str]]:
+        try:
+            return (
+                judge_connections.get_api_base_url(),
+                judge_connections.get_api_key() or "",
+                list(judge_connections.get_models()),
+            )
+        except ProjectError:
+            return DEFAULT_LITELLM_API_BASE_URL, "", []
+
+    def save_judge_connection(api_base_url: str, api_key: str, models: list[str] | None,
+                              reasoning_models: list[str] | None,
+                              autoqa_model: str | None, experiment_model: str | None):
+        try:
+            if reasoning_models is None:
+                # Not tested in this session: keep the reasoning support recorded earlier.
+                reasoning_models = list(judge_connections.get_reasoning_models())
+            judge_connections.save(api_base_url, api_key, models or [], reasoning_models)
+        except ProjectError as exc:
+            return f"❌ {exc}", judge_connection_status(), gr.update(), gr.update()
+        return (
+            "✅ 評測模型設定已儲存", judge_connection_status(),
+            judge_model_update(autoqa_model), judge_model_update(experiment_model),
+        )
+
+    def test_judge_connection(api_base_url: str, api_key: str, selected: list[str] | None):
+        try:
+            result = judge_connections.test(api_base_url or None, api_key or None)
+        except ProjectError as exc:
+            return f"❌ {exc}", gr.update(), gr.update()
+        if not result.success:
+            return f"❌ {result.message}", gr.update(), gr.update()
+        current = [model for model in (selected or []) if model]
+        choices = list(dict.fromkeys([*result.models, *current]))
+        message = f"✅ {result.message}。請勾選要加入評測選單的模型後按「儲存評測模型設定」"
+        if result.reasoning_models:
+            message += f"；支援推理深度：{', '.join(result.reasoning_models)}"
+        return message, gr.update(choices=choices, value=current), list(result.reasoning_models)
 
     def test_connection(api_base_url: str, api_key: str):
         try:
@@ -921,7 +1002,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             value=first_id,
         )
         summary = (
-            f"模型 `{result.model}`｜Prompt `{result.prompt_version}`｜題數 {result.question_count}｜"
+            f"模型 `{judge_model_label(result.model)}`｜Prompt `{result.prompt_version}`｜題數 {result.question_count}｜"
             f"正確 {result.correct_count}/{result.question_count}"
         )
         return "✅ 自動評測完成（LLM Judge 結果仍需人工抽查）", summary, rows, selector, values
@@ -1190,7 +1271,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             lines.append(
                 "**LLM Judge：** 答對 " + str(correct) + "/" + str(total) + "（"
                 + format(correct / total, ".1%") + "）｜評判 " + str(len(judged)) + "/" + str(total)
-                + " 題｜模型 " + report.judge.model
+                + " 題｜模型 " + judge_model_label(report.judge.model)
             )
         if report.judge and report.judge.enable_classic_metrics:
             lines.append(
@@ -1246,7 +1327,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             summary = (
                 f"**題目集：** {question_set.name}｜**答對：** {correct}/{total} "
                 f"（{correct / total:.1%}）｜評判 {len(judge_by_id)}/{total} 題\n\n"
-                f"**檢索模式：** {autoqa_method_summary(question_set)}｜**評判模型：** {judge.model}"
+                f"**檢索模式：** {autoqa_method_summary(question_set)}｜**評判模型：** {judge_model_label(judge.model)}"
             )
         elif judge:
             summary = f"**題目集：** {question_set.name}｜**檢索模式：** {autoqa_method_summary(question_set)}"
@@ -1303,7 +1384,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return (
                 message or "請先在「專案與連線設定」開啟專案", [], gr.update(value=[], visible=False),
                 gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), 5,
-                gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
+                judge_model_update(),
                 "尚未生成答案。", gr.update(interactive=False), "strict",
             )
         try:
@@ -1388,7 +1469,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         item.get("method") or item.get("retrieval_mode") or item.get("strategy"),
                         item.get("method") or item.get("retrieval_mode") or item.get("strategy") or "未設定",
                     ),
-                    item.get("answer_model"), item.get("judge_model"),
+                    item.get("answer_model"), judge_model_label(item.get("judge_model")),
                     item.get("question_count"), item.get("completed_count"),
                     item.get("correct_count"), item.get("partial_correct_count"), item.get("incorrect_count"),
                     f"{item['accuracy']:.1%}" if item.get("accuracy") is not None else "—",
@@ -1450,12 +1531,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 gr.update(value=summaries, visible=evaluated),
                 gr.update(value=dataset_summaries, visible=evaluated),
                 gr.update(value=results, visible=evaluated), state.get("max_concurrency", 5),
-                gr.update(choices=list(ALLOWED_CHAT_MODELS), value=state.get("judge_model", connections.get_chat_model())),
+                judge_model_update(state.get("judge_model")),
                 generation_status, gr.update(interactive=answers_ready), state.get("evaluation_mode", "strict"),
             )
         except ProjectError as exc:
             return (f"❌ {exc}", [], gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), 5,
-                    gr.update(choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model()),
+                    judge_model_update(),
                     "載入實驗狀態失敗。", gr.update(interactive=False), "strict")
 
     def experiment_progress_markup(completed: int, total: int, status: str) -> str:
@@ -2159,7 +2240,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         summary = (
             f"**題目集：** {question_set.name}｜**答對：** {correct}/{total} "
             f"（{correct / total:.1%}）｜評測 {len(result.items)}/{total} 題\n\n"
-            f"**評測模型：** {result.model}｜人工修改後的判斷已保存；其餘欄位編輯暫存於目前畫面"
+            f"**評測模型：** {judge_model_label(result.model)}｜人工修改後的判斷已保存；其餘欄位編輯暫存於目前畫面"
         )
         retrieval = retrieval_evaluation.last_result(project_id, question_set_id)
         if retrieval:
@@ -3082,6 +3163,43 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     save_connection_button = gr.Button("儲存連線設定", variant="primary", elem_classes="rounded-button")
                 connection_result = gr.Markdown()
 
+            with gr.Accordion(
+                "評測模型設定（LiteLLM proxy，LLM Judge 專用，與 GraphRAG 連線分開保存）",
+                open=True,
+                elem_classes=["static-section", "bold-title"],
+            ):
+                judge_connection_state = gr.Markdown(value=judge_connection_status)
+                gr.Markdown(
+                    "經自行架設的 LiteLLM proxy 呼叫 Gemini、Claude 等模型；各家供應商的 Key 只放在 LiteLLM 設定，"
+                    "這裡只保存 proxy 的 Base URL 與 LiteLLM Key（master key 或 virtual key）。"
+                    "儲存後，「③ 評測回答」與「4 檢索實驗」的評測模型選單會同時列出 OpenAI 與勾選的模型，"
+                    "OpenAI 模型仍使用上方共用連線。LiteLLM Key 留空時沿用已儲存的 Key，未儲存時讀取環境變數 `LITELLM_API_KEY`。"
+                    "設定方式見 `docs/LiteLLM評測模型設定.md`。"
+                )
+                with gr.Row():
+                    judge_api_base_url = gr.Textbox(
+                        label="LiteLLM Base URL",
+                        value=lambda: judge_settings_values()[0],
+                        placeholder=DEFAULT_LITELLM_API_BASE_URL,
+                    )
+                    judge_api_key = gr.Textbox(
+                        label="LiteLLM Key",
+                        value=lambda: judge_settings_values()[1],
+                        type="password",
+                        placeholder="輸入 LiteLLM master key 或 virtual key",
+                    )
+                judge_models = gr.CheckboxGroup(
+                    label="可選評測模型（LiteLLM config.yaml 的 model_name 別名）",
+                    choices=judge_settings_values()[2],
+                    value=lambda: judge_settings_values()[2],
+                    info="按「測試連線」列出 proxy 可用的模型別名後勾選",
+                )
+                judge_reasoning_models = gr.State(None)
+                with gr.Row(elem_classes="button-row"):
+                    test_judge_connection_button = gr.Button("測試連線", elem_classes="rounded-button")
+                    save_judge_connection_button = gr.Button("儲存評測模型設定", variant="primary", elem_classes="rounded-button")
+                judge_connection_result = gr.Markdown()
+
         with gr.Tab("1 文件與建圖", interactive=False) as documents_tab:
             document_empty_notice = gr.Markdown(
                 "⚠️ 目前檔案列表為空，請在「選擇要前處理／建圖的 PDF」選擇「+ 上傳 PDF...」匯入 PDF。"
@@ -3397,18 +3515,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     autoqa_enable_classic_metrics = gr.Checkbox(label="啟用 EM／F1 傳統指標", value=False)
                 with gr.Row():
                     autoqa_judge_model = gr.Dropdown(
-                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(), label="評測模型"
+                        choices=judge_model_choices(), value=connections.get_chat_model(), label="評測模型",
+                        info="LiteLLM 模型需先在「0 專案與連線設定」的評測模型設定儲存",
                     )
                     autoqa_judge_effort = gr.Dropdown(
                         choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
-                        label="推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                        label="推理深度", visible=judge_supports_reasoning(connections.get_chat_model()),
                     )
                     autoqa_judge_concurrency = gr.Number(
                         label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0
                     )
                 autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
                 autoqa_judge_model.change(
-                    lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                    lambda model: gr.update(visible=judge_supports_reasoning(model)),
                     inputs=autoqa_judge_model, outputs=autoqa_judge_effort,
                 )
                 autoqa_enable_llm_judge.change(
@@ -3641,15 +3760,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     )
                 with gr.Row():
                     experiment_judge_model = gr.Dropdown(
-                        choices=list(ALLOWED_CHAT_MODELS), value=connections.get_chat_model(),
+                        choices=judge_model_choices(), value=connections.get_chat_model(),
                         label="全域評測模型（套用至所有實驗組）",
                     )
                     experiment_judge_effort = gr.Dropdown(
                         choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
-                        label="評測推理深度", visible=connections.get_chat_model() == GPT6_LUNA_MODEL,
+                        label="評測推理深度", visible=judge_supports_reasoning(connections.get_chat_model()),
                     )
                     experiment_judge_model.change(
-                        lambda model: gr.update(visible=model == GPT6_LUNA_MODEL),
+                        lambda model: gr.update(visible=judge_supports_reasoning(model)),
                         inputs=experiment_judge_model, outputs=experiment_judge_effort,
                     )
                     experiment_evaluation_mode = gr.Dropdown(
@@ -4478,6 +4597,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[connection_result, api_base_url, api_key, chat_model, embedding_model],
         ).then(connection_status, outputs=connection_state).then(
             workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
+        )
+        test_judge_connection_button.click(
+            test_judge_connection,
+            inputs=[judge_api_base_url, judge_api_key, judge_models],
+            outputs=[judge_connection_result, judge_models, judge_reasoning_models],
+        )
+        save_judge_connection_button.click(
+            save_judge_connection,
+            inputs=[judge_api_base_url, judge_api_key, judge_models, judge_reasoning_models,
+                    autoqa_judge_model, experiment_judge_model],
+            outputs=[judge_connection_result, judge_connection_state, autoqa_judge_model, experiment_judge_model],
         )
         demo.load(workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs)
         active_project_id.change(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
