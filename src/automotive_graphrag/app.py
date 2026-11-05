@@ -245,6 +245,16 @@ APP_CSS = """
 """
 
 
+EXPERIMENT_STRATEGY_LABELS = {
+    "local": "Microsoft GraphRAG Local",
+    "global": "Microsoft GraphRAG Global",
+    "drift": "Microsoft GraphRAG DRIFT",
+    "basic": "Microsoft GraphRAG Basic",
+    "auto": "自動（逐題選擇策略）",
+    "agentic": "Agentic Search（實驗）",
+}
+
+
 def _sort_experiment_results(raw_results, groups, questions, dataset_ids=()):
     """Order rows by group, dataset, then source question order."""
     group_order = {
@@ -276,14 +286,7 @@ def _sort_experiment_results(raw_results, groups, questions, dataset_ids=()):
 
 def _experiment_dataset_summary_rows(run, groups, question_sets):
     """Build one persisted-run summary row for each experiment-group/dataset pair."""
-    strategy_labels = {
-        "local": "Microsoft GraphRAG Local",
-        "global": "Microsoft GraphRAG Global",
-        "drift": "Microsoft GraphRAG DRIFT",
-        "basic": "Microsoft GraphRAG Basic",
-        "auto": "自動（逐題選擇策略）",
-        "agentic": "Agentic Search（實驗）",
-    }
+    strategy_labels = EXPERIMENT_STRATEGY_LABELS
     raw_results = (run or {}).get("results", [])
     run_ids = list((run or {}).get("question_set_ids", []))
     rows = []
@@ -344,6 +347,10 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
             )
             average_answer_em = RetrievalExperimentService._mean_present(item.get("answer_em") for item in selected)
             average_answer_f1 = RetrievalExperimentService._mean_present(item.get("answer_f1") for item in selected)
+            average_term_hit = RetrievalExperimentService._mean_present(item.get("answer_term_hit") for item in selected)
+            average_term_coverage = RetrievalExperimentService._mean_present(
+                item.get("answer_term_coverage") for item in selected
+            )
             rows.append([
                 group.get("name", group_id),
                 f"{question_set.name} ({question_set.question_set_id[:8]})",
@@ -363,6 +370,8 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 quality_reviewed,
                 f"{average_answer_em:.1%}" if average_answer_em is not None else "—",
                 f"{average_answer_f1:.1%}" if average_answer_f1 is not None else "—",
+                f"{average_term_hit:.1%}" if average_term_hit is not None else "—",
+                f"{average_term_coverage:.1%}" if average_term_coverage is not None else "—",
             ])
     return rows
 
@@ -416,19 +425,81 @@ def _judge_panel_markup(averages, disagreements, scale: float = 1) -> str:
     return f"各評審平均 {scores}｜評審不一致 {int(disagreements or 0)} 題"
 
 
+def _experiment_item_judges(item) -> list[dict]:
+    """Each judge's score (0–2), reason and error; legacy single-judge results are rebuilt from the item."""
+    judges = [judge for judge in (item.get("judge_scores") or []) if isinstance(judge, dict)]
+    if judges:
+        return judges
+    score = RetrievalExperimentService._parse_grade(item.get("evaluation_result"))
+    if score is None and not item.get("judge_model"):
+        return []
+    return [{
+        "model": item.get("judge_model") or "", "score": score,
+        "reason": item.get("evaluation_reason") or "", "error": item.get("error"),
+    }]
+
+
 def _experiment_judge_cell(item) -> str:
-    """Judge-panel results render each judge's score as a percentage; one judge shows its reason."""
-    judges = item.get("judge_scores") or []
-    prefix = "（人工修改得分）\n" if item.get("manual_override") else ""
-    if len(judges) < 2:
-        return prefix + (item.get("evaluation_reason") or item.get("error") or "")
+    """Markdown bullet list of each judge's score; reasons are in the 各評審評分細節 table."""
+    if item.get("evaluation_result") in (None, "待評測", "未啟用"):
+        return ""
     lines = [
-        f"{judge_model_label(judge.get('model'))}：{_score_percent(judge['score'], 2)}｜{judge.get('reason') or ''}"
-        if isinstance(judge.get("score"), (int, float))
-        else f"{judge_model_label(judge.get('model'))}：失敗｜{judge.get('error') or ''}"
-        for judge in judges if isinstance(judge, dict)
+        f"* {judge_model_label(judge.get('model'))} : "
+        + (_score_percent(judge["score"], 2) if isinstance(judge.get("score"), (int, float)) else "失敗")
+        for judge in _experiment_item_judges(item)
     ]
-    return prefix + "\n".join(lines)
+    if item.get("manual_override"):
+        lines.append("* 人工修改得分")
+    return "\n".join(lines)
+
+
+def _experiment_question_cells(item) -> list:
+    """實驗組名稱／資料集／題號／來源文件／題目／系統回答／正確答案 shared by every ④ per-question table."""
+    return [
+        item.get("group_name"),
+        f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})",
+        item.get("question_id"),
+        ", ".join(item.get("source_documents", [])), item.get("question"),
+        item.get("actual_answer"), item.get("correct_answer"),
+    ]
+
+
+def _experiment_judge_detail_models(results) -> list[str]:
+    return list(dict.fromkeys(
+        judge.get("model") for item in results for judge in _experiment_item_judges(item)
+        if item.get("evaluation_result") not in (None, "待評測", "未啟用") and judge.get("model")
+    ))
+
+
+def _experiment_judge_detail_rows(results, model, strategy_labels) -> list[list]:
+    """One row per question with the selected judge's score and reason."""
+    rows = []
+    for item in results:
+        if item.get("evaluation_result") in (None, "待評測", "未啟用"):
+            continue
+        for judge in _experiment_item_judges(item):
+            if judge.get("model") != model:
+                continue
+            rows.append([
+                *_experiment_question_cells(item),
+                _score_percent(judge["score"], 2) if isinstance(judge.get("score"), (int, float)) else "失敗",
+                judge.get("reason") or judge.get("error") or "—",
+                _experiment_strategy_cell(item, strategy_labels),
+            ])
+    return rows
+
+
+def _experiment_classic_metric_rows(results) -> list[list]:
+    percent = lambda value: f"{value:.1%}" if isinstance(value, (int, float)) else "—"
+    return [
+        [
+            *_experiment_question_cells(item),
+            percent(item.get("answer_em")), percent(item.get("answer_f1")),
+            percent(item.get("answer_term_hit")), percent(item.get("answer_term_coverage")),
+        ]
+        for item in results
+        if any(item.get(key) is not None for key in ("answer_em", "answer_f1", "answer_term_hit", "answer_term_coverage"))
+    ]
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -1102,8 +1173,111 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ])
         return rows
 
+    def autoqa_answer_documents(question):
+        return ", ".join(dict.fromkeys(
+            source.document_name or source.document_id
+            for source in (question.answer_source_evidence or question.gold_evidence)
+        )) or "—"
+
+    def autoqa_item_judges(item, panel_model):
+        return item.judges or (JudgeScore(str(panel_model), 1.0 if item.is_correct else 0.0, item.judge_reason),)
+
+    def autoqa_judge_detail_models(judge):
+        """Judge models that scored at least one question, in panel order."""
+        if not judge:
+            return []
+        return list(dict.fromkeys(
+            score.model for item in judge.items for score in autoqa_item_judges(item, judge.model)
+        ))
+
+    def autoqa_judge_detail_rows(question_set, judge, model):
+        """One row per question with the selected judge model's score and reason."""
+        if not judge or not judge.items or not model:
+            return []
+        judged = {item.question_id: item for item in judge.items}
+        rows = []
+        for question in question_set.questions:
+            item = judged.get(question.question_id)
+            if not item:
+                continue
+            for score in autoqa_item_judges(item, judge.model):
+                if score.model != model:
+                    continue
+                rows.append([
+                    question.question_id, autoqa_answer_documents(question), question.question,
+                    question.answer, question.reference_answer,
+                    _score_percent(score.score) if score.score is not None else "失敗",
+                    score.reason or score.error or "—",
+                    autoqa_strategy_cell(question_set, question),
+                ])
+        return rows
+
+    def autoqa_classic_metric_rows(question_set, judge):
+        """Per-question EM／F1／Term Hit／Term Coverage rows from the saved evaluation."""
+        if not judge or not judge.classic_items:
+            return []
+        classic = {item.question_id: item for item in judge.classic_items}
+        percent = lambda value: f"{value:.1%}" if value is not None else "—"
+        rows = []
+        for question in question_set.questions:
+            item = classic.get(question.question_id)
+            if not item:
+                continue
+            rows.append([
+                question.question_id, autoqa_answer_documents(question), question.question,
+                question.answer, question.reference_answer,
+                percent(item.answer_em), percent(item.answer_f1),
+                percent(item.answer_term_hit), percent(item.answer_term_coverage),
+            ])
+        return rows
+
+    def autoqa_judge_detail_view(project_id, question_set_id, model):
+        """Rows of the 各評審評分細節 table for the judge picked in the dropdown."""
+        try:
+            question_set = question_sets.get(project_id, question_set_id)
+            judge = automatic_evaluation.last_result(project_id, question_set_id)
+        except ProjectError:
+            return gr.update(value=[], visible=False)
+        rows = autoqa_judge_detail_rows(question_set, judge, model)
+        return gr.update(value=rows, visible=bool(rows))
+
+    def autoqa_result_tables(project_id, question_set_id, judge_rows, detail_model,
+                             enable_llm_judge, enable_classic_metrics):
+        """Show each ③ result table only when its checkbox is on; the judge table keeps its current rows."""
+        if judge_rows is None:
+            judge_rows = []
+        elif hasattr(judge_rows, "itertuples"):
+            judge_rows = list(judge_rows.itertuples(index=False, name=None))
+        has_judge_rows = any(str(cell).strip() for row in judge_rows for cell in row)
+        detail_rows, metric_rows, detail_models = [], [], []
+        if (enable_llm_judge or enable_classic_metrics) and project_id and question_set_id:
+            try:
+                question_set = question_sets.get(project_id, question_set_id)
+                judge = automatic_evaluation.last_result(project_id, question_set_id)
+            except ProjectError:
+                judge = None
+            if judge and enable_llm_judge:
+                detail_models = autoqa_judge_detail_models(judge)
+                if detail_model not in detail_models:
+                    detail_model = detail_models[0] if detail_models else None
+                detail_rows = autoqa_judge_detail_rows(question_set, judge, detail_model)
+            if judge and enable_classic_metrics:
+                metric_rows = autoqa_classic_metric_rows(question_set, judge)
+        return (
+            gr.update(visible=bool(enable_llm_judge and has_judge_rows)),
+            gr.update(visible=bool(detail_rows)),
+            gr.update(
+                choices=[(judge_model_label(model), model) for model in detail_models],
+                value=detail_model if detail_models else None,
+                visible=bool(detail_rows),
+            ),
+            gr.update(value=detail_rows, visible=bool(detail_rows)),
+            gr.update(visible=bool(metric_rows)),
+            gr.update(value=metric_rows, visible=bool(metric_rows)),
+        )
+
     def autoqa_judge_scores(item, panel_model) -> str:
-        """Markdown bullet list of each judge's score; reasons stay in the JSON／CSV export."""
+        """Markdown bullet list of each judge's score; reasons are in the 各評審評分細節 table."""
         judges = item.judges or (JudgeScore(str(panel_model), 1.0 if item.is_correct else 0.0),)
         lines = [
             f"* {judge_model_label(judge.model)} : {_score_percent(judge.score)}" if judge.score is not None
@@ -1135,7 +1309,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if judge and judge.enable_classic_metrics:
             em = f"{judge.average_answer_em:.1%}" if judge.average_answer_em is not None else "—"
             f1 = f"{judge.average_answer_f1:.1%}" if judge.average_answer_f1 is not None else "—"
-            items.append(f"- **傳統指標：** Average EM {em}｜Average F1 {f1}")
+            term_hit = f"{judge.average_answer_term_hit:.1%}" if judge.average_answer_term_hit is not None else "—"
+            term_coverage = (
+                f"{judge.average_answer_term_coverage:.1%}" if judge.average_answer_term_coverage is not None else "—"
+            )
+            items.append(
+                f"- **傳統指標：** Average EM {em}｜Average F1 {f1}｜"
+                f"Average Term Hit {term_hit}｜Average Term Coverage {term_coverage}"
+            )
         if retrieval:
             metrics = (retrieval.evidence_hit_rate, retrieval.evidence_precision, retrieval.document_hit_rate)
             if all(value is None for value in metrics):
@@ -1457,14 +1638,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 generation_status = "⏳ 答案生成尚在執行中。"
             else:
                 generation_status = "尚未完成檢索並生成所有答案。"
-            strategy_labels = {
-                "local": "Microsoft GraphRAG Local",
-                "global": "Microsoft GraphRAG Global",
-                "drift": "Microsoft GraphRAG DRIFT",
-                "basic": "Microsoft GraphRAG Basic",
-                "auto": "自動（逐題選擇策略）",
-                "agentic": "Agentic Search（實驗）",
-            }
+            strategy_labels = EXPERIMENT_STRATEGY_LABELS
             summaries = [
                 [
                     item.get("group_name"),
@@ -1494,6 +1668,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     item.get("quality_reviewed_count", 0),
                     f"{item['average_answer_em']:.1%}" if item.get("average_answer_em") is not None else "—",
                     f"{item['average_answer_f1']:.1%}" if item.get("average_answer_f1") is not None else "—",
+                    f"{item['average_answer_term_hit']:.1%}" if item.get("average_answer_term_hit") is not None else "—",
+                    f"{item['average_answer_term_coverage']:.1%}" if item.get("average_answer_term_coverage") is not None else "—",
                 ]
                 for item in run.get("groups", [])
             ]
@@ -1505,11 +1681,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
             results = [
                 [
-                    item.get("group_name"),
-                    f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})",
-                    item.get("question_id"),
-                    ", ".join(item.get("source_documents", [])), item.get("question"),
-                    item.get("actual_answer"), item.get("correct_answer"),
+                    *_experiment_question_cells(item),
                     _experiment_grade_label(item.get("evaluation_result")) if item.get("evaluation_result") not in (None, "待評測") else "",
                     _experiment_judge_cell(item),
                     _experiment_strategy_cell(item, strategy_labels),
@@ -1517,8 +1689,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     f"{item['answer_point_coverage_percent']:.1f}" if item.get("answer_point_coverage_percent") is not None else "",
                     str(item["unsupported_claim_count"]) if item.get("unsupported_claim_count") is not None else "",
                     _quality_annotation_label(item.get("refusal_correctness")),
-                    f"{item['answer_em']:.1%}" if item.get("answer_em") is not None else "",
-                    f"{item['answer_f1']:.1%}" if item.get("answer_f1") is not None else "",
                 ]
                 for item in ordered_raw_results
                 if str(item.get("actual_answer", "") or "").strip()
@@ -1548,6 +1718,50 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return (f"❌ {exc}", [], gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), gr.update(value=[], visible=False), 5,
                     judge_model_update(),
                     "載入實驗狀態失敗。", gr.update(interactive=False), "strict")
+
+    def experiment_ordered_results(project_id):
+        """Saved run results in the same order as the 逐題實驗結果 table."""
+        state = retrieval_experiments.load(project_id)
+        question_set_ids = retrieval_experiments._normalize_question_set_ids(
+            state.get("question_set_ids", state.get("question_set_id", ""))
+        )
+        question_entries = [
+            (question_set.question_set_id, item)
+            for question_set in (question_sets.get(project_id, value) for value in question_set_ids)
+            for item in question_set.questions
+        ]
+        raw_results = (state.get("run") or {}).get("results", [])
+        return _sort_experiment_results(raw_results, state.get("groups", []), question_entries, question_set_ids)
+
+    def experiment_judge_detail_view(project_id, model):
+        try:
+            results = experiment_ordered_results(project_id) if project_id else []
+        except ProjectError:
+            results = []
+        rows = _experiment_judge_detail_rows(results, model, EXPERIMENT_STRATEGY_LABELS)
+        return gr.update(value=rows, visible=bool(rows))
+
+    def experiment_result_tables(project_id, detail_model, enable_llm_judge, enable_classic_metrics):
+        """Show the ④ judge-detail and classic-metric tables only when their checkbox is on."""
+        try:
+            results = experiment_ordered_results(project_id) if project_id else []
+        except ProjectError:
+            results = []
+        detail_models = _experiment_judge_detail_models(results) if enable_llm_judge else []
+        if detail_model not in detail_models:
+            detail_model = detail_models[0] if detail_models else None
+        detail_rows = _experiment_judge_detail_rows(results, detail_model, EXPERIMENT_STRATEGY_LABELS) if detail_model else []
+        metric_rows = _experiment_classic_metric_rows(results) if enable_classic_metrics else []
+        return (
+            gr.update(visible=bool(detail_rows)),
+            gr.update(
+                choices=[(judge_model_label(model), model) for model in detail_models],
+                value=detail_model, visible=bool(detail_rows),
+            ),
+            gr.update(value=detail_rows, visible=bool(detail_rows)),
+            gr.update(visible=bool(metric_rows)),
+            gr.update(value=metric_rows, visible=bool(metric_rows)),
+        )
 
     def experiment_progress_markup(completed: int, total: int, status: str) -> str:
         total = max(int(total), 0)
@@ -3505,6 +3719,45 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     wrap=True,
                     visible=False,
                 )
+                autoqa_judge_detail_divider = gr.Markdown("---", visible=False)
+                autoqa_judge_detail_model = gr.Dropdown(
+                    choices=[], value=None, label="查看評審", visible=False, interactive=True,
+                )
+                autoqa_judge_detail_table = gr.Dataframe(
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+                    interactive=False,
+                    datatype=["str"] * 8,
+                    column_widths=["5%", "8%", "13%", "18%", "13%", "6%", "22%", "15%"],
+                    label="各評審評分細節",
+                    wrap=True,
+                    visible=False,
+                )
+                autoqa_metrics_divider = gr.Markdown("---", visible=False)
+                autoqa_metrics_table = gr.Dataframe(
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+                    interactive=False,
+                    datatype=["str"] * 9,
+                    column_widths=["5%", "8%", "17%", "25%", "17%", "5%", "5%", "7%", "11%"],
+                    label="傳統指標結果",
+                    wrap=True,
+                    visible=False,
+                )
+                autoqa_table_refresh = dict(
+                    fn=autoqa_result_tables,
+                    inputs=[active_project_id, autoqa_question_set_state, autoqa_table, autoqa_judge_detail_model,
+                            autoqa_enable_llm_judge, autoqa_enable_classic_metrics],
+                    outputs=[autoqa_table, autoqa_judge_detail_divider, autoqa_judge_detail_model, autoqa_judge_detail_table,
+                             autoqa_metrics_divider, autoqa_metrics_table],
+                    show_progress="hidden",
+                )
+                autoqa_enable_llm_judge.change(**autoqa_table_refresh)
+                autoqa_enable_classic_metrics.change(**autoqa_table_refresh)
+                autoqa_judge_detail_model.input(
+                    autoqa_judge_detail_view,
+                    inputs=[active_project_id, autoqa_question_set_state, autoqa_judge_detail_model],
+                    outputs=autoqa_judge_detail_table,
+                    show_progress="hidden",
+                )
 
         with gr.Tab("4 檢索實驗", interactive=False) as experiment_tab:
             gr.Markdown(
@@ -3713,15 +3966,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     experiment_enable_classic_metrics = gr.Checkbox(
                         label="啟用 EM／F1 傳統指標", value=False,
                     )
+
+                experiment_judge_model = gr.Dropdown(
+                    choices=judge_model_choices(), value=[connections.get_chat_model()],
+                    label="全域評測模型（評審，套用至所有實驗組）",
+                    multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
+                )
+
                 with gr.Row():
-                    experiment_judge_model = gr.Dropdown(
-                        choices=judge_model_choices(), value=[connections.get_chat_model()],
-                        label="全域評測模型（評審，套用至所有實驗組）",
-                        multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
-                    )
                     experiment_judge_effort = gr.Dropdown(
                         choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
-                        label="評測推理深度", visible=judge_supports_reasoning(connections.get_chat_model()),
+                        label="推理深度", visible=judge_supports_reasoning(connections.get_chat_model()),
+                        info="僅套用到所有支援推理深度的評審，不支援的照常評分、不受影響",
                     )
                     experiment_judge_model.change(
                         lambda models: gr.update(visible=judge_supports_reasoning(models)),
@@ -3750,29 +4006,68 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     "無根據主張數只計回答中沒有來源支持的事實主張；拒答欄僅對預期無答案題填「正確」或「錯誤」，其餘填「不適用」。"
                 )
                 experiment_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1"],
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * 28,
+                    datatype=["str"] * 30,
                     label="實驗組摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_dataset_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1"],
+                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * 23,
+                    datatype=["str"] * 25,
                     label="實驗組 × 題目集摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數與理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定"],
                     interactive=True,
-                    datatype=["str"] * 16,
-                    column_widths=["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%", "4%", "4%"],
+                    datatype=["str"] * 8 + ["markdown"] + ["str"] * 5,
+                    column_widths=["6%", "8%", "4%", "8%", "10%", "15%", "12%", "5%", "9%", "7%", "6%", "4%", "3%", "3%"],
                     label="逐題實驗結果（不執行模型評測也可手動編輯得分與品質欄位；得分可填百分比或 0／1／2；拒答欄填正確／錯誤／不適用）",
                     wrap=True,
                     visible=False,
+                )
+                experiment_judge_detail_divider = gr.Markdown("---", visible=False)
+                experiment_judge_detail_model = gr.Dropdown(
+                    choices=[], value=None, label="查看評審", visible=False, interactive=True,
+                )
+                experiment_judge_detail_table = gr.Dataframe(
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+                    interactive=False,
+                    datatype=["str"] * 10,
+                    column_widths=["7%", "8%", "4%", "7%", "11%", "17%", "12%", "6%", "18%", "10%"],
+                    label="各評審評分細節",
+                    wrap=True,
+                    visible=False,
+                )
+                experiment_metrics_divider = gr.Markdown("---", visible=False)
+                experiment_metrics_table = gr.Dataframe(
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+                    interactive=False,
+                    datatype=["str"] * 11,
+                    column_widths=["7%", "8%", "4%", "7%", "13%", "21%", "14%", "5%", "5%", "7%", "9%"],
+                    label="傳統指標結果",
+                    wrap=True,
+                    visible=False,
+                )
+                experiment_table_refresh = dict(
+                    fn=experiment_result_tables,
+                    inputs=[active_project_id, experiment_judge_detail_model,
+                            experiment_enable_llm_judge, experiment_enable_classic_metrics],
+                    outputs=[experiment_judge_detail_divider, experiment_judge_detail_model,
+                             experiment_judge_detail_table, experiment_metrics_divider, experiment_metrics_table],
+                    show_progress="hidden",
+                )
+                experiment_enable_llm_judge.change(**experiment_table_refresh)
+                experiment_enable_classic_metrics.change(**experiment_table_refresh)
+                experiment_judge_detail_model.input(
+                    experiment_judge_detail_view,
+                    inputs=[active_project_id, experiment_judge_detail_model],
+                    outputs=experiment_judge_detail_table,
+                    show_progress="hidden",
                 )
 
             with gr.Accordion("⑤ 匯出實驗結果", open=True, elem_classes=["static-section", "bold-title"]):
@@ -3952,7 +4247,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
             experiment_progress_views, inputs=active_project_id,
             outputs=[experiment_progress_bar, experiment_evaluate_progress],
-        ).then(
+        ).then(**experiment_table_refresh).then(
             experiment_metric_flag_values, inputs=active_project_id,
             outputs=[experiment_enable_llm_judge, experiment_enable_classic_metrics],
         )
@@ -3972,7 +4267,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
-        ).then(
+        ).then(**autoqa_table_refresh).then(
             automatic_qa_metric_flag_values,
             inputs=[active_project_id, autoqa_question_set_state],
             outputs=[autoqa_enable_llm_judge, autoqa_enable_classic_metrics],
@@ -3993,7 +4288,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
             experiment_progress_views, inputs=active_project_id,
             outputs=[experiment_progress_bar, experiment_evaluate_progress],
-        ).then(
+        ).then(**experiment_table_refresh).then(
             experiment_metric_flag_values, inputs=active_project_id,
             outputs=[experiment_enable_llm_judge, experiment_enable_classic_metrics],
         )
@@ -4058,7 +4353,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=active_project_id,
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
-        ).then(
+        ).then(**autoqa_table_refresh).then(
             autoqa_question_set_choices,
             inputs=[active_project_id, autoqa_question_set_state],
             outputs=autoqa_question_set_selector,
@@ -4072,7 +4367,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
                      experiment_max_concurrency, experiment_judge_model,
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
-        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(**experiment_table_refresh)
         document_view_outputs = [document_table, processing_options_table, target_documents, document_empty_notice]
         documents_tab.select(
             documents_tab_visibility,
@@ -4169,7 +4464,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
             experiment_progress_views, inputs=active_project_id,
             outputs=[experiment_progress_bar, experiment_evaluate_progress],
-        )
+        ).then(**experiment_table_refresh)
         experiment_add_group_button.click(
             add_experiment_group,
             inputs=[active_project_id, experiment_group_revision],
@@ -4214,7 +4509,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode,
                      experiment_progress_bar, experiment_evaluate_progress],
             show_progress="hidden",
-        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision)
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(**experiment_table_refresh)
         experiment_evaluate_button.click(
             evaluate_retrieval_experiment_answers,
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model,
@@ -4226,13 +4521,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode,
                      experiment_evaluate_progress],
             show_progress="hidden",
-        )
+        ).then(**experiment_table_refresh)
         experiment_result_table.change(
             update_retrieval_experiment_judgments,
             inputs=[active_project_id, experiment_result_table],
             outputs=[experiment_status, experiment_summary_table,
                      experiment_dataset_summary_table, experiment_result_table],
-        )
+        ).then(**experiment_table_refresh)
         experiment_stop_button.click(
             stop_retrieval_experiment,
             inputs=active_project_id,
@@ -4255,7 +4550,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress,
             ],
             show_progress="hidden",
-        )
+        ).then(**autoqa_table_refresh)
         autoqa_import_button.click(
             import_automatic_question_set,
             inputs=[automatic_project, autoqa_import_file],
@@ -4263,7 +4558,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,
                 autoqa_summary, autoqa_table, autoqa_generation_status, autoqa_judge_button,
             ],
-        ).then(
+        ).then(**autoqa_table_refresh).then(
             lambda: (hidden_progress,) * 3,
             outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
         )
@@ -4289,7 +4584,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[automatic_project, autoqa_question_set_selector],
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
-        ).then(
+        ).then(**autoqa_table_refresh).then(
             automatic_qa_metric_flag_values,
             inputs=[automatic_project, autoqa_question_set_selector],
             outputs=[autoqa_enable_llm_judge, autoqa_enable_classic_metrics],
@@ -4312,7 +4607,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[autoqa_generation_status, autoqa_summary, autoqa_table, autoqa_judge_button,
                      autoqa_answer_progress, autoqa_judge_progress],
             show_progress="hidden",
-        )
+        ).then(**autoqa_table_refresh)
         autoqa_judge_button.click(
             evaluate_automatic_answers,
             inputs=[
@@ -4322,7 +4617,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ],
             outputs=[autoqa_result, autoqa_summary, autoqa_table, autoqa_judge_progress],
             show_progress="hidden",
-        )
+        ).then(**autoqa_table_refresh)
         autoqa_export_button.click(
             export_automatic_question_set,
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],

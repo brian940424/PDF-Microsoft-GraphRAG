@@ -11,7 +11,17 @@ import yaml
 import numpy as np
 import gradio as gr
 
-from automotive_graphrag.app import _experiment_dataset_summary_rows, _experiment_grade_label, _sort_experiment_results, create_app
+from automotive_graphrag.app import (
+    EXPERIMENT_STRATEGY_LABELS,
+    _experiment_classic_metric_rows,
+    _experiment_dataset_summary_rows,
+    _experiment_grade_label,
+    _experiment_judge_cell,
+    _experiment_judge_detail_models,
+    _experiment_judge_detail_rows,
+    _sort_experiment_results,
+    create_app,
+)
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationItem, AutomaticEvaluationService
 from automotive_graphrag.connections import ConnectionSettings, DEFAULT_REASONING_EFFORT, JudgeConnectionSettings
 from automotive_graphrag.evidence import Evidence
@@ -135,6 +145,45 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(question.question_source_evidence[0].pages, (330,))
         self.assertEqual(len(question.answer_source_evidence), 1)
         self.assertEqual(self.service.load("project")["question_set_id"], question_set.question_set_id)
+
+    def test_result_tables_split_judge_scores_reasons_and_classic_metrics(self):
+        base = {
+            "group_name": "A", "dataset_name": "Set", "dataset_id": "abcdef123456", "question_id": "Q1",
+            "source_documents": ["WW.pdf"], "question": "問", "actual_answer": "答", "correct_answer": "正解",
+            "method": "local",
+        }
+        panel = {
+            **base, "evaluation_result": "部分正確", "manual_override": True,
+            "judge_scores": [
+                {"model": "judge-a", "score": 2.0, "reason": "完整"},
+                {"model": "judge-b", "score": None, "reason": "", "error": "timeout"},
+            ],
+            "answer_em": 0.0, "answer_f1": 0.5, "answer_term_hit": 0.0, "answer_term_coverage": 0.25,
+        }
+        legacy = {**base, "question_id": "Q2", "evaluation_result": "全對",
+                  "judge_model": "judge-a", "evaluation_reason": "舊版理由"}
+        pending = {**base, "question_id": "Q3", "evaluation_result": "待評測"}
+        results = [panel, legacy, pending]
+
+        self.assertEqual(_experiment_judge_cell(panel), "* judge-a : 100%\n* judge-b : 失敗\n* 人工修改得分")
+        self.assertEqual(_experiment_judge_cell(pending), "")
+        self.assertEqual(_experiment_judge_detail_models(results), ["judge-a", "judge-b"])
+        question_cells = ["A", "Set (abcdef12)", "Q1", "WW.pdf", "問", "答", "正解"]
+        self.assertEqual(
+            _experiment_judge_detail_rows(results, "judge-a", EXPERIMENT_STRATEGY_LABELS),
+            [
+                [*question_cells, "100%", "完整", "Microsoft GraphRAG Local"],
+                [*question_cells[:2], "Q2", *question_cells[3:], "100%", "舊版理由", "Microsoft GraphRAG Local"],
+            ],
+        )
+        self.assertEqual(
+            _experiment_judge_detail_rows(results, "judge-b", EXPERIMENT_STRATEGY_LABELS),
+            [[*question_cells, "失敗", "timeout", "Microsoft GraphRAG Local"]],
+        )
+        self.assertEqual(
+            _experiment_classic_metric_rows(results),
+            [[*question_cells, "0.0%", "50.0%", "0.0%", "25.0%"]],
+        )
 
     def test_classic_only_scores_aliases_and_exports_per_question_and_average_metrics(self):
         question_set = self.service.import_question_set("project", self.question_file)
@@ -913,14 +962,33 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數與理由", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定", "Answer EM", "Answer F1"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
+        self.assertEqual(experiment_results["datatype"][8], "markdown")
         self.assertTrue(experiment_results["interactive"])
         self.assertEqual(
             experiment_results["column_widths"],
-            ["6%", "8%", "4%", "8%", "9%", "13%", "12%", "5%", "7%", "7%", "9%", "5%", "4%", "5%", "4%", "4%"],
+            ["6%", "8%", "4%", "8%", "10%", "15%", "12%", "5%", "9%", "7%", "6%", "4%", "3%", "3%"],
         )
+        judge_detail = next(
+            config for config in component_configs
+            if config.get("label") == "各評審評分細節" and config["headers"][0] == "實驗組名稱"
+        )
+        self.assertEqual(
+            judge_detail["headers"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+        )
+        classic_table = next(
+            config for config in component_configs
+            if config.get("label") == "傳統指標結果" and config["headers"][0] == "實驗組名稱"
+        )
+        self.assertEqual(
+            classic_table["headers"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+        )
+        summary_table = next(config for config in component_configs if config.get("label") == "實驗組摘要")
+        self.assertEqual(summary_table["headers"][-2:], ["Average Term Hit", "Average Term Coverage"])
         block_values = list(app.blocks.values())
         result_table_position = next(
             index for index, component in enumerate(block_values)

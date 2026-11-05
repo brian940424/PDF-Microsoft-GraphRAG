@@ -49,6 +49,23 @@ def f1_score(prediction: str, ground_truth: str) -> float:
     return (2 * precision * recall) / (precision + recall)
 
 
+def answer_term_scores(prediction: str, ground_truth: str) -> tuple[float, float]:
+    """Return all-terms-hit (0/1) and distinct answer-term coverage.
+
+    English letters/digits are matched as whole terms; each CJK ideograph is
+    one term so mixed Chinese and English answers use the same deterministic
+    normalization without requiring a language-specific tokenizer.
+    """
+    term_pattern = re.compile(r"[a-z0-9]+|[\u3400-\u4dbf\u4e00-\u9fff]")
+    expected_terms = set(term_pattern.findall(normalize_answer(ground_truth)))
+    if not expected_terms:
+        return 0.0, 0.0
+    answer_terms = set(term_pattern.findall(normalize_answer(prediction)))
+    matched = len(expected_terms & answer_terms)
+    coverage = matched / len(expected_terms)
+    return float(matched == len(expected_terms)), coverage
+
+
 def metric_max_over_ground_truths(
     metric_fn: Callable[[str, str], float],
     prediction: str,
@@ -63,7 +80,7 @@ def metric_max_over_ground_truths(
 def calculate_corpus_metrics(
     predictions: list[dict], ground_truths: list[dict]
 ) -> dict[str, float]:
-    """Calculate macro-average answer EM and F1, pairing records by ``id``.
+    """Calculate macro-average answer EM/F1/term scores, pairing records by ``id``.
 
     Predictions use ``id`` and ``predicted_answer``. Ground truths use ``id``,
     ``answer``, and an optional ``answer_aliases`` list. Missing or mismatched
@@ -80,10 +97,15 @@ def calculate_corpus_metrics(
             f"missing ground truths: {missing_ground_truths})"
         )
     if not prediction_by_id:
-        return {"answer_em": 0.0, "answer_f1": 0.0}
+        return {
+            "answer_em": 0.0, "answer_f1": 0.0,
+            "answer_term_hit": 0.0, "answer_term_coverage": 0.0,
+        }
 
     em_scores: list[float] = []
     f1_scores: list[float] = []
+    term_hit_scores: list[float] = []
+    term_coverage_scores: list[float] = []
     for question_id, prediction_record in prediction_by_id.items():
         truth_record = truth_by_id[question_id]
         predicted_answer = prediction_record.get("predicted_answer")
@@ -98,11 +120,21 @@ def calculate_corpus_metrics(
         acceptable_answers = [answer, *aliases]
         em_scores.append(metric_max_over_ground_truths(exact_match_score, predicted_answer, acceptable_answers))
         f1_scores.append(metric_max_over_ground_truths(f1_score, predicted_answer, acceptable_answers))
+        term_hit_scores.append(metric_max_over_ground_truths(
+            lambda prediction, truth: answer_term_scores(prediction, truth)[0],
+            predicted_answer, acceptable_answers,
+        ))
+        term_coverage_scores.append(metric_max_over_ground_truths(
+            lambda prediction, truth: answer_term_scores(prediction, truth)[1],
+            predicted_answer, acceptable_answers,
+        ))
 
     count = len(prediction_by_id)
     return {
         "answer_em": sum(em_scores) / count,
         "answer_f1": sum(f1_scores) / count,
+        "answer_term_hit": sum(term_hit_scores) / count,
+        "answer_term_coverage": sum(term_coverage_scores) / count,
     }
 
 

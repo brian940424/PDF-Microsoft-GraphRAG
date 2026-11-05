@@ -265,6 +265,40 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "最多選擇 5"):
             service.evaluate("L33-SM3E", self.question_set_id, model=["gpt-4o-mini", *(f"m{i}" for i in range(5))])
 
+        app = create_app(self.store.root)
+        detail_table = next(
+            component for component in app.blocks.values()
+            if hasattr(component, "get_config") and component.get_config().get("label") == "各評審評分細節"
+        )
+        self.assertEqual(
+            detail_table.get_config()["headers"],
+            ["題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+        )
+        handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
+        _judge, detail_divider, model_update, detail_update, _divider, metric_update = handlers["autoqa_result_tables"](
+            "L33-SM3E", self.question_set_id, [], "not-a-judge", True, False
+        )
+        # An unknown selection falls back to the first judge; every panel model is selectable.
+        self.assertEqual([value for _label, value in model_update["choices"]], panel)
+        self.assertEqual(model_update["value"], "gpt-4.1-mini")
+        self.assertTrue(model_update["visible"])
+        self.assertTrue(detail_divider["visible"])
+        self.assertEqual([row[5:7] for row in detail_update["value"]], [["100%", "gpt-4.1-mini"]] * 2)
+        self.assertFalse(metric_update["visible"])
+
+        switched = handlers["autoqa_judge_detail_view"]("L33-SM3E", self.question_set_id, "litellm:gemini-flash")
+        self.assertEqual(
+            [row[5:7] for row in switched["value"]],
+            [["失敗", "答案評判 API 呼叫失敗：proxy timeout"], ["100%", "litellm:gemini-flash"]],
+        )
+
+        _judge, detail_divider, model_update, detail_update, *_rest = handlers["autoqa_result_tables"](
+            "L33-SM3E", self.question_set_id, [], "litellm:claude-judge", False, False
+        )
+        self.assertFalse(model_update["visible"])
+        self.assertFalse(detail_divider["visible"])
+        self.assertFalse(detail_update["visible"])
+
     def test_question_fails_only_when_every_judge_fails(self) -> None:
         def client(_url, _key, model, prompt):
             question_id = json.loads(prompt.split("評測案例：", 1)[1])[0]["question_id"]
@@ -387,8 +421,12 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(result.items, ())
         self.assertEqual([item.answer_em for item in result.classic_items], [1.0, 1.0])
         self.assertEqual([item.answer_f1 for item in result.classic_items], [1.0, 1.0])
+        self.assertEqual([item.answer_term_hit for item in result.classic_items], [1.0, 1.0])
+        self.assertEqual([item.answer_term_coverage for item in result.classic_items], [1.0, 1.0])
         self.assertEqual(result.average_answer_em, 1.0)
         self.assertEqual(result.average_answer_f1, 1.0)
+        self.assertEqual(result.average_answer_term_hit, 1.0)
+        self.assertEqual(result.average_answer_term_coverage, 1.0)
         self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
 
         json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
@@ -397,11 +435,14 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertTrue(payload["enable_classic_metrics"])
         self.assertEqual(payload["classic_items"][0]["answer_em"], 1.0)
         self.assertEqual(payload["question_results"][0]["answer_em"], 1.0)
+        self.assertEqual(payload["question_results"][0]["answer_term_coverage"], 1.0)
         self.assertEqual(payload["summary"]["average_answer_f1"], 1.0)
+        self.assertEqual(payload["summary"]["average_answer_term_hit"], 1.0)
         with csv_path.open(encoding="utf-8", newline="") as source:
             rows = list(csv.DictReader(source))
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["answer_em"], "1.0")
+        self.assertEqual(rows[0]["answer_term_hit"], "1.0")
 
     def test_classic_scores_survive_llm_judge_failures_when_both_are_enabled(self) -> None:
         class FailingJudge:
@@ -530,6 +571,46 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             service.last_result("L33-SM3E", self.question_set_id),
             updated,
         )
+
+    def test_app_shows_classic_metric_table_only_when_its_checkbox_is_enabled(self) -> None:
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, FakeJudge([]))
+        service.evaluate(
+            "L33-SM3E", self.question_set_id,
+            enable_llm_judge=False, enable_classic_metrics=True,
+        )
+        app = create_app(self.store.root)
+        metric_table = next(
+            component for component in app.blocks.values()
+            if hasattr(component, "get_config") and component.get_config().get("label") == "傳統指標結果"
+        )
+        self.assertEqual(
+            metric_table.get_config()["headers"],
+            ["題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+        )
+        refresh = next(
+            fn.fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "autoqa_result_tables"
+        )
+        judge_rows = [["Q0001", "WW.pdf", "問題一", "系統答案1", "參考答案一", "100.0%", "", ""]]
+
+        judge_update, _detail_divider, _model_update, _detail_update, divider_update, metric_update = refresh(
+            "L33-SM3E", self.question_set_id, judge_rows, None, False, True
+        )
+        self.assertFalse(judge_update["visible"])
+        self.assertTrue(divider_update["visible"])
+        self.assertTrue(metric_update["visible"])
+        self.assertEqual(
+            metric_update["value"][0],
+            ["Q0001", "WW.pdf", "問題一", "系統答案1", "參考答案一", "0.0%", "40.0%", "0.0%", "40.0%"],
+        )
+
+        judge_update, _detail_divider, _model_update, _detail_update, divider_update, metric_update = refresh(
+            "L33-SM3E", self.question_set_id, judge_rows, None, True, False
+        )
+        self.assertTrue(judge_update["visible"])
+        self.assertFalse(divider_update["visible"])
+        self.assertFalse(metric_update["visible"])
+        judge_update, *_others = refresh("L33-SM3E", self.question_set_id, [], None, True, False)
+        self.assertFalse(judge_update["visible"])
 
     def test_app_builds_with_automatic_evaluation_controls(self) -> None:
         app = create_app(self.root / "ui-projects")
