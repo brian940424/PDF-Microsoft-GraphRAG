@@ -1304,40 +1304,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ))
         return question_sets.update_questions(project_id, question_set_id, updated)
 
-    def save_autoqa_result_edits(project_id, question_set_id, rows):
-        """Persist the editable question, system answer, and reference answer cells."""
-        if not project_id or not question_set_id or rows is None:
-            return
-        current = question_sets.get(project_id, question_set_id)
-        by_id = {item.question_id: item for item in current.questions}
-        if hasattr(rows, "itertuples"):
-            values = list(rows.itertuples(index=False, name=None))
-        else:
-            values = list(rows)
-        if not values:
-            return
-        updated = []
-        seen_ids = set()
-        for row in values:
-            if len(row) < 5:
-                raise ProjectError("評測結果表格欄位不完整")
-            question_id = str(row[0]).strip()
-            if question_id not in by_id:
-                raise ProjectError(f"題目集找不到題號：{question_id}")
-            if question_id in seen_ids:
-                raise ProjectError(f"評測結果表格含重複題號：{question_id}")
-            seen_ids.add(question_id)
-            old = by_id[question_id]
-            updated.append(replace(
-                old,
-                question=str(row[2] or "").strip(),
-                answer=str(row[3] or "").strip(),
-                reference_answer=str(row[4] or "").strip(),
-            ))
-        if seen_ids != set(by_id):
-            raise ProjectError("評測結果表格題目不完整，請重新載入後再評測")
-        question_sets.update_questions(project_id, question_set_id, updated)
-
     def automatic_qa_summary(report):
         notes = [report.judge_error or (report.judge.judge_error if report.judge else None)]
         if report.generation_errors:
@@ -2185,7 +2151,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def evaluate_automatic_answers(
-        project_id, question_set_id, rows, result_rows, answer_model, judge_model, judge_effort,
+        project_id, question_set_id, rows, answer_model, judge_model, judge_effort,
         method, concurrency, response_type, enable_llm_judge=True, enable_classic_metrics=False,
     ):
         if not project_id or not question_set_id:
@@ -2199,7 +2165,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
         try:
             save_autoqa_edits(project_id, question_set_id, rows)
-            save_autoqa_result_edits(project_id, question_set_id, result_rows)
             report = yield from stream_with_progress(
                 lambda progress: automatic_qa.evaluate_existing(
                     project_id, question_set_id, answer_model, judge_model, method,
@@ -2216,7 +2181,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             yield "❌ " + str(exc), "", autoqa_rows_update([]), hidden_progress
             return
         status = "✅ 評測完成。" + (
-            "可直接修改「平均分數」（0–1），摘要會自動更新。"
+            "各評審理由可在匯出的 JSON／CSV 查看。"
             if report.judge and report.judge.enable_llm_judge else ""
         )
         judged = max(
@@ -2227,43 +2192,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             status, automatic_qa_summary(report), autoqa_rows_update(automatic_qa_rows(report)),
             experiment_progress_update(judged, len(report.question_set.questions), "評測完成" if report.judge else "評測失敗"),
         )
-
-    def autosave_automatic_qa_judgements(project_id, question_set_id, rows):
-        if not project_id or not question_set_id:
-            return "請先完成評測", autoqa_rows_update([])
-        try:
-            question_set = question_sets.get(project_id, question_set_id)
-            if rows is None:
-                values = []
-            elif hasattr(rows, "itertuples"):
-                values = list(rows.itertuples(index=False, name=None))
-            else:
-                values = list(rows)
-            known_ids = {question.question_id for question in question_set.questions}
-            previous = automatic_evaluation.last_result(project_id, question_set_id)
-            save_autoqa_result_edits(project_id, question_set_id, values)
-            question_set = question_sets.get(project_id, question_set_id)
-            known_ids = {question.question_id for question in question_set.questions}
-            if previous is not None and not previous.items:
-                return "LLM Judge 未啟用；題目與答案已保存，沒有可修改的正確性判斷。"
-            decisions = {}
-            for row in values:
-                if len(row) < 6 or str(row[0]).strip() not in known_ids:
-                    continue
-                cell = row[5]
-                if cell is None or str(cell).strip().lower() in {"", "nan", "none"}:
-                    continue
-                decisions[str(row[0]).strip()] = cell
-            result = automatic_evaluation.update_manual_results(
-                project_id, question_set_id, decisions
-            )
-        except (ProjectError, TypeError, ValueError) as exc:
-            return f"❌ 評測結果儲存失敗：{exc}；目前表格內容仍留在畫面。"
-        summary = autoqa_summary_markup(
-            question_set, result, retrieval_evaluation.last_result(project_id, question_set_id),
-            notes=["人工修改的平均分數已保存（各評審原始分數不變）；其餘欄位編輯只暫存於目前畫面"],
-        )
-        return summary
 
     def import_automatic_question_set(project_id, uploaded):
         if not project_id or not uploaded:
@@ -3548,11 +3476,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_progress = gr.HTML(label="回答評測進度", visible=False)
                 autoqa_summary = gr.Markdown()
                 autoqa_table = gr.Dataframe(
-                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "平均分數（0–1）", "各評審分數", "實際檢索策略"],
+                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "平均分數", "各評審分數", "實際檢索策略"],
                     interactive=False,
                     datatype=["str", "str", "str", "str", "str", "number", "markdown", "str"],
-                    column_widths=["5%", "9%", "15%", "22%", "18%", "7%", "14%", "10%"],
-                    label="模型評測結果（暫時開放整表編輯；平均分數會以人工值保存，其餘欄位只暫存於目前畫面）",
+                    column_widths=["4%", "8%", "15%", "25%", "15%", "6%", "12%", "15%"],
+                    label="模型評測結果概覽",
                     wrap=True,
                     visible=False,
                 )
@@ -4367,17 +4295,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         autoqa_judge_button.click(
             evaluate_automatic_answers,
             inputs=[
-                automatic_project, autoqa_question_set_state, autoqa_questions_table, autoqa_table,
+                automatic_project, autoqa_question_set_state, autoqa_questions_table,
                 autoqa_answer_model, autoqa_judge_model, autoqa_judge_effort, autoqa_method, autoqa_judge_concurrency,
                 autoqa_response_type, autoqa_enable_llm_judge, autoqa_enable_classic_metrics,
             ],
             outputs=[autoqa_result, autoqa_summary, autoqa_table, autoqa_judge_progress],
             show_progress="hidden",
-        )
-        autoqa_table.input(
-            autosave_automatic_qa_judgements,
-            inputs=[automatic_project, autoqa_question_set_state, autoqa_table],
-            outputs=autoqa_summary,
         )
         autoqa_export_button.click(
             export_automatic_question_set,
