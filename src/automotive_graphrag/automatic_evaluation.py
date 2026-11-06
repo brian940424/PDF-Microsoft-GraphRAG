@@ -829,7 +829,12 @@ class AutomaticEvaluationService:
             "response_format": {"type": "json_object"},
         }
         payload.update(judge_completion_api_params(model, 4000, reasoning_effort))
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            # Match the descriptive client identity used by LiteLLM connection checks.
+            # Cloudflare Browser Integrity Check can block urllib's default User-Agent.
+            "User-Agent": "automotive-graphrag/0.1",
+        }
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         if litellm:
@@ -884,6 +889,11 @@ class AutomaticEvaluationService:
                         error_value = error_value.get("message") or error_value.get("detail")
                     if isinstance(error_value, str):
                         error_message = error_value.strip().replace("\n", " ")[:400]
+                if "error code: 1010" in error_body.lower():
+                    error_message = (
+                        "Cloudflare Error 1010：請求的 User-Agent 簽章遭封鎖；"
+                        "評測用戶端已設定 automotive-graphrag/0.1，請重新載入新版後重試"
+                    )
                 endpoint = urlsplit(chat_url)
                 safe_endpoint = f"{endpoint.scheme}://{endpoint.netloc}{endpoint.path}"
                 logger.error(

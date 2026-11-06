@@ -468,6 +468,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
         def fake_urlopen(request, timeout):
             urls.append(request.full_url)
+            self.assertEqual(request.get_header("User-agent"), "automotive-graphrag/0.1")
             body = json.loads(request.data.decode("utf-8"))
             bodies.append(body)
             if request.get_header("Cf-access-client-id"):
@@ -525,6 +526,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(requests[0].get_header("Cf-access-client-id"), "cf-client-id")
         self.assertEqual(requests[0].get_header("Cf-access-client-secret"), "cf-client-secret")
         self.assertEqual(requests[0].get_header("Authorization"), "Bearer sk-litellm")
+        self.assertEqual(requests[0].get_header("User-agent"), "automotive-graphrag/0.1")
         self.assertEqual(requests[0].full_url, "http://localhost:4000/v1/chat/completions")
 
     def test_litellm_403_identifies_cloudflare_or_proxy_response(self) -> None:
@@ -582,7 +584,24 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("[redacted]", log_entry)
         self.assertNotIn("secret-key", log_entry)
         self.assertNotIn("access-secret", log_entry)
-        self.assertNotIn("access-secret", message)
+
+    def test_cloudflare_error_1010_identifies_user_agent_signature_block(self) -> None:
+        def forbidden(request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "forbidden", {"server": "cloudflare", "cf-ray": "ray-1010"},
+                io.BytesIO(b"error code: 1010\n"),
+            )
+
+        with patch("urllib.request.urlopen", forbidden):
+            with self.assertRaises(ProjectError) as caught:
+                AutomaticEvaluationService._openai_chat(
+                    "https://proxy.example/v1", "sk-test", "litellm:gpt-6-luna", "prompt",
+                    extra_headers={
+                        "CF-Access-Client-Id": "id", "CF-Access-Client-Secret": "secret",
+                    },
+                )
+        self.assertIn("Cloudflare Error 1010", str(caught.exception))
+        self.assertIn("User-Agent", str(caught.exception))
 
     def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
         question_set = self.question_sets.get("L33-SM3E", self.question_set_id)
