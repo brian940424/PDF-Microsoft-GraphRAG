@@ -331,6 +331,47 @@ def format_judge_models(models: object) -> str:
     return ", ".join(parse_judge_models(models))
 
 
+class JudgeModelPreferences:
+    """Persist the automatic-QA judge selection across app refreshes."""
+
+    def __init__(self, project_root: str | Path) -> None:
+        self.path = Path(project_root) / ".judge_model_preferences.json"
+
+    def get_autoqa_models(self) -> tuple[str, ...]:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return ()
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ProjectError("評測模型偏好設定無法讀取") from exc
+        if not isinstance(value, dict):
+            raise ProjectError("評測模型偏好設定格式錯誤")
+        return parse_judge_models(value.get("automatic_qa", []))
+
+    def save_autoqa_models(self, models: object) -> tuple[str, ...]:
+        selected = parse_judge_models(models)
+        if len(selected) > MAX_JUDGE_MODELS:
+            raise ProjectError(f"評測模型最多選擇 {MAX_JUDGE_MODELS} 個")
+        payload = {"automatic_qa": list(selected)}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary_name = tempfile.mkstemp(
+            dir=self.path.parent, prefix=".judge-model-preferences-", suffix=".json"
+        )
+        try:
+            os.fchmod(handle, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as temporary:
+                json.dump(payload, temporary)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, self.path)
+            os.chmod(self.path, 0o600)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+        return selected
+
+
 def judge_model_label(model: object) -> str:
     models = parse_judge_models(model)
     if len(models) > 1:

@@ -28,6 +28,7 @@ from .connections import (
     GPT6_LUNA_MODEL,
     ConnectionSettings,
     JudgeConnectionSettings,
+    JudgeModelPreferences,
     MAX_JUDGE_MODELS,
     judge_model_label,
     parse_judge_models,
@@ -517,6 +518,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     source_sampling = SourceSamplingService(store)
     question_generation = QuestionGenerationService(store, source_sampling, connections)
     judge_connections = JudgeConnectionSettings(store.root)
+    judge_model_preferences = JudgeModelPreferences(store.root)
     automatic_evaluation = AutomaticEvaluationService(
         store, question_sets, connections, judge_connections=judge_connections
     )
@@ -560,6 +562,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         values = {model for _label, model in choices}
         selected = [model for model in parse_judge_models(value) if model in values][:MAX_JUDGE_MODELS]
         return gr.update(choices=choices, value=selected or [connections.get_chat_model()])
+
+    def autoqa_judge_model_value() -> list[str]:
+        try:
+            saved = judge_model_preferences.get_autoqa_models()
+        except ProjectError:
+            saved = ()
+        available = {model for _label, model in judge_model_choices()}
+        selected = [model for model in saved if model in available][:MAX_JUDGE_MODELS]
+        return selected or [connections.get_chat_model()]
+
+    def save_autoqa_judge_model_selection(models: object) -> str:
+        available = {model for _label, model in judge_model_choices()}
+        selected = [model for model in parse_judge_models(models) if model in available]
+        try:
+            judge_model_preferences.save_autoqa_models(selected)
+        except ProjectError as exc:
+            return f"❌ {exc}"
+        return "✅ 評測模型選擇已自動儲存"
 
     def judge_supports_reasoning(model: object) -> bool:
         """True when any selected judge accepts a reasoning depth."""
@@ -3700,9 +3720,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     autoqa_enable_classic_metrics = gr.Checkbox(label="啟用 EM／F1 傳統指標", value=False)
                 
                 autoqa_judge_model = gr.Dropdown(
-                    choices=judge_model_choices(), value=[connections.get_chat_model()], label="評測模型（評審）",
+                    choices=judge_model_choices(), value=autoqa_judge_model_value(), label="評測模型（評審）",
                     multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
                 )
+                autoqa_judge_selection_status = gr.Markdown("選擇的評測模型會自動儲存。")
                 
                 with gr.Row():
                     autoqa_judge_effort = gr.Dropdown(
@@ -3718,6 +3739,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_model.change(
                     lambda models: gr.update(visible=judge_supports_reasoning(models)),
                     inputs=autoqa_judge_model, outputs=autoqa_judge_effort,
+                )
+                autoqa_judge_model.change(
+                    save_autoqa_judge_model_selection,
+                    inputs=autoqa_judge_model,
+                    outputs=autoqa_judge_selection_status,
                 )
                 autoqa_enable_llm_judge.change(
                     lambda enabled: (

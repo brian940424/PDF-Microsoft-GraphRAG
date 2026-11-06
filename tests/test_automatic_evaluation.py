@@ -313,6 +313,25 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertNotIn(model_choices._id, connection_test["inputs"])
         self.assertEqual(len(connection_test["inputs"]), 2)
 
+    def test_autoqa_litellm_judge_selection_persists_across_app_refresh(self) -> None:
+        judge_connections = JudgeConnectionSettings(self.store.root)
+        judge_connections.save("http://localhost:4000", "sk-litellm", ["gpt-6-luna"])
+        app = create_app(self.store.root)
+        handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
+
+        self.assertEqual(
+            handlers["save_autoqa_judge_model_selection"](["litellm:gpt-6-luna"]),
+            "✅ 評測模型選擇已自動儲存",
+        )
+
+        refreshed = create_app(self.store.root)
+        selector = next(
+            component for component in refreshed.blocks.values()
+            if getattr(component, "label", None) == "評測模型（評審）"
+        )
+        self.assertEqual(selector.get_config()["value"], ["litellm:gpt-6-luna"])
+        self.assertIn(("LiteLLM／gpt-6-luna", "litellm:gpt-6-luna"), selector.choices)
+
     def test_question_fails_only_when_every_judge_fails(self) -> None:
         def client(_url, _key, model, prompt):
             question_id = json.loads(prompt.split("評測案例：", 1)[1])[0]["question_id"]
