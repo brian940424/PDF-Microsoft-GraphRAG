@@ -859,7 +859,8 @@ class AutomaticEvaluationService:
             if litellm and exc.code == 403:
                 response_headers = exc.headers or {}
                 server = str(response_headers.get("server", "")).lower()
-                if response_headers.get("cf-ray") or "cloudflare" in server:
+                cf_ray = str(response_headers.get("cf-ray", "")).strip()
+                if cf_ray or "cloudflare" in server:
                     has_cf_credentials = (
                         "CF-Access-Client-Id" in headers and "CF-Access-Client-Secret" in headers
                     )
@@ -868,8 +869,10 @@ class AutomaticEvaluationService:
                         if has_cf_credentials else
                         "本次請求未帶齊 CF-Access-Client-Id／CF-Access-Client-Secret。"
                     )
+                    ray_status = f"CF-Ray：{cf_ray}。" if cf_ray else "回應未提供 CF-Ray。"
                     raise ProjectError(
-                        f"Cloudflare Access 拒絕評測請求（HTTP 403）；{credential_status}請確認 Service Token 與 Access policy。"
+                        "LiteLLM 評測端點回傳 HTTP 403（回應經過 Cloudflare；僅憑此狀態無法確認是 Access policy 拒絕）；"
+                        f"{credential_status}{ray_status}請用 CF-Ray 在 Cloudflare 記錄中查找，並確認該 Client ID 屬於此 Zero Trust 組織。"
                     ) from exc
                 raise ProjectError(
                     "LiteLLM proxy 拒絕評測請求（HTTP 403）；請確認 LiteLLM Key 權限與模型別名設定。"

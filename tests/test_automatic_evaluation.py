@@ -530,8 +530,8 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         for headers, extra_headers, expected, credential_status in (
             ({"server": "cloudflare", "cf-ray": "test-ray"}, {
                 "CF-Access-Client-Id": "id", "CF-Access-Client-Secret": "secret",
-            }, "Cloudflare Access 拒絕", "本次請求已帶入"),
-            ({"server": "cloudflare", "cf-ray": "test-ray"}, {}, "Cloudflare Access 拒絕", "本次請求未帶齊"),
+            }, "經過 Cloudflare", "本次請求已帶入"),
+            ({"server": "cloudflare", "cf-ray": "test-ray"}, {}, "經過 Cloudflare", "本次請求未帶齊"),
             ({"server": "litellm"}, {}, "LiteLLM proxy 拒絕", None),
         ):
             def forbidden(request, timeout):
@@ -547,6 +547,9 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
                     except ProjectError as exc:
                         if credential_status:
                             self.assertIn(credential_status, str(exc))
+                        if "cf-ray" in headers:
+                            self.assertIn("test-ray", str(exc))
+                            self.assertIn("無法確認是 Access policy 拒絕", str(exc))
                         raise
 
     def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
