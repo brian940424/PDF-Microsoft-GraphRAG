@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 import tempfile
 import threading
 import time
@@ -419,6 +420,35 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(ProjectError, "HTTP 400"):
                 AutomaticEvaluationService._openai_chat("https://api.openai.com/v1", "k", "gpt-4o-mini", "p")
         self.assertEqual(len(bodies), 1)
+
+    def test_litellm_evaluation_passes_cloudflare_headers_from_environment(self) -> None:
+        judge_connections = JudgeConnectionSettings(self.store.root)
+        judge_connections.save("http://localhost:4000", "sk-litellm", ["proxy-judge"])
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, judge_connections=judge_connections,
+        )
+        requests = []
+
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self):
+                return b'{"choices":[{"message":{"content":"{\\"items\\":[]}"}}]}'
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            return Response()
+
+        with patch.dict(os.environ, {
+            "CF_ACCESS_CLIENT_ID": "cf-client-id",
+            "CF_ACCESS_CLIENT_SECRET": "cf-client-secret",
+        }, clear=True), patch("urllib.request.urlopen", fake_urlopen):
+            service._call_judge("L33-SM3E", "litellm:proxy-judge", "prompt", "medium")
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].get_header("Cf-access-client-id"), "cf-client-id")
+        self.assertEqual(requests[0].get_header("Cf-access-client-secret"), "cf-client-secret")
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer sk-litellm")
 
     def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
         question_set = self.question_sets.get("L33-SM3E", self.question_set_id)
