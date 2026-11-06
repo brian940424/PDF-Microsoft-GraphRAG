@@ -223,9 +223,13 @@ class AutomaticEvaluationService:
         effort = reasoning_effort if endpoint.supports_reasoning or model in ALLOWED_CHAT_MODELS else None
         try:
             args = (endpoint.api_base_url, endpoint.api_key, model, prompt)
-            if "reasoning_effort" in inspect.signature(self.client).parameters:
-                return self.client(*args, reasoning_effort=effort)
-            return self.client(*args)
+            parameters = inspect.signature(self.client).parameters
+            kwargs = {}
+            if "reasoning_effort" in parameters:
+                kwargs["reasoning_effort"] = effort
+            if endpoint.extra_headers and "extra_headers" in parameters:
+                kwargs["extra_headers"] = endpoint.extra_headers
+            return self.client(*args, **kwargs)
         except ProjectError:
             raise
         except Exception as exc:
@@ -809,6 +813,7 @@ class AutomaticEvaluationService:
     @staticmethod
     def _openai_chat(
         api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str | None = "medium",
+        extra_headers: dict[str, str] | None = None,
     ) -> object:
         litellm = is_litellm_model(model)
         payload: dict[str, object] = {
@@ -820,6 +825,8 @@ class AutomaticEvaluationService:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        if litellm:
+            headers.update(extra_headers or {})
 
         def post(body: dict[str, object]) -> dict[str, object]:
             request = urllib.request.Request(

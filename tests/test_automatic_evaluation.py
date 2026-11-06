@@ -384,13 +384,17 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         def fake_urlopen(request, timeout):
             body = json.loads(request.data.decode("utf-8"))
             bodies.append(body)
+            if request.get_header("Cf-access-client-id"):
+                self.assertEqual(request.get_header("Cf-access-client-id"), "id")
+                self.assertEqual(request.get_header("Cf-access-client-secret"), "secret")
             if "response_format" in body:
                 raise urllib.error.HTTPError(request.full_url, 400, "bad", {}, None)
             return Response({"choices": [{"message": {"content": 'Sure: {"items": []} done'}}]})
 
         with patch("urllib.request.urlopen", fake_urlopen):
             value = AutomaticEvaluationService._openai_chat(
-                "http://localhost:4000", "", "litellm:plain", "prompt", reasoning_effort=None
+                "http://localhost:4000", "", "litellm:plain", "prompt", reasoning_effort=None,
+                extra_headers={"CF-Access-Client-Id": "id", "CF-Access-Client-Secret": "secret"},
             )
         self.assertEqual(value, {"items": []})
         self.assertEqual([body["model"] for body in bodies], ["plain", "plain"])

@@ -588,7 +588,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         listed = "、".join(
             f"`{model}`{'（支援推理深度）' if model in reasoning else ''}" for model in models
         ) or "（無）"
-        return f"**目前狀態**：{ready}。Base URL `{base_url}`；LiteLLM Key {key}；模型 {listed}"
+        access = "Cloudflare Access 已設定" if judge_connections.get_access_headers() else "Cloudflare Access 未設定"
+        return f"**目前狀態**：{ready}。Base URL `{base_url}`；LiteLLM Key {key}；{access}；模型 {listed}"
 
     def judge_settings_values() -> tuple[str, str, list[str]]:
         try:
@@ -3357,7 +3358,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 judge_connection_state = gr.Markdown(value=judge_connection_status)
                 gr.Markdown(
                     "經自行架設的 LiteLLM proxy 呼叫 Gemini、Claude 等模型；各家供應商的 Key 只放在 LiteLLM 設定，"
-                    "這裡只保存 proxy 的 Base URL 與 LiteLLM Key（master key 或 virtual key）。"
+                    "這裡只保存 proxy 的 Base URL 與 LiteLLM Key（master key 或 virtual key）。Cloudflare Access 憑證請設為"
+                    " `CF_ACCESS_CLIENT_ID` 與 `CF_ACCESS_CLIENT_SECRET` 環境變數。"
                     "設定方式見 `docs/LiteLLM評測模型設定.md`。"
                 )
                 with gr.Row():

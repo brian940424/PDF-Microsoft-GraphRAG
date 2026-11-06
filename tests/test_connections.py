@@ -252,7 +252,7 @@ class JudgeConnectionSettingsTests(unittest.TestCase):
         }
         requested: list[tuple[str, str | None]] = []
 
-        def fake_get_json(url: str, api_key: str) -> object:
+        def fake_get_json(url: str, api_key: str, access_headers=None) -> object:
             requested.append((url, api_key))
             return responses[url]
 
@@ -264,6 +264,42 @@ class JudgeConnectionSettingsTests(unittest.TestCase):
         self.assertEqual([url for url, _key in requested], list(responses))
         self.assertEqual(parse_litellm_model_list({"data": [{"id": ""}, "x"]}), ())
         self.assertEqual(parse_litellm_reasoning_models(None), ())
+
+    def test_cloudflare_access_credentials_are_environment_headers(self) -> None:
+        settings = JudgeConnectionSettings(self.project_root)
+        with patch.dict(os.environ, {
+            "CF_ACCESS_CLIENT_ID": "client-id.example",
+            "CF_ACCESS_CLIENT_SECRET": "client-secret",
+        }, clear=True):
+            settings.save(DEFAULT_LITELLM_API_BASE_URL, "", ["claude"])
+            self.assertEqual(settings.endpoint_for("litellm:claude").extra_headers, {
+                "CF-Access-Client-Id": "client-id.example",
+                "CF-Access-Client-Secret": "client-secret",
+            })
+            self.assertNotIn("client-secret", settings.path.read_text(encoding="utf-8"))
+
+    def test_litellm_connectivity_requests_include_cloudflare_headers(self) -> None:
+        captured: list[dict[str, str]] = []
+
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return b'{"data": []}'
+
+        def fake_urlopen(request, timeout):
+            captured.append(dict(request.header_items()))
+            return Response()
+
+        with patch.dict(os.environ, {
+            "CF_ACCESS_CLIENT_ID": "id", "CF_ACCESS_CLIENT_SECRET": "secret",
+        }, clear=True), patch("urllib.request.urlopen", fake_urlopen):
+            result = JudgeConnectionSettings._test_litellm("http://proxy", "lite-key")
+        self.assertTrue(result.success)
+        self.assertEqual(len(captured), 2)
+        for headers in captured:
+            self.assertEqual(headers["Cf-access-client-id"], "id")
+            self.assertEqual(headers["Cf-access-client-secret"], "secret")
+            self.assertEqual(headers["Authorization"], "Bearer lite-key")
 
     def test_litellm_judge_params_only_send_reasoning_when_supported(self) -> None:
         self.assertEqual(judge_completion_api_params("litellm:claude", 4000, "high"), {"reasoning_effort": "high"})

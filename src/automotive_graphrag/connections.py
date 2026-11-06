@@ -277,6 +277,23 @@ class ConnectionSettings:
 LITELLM_PROVIDER = "litellm"
 LITELLM_MODEL_PREFIX = f"{LITELLM_PROVIDER}:"
 LITELLM_API_KEY_ENVIRONMENT_VARIABLE = "LITELLM_API_KEY"
+CF_ACCESS_CLIENT_ID_ENVIRONMENT_VARIABLE = "CF_ACCESS_CLIENT_ID"
+CF_ACCESS_CLIENT_SECRET_ENVIRONMENT_VARIABLE = "CF_ACCESS_CLIENT_SECRET"
+
+
+def _cloudflare_access_headers(env_file: Path | None = None) -> dict[str, str]:
+    file_values = dotenv_values(env_file) if env_file is not None and env_file.is_file() else {}
+    headers: dict[str, str] = {}
+    for variable, header in (
+        (CF_ACCESS_CLIENT_ID_ENVIRONMENT_VARIABLE, "CF-Access-Client-Id"),
+        (CF_ACCESS_CLIENT_SECRET_ENVIRONMENT_VARIABLE, "CF-Access-Client-Secret"),
+    ):
+        value = os.environ.get(variable)
+        if value is None:
+            value = file_values.get(variable)
+        if isinstance(value, str) and value.strip():
+            headers[header] = value.strip()
+    return headers
 DEFAULT_LITELLM_API_BASE_URL = "http://localhost:4000"
 
 
@@ -349,6 +366,7 @@ class JudgeEndpoint:
     api_base_url: str
     api_key: str
     supports_reasoning: bool = False
+    extra_headers: dict[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +407,11 @@ class JudgeConnectionSettings:
         if key and not ConnectionSettings._is_placeholder_key(key):
             return key
         return None
+
+    def get_access_headers(self) -> dict[str, str]:
+        """Return optional Cloudflare Access headers from process env or the repo .env."""
+        env_file = self.path.parent.parent / ".env"
+        return _cloudflare_access_headers(env_file)
 
     def masked_api_key(self) -> str:
         key = self.get_api_key()
@@ -436,7 +459,8 @@ class JudgeConnectionSettings:
         if alias not in self.get_models():
             raise ProjectError(f"評測模型不在評測模型設定的清單：{alias}")
         return JudgeEndpoint(
-            self.get_api_base_url(), self.get_api_key() or "", alias in self.get_reasoning_models()
+            self.get_api_base_url(), self.get_api_key() or "", alias in self.get_reasoning_models(),
+            self.get_access_headers(),
         )
 
     def save(
@@ -515,18 +539,20 @@ class JudgeConnectionSettings:
         return value
 
     @staticmethod
-    def _get_json(url: str, api_key: str) -> object:
+    def _get_json(url: str, api_key: str, access_headers: dict[str, str] | None = None) -> object:
         headers = {"User-Agent": "automotive-graphrag/0.1"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        headers.update(access_headers or {})
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
 
     @classmethod
     def _test_litellm(cls, api_base_url: str, api_key: str) -> JudgeConnectionTestResult:
         models_url = f"{api_base_url}/models" if api_base_url.endswith("/v1") else f"{api_base_url}/v1/models"
+        access_headers = cls._configured_access_headers()
         try:
-            body = cls._get_json(models_url, api_key)
+            body = cls._get_json(models_url, api_key, access_headers)
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403}:
                 return JudgeConnectionTestResult(False, f"LiteLLM Key 驗證失敗（HTTP {exc.code}）")
@@ -535,7 +561,7 @@ class JudgeConnectionSettings:
             return JudgeConnectionTestResult(False, "無法連線至 LiteLLM proxy")
         models = parse_litellm_model_list(body)
         try:
-            info = cls._get_json(f"{api_base_url}/model/info", api_key)
+            info = cls._get_json(f"{api_base_url}/model/info", api_key, access_headers)
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
             info = None
         reasoning = parse_litellm_reasoning_models(info)
@@ -543,6 +569,10 @@ class JudgeConnectionSettings:
         return JudgeConnectionTestResult(
             True, f"LiteLLM proxy 連線成功{listed}", models, tuple(model for model in reasoning if model in models)
         )
+
+    @staticmethod
+    def _configured_access_headers() -> dict[str, str]:
+        return _cloudflare_access_headers(Path.cwd() / ".env")
 
 
 def parse_litellm_model_list(body: object) -> tuple[str, ...]:

@@ -56,6 +56,12 @@ python3 -c "import urllib.request as u; r=u.Request('http://localhost:4000/v1/mo
 
 1. 開啟「0 專案與連線設定」的「評測模型設定（LiteLLM proxy）」區塊。
 2. 填入 **LiteLLM Base URL** 與 **LiteLLM Key**（master key 或 LiteLLM 發的 virtual key）。
+   - 若 LiteLLM 網址受 Cloudflare Access 保護，在**執行本系統**的專案根目錄 `.env` 加入以下兩項（或在管理後台程序環境設定）：
+     ```dotenv
+     CF_ACCESS_CLIENT_ID=your-cloudflare-access-client-id
+     CF_ACCESS_CLIENT_SECRET=your-cloudflare-access-client-secret
+     ```
+     兩者會作為 `CF-Access-Client-Id`、`CF-Access-Client-Secret` 標頭送出，不會保存到 `projects/.judge_connection.json`。
    - 管理後台在本機執行：`http://localhost:4000`。
    - 管理後台在 Docker 執行、proxy 在主機：`http://host.docker.internal:4000`（Linux 需在 `docker run` 加 `--add-host=host.docker.internal:host-gateway`）。
    - 兩個容器在同一個 Docker network：`http://litellm:4000`。
@@ -68,6 +74,7 @@ python3 -c "import urllib.request as u; r=u.Request('http://localhost:4000/v1/mo
 
 - **保存位置**：`projects/.judge_connection.json`（權限 600），與 GraphRAG 共用連線分開。`projects/` 已列在 `.gitignore`。
 - **Key 讀取順序**：已儲存的 LiteLLM Key → 環境變數 `LITELLM_API_KEY`。儲存時 Key 欄留空會沿用已儲存的 Key；proxy 未設定 master key 時可以不填。
+- **Cloudflare Access**：可選環境變數 `CF_ACCESS_CLIENT_ID`、`CF_ACCESS_CLIENT_SECRET`，支援本機專案根目錄 `.env` 與程序環境（程序環境優先）。若端點由 Cloudflare Access 保護，請同時設定兩者。連線測試的 `/v1/models`、`/model/info` 與評測的 `/chat/completions` 均會帶入標頭；未設定時不送出。管理後台狀態會顯示是否偵測到 Cloudflare Access 設定，不會顯示憑證值。
 - **推理深度**：只有測試連線時回報 `supports_reasoning` 的模型才顯示推理深度選單並送出 `reasoning_effort`；其他模型不送此參數，改送 `temperature: 0` 與 `max_tokens`。
 - **JSON 輸出**：一律先送 `response_format: json_object`。若 proxy 回 HTTP 400（模型不支援 JSON mode），會不帶此參數重送一次；模型回覆純文字時，從內容中擷取第一個 JSON 物件再驗證，仍失敗才判定該題評測失敗。
 - 在 LiteLLM 改了 `config.yaml` 的模型後，回到第 0 頁重新「測試連線」並儲存，推理深度支援資訊才會更新。
