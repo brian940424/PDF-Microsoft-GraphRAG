@@ -884,10 +884,14 @@ class AutomaticEvaluationService:
                         if has_cf_credentials else
                         "本次請求未帶齊 CF-Access-Client-Id／CF-Access-Client-Secret。"
                     )
+                    key_status = (
+                        f"本次 LiteLLM Bearer Key 尾碼：••••{api_key[-4:]}。"
+                        if api_key else "本次請求沒有設定 LiteLLM Bearer Key。"
+                    )
                     ray_status = f"CF-Ray：{cf_ray}。" if cf_ray else "回應未提供 CF-Ray。"
                     raise ProjectError(
                         "LiteLLM 評測端點回傳 HTTP 403（回應經過 Cloudflare；僅憑此狀態無法確認是 Access policy 拒絕）；"
-                        f"{credential_status}{ray_status}{detail}請以同一時間及 CF-Ray 對照 Access 與 LiteLLM proxy 記錄。"
+                        f"{credential_status}{key_status}{ray_status}{detail}請以同一時間及 CF-Ray 對照 Access 與 LiteLLM proxy 記錄。"
                     ) from exc
                 raise ProjectError(
                     "LiteLLM proxy 拒絕評測請求（HTTP 403）；請確認 LiteLLM Key 權限與模型別名設定。"

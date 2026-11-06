@@ -573,6 +573,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
                 )
         message = str(caught.exception)
         self.assertIn("virtual key is not allowed for this model", message)
+        self.assertIn("本次 LiteLLM Bearer Key 尾碼：••••-key", message)
         self.assertNotIn("secret-key", message)
         self.assertNotIn("access-secret", message)
 
