@@ -6,10 +6,12 @@ import csv
 import inspect
 import io
 import json
+import logging
 import os
 import tempfile
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -49,6 +51,7 @@ from .reviews import ReviewService
 
 PROMPT_VERSION = "answer-match-judge-v2"
 JUDGMENT_RESULTS = {"correct", "incorrect"}
+logger = logging.getLogger(__name__)
 JudgeClient = Callable[..., object]
 
 
@@ -860,22 +863,43 @@ class AutomaticEvaluationService:
                 response_headers = exc.headers or {}
                 server = str(response_headers.get("server", "")).lower()
                 cf_ray = str(response_headers.get("cf-ray", "")).strip()
+                try:
+                    raw_error_body = exc.read(8193).decode("utf-8", errors="replace")
+                except (OSError, AttributeError):
+                    raw_error_body = ""
+                response_body_truncated = len(raw_error_body) > 8192
+                error_body = raw_error_body[:8192]
+                for secret in (api_key, *(extra_headers.values() if extra_headers else ())):
+                    if secret:
+                        error_body = error_body.replace(secret, "[redacted]")
+                parsed_error: object = None
+                try:
+                    parsed_error = json.loads(error_body)
+                except json.JSONDecodeError:
+                    pass
+                error_message = ""
+                if isinstance(parsed_error, dict):
+                    error_value = parsed_error.get("error", parsed_error)
+                    if isinstance(error_value, dict):
+                        error_value = error_value.get("message") or error_value.get("detail")
+                    if isinstance(error_value, str):
+                        error_message = error_value.strip().replace("\n", " ")[:400]
+                endpoint = urlsplit(chat_url)
+                safe_endpoint = f"{endpoint.scheme}://{endpoint.netloc}{endpoint.path}"
+                logger.error(
+                    "LiteLLM judge HTTP 403 endpoint=%s model=%s api_key_suffix=%s "
+                    "cf_access_headers_present=%s cf_ray=%s server=%s response_body_truncated=%s response_body=%r",
+                    safe_endpoint,
+                    payload.get("model", ""),
+                    api_key[-4:] if api_key else "(missing)",
+                    "CF-Access-Client-Id" in headers and "CF-Access-Client-Secret" in headers,
+                    cf_ray or "(missing)",
+                    server or "(missing)",
+                    response_body_truncated,
+                    error_body or "(empty)",
+                )
                 if cf_ray or "cloudflare" in server:
-                    detail = ""
-                    try:
-                        error_body = json.loads(exc.read(4096).decode("utf-8", errors="replace"))
-                    except (json.JSONDecodeError, OSError, AttributeError):
-                        error_body = None
-                    if isinstance(error_body, dict):
-                        error_value = error_body.get("error", error_body)
-                        if isinstance(error_value, dict):
-                            error_value = error_value.get("message") or error_value.get("detail")
-                        if isinstance(error_value, str) and error_value.strip():
-                            detail_text = error_value.strip().replace("\n", " ")
-                            for secret in (api_key, *(extra_headers.values() if extra_headers else ())):
-                                if secret:
-                                    detail_text = detail_text.replace(secret, "[redacted]")
-                            detail = f"LiteLLM 回應內容：{detail_text[:400]}。"
+                    detail = f"回應本文：{error_message}。" if error_message else "回應未提供 JSON 錯誤說明。"
                     has_cf_credentials = (
                         "CF-Access-Client-Id" in headers and "CF-Access-Client-Secret" in headers
                     )
@@ -894,7 +918,8 @@ class AutomaticEvaluationService:
                         f"{credential_status}{key_status}{ray_status}{detail}請以同一時間及 CF-Ray 對照 Access 與 LiteLLM proxy 記錄。"
                     ) from exc
                 raise ProjectError(
-                    "LiteLLM proxy 拒絕評測請求（HTTP 403）；請確認 LiteLLM Key 權限與模型別名設定。"
+                    "LiteLLM proxy 拒絕評測請求（HTTP 403）；"
+                    f"{f'回應本文：{error_message}。' if error_message else '請查 server log 的安全遮蔽診斷記錄。'}"
                 ) from exc
             raise ProjectError(f"自動評測 API 回應 HTTP {exc.code}") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:

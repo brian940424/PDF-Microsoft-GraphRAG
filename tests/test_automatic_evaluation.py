@@ -563,18 +563,25 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
                 io.BytesIO(body),
             )
 
-        with patch("urllib.request.urlopen", forbidden):
-            with self.assertRaises(ProjectError) as caught:
-                AutomaticEvaluationService._openai_chat(
-                    "https://proxy.example/v1", "secret-key", "litellm:gpt-6-luna", "prompt",
-                    extra_headers={
-                        "CF-Access-Client-Id": "client-id", "CF-Access-Client-Secret": "access-secret",
-                    },
-                )
+        with self.assertLogs("automotive_graphrag.automatic_evaluation", level="ERROR") as captured_logs:
+            with patch("urllib.request.urlopen", forbidden):
+                with self.assertRaises(ProjectError) as caught:
+                    AutomaticEvaluationService._openai_chat(
+                        "https://proxy.example/v1", "secret-key", "litellm:gpt-6-luna", "prompt",
+                        extra_headers={
+                            "CF-Access-Client-Id": "client-id", "CF-Access-Client-Secret": "access-secret",
+                        },
+                    )
         message = str(caught.exception)
         self.assertIn("virtual key is not allowed for this model", message)
         self.assertIn("本次 LiteLLM Bearer Key 尾碼：••••-key", message)
         self.assertNotIn("secret-key", message)
+        log_entry = "\n".join(captured_logs.output)
+        self.assertIn("endpoint=https://proxy.example/v1/chat/completions", log_entry)
+        self.assertIn("response_body=", log_entry)
+        self.assertIn("[redacted]", log_entry)
+        self.assertNotIn("secret-key", log_entry)
+        self.assertNotIn("access-secret", log_entry)
         self.assertNotIn("access-secret", message)
 
     def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
