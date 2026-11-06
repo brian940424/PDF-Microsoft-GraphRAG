@@ -331,6 +331,12 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         )
         self.assertEqual(selector.get_config()["value"], ["litellm:gpt-6-luna"])
         self.assertIn(("LiteLLM／gpt-6-luna", "litellm:gpt-6-luna"), selector.choices)
+        save_event = next(
+            dependency for dependency in refreshed.config["dependencies"]
+            if dependency.get("api_name") == "save_autoqa_judge_model_selection"
+        )
+        self.assertIn((selector._id, "input"), save_event["targets"])
+        self.assertEqual(save_event["inputs"], [selector._id])
 
     def test_question_fails_only_when_every_judge_fails(self) -> None:
         def client(_url, _key, model, prompt):

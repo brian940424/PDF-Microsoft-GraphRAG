@@ -3740,7 +3740,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     lambda models: gr.update(visible=judge_supports_reasoning(models)),
                     inputs=autoqa_judge_model, outputs=autoqa_judge_effort,
                 )
-                autoqa_judge_model.change(
+                autoqa_judge_model.input(
                     save_autoqa_judge_model_selection,
                     inputs=autoqa_judge_model,
                     outputs=autoqa_judge_selection_status,
