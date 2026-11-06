@@ -831,10 +831,14 @@ class AutomaticEvaluationService:
             headers["Authorization"] = f"Bearer {api_key}"
         if litellm:
             headers.update(extra_headers or {})
+        api_base_url = api_base_url.rstrip("/")
+        chat_url = f"{api_base_url}/chat/completions"
+        if litellm and not api_base_url.endswith("/v1"):
+            chat_url = f"{api_base_url}/v1/chat/completions"
 
         def post(body: dict[str, object]) -> dict[str, object]:
             request = urllib.request.Request(
-                f"{api_base_url}/chat/completions",
+                chat_url,
                 data=json.dumps(body).encode("utf-8"),
                 headers=headers,
                 method="POST",
@@ -856,8 +860,16 @@ class AutomaticEvaluationService:
                 response_headers = exc.headers or {}
                 server = str(response_headers.get("server", "")).lower()
                 if response_headers.get("cf-ray") or "cloudflare" in server:
+                    has_cf_credentials = (
+                        "CF-Access-Client-Id" in headers and "CF-Access-Client-Secret" in headers
+                    )
+                    credential_status = (
+                        "本次請求已帶入 CF-Access-Client-Id 與 CF-Access-Client-Secret。"
+                        if has_cf_credentials else
+                        "本次請求未帶齊 CF-Access-Client-Id／CF-Access-Client-Secret。"
+                    )
                     raise ProjectError(
-                        "Cloudflare Access 拒絕評測請求（HTTP 403）；請確認 Service Token 與 Access policy。"
+                        f"Cloudflare Access 拒絕評測請求（HTTP 403）；{credential_status}請確認 Service Token 與 Access policy。"
                     ) from exc
                 raise ProjectError(
                     "LiteLLM proxy 拒絕評測請求（HTTP 403）；請確認 LiteLLM Key 權限與模型別名設定。"

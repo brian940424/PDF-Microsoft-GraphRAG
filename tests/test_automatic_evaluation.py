@@ -450,6 +450,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
     def test_litellm_chat_strips_prefix_and_retries_without_json_mode(self) -> None:
         bodies: list[dict] = []
+        urls: list[str] = []
 
         class Response:
             def __init__(self, value: dict) -> None:
@@ -465,6 +466,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
                 return json.dumps(self.value).encode("utf-8")
 
         def fake_urlopen(request, timeout):
+            urls.append(request.full_url)
             body = json.loads(request.data.decode("utf-8"))
             bodies.append(body)
             if request.get_header("Cf-access-client-id"):
@@ -481,6 +483,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             )
         self.assertEqual(value, {"items": []})
         self.assertEqual([body["model"] for body in bodies], ["plain", "plain"])
+        self.assertEqual(urls, [
+            "http://localhost:4000/v1/chat/completions",
+            "http://localhost:4000/v1/chat/completions",
+        ])
         self.assertNotIn("reasoning_effort", bodies[0])
         self.assertNotIn("response_format", bodies[1])
 
@@ -518,20 +524,30 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(requests[0].get_header("Cf-access-client-id"), "cf-client-id")
         self.assertEqual(requests[0].get_header("Cf-access-client-secret"), "cf-client-secret")
         self.assertEqual(requests[0].get_header("Authorization"), "Bearer sk-litellm")
+        self.assertEqual(requests[0].full_url, "http://localhost:4000/v1/chat/completions")
 
     def test_litellm_403_identifies_cloudflare_or_proxy_response(self) -> None:
-        for headers, expected in (
-            ({"server": "cloudflare", "cf-ray": "test-ray"}, "Cloudflare Access 拒絕"),
-            ({"server": "litellm"}, "LiteLLM proxy 拒絕"),
+        for headers, extra_headers, expected, credential_status in (
+            ({"server": "cloudflare", "cf-ray": "test-ray"}, {
+                "CF-Access-Client-Id": "id", "CF-Access-Client-Secret": "secret",
+            }, "Cloudflare Access 拒絕", "本次請求已帶入"),
+            ({"server": "cloudflare", "cf-ray": "test-ray"}, {}, "Cloudflare Access 拒絕", "本次請求未帶齊"),
+            ({"server": "litellm"}, {}, "LiteLLM proxy 拒絕", None),
         ):
             def forbidden(request, timeout):
                 raise urllib.error.HTTPError(request.full_url, 403, "forbidden", headers, None)
 
-            with self.subTest(expected=expected), patch("urllib.request.urlopen", forbidden):
+            with self.subTest(expected=expected, credential_status=credential_status), patch("urllib.request.urlopen", forbidden):
                 with self.assertRaisesRegex(ProjectError, expected):
-                    AutomaticEvaluationService._openai_chat(
-                        "https://proxy.example/v1", "sk-test", "litellm:gpt-6-luna", "prompt"
-                    )
+                    try:
+                        AutomaticEvaluationService._openai_chat(
+                            "https://proxy.example/v1", "sk-test", "litellm:gpt-6-luna", "prompt",
+                            extra_headers=extra_headers,
+                        )
+                    except ProjectError as exc:
+                        if credential_status:
+                            self.assertIn(credential_status, str(exc))
+                        raise
 
     def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
         question_set = self.question_sets.get("L33-SM3E", self.question_set_id)

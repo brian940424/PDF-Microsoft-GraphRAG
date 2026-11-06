@@ -295,7 +295,7 @@ def _cloudflare_access_headers() -> dict[str, str]:
         (CF_ACCESS_CLIENT_SECRET_ENVIRONMENT_VARIABLE, "CF-Access-Client-Secret"),
     ):
         value = os.environ.get(variable)
-        if value is None:
+        if not isinstance(value, str) or not value.strip():
             value = file_values.get(variable)
         if isinstance(value, str) and value.strip():
             headers[header] = value.strip()

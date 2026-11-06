@@ -286,7 +286,9 @@ class JudgeConnectionSettingsTests(unittest.TestCase):
             encoding="utf-8",
         )
         settings = JudgeConnectionSettings(Path(self.temporary_directory.name) / "volume" / "projects")
-        with patch.dict(os.environ, {}, clear=True), patch("pathlib.Path.cwd", return_value=app_root):
+        with patch.dict(os.environ, {
+            "CF_ACCESS_CLIENT_ID": "", "CF_ACCESS_CLIENT_SECRET": "",
+        }, clear=True), patch("pathlib.Path.cwd", return_value=app_root):
             connectivity_headers = settings._configured_access_headers()
             judge_headers = settings.get_access_headers()
         self.assertEqual(judge_headers, connectivity_headers)
