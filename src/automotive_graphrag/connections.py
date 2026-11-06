@@ -281,8 +281,14 @@ CF_ACCESS_CLIENT_ID_ENVIRONMENT_VARIABLE = "CF_ACCESS_CLIENT_ID"
 CF_ACCESS_CLIENT_SECRET_ENVIRONMENT_VARIABLE = "CF_ACCESS_CLIENT_SECRET"
 
 
-def _cloudflare_access_headers(env_file: Path | None = None) -> dict[str, str]:
-    file_values = dotenv_values(env_file) if env_file is not None and env_file.is_file() else {}
+def _cloudflare_access_headers() -> dict[str, str]:
+    file_values: dict[str, str] = {}
+    env_files = (Path.cwd() / ".env", Path(__file__).resolve().parents[2] / ".env")
+    for env_file in dict.fromkeys(path.resolve() for path in env_files):
+        if env_file.is_file():
+            for key, value in dotenv_values(env_file).items():
+                if key not in file_values and isinstance(value, str) and value.strip():
+                    file_values[key] = value
     headers: dict[str, str] = {}
     for variable, header in (
         (CF_ACCESS_CLIENT_ID_ENVIRONMENT_VARIABLE, "CF-Access-Client-Id"),
@@ -450,9 +456,8 @@ class JudgeConnectionSettings:
         return None
 
     def get_access_headers(self) -> dict[str, str]:
-        """Return optional Cloudflare Access headers from process env or the repo .env."""
-        env_file = self.path.parent.parent / ".env"
-        return _cloudflare_access_headers(env_file)
+        """Return optional Cloudflare Access headers from the same app env as connection tests."""
+        return _cloudflare_access_headers()
 
     def masked_api_key(self) -> str:
         key = self.get_api_key()
@@ -613,7 +618,7 @@ class JudgeConnectionSettings:
 
     @staticmethod
     def _configured_access_headers() -> dict[str, str]:
-        return _cloudflare_access_headers(Path.cwd() / ".env")
+        return _cloudflare_access_headers()
 
 
 def parse_litellm_model_list(body: object) -> tuple[str, ...]:

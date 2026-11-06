@@ -519,6 +519,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(requests[0].get_header("Cf-access-client-secret"), "cf-client-secret")
         self.assertEqual(requests[0].get_header("Authorization"), "Bearer sk-litellm")
 
+    def test_litellm_403_identifies_cloudflare_or_proxy_response(self) -> None:
+        for headers, expected in (
+            ({"server": "cloudflare", "cf-ray": "test-ray"}, "Cloudflare Access 拒絕"),
+            ({"server": "litellm"}, "LiteLLM proxy 拒絕"),
+        ):
+            def forbidden(request, timeout):
+                raise urllib.error.HTTPError(request.full_url, 403, "forbidden", headers, None)
+
+            with self.subTest(expected=expected), patch("urllib.request.urlopen", forbidden):
+                with self.assertRaisesRegex(ProjectError, expected):
+                    AutomaticEvaluationService._openai_chat(
+                        "https://proxy.example/v1", "sk-test", "litellm:gpt-6-luna", "prompt"
+                    )
+
     def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
         question_set = self.question_sets.get("L33-SM3E", self.question_set_id)
         questions = tuple(

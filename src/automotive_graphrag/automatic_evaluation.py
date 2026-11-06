@@ -852,6 +852,16 @@ class AutomaticEvaluationService:
                     raise
                 value = post({key: item for key, item in payload.items() if key != "response_format"})
         except urllib.error.HTTPError as exc:
+            if litellm and exc.code == 403:
+                response_headers = exc.headers or {}
+                server = str(response_headers.get("server", "")).lower()
+                if response_headers.get("cf-ray") or "cloudflare" in server:
+                    raise ProjectError(
+                        "Cloudflare Access 拒絕評測請求（HTTP 403）；請確認 Service Token 與 Access policy。"
+                    ) from exc
+                raise ProjectError(
+                    "LiteLLM proxy 拒絕評測請求（HTTP 403）；請確認 LiteLLM Key 權限與模型別名設定。"
+                ) from exc
             raise ProjectError(f"自動評測 API 回應 HTTP {exc.code}") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ProjectError("自動評測 API 無法連線或回應格式錯誤") from exc

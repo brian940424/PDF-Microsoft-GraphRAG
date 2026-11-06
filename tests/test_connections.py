@@ -278,6 +278,23 @@ class JudgeConnectionSettingsTests(unittest.TestCase):
             })
             self.assertNotIn("client-secret", settings.path.read_text(encoding="utf-8"))
 
+    def test_litellm_test_and_judge_use_app_env_with_external_projects_root(self) -> None:
+        app_root = Path(self.temporary_directory.name) / "app"
+        app_root.mkdir()
+        (app_root / ".env").write_text(
+            "CF_ACCESS_CLIENT_ID=app-client-id\nCF_ACCESS_CLIENT_SECRET=app-client-secret\n",
+            encoding="utf-8",
+        )
+        settings = JudgeConnectionSettings(Path(self.temporary_directory.name) / "volume" / "projects")
+        with patch.dict(os.environ, {}, clear=True), patch("pathlib.Path.cwd", return_value=app_root):
+            connectivity_headers = settings._configured_access_headers()
+            judge_headers = settings.get_access_headers()
+        self.assertEqual(judge_headers, connectivity_headers)
+        self.assertEqual(judge_headers, {
+            "CF-Access-Client-Id": "app-client-id",
+            "CF-Access-Client-Secret": "app-client-secret",
+        })
+
     def test_litellm_connectivity_requests_include_cloudflare_headers(self) -> None:
         captured: list[dict[str, str]] = []
 
