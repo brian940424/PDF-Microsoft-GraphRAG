@@ -176,7 +176,12 @@ GRAPHRAG_API_KEY=your-api-key
 GRAPHRAG_API_BASE=https://api.openai.com/v1
 GRAPHRAG_CHAT_MODEL=gpt-6-luna
 GRAPHRAG_EMBEDDING_MODEL=text-embedding-3-small
+# Optional: set these only when the LiteLLM judge proxy is protected by Cloudflare Access
+CF_ACCESS_CLIENT_ID=your-cloudflare-access-client-id
+CF_ACCESS_CLIENT_SECRET=your-cloudflare-access-client-secret
 ```
+
+`CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are credentials for the **LiteLLM proxy accessed by this app**. They are sent as `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers for LiteLLM connection checks and judge requests. Do not put them in the LiteLLM proxy's own `.env`; configure them in the environment passed to the GraphRAG admin container/process. They are not needed for a direct OpenAI connection.
 
 若選擇由管理後台儲存連線設定，設定會寫入持久化 Volume 內的 `.connection.json`。請將該 Volume 視為敏感資料並限制存取。
 
@@ -302,12 +307,15 @@ export GRAPHRAG_API_KEY="your-api-key"
 export GRAPHRAG_API_BASE="https://api.openai.com/v1"
 export GRAPHRAG_CHAT_MODEL="gpt-6-luna"
 export GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"
+# Optional, only for a LiteLLM judge proxy protected by Cloudflare Access
+export CF_ACCESS_CLIENT_ID="your-cloudflare-access-client-id"
+export CF_ACCESS_CLIENT_SECRET="your-cloudflare-access-client-secret"
 ```
 
 Windows PowerShell（單行）：
 
 ```powershell
-$env:PROJECTS_ROOT=(Join-Path $PWD "projects"); $env:GRAPHRAG_API_KEY="your-api-key"; $env:GRAPHRAG_API_BASE="https://api.openai.com/v1"; $env:GRAPHRAG_CHAT_MODEL="gpt-6-luna"; $env:GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"
+$env:PROJECTS_ROOT=(Join-Path $PWD "projects"); $env:GRAPHRAG_API_KEY="your-api-key"; $env:GRAPHRAG_API_BASE="https://api.openai.com/v1"; $env:GRAPHRAG_CHAT_MODEL="gpt-6-luna"; $env:GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"; $env:CF_ACCESS_CLIENT_ID="your-cloudflare-access-client-id"; $env:CF_ACCESS_CLIENT_SECRET="your-cloudflare-access-client-secret"
 ```
 
 啟動一般入口：
