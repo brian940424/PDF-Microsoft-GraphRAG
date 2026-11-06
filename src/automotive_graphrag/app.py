@@ -579,7 +579,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             judge_model_preferences.save_autoqa_models(selected)
         except ProjectError as exc:
             return f"❌ {exc}"
-        return "✅ 評測模型選擇已自動儲存"
+        return f"✅ 評測模型選擇已儲存至 `{judge_model_preferences.path.resolve()}`"
 
     def judge_supports_reasoning(model: object) -> bool:
         """True when any selected judge accepts a reasoning depth."""
@@ -3723,7 +3723,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     choices=judge_model_choices(), value=autoqa_judge_model_value(), label="評測模型（評審）",
                     multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
                 )
-                autoqa_judge_selection_status = gr.Markdown("選擇的評測模型會自動儲存。")
+                autoqa_judge_selection_status = gr.Markdown(
+                    f"選擇會自動儲存至 `{judge_model_preferences.path.resolve()}`。"
+                )
                 
                 with gr.Row():
                     autoqa_judge_effort = gr.Dropdown(

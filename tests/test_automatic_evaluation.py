@@ -319,10 +319,9 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         app = create_app(self.store.root)
         handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
 
-        self.assertEqual(
-            handlers["save_autoqa_judge_model_selection"](["litellm:gpt-6-luna"]),
-            "✅ 評測模型選擇已自動儲存",
-        )
+        save_message = handlers["save_autoqa_judge_model_selection"](["litellm:gpt-6-luna"])
+        self.assertIn("✅ 評測模型選擇已儲存至", save_message)
+        self.assertIn(".judge_model_preferences.json", save_message)
 
         refreshed = create_app(self.store.root)
         selector = next(
