@@ -299,6 +299,19 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertFalse(detail_divider["visible"])
         self.assertFalse(detail_update["visible"])
 
+    def test_litellm_connection_test_does_not_preprocess_dynamic_model_choices(self) -> None:
+        app = create_app(self.store.root)
+        model_choices = next(
+            component for component in app.blocks.values()
+            if getattr(component, "label", None) == "可選評測模型（LiteLLM config.yaml 的 model_name 別名）"
+        )
+        connection_test = next(
+            dependency for dependency in app.config["dependencies"]
+            if dependency.get("api_name") == "test_judge_connection"
+        )
+        self.assertNotIn(model_choices._id, connection_test["inputs"])
+        self.assertEqual(len(connection_test["inputs"]), 2)
+
     def test_question_fails_only_when_every_judge_fails(self) -> None:
         def client(_url, _key, model, prompt):
             question_id = json.loads(prompt.split("評測案例：", 1)[1])[0]["question_id"]

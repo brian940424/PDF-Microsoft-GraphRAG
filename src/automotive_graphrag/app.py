@@ -616,14 +616,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             judge_model_update(autoqa_model), judge_model_update(experiment_model),
         )
 
-    def test_judge_connection(api_base_url: str, api_key: str, selected: list[str] | None):
+    def test_judge_connection(api_base_url: str, api_key: str):
         try:
             result = judge_connections.test(api_base_url or None, api_key or None)
         except ProjectError as exc:
             return f"❌ {exc}", gr.update(), gr.update()
         if not result.success:
             return f"❌ {result.message}", gr.update(), gr.update()
-        current = [model for model in (selected or []) if model]
+        current = list(judge_connections.get_models())
         choices = list(dict.fromkeys([*result.models, *current]))
         message = f"✅ {result.message}。請勾選要加入評測選單的模型後按「儲存評測模型設定」"
         if result.reasoning_models:
@@ -4866,7 +4866,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         test_judge_connection_button.click(
             test_judge_connection,
-            inputs=[judge_api_base_url, judge_api_key, judge_models],
+            inputs=[judge_api_base_url, judge_api_key],
             outputs=[judge_connection_result, judge_models, judge_reasoning_models],
         )
         save_judge_connection_button.click(
