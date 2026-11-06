@@ -435,7 +435,11 @@ class AutomaticEvaluationService:
         return round(sum(item.final_score for item in items) / len(items), 4) if items else None
 
     def validate_judge_models(self, value: object) -> tuple[str, ...]:
-        models = parse_judge_models(value) or (self.connections.get_chat_model(),)
+        models = parse_judge_models(value)
+        if not models:
+            if value is not None:
+                raise ProjectError("請至少選擇一個評測模型")
+            models = (self.connections.get_chat_model(),)
         if len(models) > MAX_JUDGE_MODELS:
             raise ProjectError(f"評測模型最多選擇 {MAX_JUDGE_MODELS} 個")
         for item in models:

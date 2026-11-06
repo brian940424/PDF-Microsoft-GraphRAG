@@ -563,14 +563,38 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         selected = [model for model in parse_judge_models(value) if model in values][:MAX_JUDGE_MODELS]
         return gr.update(choices=choices, value=selected or [connections.get_chat_model()])
 
-    def autoqa_judge_model_value() -> list[str]:
+    def autoqa_judge_model_state() -> tuple[list[str], str]:
+        default_model = connections.get_chat_model()
         try:
             saved = judge_model_preferences.get_autoqa_models()
-        except ProjectError:
-            saved = ()
+        except ProjectError as exc:
+            return [default_model], (
+                f"⚠️ 無法讀取評測模型偏好：{exc}。目前使用預設 `{default_model}`；"
+                f"偏好檔：`{judge_model_preferences.path.resolve()}`"
+            )
+        if not saved:
+            return [default_model], (
+                f"目前沒有已保存的評測模型，使用預設 `{default_model}`；選擇後保存至 "
+                f"`{judge_model_preferences.path.resolve()}`。"
+            )
         available = {model for _label, model in judge_model_choices()}
         selected = [model for model in saved if model in available][:MAX_JUDGE_MODELS]
-        return selected or [connections.get_chat_model()]
+        unavailable = [model for model in saved if model not in available]
+        if unavailable:
+            missing = "、".join(judge_model_label(model) for model in unavailable)
+            if selected:
+                return selected, (
+                    f"⚠️ 已還原可用評測模型；下列已保存模型不在目前設定中：{missing}。"
+                    f"請檢查 LiteLLM 設定及 `PROJECTS_ROOT`：`{judge_model_preferences.path.resolve()}`"
+                )
+            return [], (
+                f"⚠️ 已保存的評測模型 {missing} 不在目前設定中，為避免改呼叫普通同名模型，未自動替換。"
+                f"請檢查 LiteLLM 設定及 `PROJECTS_ROOT`：`{judge_model_preferences.path.resolve()}`"
+            )
+        return selected, (
+            f"已還原評測模型：{'、'.join(judge_model_label(model) for model in selected)}；"
+            f"偏好檔：`{judge_model_preferences.path.resolve()}`"
+        )
 
     def save_autoqa_judge_model_selection(models: object) -> str:
         available = {model for _label, model in judge_model_choices()}
@@ -2431,6 +2455,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not project_id or not question_set_id:
             yield "❌ 請先生成或匯入題目集", "", autoqa_rows_update([]), hidden_progress
             return
+        if enable_llm_judge and not parse_judge_models(judge_model):
+            yield "❌ 請至少選擇一個目前可用的評測模型。", "", autoqa_rows_update([]), hidden_progress
+            return
         yield "⏳ 正在評測回答…", gr.update(), gr.update(), experiment_progress_update(0, 0, "準備開始")
 
         def render_judging(completed, total):
@@ -3719,12 +3746,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     autoqa_enable_llm_judge = gr.Checkbox(label="啟用 LLM Judge", value=True)
                     autoqa_enable_classic_metrics = gr.Checkbox(label="啟用 EM／F1 傳統指標", value=False)
                 
+                autoqa_judge_initial_value, autoqa_judge_initial_status = autoqa_judge_model_state()
                 autoqa_judge_model = gr.Dropdown(
-                    choices=judge_model_choices(), value=autoqa_judge_model_value(), label="評測模型（評審）",
+                    choices=judge_model_choices(), value=autoqa_judge_initial_value, label="評測模型（評審）",
                     multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
                 )
                 autoqa_judge_selection_status = gr.Markdown(
-                    f"選擇會自動儲存至 `{judge_model_preferences.path.resolve()}`。"
+                    autoqa_judge_initial_status
                 )
                 
                 with gr.Row():

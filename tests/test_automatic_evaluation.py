@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from automotive_graphrag.app import create_app
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationService, PROMPT_VERSION, extract_json_object
-from automotive_graphrag.connections import ConnectionSettings, JudgeConnectionSettings
+from automotive_graphrag.connections import ConnectionSettings, JudgeConnectionSettings, JudgeModelPreferences
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
@@ -336,6 +336,42 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         )
         self.assertIn((selector._id, "input"), save_event["targets"])
         self.assertEqual(save_event["inputs"], [selector._id])
+
+    def test_saved_litellm_preference_missing_from_active_root_is_not_silently_replaced(self) -> None:
+        JudgeModelPreferences(self.store.root).save_autoqa_models(["litellm:gpt-6-luna"])
+        app = create_app(self.store.root)
+        selector = next(
+            component for component in app.blocks.values()
+            if getattr(component, "label", None) == "評測模型（評審）"
+        )
+        status = next(
+            component for component in app.blocks.values()
+            if isinstance(getattr(component, "value", None), str)
+            and component.value.startswith("⚠️ 已保存的評測模型")
+        )
+        self.assertEqual(selector.get_config()["value"], [])
+        self.assertIn("不在目前設定中", status.value)
+        self.assertIn(".judge_model_preferences.json", status.value)
+
+    def test_same_litellm_alias_and_openai_model_route_to_different_endpoints(self) -> None:
+        judge_connections = JudgeConnectionSettings(self.store.root)
+        judge_connections.save("https://litellm.example/v1", "sk-litellm", ["gpt-6-luna"])
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, judge_connections=judge_connections,
+        )
+
+        openai_endpoint = service._judge_endpoint("L33-SM3E", "gpt-6-luna")
+        litellm_endpoint = service._judge_endpoint("L33-SM3E", "litellm:gpt-6-luna")
+
+        self.assertEqual(openai_endpoint.api_base_url, "https://api.openai.com/v1")
+        self.assertEqual(openai_endpoint.api_key, "test-key")
+        self.assertEqual(litellm_endpoint.api_base_url, "https://litellm.example/v1")
+        self.assertEqual(litellm_endpoint.api_key, "sk-litellm")
+
+    def test_explicit_empty_judge_selection_does_not_fall_back_to_default_model(self) -> None:
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections)
+        with self.assertRaisesRegex(ProjectError, "至少選擇一個評測模型"):
+            service.validate_judge_models([])
 
     def test_question_fails_only_when_every_judge_fails(self) -> None:
         def client(_url, _key, model, prompt):
