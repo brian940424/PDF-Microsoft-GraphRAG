@@ -323,6 +323,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("✅ 評測模型選擇已儲存至", save_message)
         self.assertIn(".judge_model_preferences.json", save_message)
 
+        refreshed_value, refreshed_status = handlers["refresh_autoqa_judge_model_selection"]()
+        self.assertEqual(refreshed_value["value"], ["litellm:gpt-6-luna"])
+        self.assertIn("LiteLLM／gpt-6-luna", refreshed_status)
+
         refreshed = create_app(self.store.root)
         selector = next(
             component for component in refreshed.blocks.values()

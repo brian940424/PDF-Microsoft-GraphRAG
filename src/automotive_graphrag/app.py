@@ -596,6 +596,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f"偏好檔：`{judge_model_preferences.path.resolve()}`"
         )
 
+    def refresh_autoqa_judge_model_selection():
+        value, status = autoqa_judge_model_state()
+        return gr.update(choices=judge_model_choices(), value=value), status
+
     def save_autoqa_judge_model_selection(models: object) -> str:
         available = {model for _label, model in judge_model_choices()}
         selected = list(parse_judge_models(models))
@@ -4661,6 +4665,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[automatic_project, autoqa_question_set_state],
             outputs=autoqa_question_set_selector,
             show_progress="hidden",
+        ).then(
+            refresh_autoqa_judge_model_selection,
+            outputs=[autoqa_judge_model, autoqa_judge_selection_status],
+            show_progress="hidden",
         )
         autoqa_question_set_selector.input(
             automatic_qa_saved_view,
@@ -4939,6 +4947,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[judge_connection_result, judge_connection_state, autoqa_judge_model, experiment_judge_model],
         )
         demo.load(workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs)
+        demo.load(
+            refresh_autoqa_judge_model_selection,
+            outputs=[autoqa_judge_model, autoqa_judge_selection_status],
+            show_progress="hidden",
+        )
+        active_project_id.change(
+            refresh_autoqa_judge_model_selection,
+            outputs=[autoqa_judge_model, autoqa_judge_selection_status],
+            show_progress="hidden",
+        )
         active_project_id.change(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
         dashboard_refresh_button.click(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
     return demo
