@@ -598,7 +598,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def save_autoqa_judge_model_selection(models: object) -> str:
         available = {model for _label, model in judge_model_choices()}
-        selected = [model for model in parse_judge_models(models) if model in available]
+        selected = list(parse_judge_models(models))
+        unavailable = [model for model in selected if model not in available]
+        if unavailable:
+            missing = "、".join(judge_model_label(model) for model in unavailable)
+            return (
+                f"❌ 未儲存：評測模型 {missing} 不在目前可用清單。請確認 LiteLLM 模型已儲存，"
+                f"且此服務使用正確的 `PROJECTS_ROOT`。"
+            )
         try:
             judge_model_preferences.save_autoqa_models(selected)
         except ProjectError as exc:

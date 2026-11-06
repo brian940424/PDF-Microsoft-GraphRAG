@@ -338,7 +338,8 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(save_event["inputs"], [selector._id])
 
     def test_saved_litellm_preference_missing_from_active_root_is_not_silently_replaced(self) -> None:
-        JudgeModelPreferences(self.store.root).save_autoqa_models(["litellm:gpt-6-luna"])
+        preferences = JudgeModelPreferences(self.store.root)
+        preferences.save_autoqa_models(["litellm:gpt-6-luna"])
         app = create_app(self.store.root)
         selector = next(
             component for component in app.blocks.values()
@@ -352,6 +353,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(selector.get_config()["value"], [])
         self.assertIn("不在目前設定中", status.value)
         self.assertIn(".judge_model_preferences.json", status.value)
+        handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
+        save_message = handlers["save_autoqa_judge_model_selection"](["litellm:gpt-6-luna"])
+        self.assertIn("❌ 未儲存", save_message)
+        self.assertEqual(preferences.get_autoqa_models(), ("litellm:gpt-6-luna",))
 
     def test_same_litellm_alias_and_openai_model_route_to_different_endpoints(self) -> None:
         judge_connections = JudgeConnectionSettings(self.store.root)
