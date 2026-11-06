@@ -861,6 +861,21 @@ class AutomaticEvaluationService:
                 server = str(response_headers.get("server", "")).lower()
                 cf_ray = str(response_headers.get("cf-ray", "")).strip()
                 if cf_ray or "cloudflare" in server:
+                    detail = ""
+                    try:
+                        error_body = json.loads(exc.read(4096).decode("utf-8", errors="replace"))
+                    except (json.JSONDecodeError, OSError, AttributeError):
+                        error_body = None
+                    if isinstance(error_body, dict):
+                        error_value = error_body.get("error", error_body)
+                        if isinstance(error_value, dict):
+                            error_value = error_value.get("message") or error_value.get("detail")
+                        if isinstance(error_value, str) and error_value.strip():
+                            detail_text = error_value.strip().replace("\n", " ")
+                            for secret in (api_key, *(extra_headers.values() if extra_headers else ())):
+                                if secret:
+                                    detail_text = detail_text.replace(secret, "[redacted]")
+                            detail = f"LiteLLM 回應內容：{detail_text[:400]}。"
                     has_cf_credentials = (
                         "CF-Access-Client-Id" in headers and "CF-Access-Client-Secret" in headers
                     )
@@ -872,7 +887,7 @@ class AutomaticEvaluationService:
                     ray_status = f"CF-Ray：{cf_ray}。" if cf_ray else "回應未提供 CF-Ray。"
                     raise ProjectError(
                         "LiteLLM 評測端點回傳 HTTP 403（回應經過 Cloudflare；僅憑此狀態無法確認是 Access policy 拒絕）；"
-                        f"{credential_status}{ray_status}請用 CF-Ray 在 Cloudflare 記錄中查找，並確認該 Client ID 屬於此 Zero Trust 組織。"
+                        f"{credential_status}{ray_status}{detail}請以同一時間及 CF-Ray 對照 Access 與 LiteLLM proxy 記錄。"
                     ) from exc
                 raise ProjectError(
                     "LiteLLM proxy 拒絕評測請求（HTTP 403）；請確認 LiteLLM Key 權限與模型別名設定。"

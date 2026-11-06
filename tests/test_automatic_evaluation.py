@@ -1,4 +1,5 @@
 import csv
+import io
 import json
 import os
 import tempfile
@@ -551,6 +552,29 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
                             self.assertIn("test-ray", str(exc))
                             self.assertIn("無法確認是 Access policy 拒絕", str(exc))
                         raise
+
+    def test_cloudflare_proxied_403_includes_sanitized_litellm_error_detail(self) -> None:
+        def forbidden(request, timeout):
+            body = json.dumps({
+                "error": {"message": "virtual key is not allowed for this model; secret-key access-secret"}
+            }).encode()
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "forbidden", {"server": "cloudflare", "cf-ray": "ray-test"},
+                io.BytesIO(body),
+            )
+
+        with patch("urllib.request.urlopen", forbidden):
+            with self.assertRaises(ProjectError) as caught:
+                AutomaticEvaluationService._openai_chat(
+                    "https://proxy.example/v1", "secret-key", "litellm:gpt-6-luna", "prompt",
+                    extra_headers={
+                        "CF-Access-Client-Id": "client-id", "CF-Access-Client-Secret": "access-secret",
+                    },
+                )
+        message = str(caught.exception)
+        self.assertIn("virtual key is not allowed for this model", message)
+        self.assertNotIn("secret-key", message)
+        self.assertNotIn("access-secret", message)
 
     def test_classic_only_uses_answer_aliases_without_calling_judge_and_exports_scores(self) -> None:
         question_set = self.question_sets.get("L33-SM3E", self.question_set_id)
