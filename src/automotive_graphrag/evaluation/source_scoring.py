@@ -4,6 +4,9 @@ The answer text carries GraphRAG citations such as ``[Data: Sources (12, 34, +mo
 number is the text unit's ``human_readable_id``, kept as ``Evidence.context_id``) or the
 Agentic Search form ``[E3]`` (``Evidence.evidence_id``). Only cited evidence that resolves to
 a retrieved text unit with a document/page is compared with the gold answer sources.
+
+Saved answers keep their citations. Evaluation splits them with ``strip_citations`` (the text
+judges and answer metrics see) and ``cited_sources`` (the sources in question-set format).
 """
 
 from __future__ import annotations
@@ -23,6 +26,12 @@ DOCUMENT_ONLY_SCORE = 0.5
 _DATA_BLOCK = re.compile(r"\[\s*Data\s*:([^\]]*)\]", re.IGNORECASE)
 _SOURCES_GROUP = re.compile(r"Sources\s*\(([^)]*)\)", re.IGNORECASE)
 _EVIDENCE_CITATION = re.compile(r"\[(E\d+)\]")
+_ANY_CITATION = re.compile(r"\s*\[\s*Data\s*:[^\]]*\]|\s*\[E\d+\]|\s*\[來源未映射\]", re.IGNORECASE)
+
+
+def strip_citations(answer: str) -> str:
+    """Answer text without GraphRAG, Agentic, or unmapped citation markers."""
+    return _ANY_CITATION.sub("", answer or "").strip()
 
 
 def cited_source_ids(answer: str) -> tuple[set[str], set[str]]:
@@ -36,15 +45,33 @@ def cited_source_ids(answer: str) -> tuple[set[str], set[str]]:
 
 
 def cited_evidence(answer: str, retrieved: Sequence[object]) -> list[object]:
-    """Retrieved text-unit evidence the answer cites, in retrieval order."""
+    """Retrieved text-unit evidence the answer cites, in retrieval order.
+
+    Models sometimes cite the page number printed in the source text instead of its record id,
+    so a ``Sources`` number that matches no retrieved record falls back to the retrieved page.
+    """
     source_ids, evidence_ids = cited_source_ids(answer)
+    text_units = [item for item in retrieved if getattr(item, "source_type", "text_unit") == "text_unit"]
+    page_citations = source_ids - {str(getattr(item, "context_id", "")) for item in text_units}
     return [
-        item for item in retrieved
-        if getattr(item, "source_type", "text_unit") == "text_unit"
-        and (
-            str(getattr(item, "context_id", "")) in source_ids
-            or str(getattr(item, "evidence_id", "")) in evidence_ids
-        )
+        item for item in text_units
+        if str(getattr(item, "context_id", "")) in source_ids
+        or str(getattr(item, "evidence_id", "")) in evidence_ids
+        or str(getattr(item, "page", None)) in page_citations
+    ]
+
+
+def cited_sources(answer: str, retrieved: Sequence[object]) -> list[dict[str, object]]:
+    """Cited evidence grouped by document, in the question set's ``answer_sources`` shape."""
+    pages_by_document: dict[str, set[int]] = {}
+    for item in cited_evidence(answer, retrieved):
+        pages = pages_by_document.setdefault(str(getattr(item, "document_id", "")), set())
+        page = getattr(item, "page", None)
+        if isinstance(page, int):
+            pages.add(page)
+    return [
+        {"document_id": document, "document_name": document, "pages": sorted(pages)}
+        for document, pages in pages_by_document.items()
     ]
 
 

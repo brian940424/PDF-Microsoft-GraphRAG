@@ -8,16 +8,12 @@ import unicodedata
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 
+from .source_scoring import strip_citations
+
 
 def normalize_answer(text: str) -> str:
-    """Remove GraphRAG source citations, then apply MuSiQue/SQuAD normalization."""
-    without_source_citations = re.sub(
-        r"\[\s*data\s*:[^\]]*\]",
-        " ",
-        text,
-        flags=re.IGNORECASE,
-    )
-    lowered = without_source_citations.lower()
+    """Remove source citations, then apply MuSiQue/SQuAD normalization."""
+    lowered = strip_citations(text).lower()
     without_punctuation = "".join(
         char for char in lowered
         if char not in string.punctuation and not unicodedata.category(char).startswith("P")

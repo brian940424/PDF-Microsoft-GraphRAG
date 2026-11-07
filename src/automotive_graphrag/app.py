@@ -41,6 +41,7 @@ from .documents import DocumentInfo, DocumentService, PageReview
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService, parse_indexing_progress
+from .evaluation.source_scoring import cited_sources, strip_citations
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_generation import GeneratedQuestion, QuestionGenerationService
@@ -456,6 +457,25 @@ def _experiment_judge_cell(item) -> str:
         if not item.get("manual_override") and extra_error_share(judge_scores_from_dicts(item.get("judge_scores"))):
             lines.append("* 來源加分 : 適用")
     return "\n".join(lines)
+
+
+def _autoqa_source_pages(sources) -> str:
+    """「文件 p.頁碼」 text for source dicts shaped like the question set's answer_sources."""
+    return "；".join(
+        f"{source['document_name']} p.{', '.join(map(str, source['pages']))}"
+        if source["pages"] else source["document_name"]
+        for source in sources
+    ) or "—"
+
+
+def _autoqa_source_cell(question) -> str:
+    """The sources the answer cites next to the gold answer sources they are scored against."""
+    gold = [
+        {"document_name": source.document_name or source.document_id, "pages": source.pages}
+        for source in (question.answer_source_evidence or question.gold_evidence)
+    ]
+    cited = cited_sources(question.answer, question.retrieved_evidence)
+    return f"系統引用：{_autoqa_source_pages(cited)}\n正確來源：{_autoqa_source_pages(gold)}"
 
 
 def _experiment_question_cells(item) -> list:
@@ -1209,7 +1229,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             judged = judges.get(question.question_id)
             rows.append([
                 question.question_id,
-                autoqa_answer_documents(question), question.question, question.answer, question.reference_answer,
+                _autoqa_source_cell(question), question.question, strip_citations(question.answer), question.reference_answer,
                 _score_percent(judged.score) if judged else "",
                 (_score_percent(judged.source_score) if judged.source_score is not None else "不適用") if judged else "",
                 _score_percent(judged.final_score) if judged else "",
@@ -1220,12 +1240,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_strategy_cell(question_set, question),
             ])
         return rows
-
-    def autoqa_answer_documents(question):
-        return ", ".join(dict.fromkeys(
-            source.document_name or source.document_id
-            for source in (question.answer_source_evidence or question.gold_evidence)
-        )) or "—"
 
     def autoqa_item_judges(item, panel_model):
         return item.judges or (JudgeScore(str(panel_model), 1.0 if item.is_correct else 0.0, item.judge_reason),)
@@ -1252,8 +1266,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 if score.model != model:
                     continue
                 rows.append([
-                    question.question_id, autoqa_answer_documents(question), question.question,
-                    question.answer, question.reference_answer,
+                    question.question_id, _autoqa_source_cell(question), question.question,
+                    strip_citations(question.answer), question.reference_answer,
                     _score_percent(score.score) if score.score is not None else "失敗",
                     score.reason or score.error or "—",
                     autoqa_strategy_cell(question_set, question),
@@ -1272,8 +1286,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             if not item:
                 continue
             rows.append([
-                question.question_id, autoqa_answer_documents(question), question.question,
-                question.answer, question.reference_answer,
+                question.question_id, _autoqa_source_cell(question), question.question,
+                strip_citations(question.answer), question.reference_answer,
                 percent(item.answer_em), percent(item.answer_f1),
                 percent(item.answer_term_hit), percent(item.answer_term_coverage),
             ])
@@ -3759,10 +3773,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_progress = gr.HTML(label="回答評測進度", visible=False)
                 autoqa_summary = gr.Markdown()
                 autoqa_table = gr.Dataframe(
-                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "LLM 分數", "來源分數", "綜合分數", "各評審分數", "實際檢索策略"],
+                    headers=["題號", "來源", "題目", "系統回答", "正確答案", "LLM 分數", "來源分數", "綜合分數", "各評審分數", "實際檢索策略"],
                     interactive=False,
                     datatype=["str", "str", "str", "str", "str", "str", "str", "str", "markdown", "str"],
-                    column_widths=["5%", "6%", "12%", "18%", "12%", "6%", "6%", "6%", "18%", "11%"],
+                    column_widths=["5%", "10%", "12%", "16%", "12%", "6%", "6%", "6%", "16%", "11%"],
                     label="模型評測結果概覽",
                     wrap=True,
                     visible=False,
@@ -3772,20 +3786,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     choices=[], value=None, label="查看評審", visible=False, interactive=True,
                 )
                 autoqa_judge_detail_table = gr.Dataframe(
-                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+                    headers=["題號", "來源", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
                     interactive=False,
                     datatype=["str"] * 8,
-                    column_widths=["5%", "8%", "13%", "18%", "13%", "6%", "22%", "15%"],
+                    column_widths=["5%", "10%", "13%", "17%", "13%", "6%", "21%", "15%"],
                     label="各評審評分細節",
                     wrap=True,
                     visible=False,
                 )
                 autoqa_metrics_divider = gr.Markdown("---", visible=False)
                 autoqa_metrics_table = gr.Dataframe(
-                    headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+                    headers=["題號", "來源", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
                     interactive=False,
                     datatype=["str"] * 9,
-                    column_widths=["5%", "8%", "17%", "25%", "17%", "5%", "5%", "7%", "11%"],
+                    column_widths=["5%", "10%", "17%", "24%", "17%", "5%", "5%", "7%", "10%"],
                     label="傳統指標結果",
                     wrap=True,
                     visible=False,

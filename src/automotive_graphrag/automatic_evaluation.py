@@ -27,7 +27,9 @@ from .evaluation.classic_metrics import (
 from .evaluation.source_scoring import (
     DEFAULT_SOURCE_WEIGHT,
     combined_score,
+    cited_sources,
     source_score,
+    strip_citations,
     validate_source_weight,
 )
 from .connections import (
@@ -45,7 +47,7 @@ from .question_sets import BatchQuestion, QuestionSetService
 from .reviews import ReviewService
 
 
-PROMPT_VERSION = "answer-rubric-judge-v1"
+PROMPT_VERSION = "answer-rubric-judge-v2"
 RUBRIC_MAX_LEVEL = 5
 CORRECT_SCORE = 0.8
 """Question score (0–1) from which an answer counts as correct: rubric level 4."""
@@ -554,7 +556,7 @@ class AutomaticEvaluationService:
             "question_id": case.question_id,
             "question": case.question,
             "correct_answer": case.reference_answer,
-            "system_answer": case.answer,
+            "system_answer": strip_citations(case.answer),
         }
         return (
             "You are an answer grader. Judge only from the question, correct answer, and system answer "
@@ -722,7 +724,11 @@ class AutomaticEvaluationService:
                 "question_id": question_id,
                 "question": question_by_id[question_id].question if question_id in question_by_id else "",
                 "expected_answer": question_by_id[question_id].reference_answer if question_id in question_by_id else "",
-                "system_answer": question_by_id[question_id].answer if question_id in question_by_id else "",
+                "system_answer": strip_citations(question_by_id[question_id].answer) if question_id in question_by_id else "",
+                "raw_system_answer": question_by_id[question_id].answer if question_id in question_by_id else "",
+                "system_answer_sources": cited_sources(
+                    question_by_id[question_id].answer, question_by_id[question_id].retrieved_evidence,
+                ) if question_id in question_by_id else [],
                 "answer_sources": [
                     asdict(source)
                     for source in (
@@ -776,7 +782,8 @@ class AutomaticEvaluationService:
             for column in (f"judge_score:{judge_model}", f"judge_reason:{judge_model}")
         ]
         fieldnames = [
-            "question_id", "question", "expected_answer", "system_answer", "answer_sources",
+            "question_id", "question", "expected_answer", "system_answer", "raw_system_answer",
+            "system_answer_sources", "answer_sources",
             "retrieved_evidence", "routed_method", "routing_reason", "duration_seconds",
             "is_correct", "average_score", "source_score", "combined_score", "source_bonus_share", "manual", "judge_reason",
             *judge_columns,
@@ -799,7 +806,14 @@ class AutomaticEvaluationService:
                 "question_id": question_id,
                 "question": question_by_id[question_id].question if question_id in question_by_id else "",
                 "expected_answer": question_by_id[question_id].reference_answer if question_id in question_by_id else "",
-                "system_answer": question_by_id[question_id].answer if question_id in question_by_id else "",
+                "system_answer": strip_citations(question_by_id[question_id].answer) if question_id in question_by_id else "",
+                "raw_system_answer": question_by_id[question_id].answer if question_id in question_by_id else "",
+                "system_answer_sources": json.dumps(
+                    cited_sources(
+                        question_by_id[question_id].answer, question_by_id[question_id].retrieved_evidence,
+                    ) if question_id in question_by_id else [],
+                    ensure_ascii=False,
+                ),
                 "answer_sources": json.dumps(
                     [
                         asdict(source)

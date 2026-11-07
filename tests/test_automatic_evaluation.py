@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from automotive_graphrag.app import create_app
+from automotive_graphrag.app import _autoqa_source_cell, create_app
 from automotive_graphrag.automatic_evaluation import (
     PROMPT_VERSION,
     AutomaticEvaluationItem,
@@ -26,7 +26,7 @@ from automotive_graphrag.connections import ConnectionSettings, ConnectionTestRe
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
-from automotive_graphrag.question_sets import BatchQuestion, QuestionSetService
+from automotive_graphrag.question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 from automotive_graphrag.reviews import ReviewService
 
 
@@ -280,7 +280,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             detail_table.get_config()["headers"],
-            ["題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+            ["題號", "來源", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
         )
         handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
         _judge, detail_divider, model_update, detail_update, _divider, metric_update = handlers["autoqa_result_tables"](
@@ -850,6 +850,27 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(item.source_bonus_share, 2 / 3)
         self.assertEqual(AutomaticEvaluationService._with_combined(item, 0.1).combined_score, 0.4)
 
+    def test_result_source_cell_shows_cited_and_gold_documents_with_pages(self) -> None:
+        cited = Evidence(
+            evidence_id="E1", rank=1, context_id="85", text_unit_id="tu", chunk_id="", section_id="",
+            section_name="", document_id="A.pdf", page=86, block_id="", text="",
+        )
+        question = BatchQuestion(
+            "Q1", "問題", "答案", answer="回答 [Data: Sources (85)]", retrieved_evidence=(cited,),
+            answer_source_evidence=(GoldEvidence("A.pdf", (86, 87), (), "A.pdf"),),
+        )
+        self.assertEqual(_autoqa_source_cell(question), "系統引用：A.pdf p.86\n正確來源：A.pdf p.86, 87")
+        unanswered = BatchQuestion("Q2", "問題", "答案")
+        self.assertEqual(_autoqa_source_cell(unanswered), "系統引用：—\n正確來源：—")
+
+    def test_judge_sees_answer_text_without_citations(self) -> None:
+        question = BatchQuestion("Q1", "問題", "答案", answer="系統答案 [Data: Sources (85)]，另見 [E3]。")
+        for mode in ("strict", "lenient"):
+            prompt = AutomaticEvaluationService._build_prompt(question, mode)
+            self.assertIn('"system_answer": "系統答案，另見。"', prompt)
+            self.assertNotIn("Sources (85)", prompt)
+            self.assertNotIn("[E3]", prompt)
+
     def test_prompts_ask_for_the_extra_content_flag(self) -> None:
         question = BatchQuestion("Q1", "題目", "答案", answer="回答")
         for mode in ("strict", "lenient"):
@@ -987,7 +1008,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             metric_table.get_config()["headers"],
-            ["題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+            ["題號", "來源", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
         )
         refresh = next(
             fn.fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "autoqa_result_tables"
@@ -1002,7 +1023,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertTrue(metric_update["visible"])
         self.assertEqual(
             metric_update["value"][0],
-            ["Q0001", "WW.pdf", "問題一", "系統答案1", "參考答案一", "0.0%", "40.0%", "0.0%", "40.0%"],
+            ["Q0001", "系統引用：—\n正確來源：WW.pdf p.21", "問題一", "系統答案1", "參考答案一", "0.0%", "40.0%", "0.0%", "40.0%"],
         )
 
         judge_update, _detail_divider, _model_update, _detail_update, divider_update, metric_update = refresh(
@@ -1036,7 +1057,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertFalse(result_table.get_config().get("interactive"))
         self.assertEqual(
             result_table.get_config()["headers"],
-            ["題號", "來源文件", "題目", "系統回答", "正確答案", "LLM 分數", "來源分數", "綜合分數", "各評審分數", "實際檢索策略"],
+            ["題號", "來源", "題目", "系統回答", "正確答案", "LLM 分數", "來源分數", "綜合分數", "各評審分數", "實際檢索策略"],
         )
         self.assertIn("只重跑前次答錯題目", labels)
         self.assertIn("自動評測 JSON", labels)
@@ -1126,6 +1147,8 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(first["question"], "問題一")
         self.assertEqual(first["expected_answer"], "參考答案一")
         self.assertEqual(first["system_answer"], "系統答案1")
+        self.assertEqual(first["raw_system_answer"], "系統答案1")
+        self.assertEqual(first["system_answer_sources"], [])
         self.assertEqual(first["answer_sources"][0]["pages"], [21])
         self.assertTrue(payload["question_results"][0]["judges"])
         with csv_path.open(encoding="utf-8", newline="") as handle:

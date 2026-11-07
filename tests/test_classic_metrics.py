@@ -15,6 +15,11 @@ def test_normalize_answer_matches_musique_rules():
     assert normalize_answer("  An   engine; and a belt. ") == "engine and belt"
 
 
+def test_normalize_answer_removes_agentic_and_unmapped_citations():
+    assert normalize_answer("答案是A [E3]") == normalize_answer("答案是A")
+    assert normalize_answer("答案是A [來源未映射]") == normalize_answer("答案是A")
+
+
 def test_normalize_answer_removes_graphrag_source_citations():
     assert normalize_answer("定影器。[Data: Sources (123)]") == "定影器"
     assert normalize_answer("定影器 [data: sources (123, 456)]") == "定影器"

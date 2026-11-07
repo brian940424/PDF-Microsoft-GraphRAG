@@ -3,8 +3,10 @@ import unittest
 from automotive_graphrag.evaluation.source_scoring import (
     cited_evidence,
     cited_source_ids,
+    cited_sources,
     combined_score,
     source_score,
+    strip_citations,
     validate_source_weight,
 )
 from automotive_graphrag.evidence import Evidence
@@ -42,6 +44,50 @@ class CitationParsingTests(unittest.TestCase):
         retrieved = [evidence("1", 10, rank=1), evidence("2", 11, rank=2), evidence("3", None, rank=3)]
         cited = cited_evidence("[Data: Sources (2)] 與 [E3]", retrieved)
         self.assertEqual([item.context_id for item in cited], ["2", "3"])
+
+
+class AnswerSplitTests(unittest.TestCase):
+    def test_strip_citations_keeps_only_answer_text(self) -> None:
+        self.assertEqual(strip_citations("會產生雜訊 [Data: Sources (85)]."), "會產生雜訊.")
+        self.assertEqual(
+            strip_citations("步驟一 [Data: Sources (1, +more); Entities (5)]，步驟二 [E3]，步驟三 [來源未映射]。"),
+            "步驟一，步驟二，步驟三。",
+        )
+        self.assertEqual(strip_citations("沒有引用 [注意] 事項"), "沒有引用 [注意] 事項")
+        self.assertEqual(strip_citations(""), "")
+
+    def test_cited_sources_use_the_question_set_shape(self) -> None:
+        retrieved = [
+            evidence("1", 12, "A.pdf", rank=1), evidence("2", 10, "A.pdf", rank=2),
+            evidence("3", 7, "B.pdf", rank=3), evidence("4", 8, "B.pdf", rank=4),
+        ]
+        self.assertEqual(cited_sources("[Data: Sources (1, 2, 3)]", retrieved), [
+            {"document_id": "A.pdf", "document_name": "A.pdf", "pages": [10, 12]},
+            {"document_id": "B.pdf", "document_name": "B.pdf", "pages": [7]},
+        ])
+        self.assertEqual(cited_sources("沒有引用", retrieved), [])
+
+
+class PrintedPageCitationTests(unittest.TestCase):
+    def test_number_matching_no_record_falls_back_to_the_retrieved_page(self) -> None:
+        retrieved = [evidence("170", 171, rank=1), evidence("172", 173, rank=2)]
+        cited = cited_evidence("[Data: Sources (171)]", retrieved)
+        self.assertEqual([item.context_id for item in cited], ["170"])
+        self.assertEqual(source_score("[Data: Sources (171)]", retrieved, [gold((171,))]), 1.0)
+
+    def test_retrieved_record_id_wins_over_a_matching_page(self) -> None:
+        retrieved = [evidence("170", 171, rank=1), evidence("171", 172, rank=2)]
+        cited = cited_evidence("[Data: Sources (171)]", retrieved)
+        self.assertEqual([item.context_id for item in cited], ["171"])
+
+    def test_number_matching_neither_record_nor_page_stays_unresolved(self) -> None:
+        retrieved = [evidence("170", 171), evidence("9", None, rank=2)]
+        self.assertEqual(cited_evidence("[Data: Sources (500)]", retrieved), [])
+        self.assertEqual(source_score("[Data: Sources (500)]", retrieved, [gold((171,))]), 0)
+
+    def test_community_report_page_is_never_a_fallback_target(self) -> None:
+        report = evidence("9", 171, "GraphRAG Community Report", source_type="community_report")
+        self.assertEqual(cited_evidence("[Data: Sources (171)]", [evidence("1", 5), report]), [])
 
 
 class SourceScoreTests(unittest.TestCase):
