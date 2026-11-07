@@ -1198,45 +1198,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", None, None
         return "✅ 已匯出自動評測 JSON 與 CSV", str(json_path), str(csv_path)
 
-    def automatic_qa_rows(report):
-        judges = {item.question_id: item for item in report.judge.items} if report.judge else {}
+    def automatic_qa_result_rows(question_set, judge, judge_error=None):
+        """Rows of the 模型評測結果概覽 table; a failed evaluation still lists every question."""
+        judge_error = judge_error or (judge.judge_error if judge else None)
+        if not judge and not judge_error:
+            return []
+        judges = {item.question_id: item for item in judge.items} if judge else {}
         rows = []
-        for question in report.question_set.questions:
+        for question in question_set.questions:
             judged = judges.get(question.question_id)
-            documents = ", ".join(dict.fromkeys(
-                source.document_name or source.document_id
-                for source in (question.answer_source_evidence or question.gold_evidence)
-            )) or "—"
             rows.append([
                 question.question_id,
-                documents,
-                question.question,
-                question.answer,
-                question.reference_answer,
-                _score_percent(judged.score) if judged else "",
-                autoqa_judge_scores(judged, report.judge.model) if judged else (
-                    report.judge_error or question.error or ("未啟用 LLM Judge" if report.judge and not report.judge.enable_llm_judge else "尚無評判結果")
-                ),
-                autoqa_strategy_cell(report.question_set, question),
-            ])
-        return rows
-
-    def automatic_qa_result_rows(question_set, judge):
-        if not judge:
-            return []
-        questions = {item.question_id: item for item in question_set.questions}
-        judges = {item.question_id: item for item in judge.items}
-        rows = []
-        for question_id, question in questions.items():
-            judged = judges.get(question_id)
-            evidence_docs = ", ".join(dict.fromkeys(item.document_id for item in question.gold_evidence)) or "—"
-            rows.append([
-                question_id,
-                evidence_docs, question.question, question.answer, question.reference_answer,
+                autoqa_answer_documents(question), question.question, question.answer, question.reference_answer,
                 _score_percent(judged.score) if judged else "",
                 (_score_percent(judged.source_score) if judged.source_score is not None else "不適用") if judged else "",
                 _score_percent(judged.final_score) if judged else "",
-                autoqa_judge_scores(judged, judge.model) if judged else ("未啟用 LLM Judge" if not judge.enable_llm_judge else "尚無評判結果"),
+                autoqa_judge_scores(judged, judge.model) if judged else (
+                    judge_error or question.error
+                    or ("未啟用 LLM Judge" if judge and not judge.enable_llm_judge else "尚無評判結果")
+                ),
                 autoqa_strategy_cell(question_set, question),
             ])
         return rows
@@ -2507,7 +2487,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             len(report.judge.classic_items) if report.judge else 0,
         )
         yield (
-            status, automatic_qa_summary(report), autoqa_rows_update(automatic_qa_rows(report)),
+            status, automatic_qa_summary(report),
+            autoqa_rows_update(automatic_qa_result_rows(report.question_set, report.judge, report.judge_error)),
             experiment_progress_update(judged, len(report.question_set.questions), "評測完成" if report.judge else "評測失敗"),
         )
 
@@ -3781,7 +3762,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     headers=["題號", "來源文件", "題目", "系統回答", "正確答案", "LLM 分數", "來源分數", "綜合分數", "各評審分數", "實際檢索策略"],
                     interactive=False,
                     datatype=["str", "str", "str", "str", "str", "str", "str", "str", "markdown", "str"],
-                    column_widths=["5%", "8%", "13%", "20%", "13%", "6%", "6%", "6%", "12%", "11%"],
+                    column_widths=["5%", "6%", "12%", "20%", "12%", "6%", "6%", "6%", "16%", "11%"],
                     label="模型評測結果概覽",
                     wrap=True,
                     visible=False,

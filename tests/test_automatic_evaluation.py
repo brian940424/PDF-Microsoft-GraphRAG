@@ -11,6 +11,7 @@ import urllib.error
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from automotive_graphrag.app import create_app
@@ -916,6 +917,62 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             service.last_result("L33-SM3E", self.question_set_id),
             updated,
         )
+
+    def test_finished_evaluation_rows_match_overview_table_columns(self) -> None:
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, FakeJudge([]))
+        judge = service.evaluate(
+            "L33-SM3E", self.question_set_id, enable_llm_judge=False, enable_classic_metrics=True,
+        )
+        judge = replace(judge, items=(AutomaticEvaluationItem(
+            "Q0001", True, "評語", judges=(JudgeScore("gpt-6-luna", 0.8),),
+            average_score=0.8, source_score=0.5, combined_score=0.85,
+        ),))
+        question_set = self.question_sets.get("L33-SM3E", self.question_set_id)
+        report = SimpleNamespace(
+            question_set=question_set, judge=judge, judge_error=None, generation_errors=(),
+            retrieval=None, retrieval_error=None, answer_model="m", generation_model="—",
+        )
+        app = create_app(self.store.root)
+        table = next(
+            component for component in app.blocks.values()
+            if hasattr(component, "get_config") and component.get_config().get("label") == "模型評測結果概覽"
+        )
+        handler = next(
+            fn.fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "evaluate_automatic_answers"
+        )
+        cells = dict(zip(handler.__code__.co_freevars, handler.__closure__))
+        sources = lambda item: "；".join(
+            f"{source.document_id}: {', '.join(str(page) for page in source.pages)}" for source in item.gold_evidence
+        )
+        question_rows = [
+            [item.question_id, item.question, item.reference_answer, sources(item), sources(item)]
+            for item in question_set.questions
+        ]
+        with patch.object(cells["automatic_qa"].cell_contents, "evaluate_existing", return_value=report):
+            *_, final = handler(
+                "L33-SM3E", self.question_set_id, question_rows, "m", [], "low", "local", 1,
+                question_set.response_type, False, True,
+            )
+        rows = final[2]["value"]
+        headers = table.get_config()["headers"]
+        self.assertEqual({len(row) for row in rows}, {len(headers)})
+        scored = dict(zip(headers, rows[0]))
+        self.assertEqual(scored["LLM 分數"], "80%")
+        self.assertEqual(scored["來源分數"], "50%")
+        self.assertEqual(scored["綜合分數"], "85%")
+        self.assertIn("gpt-6-luna", scored["各評審分數"])
+        self.assertEqual(dict(zip(headers, rows[1]))["各評審分數"], "未啟用 LLM Judge")
+
+        # A judge failure leaves no saved result, but every question still shows the error.
+        failed = SimpleNamespace(**{**vars(report), "judge": None, "judge_error": "judge offline"})
+        with patch.object(cells["automatic_qa"].cell_contents, "evaluate_existing", return_value=failed):
+            *_, final = handler(
+                "L33-SM3E", self.question_set_id, question_rows, "m", [], "low", "local", 1,
+                question_set.response_type, False, True,
+            )
+        rows = final[2]["value"]
+        self.assertEqual({len(row) for row in rows}, {len(headers)})
+        self.assertEqual(dict(zip(headers, rows[0]))["各評審分數"], "judge offline")
 
     def test_app_shows_classic_metric_table_only_when_its_checkbox_is_enabled(self) -> None:
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, FakeJudge([]))
