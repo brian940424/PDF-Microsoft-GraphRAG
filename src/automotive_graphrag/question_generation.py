@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, chat_completion_api_params
+from .connections import ConnectionSettings, chat_completion_api_params, extract_json_object, llm_request_headers
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 from .source_sampling import SourceSample, SourceSampleBatch, SourceSamplingService
@@ -92,7 +92,11 @@ class QuestionGenerationService:
         api_base_url = self.connections.get_api_base_url()
         model = self.connections.get_chat_model()
         try:
-            response = self.client(api_base_url, api_key, model, prompt)
+            args = (api_base_url, api_key, model, prompt)
+            if "reasoning_effort" in inspect.signature(self.client).parameters:
+                response = self.client(*args, reasoning_effort=self.connections.reasoning_effort_for(model))
+            else:
+                response = self.client(*args)
         except ProjectError:
             raise
         except Exception as exc:
@@ -132,7 +136,7 @@ class QuestionGenerationService:
             raise ProjectError("每份 PDF 生成題數必須是正整數")
         if maximum_source_characters < 200:
             raise ProjectError("每筆來源字數上限不可小於 200")
-        if model not in ALLOWED_CHAT_MODELS:
+        if model not in self.connections.available_chat_models():
             raise ProjectError(f"不支援的題目生成模型：{model}")
         document_samples = tuple(item for item in samples if item.document_id == document_id)
         if not document_samples:
@@ -167,7 +171,9 @@ class QuestionGenerationService:
         try:
             args = (self.connections.get_api_base_url(), api_key, model, prompt)
             if "reasoning_effort" in inspect.signature(self.client).parameters:
-                response = self.client(*args, reasoning_effort=reasoning_effort)
+                response = self.client(
+                    *args, reasoning_effort=self.connections.reasoning_effort_for(model, reasoning_effort)
+                )
             else:
                 response = self.client(*args)
         except ProjectError:
@@ -415,17 +421,19 @@ class QuestionGenerationService:
         )
 
     @staticmethod
-    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str = "medium") -> object:
+    def _openai_chat(
+        api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str | None = None,
+    ) -> object:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         }
-        payload.update(chat_completion_api_params(model, 4000, reasoning_effort))
+        payload.update(chat_completion_api_params(4000, reasoning_effort))
         request = urllib.request.Request(
             f"{api_base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=llm_request_headers(api_key),
             method="POST",
         )
         try:
@@ -441,9 +449,12 @@ class QuestionGenerationService:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ProjectError("題目生成 API 無法連線或回應格式錯誤") from exc
         try:
-            return json.loads(value["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            parsed = extract_json_object(value["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ProjectError("題目生成 API 回應缺少有效 JSON 內容") from exc
+        if parsed is None:
+            raise ProjectError("題目生成 API 回應缺少有效 JSON 內容")
+        return parsed
 
     def _path(self, project_id: str, generation_batch_id: str) -> Path:
         return self.projects.path_for(project_id) / "runs" / f"generated-questions-{generation_batch_id}.json"

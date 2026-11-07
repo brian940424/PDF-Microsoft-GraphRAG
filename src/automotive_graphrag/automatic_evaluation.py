@@ -31,18 +31,14 @@ from .evaluation.source_scoring import (
     validate_source_weight,
 )
 from .connections import (
-    ALLOWED_CHAT_MODELS,
-    GPT6_LUNA_MODEL,
     ConnectionSettings,
-    JudgeConnectionSettings,
-    JudgeEndpoint,
     MAX_JUDGE_MODELS,
+    chat_completion_api_params,
+    extract_json_object,
     format_judge_models,
-    is_litellm_model,
     judge_model_label,
+    llm_request_headers,
     parse_judge_models,
-    judge_completion_api_params,
-    litellm_alias,
 )
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
@@ -193,46 +189,30 @@ class AutomaticEvaluationService:
         question_sets: QuestionSetService | None = None,
         connections: ConnectionSettings | None = None,
         client: JudgeClient | None = None,
-        judge_connections: JudgeConnectionSettings | None = None,
     ) -> None:
         self.projects = projects
         self.question_sets = question_sets or QuestionSetService(projects)
         self.connections = connections or ConnectionSettings(projects.root)
-        self.judge_connections = judge_connections or JudgeConnectionSettings(projects.root)
         self.client = client or self._openai_chat
 
     def judge_model_choices(self) -> tuple[str, ...]:
-        """OpenAI judge models plus LiteLLM proxy aliases once the judge connection is saved."""
-        return (*ALLOWED_CHAT_MODELS, *self.judge_connections.available_models())
+        return self.connections.available_chat_models()
 
     def supports_judge_model(self, model: object) -> bool:
-        if model in ALLOWED_CHAT_MODELS:
-            return True
-        return is_litellm_model(model) and model in self.judge_connections.available_models()
+        return model in self.connections.available_chat_models()
 
     def supports_judge_reasoning(self, model: object) -> bool:
         """Whether a reasoning_effort selector applies to this judge model."""
-        return model == GPT6_LUNA_MODEL or self.judge_connections.supports_reasoning(model)
-
-    def _judge_endpoint(self, project_id: str, model: str) -> JudgeEndpoint:
-        if model in ALLOWED_CHAT_MODELS:
-            api_key = self.connections.apply_to_environment(project_id)
-            return JudgeEndpoint(self.connections.get_api_base_url(), api_key, model == GPT6_LUNA_MODEL)
-        return self.judge_connections.endpoint_for(model)
+        return self.connections.supports_reasoning(model)
 
     def _call_judge(self, project_id: str, model: str, prompt: str, reasoning_effort: str) -> object:
-        endpoint = self._judge_endpoint(project_id, model)
-        # LiteLLM models that do not report reasoning support never receive reasoning_effort.
-        effort = reasoning_effort if endpoint.supports_reasoning or model in ALLOWED_CHAT_MODELS else None
+        api_key = self.connections.apply_to_environment(project_id)
+        effort = self.connections.reasoning_effort_for(model, reasoning_effort)
         try:
-            args = (endpoint.api_base_url, endpoint.api_key, model, prompt)
-            parameters = inspect.signature(self.client).parameters
-            kwargs = {}
-            if "reasoning_effort" in parameters:
-                kwargs["reasoning_effort"] = effort
-            if endpoint.extra_headers and "extra_headers" in parameters:
-                kwargs["extra_headers"] = endpoint.extra_headers
-            return self.client(*args, **kwargs)
+            args = (self.connections.get_api_base_url(), api_key, model, prompt)
+            if "reasoning_effort" in inspect.signature(self.client).parameters:
+                return self.client(*args, reasoning_effort=effort)
+            return self.client(*args)
         except ProjectError:
             raise
         except Exception as exc:
@@ -851,39 +831,22 @@ class AutomaticEvaluationService:
             seen.add(question_id)
         return result
 
-    def _unsupported_model_message(self, model: object) -> str:
-        if is_litellm_model(model) and not self.judge_connections.is_configured():
-            return "尚未完成 LiteLLM 評測模型設定，請先到「0 專案與連線設定」儲存評測模型"
-        if is_litellm_model(model):
-            return f"評測模型不在 LiteLLM 評測模型設定的清單：{litellm_alias(str(model))}"
-        return f"不支援的評判模型：{model}"
+    @staticmethod
+    def _unsupported_model_message(model: object) -> str:
+        return f"評測模型不在連線設定的可用清單：{model}"
 
     @staticmethod
     def _openai_chat(
-        api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str | None = "medium",
-        extra_headers: dict[str, str] | None = None,
+        api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str | None = None,
     ) -> object:
-        litellm = is_litellm_model(model)
         payload: dict[str, object] = {
-            "model": litellm_alias(model) if litellm else model,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         }
-        payload.update(judge_completion_api_params(model, 4000, reasoning_effort))
-        headers = {
-            "Content-Type": "application/json",
-            # Match the descriptive client identity used by LiteLLM connection checks.
-            # Cloudflare Browser Integrity Check can block urllib's default User-Agent.
-            "User-Agent": "automotive-graphrag/0.1",
-        }
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        if litellm:
-            headers.update(extra_headers or {})
-        api_base_url = api_base_url.rstrip("/")
-        chat_url = f"{api_base_url}/chat/completions"
-        if litellm and not api_base_url.endswith("/v1"):
-            chat_url = f"{api_base_url}/v1/chat/completions"
+        payload.update(chat_completion_api_params(4000, reasoning_effort))
+        headers = llm_request_headers(api_key)
+        chat_url = f"{api_base_url.rstrip('/')}/chat/completions"
 
         def post(body: dict[str, object]) -> dict[str, object]:
             request = urllib.request.Request(
@@ -901,11 +864,11 @@ class AutomaticEvaluationService:
             except urllib.error.HTTPError as exc:
                 # Some providers behind LiteLLM reject JSON mode; retry once without it
                 # and recover the JSON object from the plain-text reply.
-                if not litellm or exc.code != 400:
+                if exc.code != 400:
                     raise
                 value = post({key: item for key, item in payload.items() if key != "response_format"})
         except urllib.error.HTTPError as exc:
-            if litellm and exc.code == 403:
+            if exc.code == 403:
                 response_headers = exc.headers or {}
                 server = str(response_headers.get("server", "")).lower()
                 cf_ray = str(response_headers.get("cf-ray", "")).strip()
@@ -915,7 +878,7 @@ class AutomaticEvaluationService:
                     raw_error_body = ""
                 response_body_truncated = len(raw_error_body) > 8192
                 error_body = raw_error_body[:8192]
-                for secret in (api_key, *(extra_headers.values() if extra_headers else ())):
+                for secret in (api_key, headers.get("CF-Access-Client-Id"), headers.get("CF-Access-Client-Secret")):
                     if secret:
                         error_body = error_body.replace(secret, "[redacted]")
                 parsed_error: object = None
@@ -1006,27 +969,3 @@ class AutomaticEvaluationService:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
-
-
-def extract_json_object(text: str) -> dict[str, object] | None:
-    """Parse a JSON object, falling back to the first object embedded in plain text.
-
-    Models without JSON mode may wrap the verdict in prose or Markdown code fences.
-    """
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        value = None
-    if isinstance(value, dict):
-        return value
-    decoder = json.JSONDecoder()
-    start = text.find("{")
-    while start != -1:
-        try:
-            value, _end = decoder.raw_decode(text, start)
-        except json.JSONDecodeError:
-            value = None
-        if isinstance(value, dict):
-            return value
-        start = text.find("{", start + 1)
-    return None

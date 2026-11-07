@@ -1,4 +1,4 @@
-"""GPT-6-compatible execution for Microsoft GraphRAG DRIFT queries."""
+"""Reasoning-model-compatible execution for Microsoft GraphRAG DRIFT queries."""
 
 from __future__ import annotations
 
@@ -6,8 +6,6 @@ import os
 import threading
 from pathlib import Path
 from typing import Any
-
-from .connections import GPT6_LUNA_MODEL
 
 
 _DRIFT_PATCH_LOCK = threading.RLock()
@@ -34,9 +32,9 @@ class SamplingParameterFilter:
 
 
 def _filter_engine_model(engine: Any, config: Any) -> Any:
-    """Wrap every model reference used by one DRIFT engine when it selects GPT-6 Luna."""
+    """Wrap every model reference used by one DRIFT engine when it selects a reasoning model."""
     model_settings = config.get_completion_model_config(config.drift_search.completion_model_id)
-    if model_settings.model != GPT6_LUNA_MODEL:
+    if "reasoning_effort" not in model_settings.call_args:
         return engine
 
     compatible_model = SamplingParameterFilter(engine.model)
@@ -54,7 +52,7 @@ def run_drift_search(
     community_level: int = 2,
     response_type: str = "Single Paragraph",
 ) -> tuple[str, dict[str, Any]]:
-    """Run the official GraphRAG DRIFT entry point with a scoped Luna adapter.
+    """Run the official GraphRAG DRIFT entry point with a scoped reasoning-model adapter.
 
     GraphRAG 3.2 builds its DRIFT model arguments in the search implementation,
     so this scoped factory wrapper is needed to remove unsupported sampling

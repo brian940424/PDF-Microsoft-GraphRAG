@@ -53,7 +53,7 @@ class DriftCompatibilityTests(unittest.TestCase):
         )
         config = SimpleNamespace(
             drift_search=SimpleNamespace(completion_model_id="drift"),
-            get_completion_model_config=lambda _model_id: SimpleNamespace(model="gpt-6-luna"),
+            get_completion_model_config=lambda _model_id: SimpleNamespace(model="gpt-6-luna", call_args={"reasoning_effort": "medium"}),
         )
 
         adapted = _filter_engine_model(engine, config)
@@ -68,7 +68,7 @@ class DriftCompatibilityTests(unittest.TestCase):
         engine = SimpleNamespace(model=completion)
         config = SimpleNamespace(
             drift_search=SimpleNamespace(completion_model_id="drift"),
-            get_completion_model_config=lambda _model_id: SimpleNamespace(model="gpt-4o-mini"),
+            get_completion_model_config=lambda _model_id: SimpleNamespace(model="gpt-4o-mini", call_args={}),
         )
 
         self.assertIs(_filter_engine_model(engine, config).model, completion)
@@ -81,7 +81,7 @@ class DriftCompatibilityTests(unittest.TestCase):
         completion = FakeCompletion()
         config = SimpleNamespace(
             drift_search=SimpleNamespace(completion_model_id="drift"),
-            get_completion_model_config=lambda _model_id: SimpleNamespace(model="gpt-6-luna"),
+            get_completion_model_config=lambda _model_id: SimpleNamespace(model="gpt-6-luna", call_args={"reasoning_effort": "medium"}),
         )
         engine = SimpleNamespace(
             model=completion,

@@ -102,7 +102,7 @@ class AgenticSearch:
         api_base_url: str,
         api_key: str | None,
         search: SearchFunction,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
     ) -> AgenticDecision:
         deadline = time.monotonic() + MAX_TOTAL_SECONDS
         call_counter = [0]
@@ -152,7 +152,7 @@ class AgenticSearch:
 
     def _decision_from_results(
         self, question: str, model: str, api_base_url: str, api_key: str,
-        steps: list[SearchStepResult], reasoning_effort: str, stop_reason: str, deadline: float,
+        steps: list[SearchStepResult], reasoning_effort: str | None, stop_reason: str, deadline: float,
         call_counter: list[int],
     ) -> AgenticDecision:
         if not any(step.evidence for step in steps):

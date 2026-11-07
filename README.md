@@ -33,7 +33,7 @@
 主要功能如下：
 
 - 在「0 專案與連線設定」建立、刪除、選取並開啟專案；管理頁面共用目前開啟的專案。
-- 在「0 專案與連線設定」共用設定 GraphRAG API Base URL、API Key 與模型。
+- 在「0 專案與連線設定」共用設定 LiteLLM proxy 的 Base URL、Key 與模型；所有模型呼叫都經由此 proxy。
 - 在「1 文件與建圖」匯入 PDF、設定各文件前處理頁面範圍與忽略比例（可選用 Vision 模型轉寫表格、圖片與掃描頁），執行建圖並即時查看日誌。
 - 在「2 問答測試」使用四種 GraphRAG 策略（或由 LLM 自動選擇策略並說明原因）單次問答並檢視可取得的來源 Evidence。
 - 對可可靠解析的檢索來源計算 Evidence Hit Rate、Evidence Precision、Document Hit Rate；無法可靠比對時明確標示不可計算。
@@ -46,7 +46,7 @@
 
 | 用途 | 模型 |
 |---|---|
-| Chat | `gpt-6-luna`（預設）、`gpt-4o-mini`、`gpt-4.1-mini` |
+| Chat | LiteLLM proxy 提供並在第 0 頁勾選的模型（預設 `gpt-6-luna`） |
 | Embedding | `text-embedding-3-small`、`text-embedding-3-large` |
 
 Chat 模型預設為 `gpt-6-luna`，Embedding 模型預設為 `text-embedding-3-small`。
@@ -108,7 +108,7 @@ API 連線設定保存在 `PROJECTS_ROOT/.connection.json`，由該根目錄下�
 需求：
 
 - Docker Engine 24 或更新版本
-- 可連線至設定的 OpenAI 相容 API
+- 可連線至 LiteLLM proxy（OpenAI 相容 API），設定方式見 [docs/LiteLLM模型設定.md](docs/LiteLLM模型設定.md)
 - 足夠的磁碟空間保存 PDF、Parquet 與 GraphRAG 索引
 
 建立映像：
@@ -172,16 +172,16 @@ docker volume create automotive-graphrag-data
 不要將 API Key 寫入 Dockerfile 或映像。可建立不提交至版本控制的 `.env`：
 
 ```dotenv
-GRAPHRAG_API_KEY=your-api-key
-GRAPHRAG_API_BASE=https://api.openai.com/v1
+GRAPHRAG_API_KEY=your-litellm-key
+GRAPHRAG_API_BASE=http://localhost:4000/v1
 GRAPHRAG_CHAT_MODEL=gpt-6-luna
 GRAPHRAG_EMBEDDING_MODEL=text-embedding-3-small
-# Optional: set these only when the LiteLLM judge proxy is protected by Cloudflare Access
+# Optional: set these only when the LiteLLM proxy is protected by Cloudflare Access
 CF_ACCESS_CLIENT_ID=your-cloudflare-access-client-id
 CF_ACCESS_CLIENT_SECRET=your-cloudflare-access-client-secret
 ```
 
-`CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are credentials for the **LiteLLM proxy accessed by this app**. They are sent as `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers for LiteLLM connection checks and judge requests. Do not put them in the LiteLLM proxy's own `.env`; configure them in the environment passed to the GraphRAG admin container/process. They are not needed for a direct OpenAI connection.
+`CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are credentials for the **LiteLLM proxy accessed by this app**. They are sent as `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers for every LiteLLM request, including GraphRAG indexing and queries. Do not put them in the LiteLLM proxy's own `.env`; configure them in the environment passed to the GraphRAG admin container/process. They are not needed when the proxy is not behind Cloudflare Access.
 
 若選擇由管理後台儲存連線設定，設定會寫入持久化 Volume 內的 `.connection.json`。請將該 Volume 視為敏感資料並限制存取。
 
@@ -252,7 +252,7 @@ docker run --rm --name automotive-graphrag-portal --env-file .env -p 7860:7860 -
 
 檢查以下項目：
 
-- API Base URL 與 API Key 是否正確。
+- LiteLLM Base URL 與 LiteLLM Key 是否正確。
 - 模型是否在允許清單內。
 - PDF 是否已完成前處理並產生 `processed/input.jsonl`。
 - `graphrag/indexing.log` 與 `graphrag/last_index_run.json` 的錯誤訊息。
@@ -270,7 +270,7 @@ docker run --rm --name automotive-graphrag-portal --env-file .env -p 7860:7860 -
 
 ### 如何降低開發測試成本
 
-- Chat 預設使用 `gpt-6-luna`；也可在連線設定中選擇其他允許的模型。
+- Chat 預設使用 `gpt-6-luna`；也可在連線設定中勾選 proxy 提供的其他模型。
 - Embedding 使用 `text-embedding-3-small`。
 - 題目生成先縮小頁碼、章節及取樣數量。
 - 自動評測使用既有回答，不要勾選重新執行系統回答。
@@ -303,11 +303,11 @@ Linux／macOS：
 
 ```bash
 export PROJECTS_ROOT="$PWD/projects"
-export GRAPHRAG_API_KEY="your-api-key"
-export GRAPHRAG_API_BASE="https://api.openai.com/v1"
+export GRAPHRAG_API_KEY="your-litellm-key"
+export GRAPHRAG_API_BASE="http://localhost:4000/v1"
 export GRAPHRAG_CHAT_MODEL="gpt-6-luna"
 export GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"
-# Optional, only for a LiteLLM judge proxy protected by Cloudflare Access
+# Optional, only for a LiteLLM proxy protected by Cloudflare Access
 export CF_ACCESS_CLIENT_ID="your-cloudflare-access-client-id"
 export CF_ACCESS_CLIENT_SECRET="your-cloudflare-access-client-secret"
 ```
@@ -315,7 +315,7 @@ export CF_ACCESS_CLIENT_SECRET="your-cloudflare-access-client-secret"
 Windows PowerShell（單行）：
 
 ```powershell
-$env:PROJECTS_ROOT=(Join-Path $PWD "projects"); $env:GRAPHRAG_API_KEY="your-api-key"; $env:GRAPHRAG_API_BASE="https://api.openai.com/v1"; $env:GRAPHRAG_CHAT_MODEL="gpt-6-luna"; $env:GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"; $env:CF_ACCESS_CLIENT_ID="your-cloudflare-access-client-id"; $env:CF_ACCESS_CLIENT_SECRET="your-cloudflare-access-client-secret"
+$env:PROJECTS_ROOT=(Join-Path $PWD "projects"); $env:GRAPHRAG_API_KEY="your-litellm-key"; $env:GRAPHRAG_API_BASE="http://localhost:4000/v1"; $env:GRAPHRAG_CHAT_MODEL="gpt-6-luna"; $env:GRAPHRAG_EMBEDDING_MODEL="text-embedding-3-small"; $env:CF_ACCESS_CLIENT_ID="your-cloudflare-access-client-id"; $env:CF_ACCESS_CLIENT_SECRET="your-cloudflare-access-client-secret"
 ```
 
 啟動一般入口：

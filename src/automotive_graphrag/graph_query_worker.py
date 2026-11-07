@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .connections import GPT6_LUNA_MODEL
 from .querying import QueryService
 
 
@@ -18,7 +17,6 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     method = str(payload.get("method", ""))
     root_dir = Path(str(payload["root_dir"]))
     question = str(payload["question"])
-    model = str(payload.get("model", ""))
     response_type = str(payload.get("response_type") or "Single Paragraph")
     community_level = int(payload.get("community_level", 2))
     dynamic_community_selection = bool(payload.get("dynamic_community_selection", False))
@@ -43,7 +41,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
             dynamic_community_selection=dynamic_community_selection,
             **common,
         )
-    elif method == "drift" and model == GPT6_LUNA_MODEL:
+    elif method == "drift":
         from .drift_compat import run_drift_search
 
         answer, context = run_drift_search(
@@ -52,8 +50,6 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
             community_level=community_level,
             response_type=response_type,
         )
-    elif method == "drift":
-        answer, context = cli_query.run_drift_search(community_level=community_level, **common)
     else:
         answer, context = cli_query.run_basic_search(
             data_dir=None,

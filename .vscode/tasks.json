@@ -31,6 +31,30 @@
                     "endsPattern": "Running on local URL"
                 }
             }
+        },
+        {
+            "label": "專案儀表板",
+            "type": "shell",
+            "command": "./progress-dashboard/start.sh",
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": false
+            },
+            "problemMatcher": {
+                "owner": "progress-dashboard",
+                "pattern": {
+                    "regexp": "^(\\w*Error): (.*)$",
+                    "code": 1,
+                    "message": 2
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "next dev",
+                    "endsPattern": "Ready in"
+                }
+            }
         }
     ]
 }

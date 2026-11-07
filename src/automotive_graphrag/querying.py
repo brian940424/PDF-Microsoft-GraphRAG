@@ -20,7 +20,7 @@ from typing import Any, Callable
 import pandas as pd
 import yaml
 
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, configure_completion_model
+from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
@@ -104,18 +104,19 @@ class QueryService:
         if normalized_method not in QUERY_METHODS | {AUTO_METHOD, AGENTIC_METHOD}:
             raise ProjectError(f"不支援的查詢方法：{method}")
         selected_model = chat_model or self.connection_settings.get_chat_model()
-        if selected_model not in ALLOWED_CHAT_MODELS:
+        if selected_model not in self.connection_settings.available_chat_models():
             raise ProjectError(f"不支援的 Chat 模型：{selected_model}")
         graph_root = project_path / "graphrag"
         if not (graph_root / "output").is_dir():
             raise ProjectError("找不到此專案的 GraphRAG 索引輸出")
         self.connection_settings.apply_to_environment(project_id)
+        applied_effort = self.connection_settings.reasoning_effort_for(selected_model, reasoning_effort)
         self._configure_connection(
             graph_root / "settings.yaml",
             self.connection_settings.get_api_base_url(),
             selected_model,
             self.connection_settings.get_embedding_model(),
-            reasoning_effort,
+            applied_effort,
         )
         started = datetime.now(timezone.utc)
         started_clock = time.monotonic()
@@ -139,7 +140,7 @@ class QueryService:
                 selected_model,
                 self.connection_settings.get_api_base_url(),
                 self.connection_settings.get_api_key(project_id),
-                reasoning_effort,
+                applied_effort,
             )
             normalized_method, routing_reason = decision.method, decision.reason
         command = [
@@ -171,7 +172,7 @@ class QueryService:
                 self.connection_settings.get_api_base_url(),
                 self.connection_settings.get_api_key(project_id),
                 execute_search,
-                reasoning_effort,
+                applied_effort,
             )
             result = QueryExecution(decision.returncode, decision.answer, decision.error or "", decision.context)
             routing_reason = decision.stop_reason
@@ -368,7 +369,7 @@ class QueryService:
         api_base_url: str,
         chat_model: str,
         embedding_model: str,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
     ) -> None:
         try:
             value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
@@ -380,7 +381,7 @@ class QueryService:
         for model in value.get("completion_models", {}).values():
             configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
-            model["model"] = embedding_model
+            configure_embedding_model(model, embedding_model)
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:

@@ -136,7 +136,7 @@ class QueryServiceTests(unittest.TestCase):
 
         result = service.ask("L33-SM3E", " 手冊涵蓋哪些系統？ ", method="auto", chat_model="gpt-4.1-mini")
 
-        self.assertEqual(router.calls, [("手冊涵蓋哪些系統？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key", "medium")])
+        self.assertEqual(router.calls, [("手冊涵蓋哪些系統？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key", None)])
         command = runner.commands[0]
         self.assertEqual(command[command.index("--method") + 1], "global")
         self.assertEqual(result.method, "global")
@@ -168,7 +168,7 @@ class QueryServiceTests(unittest.TestCase):
 
         result = service.ask("L33-SM3E", "如何檢查保險絲？", method="agentic", chat_model="gpt-4.1-mini", reasoning_effort="high")
 
-        self.assertEqual(agentic.calls, [("如何檢查保險絲？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key", "high")])
+        self.assertEqual(agentic.calls, [("如何檢查保險絲？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key", None)])
         self.assertEqual(result.requested_method, "agentic")
         self.assertEqual(result.method, "agentic")
         self.assertEqual(result.answer, "根據手冊先檢查保險絲 [E1]。")

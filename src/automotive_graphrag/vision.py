@@ -17,11 +17,10 @@ from typing import Any, Callable, Iterable
 
 import pymupdf
 
-from .connections import ALLOWED_CHAT_MODELS, GPT6_LUNA_MODEL, REASONING_EFFORT_OPTIONS
+from .connections import REASONING_EFFORT_OPTIONS, extract_json_object, llm_request_headers
 from .projects import ProjectError
 
 
-ALLOWED_VISION_MODELS = ALLOWED_CHAT_MODELS
 DEFAULT_VISION_CONCURRENCY = 8
 RENDER_SCALE = 2.0
 REQUEST_TIMEOUT_SECONDS = 180
@@ -90,16 +89,17 @@ class VisionSettings:
     api_base_url: str = ""
     api_key: str = ""
     max_workers: int = DEFAULT_VISION_CONCURRENCY
-    reasoning_effort: str = "none"
+    # None means the model does not accept reasoning_effort at all.
+    reasoning_effort: str | None = "none"
 
     def __post_init__(self) -> None:
-        if self.model not in ALLOWED_VISION_MODELS:
-            raise ProjectError(f"Vision 模型不在允許清單：{', '.join(ALLOWED_VISION_MODELS)}")
+        if not self.model:
+            raise ProjectError("Vision 模型為必填")
         if self.scope not in VISION_SCOPES:
             raise ProjectError(f"不支援的 Vision 解析範圍：{self.scope}")
         if self.max_workers < 1:
             raise ProjectError("Vision 並行數必須大於 0")
-        if self.reasoning_effort not in VISION_REASONING_EFFORT_OPTIONS:
+        if self.reasoning_effort is not None and self.reasoning_effort not in VISION_REASONING_EFFORT_OPTIONS:
             raise ProjectError("不支援的 Vision 推理深度")
 
 
@@ -177,32 +177,27 @@ def analyze_page(image_base64: str, page_number: int, language: str | None, sett
             },
         ],
         "response_format": {"type": "json_object"},
-        # Transcription rarely benefits from reasoning; GPT-6 reasoning requests
-        # only accept temperature when the effort is none.
+        # Transcription rarely benefits from reasoning; reasoning requests only
+        # accept temperature when the effort is none.
     }
-    if settings.model == GPT6_LUNA_MODEL:
+    if settings.reasoning_effort is not None:
         payload["reasoning_effort"] = settings.reasoning_effort
-    if settings.model != GPT6_LUNA_MODEL or settings.reasoning_effort == "none":
+    if settings.reasoning_effort in {None, "none"}:
         payload["temperature"] = 0
     response = _post_json(f"{settings.api_base_url.rstrip('/')}/chat/completions", payload, settings.api_key)
     try:
         content = response["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError("Vision API 回傳缺少 choices/message/content") from exc
-    try:
-        result = json.loads(content)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("Vision 模型回傳的不是有效 JSON") from exc
+    result = extract_json_object(content) if isinstance(content, str) else None
+    if result is None:
+        raise ValueError("Vision 模型回傳的不是有效 JSON")
     return serialize_result(validate_result(result, page_number))
 
 
 def _post_json(url: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-        "User-Agent": "automotive-graphrag/0.1",
-    }
+    headers = llm_request_headers(api_key)
     for attempt in range(MAX_RETRIES + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:

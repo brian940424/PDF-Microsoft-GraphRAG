@@ -9,7 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-from .connections import chat_completion_api_params
+from .connections import chat_completion_api_params, extract_json_object, llm_request_headers
 from .projects import ProjectError
 
 
@@ -49,7 +49,7 @@ class StrategyRouter:
 
     def route(
         self, question: str, model: str, api_base_url: str, api_key: str | None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
     ) -> StrategyDecision:
         """Return the selected method, falling back to Local instead of failing the query."""
         if not api_key:
@@ -81,18 +81,18 @@ class StrategyRouter:
     @staticmethod
     def _openai_chat(
         api_base_url: str, api_key: str, model: str, prompt: str,
-        reasoning_effort: str = "medium", timeout_seconds: float = 60,
+        reasoning_effort: str | None = None, timeout_seconds: float = 60,
     ) -> object:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         }
-        payload.update(chat_completion_api_params(model, 2000, reasoning_effort))
+        payload.update(chat_completion_api_params(2000, reasoning_effort))
         request = urllib.request.Request(
             f"{api_base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=llm_request_headers(api_key),
             method="POST",
         )
         try:
@@ -103,6 +103,9 @@ class StrategyRouter:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ProjectError("策略判斷 API 無法連線或回應格式錯誤") from exc
         try:
-            return json.loads(value["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            parsed = extract_json_object(value["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ProjectError("策略判斷 API 回應缺少有效 JSON 內容") from exc
+        if parsed is None:
+            raise ProjectError("策略判斷 API 回應缺少有效 JSON 內容")
+        return parsed

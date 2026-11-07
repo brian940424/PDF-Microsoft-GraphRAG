@@ -8,7 +8,6 @@ from datetime import datetime
 from typing import Callable
 
 from .automatic_evaluation import AutomaticEvaluationResult, AutomaticEvaluationService
-from .connections import ALLOWED_CHAT_MODELS
 from .projects import ProjectError, ProjectStore
 from .question_generation import QuestionGenerationService, normalize_question
 from .question_sets import BatchQuestion, QuestionSet, QuestionSetService
@@ -62,8 +61,6 @@ class AutomaticQATestService:
     ) -> QuestionSet:
         if questions_per_pdf < 1:
             raise ProjectError("每份 PDF 題數必須是正整數")
-        if generation_model not in ALLOWED_CHAT_MODELS:
-            raise ProjectError(f"不支援的生題模型：{generation_model}")
         project = self.projects.get(project_id)
         if project.status != "INDEXED":
             raise ProjectError(f"專案狀態 {project.status} 尚未完成建圖")

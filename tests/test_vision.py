@@ -121,9 +121,9 @@ class VisionPreprocessTests(unittest.TestCase):
         self.assertEqual(sorted(records), [1, 2])
         self.assertEqual(report.empty_pages, 1)
 
-    def test_settings_reject_unknown_model_and_scope(self) -> None:
+    def test_settings_reject_missing_model_and_unknown_scope(self) -> None:
         with self.assertRaises(ProjectError):
-            VisionSettings(model="gpt-unknown")
+            VisionSettings(model="")
         with self.assertRaises(ProjectError):
             VisionSettings(model="gpt-6-luna", scope="everything")
 
@@ -235,6 +235,20 @@ class AnalyzePageTests(unittest.TestCase):
         payload = json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertNotIn("temperature", payload)
+
+    def test_model_without_reasoning_support_never_receives_the_parameter(self) -> None:
+        content = {"page_number": 1, "content": [{"type": "text", "data": "text"}]}
+        response = {"choices": [{"message": {"content": json.dumps(content)}}]}
+        settings = VisionSettings(
+            model="plain-model", reasoning_effort=None,
+            api_base_url="https://api.example/v1", api_key="sk-test",
+        )
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(response).encode()
+            analyze_page("aW1n", 1, None, settings)
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertNotIn("reasoning_effort", payload)
+        self.assertEqual(payload["temperature"], 0)
 
     def test_authentication_error_aborts(self) -> None:
         error = urllib.error.HTTPError("url", 401, "Unauthorized", {}, io.BytesIO(b"invalid key"))

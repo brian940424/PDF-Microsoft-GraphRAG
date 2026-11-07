@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from automotive_graphrag.app import create_app
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationService, PROMPT_VERSION, extract_json_object
-from automotive_graphrag.connections import ConnectionSettings, JudgeConnectionSettings, JudgeModelPreferences
+from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult, JudgeModelPreferences
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
@@ -175,46 +175,41 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["reviewer_note"], "人工抽查")
 
-    def test_litellm_judge_uses_judge_connection_and_records_model(self) -> None:
+    def test_judge_uses_the_shared_connection_and_records_model(self) -> None:
         judge = FakeJudge([self.judged()])
-        judge_connections = JudgeConnectionSettings(self.store.root)
         service = AutomaticEvaluationService(
-            self.store, self.question_sets, self.connections, judge, judge_connections=judge_connections
+            self.store, self.question_sets, self.connections, judge
         )
-        self.assertNotIn("litellm:claude-judge", service.judge_model_choices())
-        with self.assertRaisesRegex(ProjectError, "LiteLLM"):
-            service.evaluate("L33-SM3E", self.question_set_id, model="litellm:claude-judge")
+        self.assertNotIn("claude-judge", service.judge_model_choices())
+        with self.assertRaisesRegex(ProjectError, "可用清單"):
+            service.evaluate("L33-SM3E", self.question_set_id, model="claude-judge")
         self.assertEqual(judge.calls, [])
 
-        judge_connections.save("http://localhost:4000", "sk-litellm", ["claude-judge"])
-        self.assertEqual(
-            service.judge_model_choices(),
-            ("gpt-4o-mini", "gpt-4.1-mini", "gpt-6-luna", "litellm:claude-judge"),
-        )
-        result = service.evaluate("L33-SM3E", self.question_set_id, model="litellm:claude-judge")
+        self.connections.save("http://localhost:4000", "sk-litellm", "claude-judge", "text-embedding-3-small", ["claude-judge"], [])
+        self.assertEqual(service.judge_model_choices(), ("claude-judge",))
+        result = service.evaluate("L33-SM3E", self.question_set_id, model="claude-judge")
 
-        self.assertEqual(result.model, "litellm:claude-judge")
+        self.assertEqual(result.model, "claude-judge")
         self.assertEqual(
             {(url, key, model) for url, key, model, _prompt in judge.calls},
-            {("http://localhost:4000", "sk-litellm", "litellm:claude-judge")},
+            {("http://localhost:4000/v1", "sk-litellm", "claude-judge")},
         )
         grade_judge = lambda *_args, **_kwargs: {"item": {"question_id": "Q0001", "result": 2, "reason": "ok"}}
         service.client = grade_judge
         grade = service.evaluate_single_answer_grade(
-            "L33-SM3E", "Q0001", "問題一", "參考答案一", "系統答案1", "litellm:claude-judge"
+            "L33-SM3E", "Q0001", "問題一", "參考答案一", "系統答案1", "claude-judge"
         )
         self.assertEqual(grade.score, 2)
 
-        openai_judge = FakeJudge([self.judged()])
-        service.client = openai_judge
-        service.evaluate("L33-SM3E", self.question_set_id, model="gpt-4o-mini")
-        self.assertEqual(openai_judge.calls[0][:3], ("https://api.openai.com/v1", "test-key", "gpt-4o-mini"))
+    def test_results_saved_with_the_former_prefix_validate_and_display_plainly(self) -> None:
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, FakeJudge([]))
+        self.assertEqual(service.validate_judge_models("litellm:gpt-6-luna"), ("gpt-6-luna",))
 
     def test_judge_panel_scores_every_question_with_each_model_and_averages(self) -> None:
         verdicts = {
             ("gpt-4.1-mini", "Q0001"): "correct", ("gpt-4.1-mini", "Q0002"): "correct",
-            ("litellm:claude-judge", "Q0001"): "incorrect", ("litellm:claude-judge", "Q0002"): "correct",
-            ("litellm:gemini-flash", "Q0002"): "correct",
+            ("claude-judge", "Q0001"): "incorrect", ("claude-judge", "Q0002"): "correct",
+            ("gemini-flash", "Q0002"): "correct",
         }
         prompts: dict[str, set[str]] = {}
         lock = threading.Lock()
@@ -226,14 +221,12 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             if (model, question_id) not in verdicts:
                 raise RuntimeError("proxy timeout")
             return {"items": [{"question_id": question_id, "result": verdicts[(model, question_id)], "reason": model}]}
-
-        judge_connections = JudgeConnectionSettings(self.store.root)
-        judge_connections.save("http://localhost:4000", "sk", ["claude-judge", "gemini-flash"])
+        self.connections.save("http://localhost:4000", "sk", "claude-judge", "text-embedding-3-small", ["gpt-4.1-mini", "claude-judge", "gemini-flash"], [])
         service = AutomaticEvaluationService(
-            self.store, self.question_sets, self.connections, client, judge_connections=judge_connections
+            self.store, self.question_sets, self.connections, client
         )
         progress: list[tuple[int, int]] = []
-        panel = ["gpt-4.1-mini", "litellm:claude-judge", "litellm:gemini-flash"]
+        panel = ["gpt-4.1-mini", "claude-judge", "gemini-flash"]
         result = service.evaluate(
             "L33-SM3E", self.question_set_id, model=panel, progress_callback=lambda *args: progress.append(args)
         )
@@ -242,7 +235,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual({question_id: len(values) for question_id, values in prompts.items()}, {"Q0001": 1, "Q0002": 1})
         self.assertEqual(progress[-1], (6, 6))
         self.assertEqual(result.models, tuple(panel))
-        self.assertEqual(result.model, "gpt-4.1-mini, litellm:claude-judge, litellm:gemini-flash")
+        self.assertEqual(result.model, "gpt-4.1-mini, claude-judge, gemini-flash")
         first, second = result.items
         self.assertEqual([judge.score for judge in first.judges], [1.0, 0.0, None])
         self.assertEqual(first.judges[2].error, "答案評判 API 呼叫失敗：proxy timeout")
@@ -251,18 +244,18 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(result.average_score, 0.75)
         self.assertEqual(
             result.judge_average_scores,
-            {"gpt-4.1-mini": 1.0, "litellm:claude-judge": 0.5, "litellm:gemini-flash": 1.0},
+            {"gpt-4.1-mini": 1.0, "claude-judge": 0.5, "gemini-flash": 1.0},
         )
         self.assertEqual(result.disagreement_count, 1)
         self.assertIn("部分評審失敗", result.judge_error)
-        self.assertIn("LiteLLM／gemini-flash：失敗", first.judge_reason)
+        self.assertIn("gemini-flash：失敗", first.judge_reason)
         self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
 
         _json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
         rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
         self.assertEqual(rows[0]["average_score"], "0.5")
-        self.assertEqual(rows[0]["judge_score:litellm:claude-judge"], "0.0")
-        self.assertEqual(rows[0]["judge_reason:litellm:gemini-flash"], "答案評判 API 呼叫失敗：proxy timeout")
+        self.assertEqual(rows[0]["judge_score:claude-judge"], "0.0")
+        self.assertEqual(rows[0]["judge_reason:gemini-flash"], "答案評判 API 呼叫失敗：proxy timeout")
 
         with self.assertRaisesRegex(ProjectError, "最多選擇 5"):
             service.evaluate("L33-SM3E", self.question_set_id, model=["gpt-4o-mini", *(f"m{i}" for i in range(5))])
@@ -288,14 +281,14 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual([row[5:7] for row in detail_update["value"]], [["100%", "gpt-4.1-mini"]] * 2)
         self.assertFalse(metric_update["visible"])
 
-        switched = handlers["autoqa_judge_detail_view"]("L33-SM3E", self.question_set_id, "litellm:gemini-flash")
+        switched = handlers["autoqa_judge_detail_view"]("L33-SM3E", self.question_set_id, "gemini-flash")
         self.assertEqual(
             [row[5:7] for row in switched["value"]],
-            [["失敗", "答案評判 API 呼叫失敗：proxy timeout"], ["100%", "litellm:gemini-flash"]],
+            [["失敗", "答案評判 API 呼叫失敗：proxy timeout"], ["100%", "gemini-flash"]],
         )
 
         _judge, detail_divider, model_update, detail_update, *_rest = handlers["autoqa_result_tables"](
-            "L33-SM3E", self.question_set_id, [], "litellm:claude-judge", False, False
+            "L33-SM3E", self.question_set_id, [], "claude-judge", False, False
         )
         self.assertFalse(model_update["visible"])
         self.assertFalse(detail_divider["visible"])
@@ -305,36 +298,59 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         app = create_app(self.store.root)
         model_choices = next(
             component for component in app.blocks.values()
-            if getattr(component, "label", None) == "可選評測模型（LiteLLM config.yaml 的 model_name 別名）"
+            if getattr(component, "label", None) == "可用模型（LiteLLM config.yaml 的 model_name）"
         )
         connection_test = next(
             dependency for dependency in app.config["dependencies"]
-            if dependency.get("api_name") == "test_judge_connection"
+            if dependency.get("api_name") == "test_connection"
         )
         self.assertNotIn(model_choices._id, connection_test["inputs"])
         self.assertEqual(len(connection_test["inputs"]), 2)
 
+    def test_connection_panel_is_a_single_litellm_section(self) -> None:
+        app = create_app(self.store.root)
+        labels = {getattr(component, "label", None) for component in app.blocks.values()}
+        self.assertIn("LiteLLM 連線設定（所有專案共用）", labels)
+        self.assertNotIn("GraphRAG 共用連線設定（所有專案共用）", labels)
+        self.assertFalse(any(isinstance(label, str) and "評測模型設定" in label for label in labels))
+        selector = next(
+            component for component in app.blocks.values()
+            if getattr(component, "label", None) == "評測模型（評審）"
+        )
+        self.assertFalse(any("LiteLLM" in label for label, _value in selector.choices))
+
+    def test_connection_test_warns_when_proxy_has_no_embedding_model(self) -> None:
+        app = create_app(self.store.root)
+        handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
+        result = ConnectionTestResult(True, "ok", ("claude", "gpt-6-luna"), ("claude",), ())
+        with patch.object(ConnectionSettings, "test", return_value=result):
+            message, models, chat, embedding, reasoning, embedding_state = handlers["test_connection"]("", "")
+        self.assertIn("未提供 Embedding 模型", message)
+        self.assertEqual(models["choices"], ["claude", "gpt-6-luna"])
+        self.assertEqual(chat["value"], "gpt-6-luna")
+        self.assertEqual(reasoning, ["claude"])
+        self.assertNotIn("choices", embedding)
+
     def test_autoqa_litellm_judge_selection_persists_across_app_refresh(self) -> None:
-        judge_connections = JudgeConnectionSettings(self.store.root)
-        judge_connections.save("http://localhost:4000", "sk-litellm", ["gpt-6-luna"])
+        self.connections.save("http://localhost:4000", "sk-litellm", "gpt-6-luna", "text-embedding-3-small", ["gpt-6-luna"], [])
         app = create_app(self.store.root)
         handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
 
-        save_message = handlers["save_autoqa_judge_model_selection"](["litellm:gpt-6-luna"])
+        save_message = handlers["save_autoqa_judge_model_selection"](["gpt-6-luna"])
         self.assertIn("✅ 評測模型選擇已儲存至", save_message)
         self.assertIn(".judge_model_preferences.json", save_message)
 
         refreshed_value, refreshed_status = handlers["refresh_autoqa_judge_model_selection"]()
-        self.assertEqual(refreshed_value["value"], ["litellm:gpt-6-luna"])
-        self.assertIn("LiteLLM／gpt-6-luna", refreshed_status)
+        self.assertEqual(refreshed_value["value"], ["gpt-6-luna"])
+        self.assertIn("gpt-6-luna", refreshed_status)
 
         refreshed = create_app(self.store.root)
         selector = next(
             component for component in refreshed.blocks.values()
             if getattr(component, "label", None) == "評測模型（評審）"
         )
-        self.assertEqual(selector.get_config()["value"], ["litellm:gpt-6-luna"])
-        self.assertIn(("LiteLLM／gpt-6-luna", "litellm:gpt-6-luna"), selector.choices)
+        self.assertEqual(selector.get_config()["value"], ["gpt-6-luna"])
+        self.assertIn(("gpt-6-luna", "gpt-6-luna"), selector.choices)
         save_event = next(
             dependency for dependency in refreshed.config["dependencies"]
             if dependency.get("api_name") == "save_autoqa_judge_model_selection"
@@ -344,7 +360,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
     def test_saved_litellm_preference_missing_from_active_root_is_not_silently_replaced(self) -> None:
         preferences = JudgeModelPreferences(self.store.root)
-        preferences.save_autoqa_models(["litellm:gpt-6-luna"])
+        preferences.save_autoqa_models(["model-removed-from-proxy"])
         app = create_app(self.store.root)
         selector = next(
             component for component in app.blocks.values()
@@ -359,24 +375,9 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("不在目前設定中", status.value)
         self.assertIn(".judge_model_preferences.json", status.value)
         handlers = {getattr(fn.fn, "__name__", ""): fn.fn for fn in app.fns.values()}
-        save_message = handlers["save_autoqa_judge_model_selection"](["litellm:gpt-6-luna"])
+        save_message = handlers["save_autoqa_judge_model_selection"](["model-removed-from-proxy"])
         self.assertIn("❌ 未儲存", save_message)
-        self.assertEqual(preferences.get_autoqa_models(), ("litellm:gpt-6-luna",))
-
-    def test_same_litellm_alias_and_openai_model_route_to_different_endpoints(self) -> None:
-        judge_connections = JudgeConnectionSettings(self.store.root)
-        judge_connections.save("https://litellm.example/v1", "sk-litellm", ["gpt-6-luna"])
-        service = AutomaticEvaluationService(
-            self.store, self.question_sets, self.connections, judge_connections=judge_connections,
-        )
-
-        openai_endpoint = service._judge_endpoint("L33-SM3E", "gpt-6-luna")
-        litellm_endpoint = service._judge_endpoint("L33-SM3E", "litellm:gpt-6-luna")
-
-        self.assertEqual(openai_endpoint.api_base_url, "https://api.openai.com/v1")
-        self.assertEqual(openai_endpoint.api_key, "test-key")
-        self.assertEqual(litellm_endpoint.api_base_url, "https://litellm.example/v1")
-        self.assertEqual(litellm_endpoint.api_key, "sk-litellm")
+        self.assertEqual(preferences.get_autoqa_models(), ("model-removed-from-proxy",))
 
     def test_explicit_empty_judge_selection_does_not_fall_back_to_default_model(self) -> None:
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections)
@@ -421,8 +422,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(loaded.items[0].judges, ())
 
     def test_litellm_reasoning_effort_is_only_sent_when_model_supports_it(self) -> None:
-        judge_connections = JudgeConnectionSettings(self.store.root)
-        judge_connections.save("http://localhost:4000", "sk", ["claude-judge", "plain"], ["claude-judge"])
+        self.connections.save("http://localhost:4000", "sk", "claude-judge", "text-embedding-3-small", ["claude-judge", "plain"], ["claude-judge"])
         efforts: list[tuple[str, object]] = []
 
         def client(_url, _key, model, _prompt, reasoning_effort="medium"):
@@ -430,14 +430,13 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             return {"item": {"question_id": "Q0001", "result": 1, "reason": "partial"}}
 
         service = AutomaticEvaluationService(
-            self.store, self.question_sets, self.connections, client, judge_connections=judge_connections
+            self.store, self.question_sets, self.connections, client
         )
-        self.assertTrue(service.supports_judge_reasoning("litellm:claude-judge"))
-        self.assertFalse(service.supports_judge_reasoning("litellm:plain"))
-        self.assertTrue(service.supports_judge_reasoning("gpt-6-luna"))
-        for model in ("litellm:claude-judge", "litellm:plain"):
+        self.assertTrue(service.supports_judge_reasoning("claude-judge"))
+        self.assertFalse(service.supports_judge_reasoning("plain"))
+        for model in ("claude-judge", "plain"):
             service.evaluate_single_answer_grade("L33-SM3E", "Q0001", "問", "答", "系統", model, reasoning_effort="high")
-        self.assertEqual(efforts, [("litellm:claude-judge", "high"), ("litellm:plain", None)])
+        self.assertEqual(efforts, [("claude-judge", "high"), ("plain", None)])
 
     def test_plain_text_judge_reply_extracts_first_json_object(self) -> None:
         reply = '判定如下：\n```json\n{"item": {"question_id": "Q0001", "result": 2, "reason": "ok"}}\n```'
@@ -449,7 +448,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIsNone(extract_json_object("no json {here"))
         self.assertEqual(extract_json_object('x {"a": {"b": 1}} y'), {"a": {"b": 1}})
 
-    def test_litellm_chat_strips_prefix_and_retries_without_json_mode(self) -> None:
+    def test_chat_retries_without_json_mode(self) -> None:
         bodies: list[dict] = []
         urls: list[str] = []
 
@@ -478,10 +477,11 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
                 raise urllib.error.HTTPError(request.full_url, 400, "bad", {}, None)
             return Response({"choices": [{"message": {"content": 'Sure: {"items": []} done'}}]})
 
-        with patch("urllib.request.urlopen", fake_urlopen):
+        with patch.dict(os.environ, {
+            "CF_ACCESS_CLIENT_ID": "id", "CF_ACCESS_CLIENT_SECRET": "secret",
+        }), patch("urllib.request.urlopen", fake_urlopen):
             value = AutomaticEvaluationService._openai_chat(
-                "http://localhost:4000", "", "litellm:plain", "prompt", reasoning_effort=None,
-                extra_headers={"CF-Access-Client-Id": "id", "CF-Access-Client-Secret": "secret"},
+                "http://localhost:4000/v1", "", "plain", "prompt", reasoning_effort=None,
             )
         self.assertEqual(value, {"items": []})
         self.assertEqual([body["model"] for body in bodies], ["plain", "plain"])
@@ -492,17 +492,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", bodies[0])
         self.assertNotIn("response_format", bodies[1])
 
-        bodies.clear()
-        with patch("urllib.request.urlopen", fake_urlopen):
-            with self.assertRaisesRegex(ProjectError, "HTTP 400"):
-                AutomaticEvaluationService._openai_chat("https://api.openai.com/v1", "k", "gpt-4o-mini", "p")
-        self.assertEqual(len(bodies), 1)
-
     def test_litellm_evaluation_passes_cloudflare_headers_from_environment(self) -> None:
-        judge_connections = JudgeConnectionSettings(self.store.root)
-        judge_connections.save("http://localhost:4000", "sk-litellm", ["proxy-judge"])
+        self.connections.save("http://localhost:4000", "sk-litellm", "proxy-judge", "text-embedding-3-small", ["proxy-judge"], [])
         service = AutomaticEvaluationService(
-            self.store, self.question_sets, self.connections, judge_connections=judge_connections,
+            self.store, self.question_sets, self.connections,
         )
         requests = []
 
@@ -520,7 +513,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             "CF_ACCESS_CLIENT_ID": "cf-client-id",
             "CF_ACCESS_CLIENT_SECRET": "cf-client-secret",
         }, clear=True), patch("urllib.request.urlopen", fake_urlopen):
-            service._call_judge("L33-SM3E", "litellm:proxy-judge", "prompt", "medium")
+            service._call_judge("L33-SM3E", "proxy-judge", "prompt", "medium")
 
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0].get_header("Cf-access-client-id"), "cf-client-id")
@@ -530,7 +523,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(requests[0].full_url, "http://localhost:4000/v1/chat/completions")
 
     def test_litellm_403_identifies_cloudflare_or_proxy_response(self) -> None:
-        for headers, extra_headers, expected, credential_status in (
+        for headers, access_headers, expected, credential_status in (
             ({"server": "cloudflare", "cf-ray": "test-ray"}, {
                 "CF-Access-Client-Id": "id", "CF-Access-Client-Secret": "secret",
             }, "經過 Cloudflare", "本次請求已帶入"),
@@ -540,12 +533,13 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             def forbidden(request, timeout):
                 raise urllib.error.HTTPError(request.full_url, 403, "forbidden", headers, None)
 
-            with self.subTest(expected=expected, credential_status=credential_status), patch("urllib.request.urlopen", forbidden):
+            with self.subTest(expected=expected, credential_status=credential_status), patch(
+                "urllib.request.urlopen", forbidden
+            ), patch("automotive_graphrag.connections._cloudflare_access_headers", return_value=access_headers):
                 with self.assertRaisesRegex(ProjectError, expected):
                     try:
                         AutomaticEvaluationService._openai_chat(
-                            "https://proxy.example/v1", "sk-test", "litellm:gpt-6-luna", "prompt",
-                            extra_headers=extra_headers,
+                            "https://proxy.example/v1", "sk-test", "gpt-6-luna", "prompt",
                         )
                     except ProjectError as exc:
                         if credential_status:
@@ -566,13 +560,13 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             )
 
         with self.assertLogs("automotive_graphrag.automatic_evaluation", level="ERROR") as captured_logs:
-            with patch("urllib.request.urlopen", forbidden):
+            with patch("urllib.request.urlopen", forbidden), patch(
+                "automotive_graphrag.connections._cloudflare_access_headers",
+                return_value={"CF-Access-Client-Id": "client-id", "CF-Access-Client-Secret": "access-secret"},
+            ):
                 with self.assertRaises(ProjectError) as caught:
                     AutomaticEvaluationService._openai_chat(
-                        "https://proxy.example/v1", "secret-key", "litellm:gpt-6-luna", "prompt",
-                        extra_headers={
-                            "CF-Access-Client-Id": "client-id", "CF-Access-Client-Secret": "access-secret",
-                        },
+                        "https://proxy.example/v1", "secret-key", "gpt-6-luna", "prompt",
                     )
         message = str(caught.exception)
         self.assertIn("virtual key is not allowed for this model", message)
@@ -595,10 +589,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         with patch("urllib.request.urlopen", forbidden):
             with self.assertRaises(ProjectError) as caught:
                 AutomaticEvaluationService._openai_chat(
-                    "https://proxy.example/v1", "sk-test", "litellm:gpt-6-luna", "prompt",
-                    extra_headers={
-                        "CF-Access-Client-Id": "id", "CF-Access-Client-Secret": "secret",
-                    },
+                    "https://proxy.example/v1", "sk-test", "gpt-6-luna", "prompt",
                 )
         self.assertIn("Cloudflare Error 1010", str(caught.exception))
         self.assertIn("User-Agent", str(caught.exception))

@@ -29,13 +29,12 @@ from .automatic_evaluation import (
     judge_scores_from_dicts,
 )
 from .connections import (
-    ALLOWED_CHAT_MODELS,
     DEFAULT_REASONING_EFFORT,
-    GPT6_LUNA_MODEL,
     REASONING_EFFORT_OPTIONS,
     ConnectionSettings,
     MAX_JUDGE_MODELS,
     configure_completion_model,
+    configure_embedding_model,
     format_judge_models,
     parse_judge_models,
 )
@@ -281,13 +280,13 @@ class RetrievalExperimentService:
 
     def _supports_judge_model(self, model: object) -> bool:
         supports = getattr(self.judging, "supports_judge_model", None)
-        return supports(model) if callable(supports) else model in ALLOWED_CHAT_MODELS
+        return supports(model) if callable(supports) else model in self.connections.available_chat_models()
 
     def _supports_judge_reasoning(self, model: object) -> bool:
         """True when any model of the judge panel accepts reasoning_effort."""
         supports = getattr(self.judging, "supports_judge_reasoning", None)
         return any(
-            supports(item) if callable(supports) else item == GPT6_LUNA_MODEL
+            supports(item) if callable(supports) else self.connections.supports_reasoning(item)
             for item in parse_judge_models(model)
         )
 
@@ -563,7 +562,7 @@ class RetrievalExperimentService:
                     continue
                 value = str(raw_value).strip()
                 if value:
-                    if field_name == "answer_model" and value not in ALLOWED_CHAT_MODELS:
+                    if field_name == "answer_model" and value not in self.connections.available_chat_models():
                         raise ProjectError(f"{group.get('group_id')} 的回答模型不支援")
                     group[field_name] = value
             if len(row) >= 4:
@@ -624,7 +623,7 @@ class RetrievalExperimentService:
         return current
 
     def set_group_answer_model(self, project_id: str, group_id: str, answer_model: str) -> dict[str, object]:
-        if answer_model not in ALLOWED_CHAT_MODELS:
+        if answer_model not in self.connections.available_chat_models():
             raise ProjectError("不支援的回答模型")
         current = self.load(project_id)
         matched = False
@@ -653,13 +652,13 @@ class RetrievalExperimentService:
         self, project_id: str, group_id: str, reasoning_effort: str
     ) -> dict[str, object]:
         if reasoning_effort not in REASONING_EFFORT_OPTIONS:
-            raise ProjectError("不支援的 Luna 推理深度")
+            raise ProjectError("不支援的推理深度")
         current = self.load(project_id)
         matched = False
         for group in current["groups"]:
             if group.get("group_id") == group_id:
-                if group.get("answer_model") != GPT6_LUNA_MODEL:
-                    raise ProjectError("只有回答模型為 gpt-6-luna 時可以設定推理深度")
+                if not self.connections.supports_reasoning(group.get("answer_model")):
+                    raise ProjectError("此回答模型不支援推理深度")
                 group["answer_reasoning_effort"] = reasoning_effort
                 matched = True
         if matched:
@@ -1141,7 +1140,7 @@ class RetrievalExperimentService:
                     "response_type": summary.get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE),
                     "answer_reasoning_effort": (
                         summary.get("answer_reasoning_effort", DEFAULT_REASONING_EFFORT)
-                        if summary.get("answer_model") == GPT6_LUNA_MODEL
+                        if self.connections.supports_reasoning(summary.get("answer_model"))
                         else None
                     ),
                     "strategy_parameters": summary.get("strategy_parameters", {}),
@@ -1352,6 +1351,7 @@ class RetrievalExperimentService:
                     group.answer_model,
                     self.connections.get_api_base_url(),
                     self.connections.get_api_key(project_id),
+                    self.connections.reasoning_effort_for(group.answer_model, group.answer_reasoning_effort),
                 )
                 method = routed_method = decision.method
                 routing_reason = decision.reason
@@ -1382,7 +1382,8 @@ class RetrievalExperimentService:
 
                 decision = self.agentic_search.run(
                     question.question, group.answer_model, api_base, api_key,
-                    execute_search, group.answer_reasoning_effort,
+                    execute_search,
+                    self.connections.reasoning_effort_for(group.answer_model, group.answer_reasoning_effort),
                 )
                 method = EXPERIMENT_AGENTIC_METHOD
                 answer = decision.answer
@@ -1801,7 +1802,7 @@ class RetrievalExperimentService:
         if response_type not in EXPERIMENT_RESPONSE_TYPES:
             raise ProjectError("不支援的 GraphRAG 回答格式")
         if reasoning_effort not in REASONING_EFFORT_OPTIONS:
-            raise ProjectError("不支援的 Luna 推理深度")
+            raise ProjectError("不支援的推理深度")
         defaults = default_strategy_parameters()[method]
         selected_parameters = {**defaults, **(strategy_parameters or {})}
         allowed_names = {item[0] for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS[method]}
@@ -1817,7 +1818,11 @@ class RetrievalExperimentService:
             for config in settings.get(section, {}).values():
                 config["api_base"] = self.connections.get_api_base_url()
         for config in settings.get("completion_models", {}).values():
-            configure_completion_model(config, model, reasoning_effort)
+            configure_completion_model(
+                config, model, self.connections.reasoning_effort_for(model, reasoning_effort)
+            )
+        for config in settings.get("embedding_models", {}).values():
+            configure_embedding_model(config)
         settings_section = {"local": "local_search", "global": "global_search", "drift": "drift_search", "basic": "basic_search"}[method]
         section = settings.setdefault(settings_section, {})
         for key in EXPERIMENT_STRATEGY_CONFIG_KEYS[method]:
@@ -1878,14 +1883,14 @@ class RetrievalExperimentService:
             seen.add(group.group_id)
             if not group.name.strip():
                 raise ProjectError(f"{group.group_id} 的實驗組名稱不可空白")
-            if group.answer_model not in ALLOWED_CHAT_MODELS:
+            if group.answer_model not in self.connections.available_chat_models():
                 raise ProjectError(f"{group.group_id} 的回答模型不支援")
             if group.method not in EXPERIMENT_GROUP_METHODS:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 策略不支援")
             if group.response_type not in EXPERIMENT_RESPONSE_TYPES:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 回答格式不支援")
             if group.answer_reasoning_effort not in REASONING_EFFORT_OPTIONS:
-                raise ProjectError(f"{group.group_id} 的 Luna 推理深度不支援")
+                raise ProjectError(f"{group.group_id} 的推理深度不支援")
             strategy_parameters = group.strategy_parameters or default_strategy_parameters()
             for method, parameters in strategy_parameters.items():
                 specs = {item[0]: item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS.get(method, ())}
