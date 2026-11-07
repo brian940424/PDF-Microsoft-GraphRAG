@@ -234,6 +234,55 @@ class ConnectionSettingsTests(unittest.TestCase):
         with patch.dict(os.environ, {"LITELLM_API_KEY": "sk-env", "GRAPHRAG_API_KEY": "old"}, clear=True):
             self.assertEqual(settings.get_api_key(), "sk-env")
 
+    def test_environment_key_wins_over_project_dotenv(self) -> None:
+        graph_root = self.project_root / "L33-SM3E" / "graphrag"
+        graph_root.mkdir(parents=True)
+        (graph_root / ".env").write_text("GRAPHRAG_API_KEY=dotenv-key\n", encoding="utf-8")
+        settings = ConnectionSettings(self.project_root)
+        with patch.dict(os.environ, {"GRAPHRAG_API_KEY": "env-key"}, clear=True):
+            self.assertEqual(settings.get_api_key("L33-SM3E"), "env-key")
+
+    def test_saved_connection_wins_over_environment(self) -> None:
+        settings = ConnectionSettings(self.project_root)
+        settings.save("http://saved:4000/v1", "sk-saved", "gpt-4o-mini", "text-embedding-3-large")
+        environment = {
+            "GRAPHRAG_API_BASE": "http://env:4000/v1",
+            "GRAPHRAG_CHAT_MODEL": "gpt-4.1-mini",
+            "GRAPHRAG_EMBEDDING_MODEL": "text-embedding-3-small",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(settings.get_api_base_url(), "http://saved:4000/v1")
+            self.assertEqual(settings.get_chat_model(), "gpt-4o-mini")
+            self.assertEqual(settings.get_embedding_model(), "text-embedding-3-large")
+
+    def test_environment_connection_is_used_when_nothing_is_saved(self) -> None:
+        settings = ConnectionSettings(self.project_root)
+        environment = {
+            "GRAPHRAG_API_BASE": "http://env:4000/v1",
+            "GRAPHRAG_CHAT_MODEL": "gpt-4.1-mini",
+            "GRAPHRAG_EMBEDDING_MODEL": "text-embedding-3-large",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(settings.get_api_base_url(), "http://env:4000/v1")
+            self.assertEqual(settings.get_chat_model(), "gpt-4.1-mini")
+            self.assertEqual(settings.get_embedding_model(), "text-embedding-3-large")
+
+    def test_local_dotenv_only_supplies_the_key(self) -> None:
+        self.project_root.mkdir(parents=True)
+        (self.project_root.parent / ".env").write_text(
+            "GRAPHRAG_API_KEY=dotenv-key\n"
+            "GRAPHRAG_API_BASE=http://dotenv:4000/v1\n"
+            "GRAPHRAG_CHAT_MODEL=gpt-4.1-mini\n"
+            "GRAPHRAG_EMBEDDING_MODEL=text-embedding-3-large\n",
+            encoding="utf-8",
+        )
+        settings = ConnectionSettings(self.project_root)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.get_api_key(), "dotenv-key")
+            self.assertEqual(settings.get_api_base_url(), DEFAULT_API_BASE_URL)
+            self.assertEqual(settings.get_chat_model(), "gpt-6-luna")
+            self.assertEqual(settings.get_embedding_model(), "text-embedding-3-small")
+
     def test_save_rejects_invalid_values(self) -> None:
         settings = ConnectionSettings(self.project_root)
         with self.assertRaisesRegex(ProjectError, "空白"):

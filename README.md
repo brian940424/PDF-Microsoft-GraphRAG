@@ -183,7 +183,9 @@ CF_ACCESS_CLIENT_SECRET=your-cloudflare-access-client-secret
 
 `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are credentials for the **LiteLLM proxy accessed by this app**. They are sent as `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers for every LiteLLM request, including GraphRAG indexing and queries. Do not put them in the LiteLLM proxy's own `.env`; configure them in the environment passed to the GraphRAG admin container/process. They are not needed when the proxy is not behind Cloudflare Access.
 
-若選擇由管理後台儲存連線設定，設定會寫入持久化 Volume 內的 `.connection.json`。請將該 Volume 視為敏感資料並限制存取。
+以 `--env-file` 傳入時，上述設定都會成為環境變數。非 Docker 的本機 `.env` 只提供 API Key 與 Cloudflare Access 憑證，Base URL 與模型請改用環境變數或管理後台設定。
+
+若選擇由管理後台儲存連線設定，設定會寫入持久化 Volume 內的 `.connection.json`，並優先於環境變數與 `.env`；儲存後再改這些值不會生效。請將該 Volume 視為敏感資料並限制存取。
 
 ## 部署後如何啟動
 
