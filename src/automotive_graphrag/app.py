@@ -475,7 +475,7 @@ def _autoqa_source_cell(question) -> str:
         for source in (question.answer_source_evidence or question.gold_evidence)
     ]
     cited = cited_sources(question.answer, question.retrieved_evidence)
-    return f"系統引用：{_autoqa_source_pages(cited)}\n正確來源：{_autoqa_source_pages(gold)}"
+    return f"* 系統引用：{_autoqa_source_pages(cited)}\n* 正確來源：{_autoqa_source_pages(gold)}"
 
 
 def _experiment_question_cells(item) -> list:
@@ -3775,8 +3775,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_table = gr.Dataframe(
                     headers=["題號", "來源", "題目", "系統回答", "正確答案", "LLM 分數", "來源分數", "綜合分數", "各評審分數", "實際檢索策略"],
                     interactive=False,
-                    datatype=["str", "str", "str", "str", "str", "str", "str", "str", "markdown", "str"],
-                    column_widths=["5%", "10%", "12%", "16%", "12%", "6%", "6%", "6%", "16%", "11%"],
+                    datatype=["str", "markdown", "str", "str", "str", "str", "str", "str", "markdown", "str"],
+                    column_widths=["5%", "10%", "12%", "16%", "12%", "6%", "6%", "6%", "17%", "10%"],
                     label="模型評測結果概覽",
                     wrap=True,
                     visible=False,
@@ -3788,7 +3788,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_judge_detail_table = gr.Dataframe(
                     headers=["題號", "來源", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
                     interactive=False,
-                    datatype=["str"] * 8,
+                    datatype=["str", "markdown", *["str"] * 6],
                     column_widths=["5%", "10%", "13%", "17%", "13%", "6%", "21%", "15%"],
                     label="各評審評分細節",
                     wrap=True,
@@ -3798,7 +3798,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 autoqa_metrics_table = gr.Dataframe(
                     headers=["題號", "來源", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * 9,
+                    datatype=["str", "markdown", *["str"] * 7],
                     column_widths=["5%", "10%", "17%", "24%", "17%", "5%", "5%", "7%", "10%"],
                     label="傳統指標結果",
                     wrap=True,

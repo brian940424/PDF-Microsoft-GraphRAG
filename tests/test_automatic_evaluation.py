@@ -859,9 +859,9 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             "Q1", "問題", "答案", answer="回答 [Data: Sources (85)]", retrieved_evidence=(cited,),
             answer_source_evidence=(GoldEvidence("A.pdf", (86, 87), (), "A.pdf"),),
         )
-        self.assertEqual(_autoqa_source_cell(question), "系統引用：A.pdf p.86\n正確來源：A.pdf p.86, 87")
+        self.assertEqual(_autoqa_source_cell(question), "* 系統引用：A.pdf p.86\n* 正確來源：A.pdf p.86, 87")
         unanswered = BatchQuestion("Q2", "問題", "答案")
-        self.assertEqual(_autoqa_source_cell(unanswered), "系統引用：—\n正確來源：—")
+        self.assertEqual(_autoqa_source_cell(unanswered), "* 系統引用：—\n* 正確來源：—")
 
     def test_judge_sees_answer_text_without_citations(self) -> None:
         question = BatchQuestion("Q1", "問題", "答案", answer="系統答案 [Data: Sources (85)]，另見 [E3]。")
@@ -1023,7 +1023,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertTrue(metric_update["visible"])
         self.assertEqual(
             metric_update["value"][0],
-            ["Q0001", "系統引用：—\n正確來源：WW.pdf p.21", "問題一", "系統答案1", "參考答案一", "0.0%", "40.0%", "0.0%", "40.0%"],
+            ["Q0001", "* 系統引用：—\n* 正確來源：WW.pdf p.21", "問題一", "系統答案1", "參考答案一", "0.0%", "40.0%", "0.0%", "40.0%"],
         )
 
         judge_update, _detail_divider, _model_update, _detail_update, divider_update, metric_update = refresh(
