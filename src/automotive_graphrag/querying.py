@@ -24,7 +24,7 @@ from .connections import ConnectionSettings, configure_completion_model, configu
 from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
-from .strategy_routing import StrategyRouter
+from .strategy_routing import SearchOutcome, StrategyRouter, search_with_fallback
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
@@ -134,34 +134,38 @@ class QueryService:
             "cost_status": "unknown_usage_not_returned_by_query_adapter",
             "settings_sha256": hashlib.sha256((graph_root / "settings.yaml").read_bytes()).hexdigest(),
         }
+        def query_command(search_method: str, search_question: str) -> list[str]:
+            return [
+                sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
+                "--method", search_method, "--response-type", response_type, search_question,
+            ]
+
         if normalized_method == AUTO_METHOD:
-            decision = self.router.route(
-                prompt,
-                selected_model,
-                self.connection_settings.get_api_base_url(),
-                self.connection_settings.get_api_key(project_id),
-                applied_effort,
+            api_base_url = self.connection_settings.get_api_base_url()
+            api_key = self.connection_settings.get_api_key(project_id)
+
+            def search(search_method: str) -> SearchOutcome:
+                try:
+                    execution = self.runner(query_command(search_method, prompt))
+                except ProjectError as exc:
+                    return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
+                if execution.returncode != 0:
+                    return SearchOutcome("", self._last_error(execution), execution)
+                return SearchOutcome((execution.stdout or "").strip(), None, execution)
+
+            fallback = search_with_fallback(
+                self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort),
+                search,
+                lambda answer: self.router.check_answer(
+                    prompt, answer, selected_model, api_base_url, api_key, applied_effort,
+                ),
             )
-            normalized_method, routing_reason = decision.method, decision.reason
-        command = [
-            sys.executable,
-            "-m",
-            "graphrag",
-            "query",
-            "--root",
-            str(graph_root),
-            "--method",
-            normalized_method,
-            "--response-type",
-            response_type,
-            prompt,
-        ]
-        if normalized_method == AGENTIC_METHOD:
+            normalized_method, routing_reason = fallback.method, fallback.reason
+            execution_metadata["strategy_attempts"] = list(fallback.attempts)
+            result = fallback.outcome.payload or QueryExecution(0, fallback.outcome.answer, "")
+        elif normalized_method == AGENTIC_METHOD:
             def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
-                search_command = [
-                    sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
-                    "--method", search_method, "--response-type", response_type, search_question,
-                ]
+                search_command = query_command(search_method, search_question)
                 if not self._custom_runner:
                     return self._run(search_command, timeout_seconds=timeout_seconds)
                 return self.runner(search_command)
@@ -179,7 +183,7 @@ class QueryService:
             execution_metadata.update(decision.execution_metadata)
             execution_metadata["requested_method"] = requested_method
         else:
-            result = self.runner(command)
+            result = self.runner(query_command(normalized_method, prompt))
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)

@@ -47,7 +47,7 @@ from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
-from .strategy_routing import StrategyRouter
+from .strategy_routing import SearchOutcome, StrategyRouter, search_with_fallback
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
@@ -1350,17 +1350,45 @@ class RetrievalExperimentService:
         method = group.method
         execution_trace: dict[str, object] = {}
         try:
-            if group.method == EXPERIMENT_AUTO_METHOD:
-                decision = self.router.route(
-                    question.question,
-                    group.answer_model,
-                    self.connections.get_api_base_url(),
-                    self.connections.get_api_key(project_id),
-                    self.connections.reasoning_effort_for(group.answer_model, group.answer_reasoning_effort),
+            def run_strategy(strategy: str) -> tuple[str, dict[str, object]]:
+                query_arguments = (
+                    project_id, question.question, strategy, group.answer_model, group.response_type,
+                    group.answer_reasoning_effort,
                 )
-                method = routed_method = decision.method
-                routing_reason = decision.reason
-            if group.method == EXPERIMENT_AGENTIC_METHOD:
+                parameters = inspect.signature(self.query_function).parameters.values()
+                accepts_strategy_parameters = any(
+                    item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
+                ) or len(inspect.signature(self.query_function).parameters) >= 7
+                if accepts_strategy_parameters:
+                    return self.query_function(*query_arguments, group.strategy_parameters.get(strategy, {}))
+                return self.query_function(*query_arguments)
+
+            if group.method == EXPERIMENT_AUTO_METHOD:
+                api_base = self.connections.get_api_base_url()
+                api_key = self.connections.get_api_key(project_id)
+                effort = self.connections.reasoning_effort_for(group.answer_model, group.answer_reasoning_effort)
+
+                def search(strategy: str) -> SearchOutcome:
+                    try:
+                        answer_value, context_value = run_strategy(strategy)
+                    except Exception as exc:
+                        return SearchOutcome("", str(exc))
+                    return SearchOutcome(str(answer_value), None, context_value)
+
+                fallback = search_with_fallback(
+                    self.router.route(question.question, group.answer_model, api_base, api_key, effort),
+                    search,
+                    lambda candidate: self.router.check_answer(
+                        question.question, candidate, group.answer_model, api_base, api_key, effort,
+                    ),
+                )
+                method = routed_method = fallback.method
+                routing_reason = fallback.reason
+                execution_trace = {"strategy_attempts": list(fallback.attempts)}
+                if fallback.outcome.error:
+                    raise ProjectError(fallback.outcome.error)
+                answer, context = fallback.outcome.answer, fallback.outcome.payload or {}
+            elif group.method == EXPERIMENT_AGENTIC_METHOD:
                 api_base = self.connections.get_api_base_url()
                 api_key = self.connections.get_api_key(project_id)
 
@@ -1420,24 +1448,11 @@ class RetrievalExperimentService:
                 ]
                 execution_trace = context
             else:
-                query_arguments = (
-                    project_id, question.question, method, group.answer_model, group.response_type,
-                    group.answer_reasoning_effort,
-                )
-                parameters = inspect.signature(self.query_function).parameters.values()
-                accepts_strategy_parameters = any(
-                    item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
-                ) or len(inspect.signature(self.query_function).parameters) >= 7
-                if accepts_strategy_parameters:
-                    answer, context = self.query_function(
-                        *query_arguments, group.strategy_parameters.get(method, {})
-                    )
-                else:
-                    answer, context = self.query_function(*query_arguments)
+                answer, context = run_strategy(method)
         except Exception as exc:
             return replace(
                 self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name),
-                routed_method=routed_method, routing_reason=routing_reason,
+                routed_method=routed_method, routing_reason=routing_reason, execution_trace=execution_trace,
             )
         try:
             retrieved_evidence: tuple[Evidence, ...] = ()

@@ -14,7 +14,7 @@ from automotive_graphrag.evidence import Evidence, EvidenceService
 from automotive_graphrag.agentic_search import AgenticDecision
 from automotive_graphrag.querying import QueryExecution, QueryService
 from automotive_graphrag.source_metadata import SourceMetadata
-from automotive_graphrag.strategy_routing import StrategyDecision
+from automotive_graphrag.strategy_routing import AnswerCheck, NOT_FOUND_ANSWER, StrategyDecision
 
 
 class FakeQueryRunner:
@@ -54,13 +54,35 @@ class FakeEvidenceService:
 
 
 class FakeRouter:
-    def __init__(self, decision: StrategyDecision) -> None:
+    def __init__(self, decision: StrategyDecision, refusals: tuple[str, ...] = ()) -> None:
         self.decision = decision
+        self.refusals = refusals
+        self.checked: list[str] = []
         self.calls: list[tuple[str, str, str, str | None, str]] = []
 
     def route(self, question: str, model: str, api_base_url: str, api_key: str | None, reasoning_effort: str = "medium") -> StrategyDecision:
         self.calls.append((question, model, api_base_url, api_key, reasoning_effort))
         return self.decision
+
+    def check_answer(self, question: str, answer: str, *_: object) -> AnswerCheck:
+        self.checked.append(answer)
+        return AnswerCheck(answer not in self.refusals, "檢查結果")
+
+
+class ScriptedRunner:
+    """Answer per --method; a None answer simulates a failed GraphRAG process."""
+
+    def __init__(self, answers: dict[str, str | None]) -> None:
+        self.answers = answers
+        self.methods: list[str] = []
+
+    def __call__(self, command: list[str]) -> QueryExecution:
+        method = command[command.index("--method") + 1]
+        self.methods.append(method)
+        answer = self.answers[method]
+        if answer is None:
+            return QueryExecution(1, "", f"{method} failed\n")
+        return QueryExecution(0, answer, "", {"sources": [{"id": method, "text": "來源"}]})
 
 
 class FailingEvidenceService:
@@ -143,6 +165,57 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.requested_method, "auto")
         self.assertEqual(result.routing_reason, "問題要求整體主題歸納")
         self.assertEqual(service.history("L33-SM3E"), [result])
+
+    def test_auto_query_falls_back_in_ranked_order_and_stops_at_first_answer(self) -> None:
+        runner = ScriptedRunner({"basic": "資料中沒有", "local": None, "global": "找到了", "drift": "不該執行"})
+        router = FakeRouter(
+            StrategyDecision("basic", "單一數值", ("basic", "local", "global", "drift")),
+            refusals=("資料中沒有",),
+        )
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
+        )
+
+        result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(runner.methods, ["basic", "local", "global"])
+        self.assertEqual(router.checked, ["資料中沒有", "找到了"])
+        self.assertEqual((result.status, result.method, result.answer), ("COMPLETED", "global", "找到了"))
+        self.assertEqual(result.requested_method, "auto")
+        self.assertEqual(result.context["sources"][0]["id"], "global")
+        self.assertEqual(len(result.evidence), 1)
+        self.assertIn("Basic 未找到答案、Local 查詢失敗，改用 Global 找到答案", result.routing_reason)
+        self.assertEqual(
+            [(item["method"], item["status"]) for item in result.execution_metadata["strategy_attempts"]],
+            [("basic", "not_found"), ("local", "failed"), ("global", "found")],
+        )
+        self.assertEqual(service.history("L33-SM3E"), [result])
+
+    def test_auto_query_reports_not_found_after_all_methods(self) -> None:
+        runner = ScriptedRunner({"local": "沒有", "basic": "沒有", "global": None, "drift": "沒有"})
+        router = FakeRouter(StrategyDecision("local", "具體事實"), refusals=("沒有",))
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
+        )
+
+        result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(runner.methods, ["local", "basic", "global", "drift"])
+        self.assertEqual((result.status, result.answer, result.method), ("COMPLETED", NOT_FOUND_ANSWER, "local"))
+        self.assertEqual(result.evidence, ())
+        self.assertEqual(result.context, {})
+        self.assertIn("Global 查詢失敗", result.routing_reason)
+
+    def test_auto_query_fails_when_every_method_fails(self) -> None:
+        runner = ScriptedRunner(dict.fromkeys(("local", "basic", "global", "drift")))
+        router = FakeRouter(StrategyDecision("local", "具體事實"))
+        service = QueryService(self.store, runner, self.connections, router=router)
+
+        result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(len(runner.methods), 4)
+        self.assertEqual((result.status, result.error), ("FAILED", "drift failed"))
+        self.assertEqual(router.checked, [])
 
     def test_fixed_method_does_not_call_router(self) -> None:
         router = FakeRouter(StrategyDecision("global", "unused"))

@@ -35,7 +35,7 @@ from automotive_graphrag.retrieval_experiments import (
     RetrievalExperimentService,
 )
 from automotive_graphrag.source_metadata import SourceMetadata
-from automotive_graphrag.strategy_routing import StrategyDecision
+from automotive_graphrag.strategy_routing import AnswerCheck, NOT_FOUND_ANSWER, StrategyDecision
 
 
 class FakeJudge:
@@ -466,6 +466,9 @@ class RetrievalExperimentTests(unittest.TestCase):
                 routed.append((question_text, model, api_key))
                 return StrategyDecision("basic", "單一數值查詢")
 
+            def check_answer(self, *_):
+                return AnswerCheck(True, "已回答")
+
         received = []
         self.service.router = FakeRouter()  # type: ignore[assignment]
         self.service.query_function = lambda *args: (received.append(args) or "回答", {})
@@ -485,6 +488,67 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(result.effective_method, "basic")
         self.assertEqual(result.routing_reason, "單一數值查詢")
         self.assertIn("已映射", result.retrieval_metrics_status)
+
+    def _auto_group(self, ranking, refusals=()):
+        question = self.service.import_question_set("project", self.question_file).questions[0]
+
+        class FakeRouter:
+            def route(self, *_):
+                return StrategyDecision(ranking[0], "選擇原因", ranking)
+
+            def check_answer(self, _question, answer, *_):
+                return AnswerCheck(answer not in refusals, "檢查")
+
+        self.service.router = FakeRouter()  # type: ignore[assignment]
+        state = self.service.add_group("project")
+        group_id = state["groups"][0]["group_id"]
+        self.service.set_group_method("project", group_id, "auto")
+        self.service.set_group_strategy_parameter("project", group_id, "global", "data_max_tokens", 9000)
+        return ExperimentGroup(**self.service.load("project")["groups"][0]), question
+
+    def test_auto_group_falls_back_with_next_strategy_parameters(self):
+        group, question = self._auto_group(("basic", "local", "global", "drift"), refusals=("沒有",))
+        received = []
+
+        def query(*args):
+            received.append(args)
+            if args[2] == "local":
+                raise ProjectError("Local 壞了")
+            return ("沒有" if args[2] == "basic" else "回答", {})
+
+        self.service.query_function = query
+
+        result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+
+        self.assertEqual([args[2] for args in received], ["basic", "local", "global"])
+        self.assertEqual(received[2][6]["data_max_tokens"], 9000)
+        self.assertEqual((result.status, result.routed_method, result.actual_answer), ("answered", "global", "回答"))
+        self.assertIn("改用 Global 找到答案", result.routing_reason)
+        self.assertEqual(
+            [(item["method"], item["status"]) for item in result.execution_trace["strategy_attempts"]],
+            [("basic", "not_found"), ("local", "failed"), ("global", "found")],
+        )
+
+    def test_auto_group_reports_not_found_and_all_failures(self):
+        group, question = self._auto_group(("local", "basic", "global", "drift"), refusals=("沒有",))
+        self.service.query_function = lambda *args: ("沒有", {})
+
+        result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+
+        self.assertEqual((result.status, result.actual_answer), ("answered", NOT_FOUND_ANSWER))
+        self.assertEqual(result.routed_method, "local")
+        self.assertEqual(result.retrieved_evidence, ())
+
+        def fail(*_):
+            raise ProjectError("查詢壞了")
+
+        self.service.query_function = fail
+
+        failed = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+
+        self.assertNotEqual(failed.status, "answered")
+        self.assertIn("查詢壞了", failed.error)
+        self.assertEqual(len(failed.execution_trace["strategy_attempts"]), 4)
 
     def test_auto_group_metrics_skip_questions_routed_to_global(self):
         question_set = self.service.import_question_set("project", self.question_file)
