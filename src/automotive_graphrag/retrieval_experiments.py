@@ -25,6 +25,7 @@ from .automatic_evaluation import (
     JudgeScore,
     average_judge_score,
     combined_judge_reason,
+    extra_error_share,
     judge_panel_summary,
     judge_scores_from_dicts,
 )
@@ -313,7 +314,7 @@ class RetrievalExperimentService:
     def _source_stats(
         cls, items, total: int, weight: float = DEFAULT_SOURCE_WEIGHT,
     ) -> tuple[float | None, float | None]:
-        """Average cited-source score and the combined (judge 0–2 → 0–1, mixed with source) accuracy.
+        """Average cited-source score and the combined (judge 0–2 → 0–1, plus source bonus) accuracy.
 
         ``items`` are result dicts or ``ExperimentQuestionResult`` objects; questions without a
         judge grade contribute 0 to the combined accuracy, like ``score_accuracy``.
@@ -326,7 +327,10 @@ class RetrievalExperimentService:
         for item in items:
             grade = cls._parse_grade(value(item, "evaluation_result"))
             if grade is not None:
-                combined_sum += combined_score(grade / 2, value(item, "source_score"), weight)
+                bonus_share = 0.0 if value(item, "manual_override") else extra_error_share(
+                    judge_scores_from_dicts(value(item, "judge_scores"))
+                )
+                combined_sum += combined_score(grade / 2, value(item, "source_score"), weight, bonus_share)
         average_source = cls._mean_present(sources)
         return (
             round(average_source, 4) if average_source is not None else None,
@@ -1519,7 +1523,10 @@ class RetrievalExperimentService:
                         evaluation_mode=evaluation_mode,
                         reasoning_effort=judge_reasoning_effort,
                     )
-                    judges.append(JudgeScore(model, float(judged.score), judged.judge_reason))
+                    judges.append(JudgeScore(
+                        model, float(judged.score), judged.judge_reason,
+                        extra_content_error=judged.extra_content_error,
+                    ))
                 except Exception as exc:
                     judges.append(JudgeScore(model, None, "", str(exc)))
             average = average_judge_score(judges)

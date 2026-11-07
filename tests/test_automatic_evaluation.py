@@ -13,7 +13,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from automotive_graphrag.app import create_app
-from automotive_graphrag.automatic_evaluation import AutomaticEvaluationService, PROMPT_VERSION, extract_json_object
+from automotive_graphrag.automatic_evaluation import (
+    PROMPT_VERSION,
+    AutomaticEvaluationItem,
+    AutomaticEvaluationService,
+    JudgeScore,
+    extract_json_object,
+)
 from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult, JudgeModelPreferences
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
@@ -126,18 +132,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     @staticmethod
-    def judged(q1_score: int = 3) -> dict[str, object]:
+    def judged(q1_score: int = 3, extra_content_error: bool = False) -> dict[str, object]:
         return {
             "items": [
                 {
                     "question_id": "Q0001",
                     "result": "incorrect" if q1_score < 4 else "correct",
                     "reason": "第一題評語",
+                    "extra_content_error": extra_content_error,
                 },
                 {
                     "question_id": "Q0002",
                     "result": "correct",
                     "reason": "第二題評語",
+                    "extra_content_error": True,  # ignored: a correct answer never earns a bonus
                 },
             ]
         }
@@ -735,7 +743,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "並行數必須介於 1 到 32"):
             service.evaluate("L33-SM3E", self.question_set_id, concurrency=0)
 
-    def test_combined_score_mixes_judge_and_cited_source_scores(self) -> None:
+    def test_cited_sources_only_lift_answers_wrong_because_of_added_content(self) -> None:
         class CitingRunner(AnswerRunner):
             def ask(self, *args, **kwargs):
                 result = super().ask(*args, **kwargs)
@@ -744,12 +752,13 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         question_sets = QuestionSetService(self.store, CitingRunner())
         question_sets.run("L33-SM3E", self.question_set_id)
         service = AutomaticEvaluationService(
-            self.store, question_sets, self.connections, FakeJudge([self.judged()])
+            self.store, question_sets, self.connections,
+            FakeJudge([self.judged(extra_content_error=True)]),
         )
 
         result = service.evaluate("L33-SM3E", self.question_set_id)
 
-        # Both answers cite the gold page; Q1 is judged incorrect, Q2 correct.
+        # Both answers cite the gold page; Q1 is wrong only through added content, Q2 is correct.
         self.assertEqual([item.source_score for item in result.items], [1.0, 1.0])
         self.assertEqual([item.combined_score for item in result.items], [0.1, 1.0])
         self.assertEqual(result.source_weight, 0.1)
@@ -760,6 +769,8 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         updated = service.update_manual_results("L33-SM3E", self.question_set_id, {"Q0001": 1})
         self.assertEqual(updated.items[0].combined_score, 1.0)
         self.assertEqual(updated.average_combined_score, 1.0)
+        partial = service.update_manual_results("L33-SM3E", self.question_set_id, {"Q0001": 0.5})
+        self.assertEqual(partial.items[0].combined_score, 0.5)  # a manual score is final
 
         weighted = service.evaluate("L33-SM3E", self.question_set_id, source_weight=0.5)
         self.assertEqual(weighted.items[0].combined_score, 0.5)
@@ -772,6 +783,53 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         with csv_path.open(encoding="utf-8", newline="") as source:
             rows = list(csv.DictReader(source))
         self.assertEqual(rows[0]["source_score"], "1.0")
+        self.assertEqual(rows[0]["source_bonus_share"], "1.0")
+
+    def test_ordinary_wrong_and_correct_answers_ignore_sources(self) -> None:
+        class CitingRunner(AnswerRunner):
+            def ask(self, *args, **kwargs):
+                result = super().ask(*args, **kwargs)
+                return replace(result, answer=result.answer + " [Data: Sources (1)]")
+
+        question_sets = QuestionSetService(self.store, CitingRunner())
+        question_sets.run("L33-SM3E", self.question_set_id)
+        service = AutomaticEvaluationService(
+            self.store, question_sets, self.connections, FakeJudge([self.judged()])
+        )
+        result = service.evaluate("L33-SM3E", self.question_set_id)
+        self.assertEqual([item.source_score for item in result.items], [1.0, 1.0])
+        self.assertEqual([item.combined_score for item in result.items], [0.0, 1.0])
+
+    def test_source_bonus_scales_with_share_of_flagging_judges(self) -> None:
+        item = AutomaticEvaluationItem(
+            "Q1", False, "reason", average_score=1 / 3, source_score=1.0,
+            judges=(
+                JudgeScore("a", 1.0, "ok"),
+                JudgeScore("b", 0.0, "extra", extra_content_error=True),
+                JudgeScore("c", 0.0, "extra", extra_content_error=True),
+                JudgeScore("d", None, "", "failed", extra_content_error=True),
+            ),
+        )
+        self.assertAlmostEqual(item.source_bonus_share, 2 / 3)
+        self.assertEqual(AutomaticEvaluationService._with_combined(item, 0.1).combined_score, 0.4)
+
+    def test_prompts_ask_for_the_extra_content_flag(self) -> None:
+        question = BatchQuestion("Q1", "題目", "答案", answer="回答")
+        for mode in ("strict", "lenient"):
+            self.assertIn("extra_content_error", AutomaticEvaluationService._build_prompt([question], mode))
+            self.assertIn("extra_content_error", AutomaticEvaluationService._build_grade_prompt(question, mode))
+
+    def test_grade_flag_is_ignored_for_a_full_grade(self) -> None:
+        def respond(score, flag):
+            return lambda *args: {"item": {
+                "question_id": "Q1", "result": score, "reason": "r", "extra_content_error": flag,
+            }}
+
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, respond(2, True))
+        args = ("L33-SM3E", "Q1", "題目", "答案", "回答", self.connections.get_chat_model())
+        self.assertFalse(service.evaluate_single_answer_grade(*args).extra_content_error)
+        service.client = respond(1, True)
+        self.assertTrue(service.evaluate_single_answer_grade(*args).extra_content_error)
 
     def test_uncited_answers_score_zero_source_and_legacy_records_fall_back(self) -> None:
         service = AutomaticEvaluationService(
@@ -779,17 +837,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         )
         result = service.evaluate("L33-SM3E", self.question_set_id)
         self.assertEqual([item.source_score for item in result.items], [0.0, 0.0])
-        self.assertEqual(result.average_combined_score, 0.45)
+        self.assertEqual(result.average_combined_score, 0.5)
 
         path = service._path("L33-SM3E", self.question_set_id)
         legacy = json.loads(path.read_text(encoding="utf-8"))
-        legacy.pop("average_combined_score")
+        legacy["average_combined_score"] = 0.123  # stale value from the former weighted formula
         for item in legacy["items"]:
             item.pop("source_score")
-            item.pop("combined_score")
+            item["combined_score"] = 0.123
+            for judge in item["judges"]:
+                judge.pop("extra_content_error")
         path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
         loaded = service.last_result("L33-SM3E", self.question_set_id)
         self.assertEqual(loaded.average_combined_score, loaded.average_score)
+        self.assertEqual([item.final_score for item in loaded.items], [0.0, 1.0])
 
     def test_manual_score_edit_overrides_average_and_keeps_judge_scores(self) -> None:
         service = AutomaticEvaluationService(

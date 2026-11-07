@@ -45,7 +45,12 @@ from .question_sets import BatchQuestion, QuestionSetService
 from .reviews import ReviewService
 
 
-PROMPT_VERSION = "answer-match-judge-v2"
+PROMPT_VERSION = "answer-match-judge-v3"
+EXTRA_CONTENT_RULE = (
+    'Set "extra_content_error" to true only when the answer is not fully correct, yet it contains all '
+    "essential information and steps of the correct answer, and the only reason it loses credit is "
+    "content it added beyond the correct answer. Otherwise set it to false.\n"
+)
 JUDGMENT_RESULTS = {"correct", "incorrect"}
 logger = logging.getLogger(__name__)
 JudgeClient = Callable[..., object]
@@ -59,6 +64,8 @@ class JudgeScore:
     score: float | None
     reason: str = ""
     error: str | None = None
+    extra_content_error: bool = False
+    """The answer covers the correct answer and lost credit only because of added content."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +79,8 @@ class AutomaticEvaluationItem:
     source_score: float | None = None
     """Cited-source vs gold answer-source score (0–1); None when not applicable."""
     combined_score: float | None = None
-    """Weighted judge score and source score (0–1); equals ``score`` when the source score is N/A."""
+    """Judge score plus the source bonus (0–1); equals ``score`` when no bonus applies."""
+    extra_content_error: bool = False
 
     @property
     def score(self) -> float:
@@ -86,12 +94,18 @@ class AutomaticEvaluationItem:
         """Combined score, falling back to the judge score for records without one."""
         return self.combined_score if self.combined_score is not None else self.score
 
+    @property
+    def source_bonus_share(self) -> float:
+        """Share of judges granting the source bonus; a manual score is final and gets none."""
+        return 0.0 if self.manual else extra_error_share(self.judges)
+
 
 @dataclass(frozen=True, slots=True)
 class AutomaticEvaluationGrade:
     question_id: str
     score: int
     judge_reason: str
+    extra_content_error: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +150,12 @@ def average_judge_score(judges: Sequence[JudgeScore]) -> float | None:
     return round(sum(scores) / len(scores), 4) if scores else None
 
 
+def extra_error_share(judges: Sequence[JudgeScore]) -> float:
+    """Share of successful judges reporting that only added content made the answer wrong."""
+    scored = [item for item in judges if item.score is not None]
+    return sum(item.extra_content_error for item in scored) / len(scored) if scored else 0.0
+
+
 def combined_judge_reason(judges: Sequence[JudgeScore], score_format: Callable[[float], str] = lambda value: f"{value:g}") -> str:
     """Single judge keeps its plain reason; a panel lists each model's score and reason."""
     if len(judges) == 1 and judges[0].score is not None:
@@ -178,6 +198,7 @@ def judge_scores_from_dicts(values: object) -> tuple[JudgeScore, ...]:
                 float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
                 str(value.get("reason") or ""),
                 value.get("error") if isinstance(value.get("error"), str) else None,
+                value.get("extra_content_error") is True,
             ))
     return tuple(result)
 
@@ -303,7 +324,8 @@ class AutomaticEvaluationService:
                     try:
                         single = future.result()
                         verdicts[question.question_id][judge_model] = JudgeScore(
-                            judge_model, 1.0 if single.is_correct else 0.0, single.judge_reason
+                            judge_model, 1.0 if single.is_correct else 0.0, single.judge_reason,
+                            extra_content_error=single.extra_content_error,
                         )
                     except Exception as exc:
                         verdicts[question.question_id][judge_model] = JudgeScore(judge_model, None, "", str(exc))
@@ -332,14 +354,14 @@ class AutomaticEvaluationService:
                     judges=judges,
                     average_score=average,
                     source_score=source,
-                    combined_score=combined_score(average, source, source_weight),
+                    combined_score=combined_score(average, source, source_weight, extra_error_share(judges)),
                 )
         if failures and not enable_classic_metrics:
             raise ProjectError("自動評測部分請求失敗：" + "；".join(failures))
         if enable_llm_judge and selected_ids is not None and previous is not None:
             items_by_id = {item.question_id: item for item in previous.items}
             items_by_id.update(judged_by_id)
-            # Carried-over items are re-weighted so every question uses this run's source weight.
+            # Carried-over items are rescored so every question uses this run's source weight.
             items = tuple(self._with_combined(item, source_weight) for item in items_by_id.values())
         else:
             items = tuple(
@@ -411,7 +433,9 @@ class AutomaticEvaluationService:
 
     @staticmethod
     def _with_combined(item: AutomaticEvaluationItem, weight: float) -> AutomaticEvaluationItem:
-        return replace(item, combined_score=combined_score(item.score, item.source_score, weight))
+        return replace(
+            item, combined_score=combined_score(item.score, item.source_score, weight, item.source_bonus_share)
+        )
 
     @staticmethod
     def _average_final_score(items: Sequence[AutomaticEvaluationItem]) -> float | None:
@@ -488,7 +512,9 @@ class AutomaticEvaluationService:
         reason = raw.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise ProjectError(f"{question_id} 缺少評判理由")
-        return AutomaticEvaluationGrade(question_id, score, reason.strip())
+        return AutomaticEvaluationGrade(
+            question_id, score, reason.strip(), score != 2 and raw.get("extra_content_error") is True
+        )
 
     @staticmethod
     def _build_grade_prompt(case: BatchQuestion, evaluation_mode: str) -> str:
@@ -499,7 +525,8 @@ class AutomaticEvaluationService:
             "1=部分對（有正確核心內容，但仍缺少重要資訊／必要步驟，或有局部錯誤）；"
             "2=全對（正確答案的所有必要資訊、條件與步驟均完整且無實質錯誤）。"
             "流程題若漏任何必要步驟，不可評 2；若已答對部分步驟評 1。"
-            '只輸出 JSON：{"item":{"question_id":"...","result":0或1或2,"reason":"..."}}。'
+            f"\n{EXTRA_CONTENT_RULE}"
+            '只輸出 JSON：{"item":{"question_id":"...","result":0或1或2,"extra_content_error":true或false,"reason":"..."}}。'
             f"理由簡短說明評級依據。案例：{json.dumps({'question_id':case.question_id,'question':case.question,'correct_answer':case.reference_answer,'system_answer':case.answer}, ensure_ascii=False)}"
         )
 
@@ -512,6 +539,7 @@ class AutomaticEvaluationService:
             raise ProjectError("自動評測紀錄格式錯誤") from exc
         # Migrate records written by the former scored/evidence-based judge.
         raw_items = value.pop("items", [])
+        source_weight = float(value.get("source_weight", DEFAULT_SOURCE_WEIGHT))
         migrated_items = []
         for item in raw_items:
             if "is_correct" not in item:
@@ -522,7 +550,8 @@ class AutomaticEvaluationService:
                 }
             item = {key: value for key, value in item.items() if key in AutomaticEvaluationItem.__dataclass_fields__}
             item["judges"] = judge_scores_from_dicts(item.get("judges"))
-            migrated_items.append(AutomaticEvaluationItem(**item))
+            # Rescored on load so records from the former weighted formula match the current rule.
+            migrated_items.append(self._with_combined(AutomaticEvaluationItem(**item), source_weight))
         raw_classic_items = value.pop("classic_items", [])
         classic_items = tuple(ClassicMetricsItem(**item) for item in raw_classic_items)
         allowed_fields = set(AutomaticEvaluationResult.__dataclass_fields__) - {"items"}
@@ -549,8 +578,7 @@ class AutomaticEvaluationService:
         value["models"] = tuple(value.get("models") or parse_judge_models(value.get("model")))
         if value.get("average_score") is None and value.get("enable_llm_judge", True):
             value["average_score"] = self._average_item_score(migrated_items)
-        if value.get("average_combined_score") is None and value.get("enable_llm_judge", True):
-            # Records written before source scoring: combined equals the judge score.
+        if value.get("enable_llm_judge", True):
             value["average_combined_score"] = self._average_final_score(migrated_items)
         if "judge_average_scores" not in value:
             value["judge_average_scores"], value["disagreement_count"] = judge_panel_summary(
@@ -655,6 +683,7 @@ class AutomaticEvaluationService:
                 "average_score": judge_by_id[question_id].score if question_id in judge_by_id else None,
                 "source_score": judge_by_id[question_id].source_score if question_id in judge_by_id else None,
                 "combined_score": judge_by_id[question_id].final_score if question_id in judge_by_id else None,
+                "source_bonus_share": judge_by_id[question_id].source_bonus_share if question_id in judge_by_id else 0.0,
                 "manual": judge_by_id[question_id].manual if question_id in judge_by_id else False,
                 "judges": [asdict(judge) for judge in judge_by_id[question_id].judges] if question_id in judge_by_id else [],
                 "judge_reason": judge_by_id[question_id].judge_reason if question_id in judge_by_id else "",
@@ -692,7 +721,7 @@ class AutomaticEvaluationService:
         fieldnames = [
             "question_id", "question", "expected_answer", "system_answer", "answer_sources",
             "retrieved_evidence", "routed_method", "routing_reason", "duration_seconds",
-            "is_correct", "average_score", "source_score", "combined_score", "manual", "judge_reason",
+            "is_correct", "average_score", "source_score", "combined_score", "source_bonus_share", "manual", "judge_reason",
             *judge_columns,
             "answer_em",
             "answer_f1",
@@ -736,6 +765,7 @@ class AutomaticEvaluationService:
                 "average_score": item.score if item else None,
                 "source_score": item.source_score if item else None,
                 "combined_score": item.final_score if item else None,
+                "source_bonus_share": item.source_bonus_share if item else 0.0,
                 "manual": item.manual if item else False,
                 "judge_reason": item.judge_reason if item else "",
             }
@@ -787,8 +817,9 @@ class AutomaticEvaluationService:
         return (
             "你是答案比對員。只根據每筆資料中的題目、正確答案和系統回答判斷，不得使用外部知識或任何檢索證據。\n"
             f"{criteria}"
+            f"{EXTRA_CONTENT_RULE}"
             "只輸出 JSON object，格式為 "
-            '{"items":[{"question_id":"...","result":"correct或incorrect","reason":"..."}]}。'
+            '{"items":[{"question_id":"...","result":"correct或incorrect","extra_content_error":true或false,"reason":"..."}]}。'
             "每個輸入題號必須恰好出現一次。reason 簡短指出符合之處，或具體缺漏、矛盾、錯誤。\n"
             f"評測案例：{json.dumps(cases, ensure_ascii=False)}"
         )
@@ -826,6 +857,7 @@ class AutomaticEvaluationService:
                     question_id=question_id,
                     is_correct=judgment == "correct",
                     judge_reason=reason.strip(),
+                    extra_content_error=judgment == "incorrect" and raw.get("extra_content_error") is True,
                 )
             )
             seen.add(question_id)

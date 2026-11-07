@@ -77,11 +77,20 @@ class SourceScoreTests(unittest.TestCase):
 
 class CombinedScoreTests(unittest.TestCase):
     def test_weighted_mix_and_fallback(self) -> None:
-        self.assertEqual(combined_score(1.0, 0.0), 0.9)
-        self.assertEqual(combined_score(0.0, 1.0), 0.1)
-        self.assertEqual(combined_score(0.5, 1.0, 0.2), 0.6)
-        self.assertEqual(combined_score(0.75, None), 0.75)
-        self.assertIsNone(combined_score(None, 1.0))
+        # Without an eligible judge the source score never changes the result.
+        self.assertEqual(combined_score(1.0, 0.0), 1.0)
+        self.assertEqual(combined_score(0.0, 1.0), 0.0)
+        self.assertEqual(combined_score(0.75, None, bonus_share=1.0), 0.75)
+        self.assertIsNone(combined_score(None, 1.0, bonus_share=1.0))
+
+    def test_bonus_scales_with_source_weight_and_judge_share(self) -> None:
+        self.assertEqual(combined_score(0.0, 0.5, bonus_share=1.0), 0.05)
+        self.assertEqual(combined_score(0.5, 1.0, 0.2, bonus_share=1.0), 0.7)
+        self.assertEqual(combined_score(0.5, 1.0, bonus_share=0.5), 0.55)
+        self.assertEqual(combined_score(0.0, 0.0, bonus_share=1.0), 0.0)
+
+    def test_bonus_is_capped_at_full_score(self) -> None:
+        self.assertEqual(combined_score(0.5, 1.0, 1.0, bonus_share=1.0), 1.0)
 
     def test_weight_validation(self) -> None:
         self.assertEqual(validate_source_weight("0.2"), 0.2)

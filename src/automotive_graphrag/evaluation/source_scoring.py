@@ -12,7 +12,7 @@ import re
 from collections.abc import Sequence
 
 DEFAULT_SOURCE_WEIGHT = 0.1
-"""Share of the combined score taken by the source score; the LLM judge takes the rest."""
+"""Largest bonus (on the 0–1 scale) a fully matching source can add to an eligible answer."""
 
 PAGE_TOLERANCE = 1
 """Cited pages within this distance of a gold page count as a hit (PDF vs printed page offsets)."""
@@ -87,13 +87,23 @@ def source_score(answer: str, retrieved: Sequence[object], gold: Sequence[object
     return round(recall, 4)
 
 
-def combined_score(judge_score: float | None, source: float | None, weight: float = DEFAULT_SOURCE_WEIGHT) -> float | None:
-    """Weighted 0–1 score; falls back to the judge score alone when the source score is N/A."""
+def combined_score(
+    judge_score: float | None,
+    source: float | None,
+    weight: float = DEFAULT_SOURCE_WEIGHT,
+    bonus_share: float = 0.0,
+) -> float | None:
+    """Judge score (0–1) plus a source bonus, capped at 1.
+
+    Sources never reduce the score. ``bonus_share`` is the share of judges that found the answer
+    covers the correct answer and is wrong only because of added content; with no such judge the
+    result is the judge score alone.
+    """
     if judge_score is None:
         return None
     if source is None:
         return round(judge_score, 4)
-    return round((1 - weight) * judge_score + weight * source, 4)
+    return round(min(1.0, judge_score + bonus_share * weight * source), 4)
 
 
 def validate_source_weight(value: object) -> float:

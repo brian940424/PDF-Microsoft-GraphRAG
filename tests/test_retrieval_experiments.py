@@ -39,9 +39,10 @@ from automotive_graphrag.strategy_routing import StrategyDecision
 
 
 class FakeJudge:
-    def __init__(self, lenient_result: bool | None = None):
+    def __init__(self, lenient_result: bool | None = None, extra_content_error: bool = False):
         self.calls = []
         self.lenient_result = lenient_result
+        self.extra_content_error = extra_content_error
 
     def evaluate_single_answer(self, project_id, question_id, question, correct, actual, model, evaluation_mode="strict"):
         self.calls.append((project_id, question_id, question, correct, actual, model, evaluation_mode))
@@ -61,7 +62,10 @@ class FakeJudge:
         if evaluation_mode == "lenient" and self.lenient_result is not None:
             score = 2 if self.lenient_result else 0
         reason = f"寬鬆評分 model={model}" if evaluation_mode == "lenient" else f"model={model}"
-        return SimpleNamespace(question_id=question_id, score=score, judge_reason=reason)
+        return SimpleNamespace(
+            question_id=question_id, score=score, judge_reason=reason,
+            extra_content_error=self.extra_content_error and score != 2,
+        )
 
 
 class RetrievalExperimentTests(unittest.TestCase):
@@ -294,7 +298,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(len(dataset_summaries), 2)
         self.assertEqual({row[1].split(" (")[0] for row in dataset_summaries}, {"questions", "second-dataset"})
-        self.assertTrue(all(row[4:12] == [2, 2, 2, 2, 0, 0, "100.0%", "100.0%"] for row in dataset_summaries))
+        self.assertTrue(all(row[4:8] == [2, 2, 2, "100.0%"] for row in dataset_summaries))
 
         self.service.update_manual_judgments(
             "project", [("實驗組1", dataset_ids[0], run.results[0].question_id, False)]
@@ -394,7 +398,8 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(summary.evidence_precision, 1.0)
         self.assertEqual(summary.document_hit_rate, 1.0)
 
-    def test_cited_source_score_is_combined_with_judge_grade(self):
+    def test_cited_source_bonus_applies_only_to_extra_content_errors(self):
+        self.service.judging.extra_content_error = True
         question_set = self.service.import_question_set("project", self.question_file)
         question = question_set.questions[0]
         gold = question.answer_source_evidence[0]
@@ -414,6 +419,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(evaluated.evaluation_result, 0)
         self.assertEqual(evaluated.source_score, 1.0)
         self.assertIn("來源分數 : 100%", _experiment_judge_cell(asdict(evaluated)))
+        self.assertIn("來源加分 : 適用", _experiment_judge_cell(asdict(evaluated)))
 
         run = self.service._persist_run(
             "project", question_set.question_set_id, [group], "gpt-4.1-mini", 1,
@@ -422,7 +428,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         summary = run.groups[0]
         self.assertEqual(summary.score_accuracy, 0.0)
         self.assertEqual(summary.average_source_score, 1.0)
-        # Two questions in the set; only Q0001 is evaluated: (0.9 * 0 + 0.1 * 1) / 2.
+        # Two questions in the set; only Q0001 is evaluated: (0 + 0.1 * 1) / 2.
         self.assertEqual(summary.combined_score_accuracy, 0.05)
 
         self.service.update_manual_judgments("project", [("Local", "Q0001", 2)])
@@ -432,6 +438,23 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(payload["evaluation"]["source_weight"], 0.1)
         self.assertEqual(payload["groups"][0]["summary"]["average_source_score"], 1.0)
         self.assertEqual(payload["summary"]["combined_score_accuracy"], 0.5)
+
+        # A manual grade is final: the judge's flag no longer earns a bonus.
+        self.service.update_manual_judgments("project", [("Local", "Q0001", 1)])
+        group_value = self.service.load("project")["run"]["groups"][0]
+        self.assertEqual(group_value["combined_score_accuracy"], 0.25)
+
+    def test_ordinary_wrong_answer_gets_no_source_bonus(self):
+        run_items = [{
+            "evaluation_result": 0, "source_score": 1.0,
+            "judge_scores": [{"model": "a", "score": 0.0, "reason": "wrong"}],
+        }]
+        self.assertEqual(self.service._source_stats(run_items, 1), (1.0, 0.0))
+        self.assertNotIn("來源加分", _experiment_judge_cell(run_items[0] | {"question_id": "Q1"}))
+
+    def test_full_grade_ignores_source_score(self):
+        run_items = [{"evaluation_result": 2, "source_score": 0.0, "judge_scores": []}]
+        self.assertEqual(self.service._source_stats(run_items, 1), (0.0, 1.0))
 
     def test_auto_group_routes_each_question_and_uses_routed_strategy_parameters(self):
         question_set = self.service.import_question_set("project", self.question_file)
@@ -650,7 +673,9 @@ class RetrievalExperimentTests(unittest.TestCase):
                 if model == "gpt-6-luna" and question_id == "Q2":
                     raise ProjectError("timeout")
                 score = {"gpt-4o-mini": 2, "gpt-4.1-mini": 1, "gpt-6-luna": 2}[model]
-                return SimpleNamespace(question_id=question_id, score=score, judge_reason=f"{model} 理由")
+                return SimpleNamespace(
+                    question_id=question_id, score=score, judge_reason=f"{model} 理由", extra_content_error=False,
+                )
 
         judge = PanelJudge()
         self.service.judging = judge
@@ -682,7 +707,10 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         # Re-saving the displayed table value (two decimals) is not treated as a manual edit.
         self.assertEqual(_experiment_grade_label(first.evaluation_result), "83.3%")
-        self.assertEqual(_experiment_grade_label(2), "100%（全對）")
+        self.assertEqual(_experiment_grade_label(2), "100%")
+        self.assertEqual(_experiment_grade_label(1), "50%")
+        self.assertEqual(_experiment_grade_label(0), "0%")
+        # Tables saved before labels were removed still parse.
         self.assertEqual(RetrievalExperimentService._parse_grade("100%（全對）"), 2)
         self.assertEqual(RetrievalExperimentService._parse_grade("50%（部分對）"), 1)
         self.service.update_manual_judgments("project", [("Local", "Q1", "83.3%")])
@@ -1027,6 +1055,9 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         summary_table = next(config for config in component_configs if config.get("label") == "實驗組摘要")
         self.assertEqual(summary_table["headers"][-2:], ["Average Term Hit", "Average Term Coverage"])
+        dataset_table = next(config for config in component_configs if config.get("label") == "實驗組 × 題目集摘要")
+        for table in (summary_table, dataset_table):
+            self.assertFalse({"全對", "部分對", "錯誤", "全對率"} & set(table["headers"]))
         block_values = list(app.blocks.values())
         result_table_position = next(
             index for index, component in enumerate(block_values)

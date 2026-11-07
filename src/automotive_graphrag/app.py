@@ -18,7 +18,12 @@ from pathlib import Path
 import gradio as gr
 from PIL import Image
 
-from .automatic_evaluation import AutomaticEvaluationService, JudgeScore
+from .automatic_evaluation import (
+    AutomaticEvaluationService,
+    JudgeScore,
+    extra_error_share,
+    judge_scores_from_dicts,
+)
 from .automatic_qa import AutomaticQATestService
 from .connections import (
     DEFAULT_API_BASE_URL,
@@ -105,7 +110,7 @@ QUERY_METHOD_CHOICES = [*STANDARD_QUERY_METHOD_CHOICES, (QUERY_METHOD_LABELS["ag
 AUTOQA_QUERY_METHOD_CHOICES = [*STANDARD_QUERY_METHOD_CHOICES, (QUERY_METHOD_LABELS["agentic"], "agentic")]
 AUTOMATIC_EVALUATION_COLUMNS = [
     "Question ID",
-    "判斷",
+    "分數",
     "Judge Reason",
 ]
 INDEXING_LOG_AUTOSCROLL_JS = """() => {
@@ -302,7 +307,7 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
             correct, partial, incorrect, score_sum = RetrievalExperimentService._grade_counts(
                 item.get("evaluation_result") for item in selected
             )
-            judged = [None] * (correct + partial + incorrect)
+            judged = correct + partial + incorrect
             metric_samples = []
             if method in EVIDENCE_METHODS or method in {EXPERIMENT_AUTO_METHOD, EXPERIMENT_AGENTIC_METHOD}:
                 for item in selected:
@@ -354,8 +359,7 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 f"{question_set.name} ({question_set.question_set_id[:8]})",
                 strategy_labels.get(method, method or "未設定"),
                 group.get("answer_model", ""),
-                len(question_set.questions), answered, len(judged), correct, partial, incorrect,
-                f"{correct / len(question_set.questions):.1%}" if question_set.questions else "—",
+                len(question_set.questions), answered, judged,
                 f"{score_sum / (2 * len(question_set.questions)):.1%}" if question_set.questions else "—",
                 f"{metrics[0]:.1%}" if metrics[0] is not None else "不可計算",
                 f"{metrics[1]:.1%}" if metrics[1] is not None else "不可計算",
@@ -411,8 +415,7 @@ def _experiment_grade_label(value):
     score = RetrievalExperimentService._parse_grade(value)
     if score is None:
         return value or ""
-    label = {0: "錯誤", 1: "部分對", 2: "全對"}.get(score)
-    return _score_percent(score, 2) + (f"（{label}）" if label and not isinstance(score, float) else "")
+    return _score_percent(score, 2)
 
 
 def _judge_panel_markup(averages, disagreements, scale: float = 1) -> str:
@@ -450,6 +453,8 @@ def _experiment_judge_cell(item) -> str:
         lines.append("* 人工修改得分")
     if isinstance(item.get("source_score"), (int, float)):
         lines.append(f"* 來源分數 : {_score_percent(item['source_score'])}")
+        if not item.get("manual_override") and extra_error_share(judge_scores_from_dicts(item.get("judge_scores"))):
+            lines.append("* 來源加分 : 適用")
     return "\n".join(lines)
 
 
@@ -1163,7 +1168,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         rows = [
             [
                 item.question_id,
-                "正確" if item.is_correct else "錯誤",
+                _score_percent(item.score),
                 item.judge_reason,
             ]
             for item in result.items
@@ -1176,7 +1181,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         summary = (
             f"模型 `{judge_model_label(result.model)}`｜Prompt `{result.prompt_version}`｜題數 {result.question_count}｜"
-            f"正確 {result.correct_count}/{result.question_count}"
+            f"平均分數 {_score_percent(result.average_score or 0)}"
         )
         return "✅ 自動評測完成（LLM Judge 結果仍需人工抽查）", summary, rows, selector, values
 
@@ -1370,8 +1375,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 _score_percent(judge.average_source_score) if judge.average_source_score is not None else "不適用"
             )
             items.append(
-                f"- **綜合分數：** {combined}（LLM {1 - judge.source_weight:.0%}＋來源 {judge.source_weight:.0%}；"
-                "無來源標註或無頁碼來源的題目只計 LLM）"
+                f"- **綜合分數：** {combined}（答對不看來源；已涵蓋正解但因補充內容判錯時，"
+                f"依來源分數最多加 {judge.source_weight:.0%}；其餘只計 LLM）"
             )
             items.append(
                 f"- **LLM Judge：** 平均分數 {score}（評判 {len(judge.items)}/{total} 題）｜"
@@ -1723,8 +1728,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     ),
                     item.get("answer_model"), judge_model_label(item.get("judge_model")),
                     item.get("question_count"), item.get("completed_count"),
-                    item.get("correct_count"), item.get("partial_correct_count"), item.get("incorrect_count"),
-                    f"{item['accuracy']:.1%}" if item.get("accuracy") is not None else "—",
                     f"{item['score_accuracy']:.1%}" if item.get("score_accuracy") is not None else "—",
                     f"{item['average_source_score']:.1%}" if item.get("average_source_score") is not None else "不適用",
                     f"{item['combined_score_accuracy']:.1%}" if item.get("combined_score_accuracy") is not None else "—",
@@ -4082,17 +4085,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     "無根據主張數只計回答中沒有來源支持的事實主張；拒答欄僅對預期無答案題填「正確」或「錯誤」，其餘填「不適用」。"
                 )
                 experiment_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "全對", "部分對", "錯誤", "全對率", "得分正確率", "來源分數", "綜合得分率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "得分正確率", "來源分數", "綜合得分率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * 32,
+                    datatype=["str"] * 28,
                     label="實驗組摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_dataset_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "全對", "部分對", "錯誤", "全對率", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * 25,
+                    datatype=["str"] * 21,
                     label="實驗組 × 題目集摘要",
                     wrap=True,
                     visible=False,
@@ -4177,7 +4180,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         with gr.Tab("自動評測（已整合）", visible=False):
             gr.Markdown(
                 "## 答案正確性自動評測\n"
-                "僅根據題目、正確答案和系統回答評為 0 錯誤、1 部分對或 2 全對並說明理由，不使用 Evidence。"
+                "僅根據題目、正確答案和系統回答給分並說明理由，不使用 Evidence。"
             )
             with gr.Row():
                 automatic_project_refresh = gr.Button("重新整理題目集")
