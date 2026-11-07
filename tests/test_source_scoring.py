@@ -115,6 +115,12 @@ class SourceScoreTests(unittest.TestCase):
         # A cited id missing from the retrieved context cannot be resolved.
         self.assertEqual(source_score("[Data: Sources (99)]", retrieved, [gold((10,))]), 0.0)
 
+    def test_document_only_credit_can_be_turned_off(self) -> None:
+        retrieved = [evidence("1", 10)]
+        self.assertEqual(source_score("[Data: Sources (1)]", retrieved, [gold((50,))], 0.0), 0.0)
+        self.assertEqual(source_score("[Data: Sources (1)]", retrieved, [gold((10,))], 0.0), 1.0)
+        self.assertEqual(source_score("[Data: Sources (1)]", retrieved, [gold((10, 50))], 0.0), 0.5)
+
     def test_document_only_gold(self) -> None:
         retrieved = [evidence("1", 10)]
         self.assertEqual(source_score("[Data: Sources (1)]", retrieved, [gold(())]), 1.0)

@@ -18,11 +18,13 @@ from automotive_graphrag.app import _autoqa_source_cell, create_app
 from automotive_graphrag.automatic_evaluation import (
     PROMPT_VERSION,
     AutomaticEvaluationItem,
+    project_document_only_score,
     AutomaticEvaluationService,
     JudgeScore,
     extract_json_object,
 )
 from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult, JudgeModelPreferences
+from automotive_graphrag.evaluation.source_scoring import DOCUMENT_ONLY_SCORE
 from automotive_graphrag.evidence import Evidence
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
@@ -849,6 +851,16 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         )
         self.assertAlmostEqual(item.source_bonus_share, 2 / 3)
         self.assertEqual(AutomaticEvaluationService._with_combined(item, 0.1).combined_score, 0.4)
+
+    def test_wrong_page_earns_document_credit_only_with_several_indexed_documents(self) -> None:
+        indexed = self.store.path_for("L33-SM3E") / "graphrag" / "indexed_documents.json"
+        indexed.parent.mkdir(parents=True, exist_ok=True)
+        indexed.write_text(json.dumps({"A.pdf": "t"}), encoding="utf-8")
+        self.assertEqual(project_document_only_score(self.store, "L33-SM3E"), 0.0)
+        indexed.write_text(json.dumps({"A.pdf": "t", "B.pdf": "t"}), encoding="utf-8")
+        self.assertEqual(project_document_only_score(self.store, "L33-SM3E"), DOCUMENT_ONLY_SCORE)
+        indexed.write_text("{}", encoding="utf-8")
+        self.assertEqual(project_document_only_score(self.store, "L33-SM3E"), DOCUMENT_ONLY_SCORE)
 
     def test_result_source_cell_shows_cited_and_gold_documents_with_pages(self) -> None:
         cited = Evidence(

@@ -26,6 +26,7 @@ from .evaluation.classic_metrics import (
 )
 from .evaluation.source_scoring import (
     DEFAULT_SOURCE_WEIGHT,
+    DOCUMENT_ONLY_SCORE,
     combined_score,
     cited_sources,
     source_score,
@@ -42,6 +43,7 @@ from .connections import (
     llm_request_headers,
     parse_judge_models,
 )
+from .documents import DocumentService
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .reviews import ReviewService
@@ -225,6 +227,11 @@ def judge_panel_summary(items: Sequence[object], judges_of: Callable[[object], S
     return {model: round(sum(values) / len(values), 4) for model, values in totals.items()}, disagreements
 
 
+def project_document_only_score(projects: ProjectStore, project_id: str) -> float:
+    """Credit for citing the right document on the wrong page: none when the graph has one document."""
+    return 0.0 if len(DocumentService(projects).indexed_documents(project_id)) == 1 else DOCUMENT_ONLY_SCORE
+
+
 def judge_scores_from_dicts(values: object) -> tuple[JudgeScore, ...]:
     if not isinstance(values, (list, tuple)):
         return ()
@@ -337,6 +344,7 @@ class AutomaticEvaluationService:
             if enable_llm_judge else ""
         )
         judged_by_id: dict[str, AutomaticEvaluationItem] = {}
+        document_only_score = project_document_only_score(self.projects, project_id)
         failures: list[str] = []
         partial_failures: list[str] = []
         total_calls = len(eligible) * len(models)
@@ -387,7 +395,7 @@ class AutomaticEvaluationService:
                         f"{question.question_id}（{'、'.join(judge_model_label(item.model) for item in failed)}）"
                     )
                 average = average_judge_score(judges)
-                source = self._question_source_score(question)
+                source = self._question_source_score(question, document_only_score)
                 judged_by_id[question.question_id] = AutomaticEvaluationItem(
                     question_id=question.question_id,
                     is_correct=average >= CORRECT_SCORE,
@@ -468,9 +476,9 @@ class AutomaticEvaluationService:
         return result
 
     @staticmethod
-    def _question_source_score(question: BatchQuestion) -> float | None:
+    def _question_source_score(question: BatchQuestion, document_only_score: float) -> float | None:
         gold = question.answer_source_evidence or question.gold_evidence
-        return source_score(question.answer, question.retrieved_evidence, gold)
+        return source_score(question.answer, question.retrieved_evidence, gold, document_only_score)
 
     @staticmethod
     def _with_combined(item: AutomaticEvaluationItem, weight: float) -> AutomaticEvaluationItem:

@@ -21,7 +21,10 @@ PAGE_TOLERANCE = 1
 """Cited pages within this distance of a gold page count as a hit (PDF vs printed page offsets)."""
 
 DOCUMENT_ONLY_SCORE = 0.5
-"""Score when the cited sources reach the right document but none of the gold pages."""
+"""Score when the cited sources reach the right document but none of the gold pages.
+
+Only meaningful with several documents to choose from; single-document projects pass 0.
+"""
 
 _DATA_BLOCK = re.compile(r"\[\s*Data\s*:([^\]]*)\]", re.IGNORECASE)
 _SOURCES_GROUP = re.compile(r"Sources\s*\(([^)]*)\)", re.IGNORECASE)
@@ -75,12 +78,17 @@ def cited_sources(answer: str, retrieved: Sequence[object]) -> list[dict[str, ob
     ]
 
 
-def source_score(answer: str, retrieved: Sequence[object], gold: Sequence[object]) -> float | None:
+def source_score(
+    answer: str,
+    retrieved: Sequence[object],
+    gold: Sequence[object],
+    document_only_score: float = DOCUMENT_ONLY_SCORE,
+) -> float | None:
     """0–1 score of the cited sources against the gold answer sources; None when not applicable.
 
     * No gold answer sources, or no retrieved text units (e.g. Global Search reports): None.
     * Gold pages: recall of gold pages hit by a cited page (±``PAGE_TOLERANCE``) in the same
-      document; when no page is hit but a cited source is in a gold document, ``DOCUMENT_ONLY_SCORE``.
+      document; when no page is hit but a cited source is in a gold document, ``document_only_score``.
     * Gold documents without pages: 1.0 when any cited source is in that document.
     * An answer that cites nothing resolvable scores 0.
     """
@@ -110,7 +118,7 @@ def source_score(answer: str, retrieved: Sequence[object], gold: Sequence[object
     )
     recall = hits / len(gold_pages)
     if recall == 0 and document_hit:
-        return DOCUMENT_ONLY_SCORE
+        return document_only_score
     return round(recall, 4)
 
 

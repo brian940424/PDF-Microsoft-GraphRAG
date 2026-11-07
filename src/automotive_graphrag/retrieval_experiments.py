@@ -28,6 +28,7 @@ from .automatic_evaluation import (
     extra_error_share,
     judge_panel_summary,
     judge_scores_from_dicts,
+    project_document_only_score,
 )
 from .connections import (
     DEFAULT_REASONING_EFFORT,
@@ -1509,6 +1510,7 @@ class RetrievalExperimentService:
             source_score=source_score(
                 generated.actual_answer, generated.retrieved_evidence,
                 question.answer_source_evidence or question.gold_evidence,
+                project_document_only_score(self.projects, project_id),
             ),
         )
         if enable_llm_judge:
