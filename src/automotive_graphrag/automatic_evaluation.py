@@ -648,11 +648,29 @@ class AutomaticEvaluationService:
         review_by_id = {item.question_id: item for item in reviews}
         payload = asdict(result)
         payload["human_reviews"] = [asdict(item) for item in reviews if item.human_label is not None]
+        question_set = self.question_sets.get(project_id, question_set_id)
+        question_by_id = {item.question_id: item for item in question_set.questions}
         judge_by_id = {item.question_id: item for item in result.items}
         classic_by_id = {item.question_id: item for item in result.classic_items}
         payload["question_results"] = [
             {
                 "question_id": question_id,
+                "question": question_by_id[question_id].question if question_id in question_by_id else "",
+                "expected_answer": question_by_id[question_id].reference_answer if question_id in question_by_id else "",
+                "system_answer": question_by_id[question_id].answer if question_id in question_by_id else "",
+                "answer_sources": [
+                    asdict(source)
+                    for source in (
+                        question_by_id[question_id].answer_source_evidence
+                        or question_by_id[question_id].gold_evidence
+                    )
+                ] if question_id in question_by_id else [],
+                "retrieved_evidence": [
+                    asdict(evidence) for evidence in question_by_id[question_id].retrieved_evidence
+                ] if question_id in question_by_id else [],
+                "routed_method": question_by_id[question_id].routed_method if question_id in question_by_id else "",
+                "routing_reason": question_by_id[question_id].routing_reason if question_id in question_by_id else "",
+                "duration_seconds": question_by_id[question_id].duration_seconds if question_id in question_by_id else None,
                 "is_correct": judge_by_id[question_id].is_correct if question_id in judge_by_id else None,
                 "average_score": judge_by_id[question_id].score if question_id in judge_by_id else None,
                 "source_score": judge_by_id[question_id].source_score if question_id in judge_by_id else None,
@@ -692,7 +710,9 @@ class AutomaticEvaluationService:
             for column in (f"judge_score:{judge_model}", f"judge_reason:{judge_model}")
         ]
         fieldnames = [
-            "question_id", "is_correct", "average_score", "source_score", "combined_score", "manual", "judge_reason",
+            "question_id", "question", "expected_answer", "system_answer", "answer_sources",
+            "retrieved_evidence", "routed_method", "routing_reason", "duration_seconds",
+            "is_correct", "average_score", "source_score", "combined_score", "manual", "judge_reason",
             *judge_columns,
             "answer_em",
             "answer_f1",
@@ -711,6 +731,27 @@ class AutomaticEvaluationService:
             classic = classic_by_id.get(question_id)
             row = {
                 "question_id": question_id,
+                "question": question_by_id[question_id].question if question_id in question_by_id else "",
+                "expected_answer": question_by_id[question_id].reference_answer if question_id in question_by_id else "",
+                "system_answer": question_by_id[question_id].answer if question_id in question_by_id else "",
+                "answer_sources": json.dumps(
+                    [
+                        asdict(source)
+                        for source in (
+                            question_by_id[question_id].answer_source_evidence
+                            or question_by_id[question_id].gold_evidence
+                        )
+                    ] if question_id in question_by_id else [],
+                    ensure_ascii=False,
+                ),
+                "retrieved_evidence": json.dumps(
+                    [asdict(evidence) for evidence in question_by_id[question_id].retrieved_evidence]
+                    if question_id in question_by_id else [],
+                    ensure_ascii=False,
+                ),
+                "routed_method": question_by_id[question_id].routed_method if question_id in question_by_id else "",
+                "routing_reason": question_by_id[question_id].routing_reason if question_id in question_by_id else "",
+                "duration_seconds": question_by_id[question_id].duration_seconds if question_id in question_by_id else None,
                 "is_correct": item.is_correct if item else None,
                 "average_score": item.score if item else None,
                 "source_score": item.source_score if item else None,

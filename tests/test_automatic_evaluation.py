@@ -894,8 +894,11 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         )
         self.assertIn("只重跑前次答錯題目", labels)
         self.assertIn("自動評測 JSON", labels)
+        self.assertIn("評測結果 JSON（按匯出後顯示）", labels)
+        self.assertIn("評測結果 CSV（按匯出後顯示）", labels)
         self.assertIn("檢索並生成回答", button_values)
         self.assertIn("評測回答", button_values)
+        self.assertIn("匯出評測結果（JSON／CSV）", button_values)
         self.assertIn("評測請求並行數", labels)
         self.assertIn("本次回答模型", labels)
         self.assertEqual(sum(label == "回答格式" for label in labels), 1)
@@ -928,6 +931,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             and component.get_config().get("label") == "回答格式"
         ]
         self.assertEqual(len(response_type_dropdowns), 2)
+
+        export_button = next(
+            component for component in app.blocks.values()
+            if hasattr(component, "get_config")
+            and component.get_config().get("value") == "匯出評測結果（JSON／CSV）"
+        )
+        export_event = next(
+            dependency for dependency in app.config["dependencies"]
+            if (export_button._id, "click") in dependency.get("targets", [])
+        )
+        export_handler = app.fns[export_event["id"]].fn
+        self.assertEqual(getattr(export_handler, "__name__", ""), "export_automatic_evaluation")
+        self.assertEqual(len(export_event["inputs"]), 2)
+        self.assertEqual(len(export_event["outputs"]), 3)
         self.assertTrue(all(component.get_config()["value"] == "Single Paragraph"
                             for component in response_type_dropdowns))
         tabs = {
@@ -939,6 +956,43 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertNotIn("新題目集名稱", labels)
         self.assertNotIn("題目集內容（每題均包含問題與答案）", labels)
         self.assertNotIn("將目前問題與編輯後答案加入題目集", button_values)
+
+    def test_autoqa_export_callback_stages_judge_json_and_csv_downloads(self) -> None:
+        service = AutomaticEvaluationService(
+            self.store, self.question_sets, self.connections, FakeJudge([self.judged()])
+        )
+        service.evaluate("L33-SM3E", self.question_set_id, model="gpt-4o-mini", enable_classic_metrics=True)
+        app = create_app(self.store.root)
+        export = next(
+            fn.fn for fn in app.fns.values()
+            if getattr(fn.fn, "__name__", "") == "export_automatic_evaluation"
+        )
+
+        message, json_download, csv_download = export("L33-SM3E", self.question_set_id)
+
+        self.assertIn("已匯出自動評測 JSON 與 CSV", message)
+        json_path, csv_path = Path(json_download), Path(csv_download)
+        self.assertTrue(json_path.is_file())
+        self.assertTrue(csv_path.is_file())
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(payload["question_results"]), 2)
+        first = payload["question_results"][0]
+        self.assertEqual(first["question"], "問題一")
+        self.assertEqual(first["expected_answer"], "參考答案一")
+        self.assertEqual(first["system_answer"], "系統答案1")
+        self.assertEqual(first["answer_sources"][0]["pages"], [21])
+        self.assertTrue(payload["question_results"][0]["judges"])
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["question"], "問題一")
+        self.assertEqual(rows[0]["expected_answer"], "參考答案一")
+        self.assertIn("judge_reason:gpt-4o-mini", rows[0])
+
+        message, json_download, csv_download = export(None, self.question_set_id)
+        self.assertIn("請先選擇專案與題目集", message)
+        self.assertIsNone(json_download)
+        self.assertIsNone(csv_download)
 
 
 if __name__ == "__main__":

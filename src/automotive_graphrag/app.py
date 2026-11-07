@@ -3829,6 +3829,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     wrap=True,
                     visible=False,
                 )
+                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                    autoqa_evaluation_export_button = gr.Button("匯出評測結果（JSON／CSV）")
+                    autoqa_evaluation_json_export = gr.File(
+                        label="評測結果 JSON（按匯出後顯示）",
+                        height=70,
+                        elem_classes=["no-dashed-file"],
+                    )
+                    autoqa_evaluation_csv_export = gr.File(
+                        label="評測結果 CSV（按匯出後顯示）",
+                        height=70,
+                        elem_classes=["no-dashed-file"],
+                    )
                 autoqa_table_refresh = dict(
                     fn=autoqa_result_tables,
                     inputs=[active_project_id, autoqa_question_set_state, autoqa_table, autoqa_judge_detail_model,
@@ -4709,6 +4721,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[autoqa_result, autoqa_summary, autoqa_table, autoqa_judge_progress],
             show_progress="hidden",
         ).then(**autoqa_table_refresh)
+        autoqa_evaluation_export_button.click(
+            export_automatic_evaluation,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=[autoqa_result, autoqa_evaluation_json_export, autoqa_evaluation_csv_export],
+        )
         autoqa_export_button.click(
             export_automatic_question_set,
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
