@@ -45,13 +45,40 @@ from .question_sets import BatchQuestion, QuestionSetService
 from .reviews import ReviewService
 
 
-PROMPT_VERSION = "answer-match-judge-v3"
-EXTRA_CONTENT_RULE = (
-    'Set "extra_content_error" to true only when the answer is not fully correct, yet it contains all '
-    "essential information and steps of the correct answer, and the only reason it loses credit is "
-    "content it added beyond the correct answer. Otherwise set it to false.\n"
+PROMPT_VERSION = "answer-rubric-judge-v1"
+RUBRIC_MAX_LEVEL = 5
+CORRECT_SCORE = 0.8
+"""Question score (0–1) from which an answer counts as correct: rubric level 4."""
+EXTRA_CONTENT_LEVEL = 3
+"""The rubric level that holds answers covering the correct answer but wrong through added content."""
+RUBRIC_PROMPT = """Grade the system answer against the correct answer with this rubric. Pick the highest level whose description fully applies, then apply the caps.
+
+Level 5 (100%): Contains all required information, steps, and conditions, with no substantive error. Paraphrases and format differences are acceptable.
+Level 4 (80%): All core content is correct. Only a minor detail is missing, or a small deviation does not affect the outcome.
+Level 3 (60%): Either (a) the answer states all of the correct answer accurately, and its only fault is content the correct answer does not mention, or (b) the core is correct but one important item is missing.
+Level 2 (40%): About half of the required content is correct.
+Level 1 (20%): Related to the question, but only scattered content is correct.
+Level 0 (0%): Contradicts the correct answer throughout, is off-topic, or gives no answer.
+
+Caps override the levels above. A cap only limits the level and never raises it:
+- A procedure missing a required step scores at most level 3.
+- Steps in the wrong order, where the order affects the outcome, score at most level 2.
+- Core content that contradicts the correct answer scores at most level 1. Changing a value, condition, or step that the correct answer states is a contradiction, not added content, so it can never be level 3 case (a).
+"""
+STRICT_RUBRIC_MODE = (
+    "Mode: strict. Substantive steps or claims that the correct answer does not support "
+    "score at most level 3, even when everything else is correct.\n"
 )
-JUDGMENT_RESULTS = {"correct", "incorrect"}
+LENIENT_RUBRIC_MODE = (
+    "Mode: lenient. Accept synonyms, concise rewording, format changes, and a different order "
+    "when order does not affect the outcome. Do not deduct for detail the correct answer does "
+    "not mention unless that detail makes the answer wrong.\n"
+)
+RUBRIC_OUTPUT = """Set "extra_content_error" to true only for level 3 case (a). Otherwise set it to false.
+Write "reason" in Traditional Chinese. Begin it with the level number, then justify that level: cite the specific content that matches the correct answer, cite what is missing, wrong, or added, and name any cap you applied. Do not only restate the rubric.
+Output only a JSON object in this format:
+{"item":{"question_id":"...","level":0,"extra_content_error":false,"reason":"..."}}
+"""
 logger = logging.getLogger(__name__)
 JudgeClient = Callable[..., object]
 
@@ -102,10 +129,22 @@ class AutomaticEvaluationItem:
 
 @dataclass(frozen=True, slots=True)
 class AutomaticEvaluationGrade:
+    """One judge's rubric verdict for one answer."""
+
     question_id: str
-    score: int
+    level: int
     judge_reason: str
     extra_content_error: bool = False
+
+    @property
+    def rubric_score(self) -> float:
+        """Rubric level on the 0–1 scale."""
+        return round(self.level / RUBRIC_MAX_LEVEL, 4)
+
+    @property
+    def score(self) -> float:
+        """Rubric level on the 0–2 scale that retrieval experiments store."""
+        return round(self.rubric_score * 2, 4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +331,7 @@ class AutomaticEvaluationService:
 
         models = self.validate_judge_models(model) if enable_llm_judge else ()
         prompt = (
-            "\n\n---\n\n".join(self._build_prompt([item]) for item in eligible)
+            "\n\n---\n\n".join(self._build_prompt(item) for item in eligible)
             if enable_llm_judge else ""
         )
         judged_by_id: dict[str, AutomaticEvaluationItem] = {}
@@ -324,7 +363,7 @@ class AutomaticEvaluationService:
                     try:
                         single = future.result()
                         verdicts[question.question_id][judge_model] = JudgeScore(
-                            judge_model, 1.0 if single.is_correct else 0.0, single.judge_reason,
+                            judge_model, single.score, single.judge_reason,
                             extra_content_error=single.extra_content_error,
                         )
                     except Exception as exc:
@@ -349,7 +388,7 @@ class AutomaticEvaluationService:
                 source = self._question_source_score(question)
                 judged_by_id[question.question_id] = AutomaticEvaluationItem(
                     question_id=question.question_id,
-                    is_correct=average >= 0.5,
+                    is_correct=average >= CORRECT_SCORE,
                     judge_reason=combined_judge_reason(judges),
                     judges=judges,
                     average_score=average,
@@ -472,62 +511,80 @@ class AutomaticEvaluationService:
         """Judge one answer without retrieval evidence or shared question-set mutation."""
         if not self.supports_judge_model(model):
             raise ProjectError(self._unsupported_model_message(model))
-        if evaluation_mode not in {"strict", "lenient"}:
-            raise ProjectError("不支援的評分方式")
-        case = BatchQuestion(
-            question_id=question_id,
-            question=question,
-            reference_answer=correct_answer,
-            answer=system_answer,
+        verdict = self._judge_answer(
+            project_id,
+            BatchQuestion(
+                question_id=question_id,
+                question=question,
+                reference_answer=correct_answer,
+                answer=system_answer,
+            ),
+            model, evaluation_mode, reasoning_effort,
         )
-        prompt = self._build_prompt([case], evaluation_mode)
-        response = self._call_judge(project_id, model, prompt, reasoning_effort)
-        return self._parse_response(response, [case])[0]
+        return AutomaticEvaluationItem(
+            question_id=question_id,
+            is_correct=verdict.rubric_score >= CORRECT_SCORE,
+            judge_reason=verdict.judge_reason,
+            average_score=verdict.rubric_score,
+            extra_content_error=verdict.extra_content_error,
+        )
 
     def evaluate_single_answer_grade(
         self, project_id: str, question_id: str, question: str, correct_answer: str,
         system_answer: str, model: str, evaluation_mode: str = "strict",
         reasoning_effort: str = "medium",
     ) -> AutomaticEvaluationGrade:
-        """Three-level evaluation for retrieval experiments only (0 incorrect, 1 partial, 2 full)."""
+        """Rubric verdict for retrieval experiments, which store its 0–2 ``score``."""
         if not self.supports_judge_model(model):
             raise ProjectError(self._unsupported_model_message(model))
+        case = BatchQuestion(question_id, question, correct_answer, answer=system_answer)
+        return self._judge_answer(project_id, case, model, evaluation_mode, reasoning_effort)
+
+    def _judge_answer(
+        self, project_id: str, case: BatchQuestion, model: str, evaluation_mode: str, reasoning_effort: str,
+    ) -> AutomaticEvaluationGrade:
         if evaluation_mode not in {"strict", "lenient"}:
             raise ProjectError("不支援的評分方式")
-        case = BatchQuestion(question_id, question, correct_answer, answer=system_answer)
-        prompt = self._build_grade_prompt(case, evaluation_mode)
-        response = self._call_judge(project_id, model, prompt, reasoning_effort)
-        if isinstance(response, str):
-            response = extract_json_object(response)
-            if response is None:
-                raise ProjectError("三段評測結果不是有效 JSON")
-        raw = response.get("item") if isinstance(response, dict) else None
-        if not isinstance(raw, dict) or raw.get("question_id") != question_id:
-            raise ProjectError("三段評測結果缺少正確的 question_id")
-        score = raw.get("result")
-        if isinstance(score, str) and score.isdigit():
-            score = int(score)
-        if isinstance(score, bool) or score not in {0, 1, 2}:
-            raise ProjectError(f"{question_id} 的 result 必須是 0、1 或 2")
-        reason = raw.get("reason")
-        if not isinstance(reason, str) or not reason.strip():
-            raise ProjectError(f"{question_id} 缺少評判理由")
-        return AutomaticEvaluationGrade(
-            question_id, score, reason.strip(), score != 2 and raw.get("extra_content_error") is True
+        response = self._call_judge(project_id, model, self._build_prompt(case, evaluation_mode), reasoning_effort)
+        return self._parse_verdict(response, case.question_id)
+
+    @staticmethod
+    def _build_prompt(case: BatchQuestion, evaluation_mode: str = "strict") -> str:
+        evaluation_case = {
+            "question_id": case.question_id,
+            "question": case.question,
+            "correct_answer": case.reference_answer,
+            "system_answer": case.answer,
+        }
+        return (
+            "You are an answer grader. Judge only from the question, correct answer, and system answer "
+            "below. Do not use outside knowledge or retrieval evidence.\n\n"
+            f"{RUBRIC_PROMPT}\n"
+            f"{LENIENT_RUBRIC_MODE if evaluation_mode == 'lenient' else STRICT_RUBRIC_MODE}\n"
+            f"{RUBRIC_OUTPUT}\n"
+            f"Evaluation case: {json.dumps(evaluation_case, ensure_ascii=False)}"
         )
 
     @staticmethod
-    def _build_grade_prompt(case: BatchQuestion, evaluation_mode: str) -> str:
-        mode = "採較寬鬆語意理解，同義改寫及不改變正解的合理補充可接受。" if evaluation_mode == "lenient" else "採嚴格比對，不可缺少正解的必要資訊或步驟，也不可增加會導致錯誤的實質內容。"
-        return (
-            "你是答案比對員，只根據題目、正確答案和系統回答評判，不得使用外部知識或檢索證據。"
-            f"{mode}請分三等級：0=錯誤（核心內容錯誤、矛盾，或幾乎未答對）；"
-            "1=部分對（有正確核心內容，但仍缺少重要資訊／必要步驟，或有局部錯誤）；"
-            "2=全對（正確答案的所有必要資訊、條件與步驟均完整且無實質錯誤）。"
-            "流程題若漏任何必要步驟，不可評 2；若已答對部分步驟評 1。"
-            f"\n{EXTRA_CONTENT_RULE}"
-            '只輸出 JSON：{"item":{"question_id":"...","result":0或1或2,"extra_content_error":true或false,"reason":"..."}}。'
-            f"理由簡短說明評級依據。案例：{json.dumps({'question_id':case.question_id,'question':case.question,'correct_answer':case.reference_answer,'system_answer':case.answer}, ensure_ascii=False)}"
+    def _parse_verdict(response: object, question_id: str) -> AutomaticEvaluationGrade:
+        if isinstance(response, str):
+            response = extract_json_object(response)
+            if response is None:
+                raise ProjectError("自動評測結果不是有效 JSON")
+        raw = response.get("item") if isinstance(response, dict) else None
+        if not isinstance(raw, dict) or raw.get("question_id") != question_id:
+            raise ProjectError("自動評測結果缺少正確的 question_id")
+        level = raw.get("level")
+        if isinstance(level, str) and level.isdigit():
+            level = int(level)
+        if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= RUBRIC_MAX_LEVEL:
+            raise ProjectError(f"{question_id} 的 level 必須是 0 到 {RUBRIC_MAX_LEVEL} 的整數")
+        reason = raw.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ProjectError(f"{question_id} 缺少評分理由")
+        return AutomaticEvaluationGrade(
+            question_id, level, reason.strip(),
+            level == EXTRA_CONTENT_LEVEL and raw.get("extra_content_error") is True,
         )
 
     def last_result(self, project_id: str, question_set_id: str) -> AutomaticEvaluationResult | None:
@@ -606,7 +663,7 @@ class AutomaticEvaluationService:
                 items.append(item)
                 continue
             items.append(self._with_combined(
-                replace(item, is_correct=score >= 0.5, average_score=score, manual=True), result.source_weight
+                replace(item, is_correct=score >= CORRECT_SCORE, average_score=score, manual=True), result.source_weight
             ))
         updated = replace(
             result,
@@ -788,80 +845,6 @@ class AutomaticEvaluationService:
             writer.writerow(row)
         self._atomic_text(csv_path, buffer.getvalue())
         return json_path, csv_path
-
-    @staticmethod
-    def _build_prompt(questions: list[BatchQuestion], evaluation_mode: str = "strict") -> str:
-        cases = [
-            {
-                "question_id": item.question_id,
-                "question": item.question,
-                "correct_answer": item.reference_answer,
-                "system_answer": item.answer,
-            }
-            for item in questions
-        ]
-        if evaluation_mode == "lenient":
-            criteria = (
-                "使用寬鬆的語意比對：若系統回答已表達正確答案的全部核心資訊與必要步驟，判為 correct。"
-                "必須接受同義詞、語序或格式差異、簡潔改寫，以及不改變正解含義的合理補充。\n"
-                "不要要求逐字包含正確答案，也不要只因回答比正確答案更詳細、包含正確答案未提到的背景或補充資訊，就判為 incorrect。"
-                "只有在回答漏掉核心資訊／必要步驟、與正確答案的核心內容矛盾，或額外內容明確使答案變成錯誤時，才判為 incorrect。\n"
-                "流程題仍須涵蓋所有必要步驟；只有當順序會影響結果時才要求相同順序。非流程題以是否傳達正確答案的核心意思為準。\n"
-            )
-        else:
-            criteria = (
-                "若系統回答與正確答案表達的內容一致，且完整包含所有必要步驟、條件、順序與要求，判為 correct。\n"
-                "只要缺少必要內容／步驟、步驟順序錯誤、與正確答案矛盾，或加入正確答案未支持的額外步驟／實質資訊，判為 incorrect。"
-                "不要求字面完全相同；同義改寫可接受，但不能因此省略或新增實質內容。非流程型答案也不得缺漏或添加實質主張。\n"
-            )
-        return (
-            "你是答案比對員。只根據每筆資料中的題目、正確答案和系統回答判斷，不得使用外部知識或任何檢索證據。\n"
-            f"{criteria}"
-            f"{EXTRA_CONTENT_RULE}"
-            "只輸出 JSON object，格式為 "
-            '{"items":[{"question_id":"...","result":"correct或incorrect","extra_content_error":true或false,"reason":"..."}]}。'
-            "每個輸入題號必須恰好出現一次。reason 簡短指出符合之處，或具體缺漏、矛盾、錯誤。\n"
-            f"評測案例：{json.dumps(cases, ensure_ascii=False)}"
-        )
-
-    @staticmethod
-    def _parse_response(
-        response: object, questions: list[BatchQuestion]
-    ) -> list[AutomaticEvaluationItem]:
-        if isinstance(response, str):
-            response = extract_json_object(response)
-            if response is None:
-                raise ProjectError("自動評測結果不是有效 JSON")
-        if not isinstance(response, dict) or not isinstance(response.get("items"), list):
-            raise ProjectError("自動評測結果缺少 items 陣列")
-        raw_items = response["items"]
-        question_by_id = {item.question_id: item for item in questions}
-        if len(raw_items) != len(question_by_id):
-            raise ProjectError("Judge 回傳題數與預期不符")
-        result: list[AutomaticEvaluationItem] = []
-        seen: set[str] = set()
-        for raw in raw_items:
-            if not isinstance(raw, dict):
-                raise ProjectError("Judge 回傳項目格式錯誤")
-            question_id = raw.get("question_id")
-            judgment = raw.get("result")
-            reason = raw.get("reason")
-            if not isinstance(question_id, str) or question_id not in question_by_id or question_id in seen:
-                raise ProjectError("Judge 回傳未知或重複的 question_id")
-            if not isinstance(judgment, str) or judgment not in JUDGMENT_RESULTS:
-                raise ProjectError(f"{question_id} 的 result 必須是 correct 或 incorrect")
-            if not isinstance(reason, str) or not reason.strip():
-                raise ProjectError(f"{question_id} 缺少 Judge reason")
-            result.append(
-                AutomaticEvaluationItem(
-                    question_id=question_id,
-                    is_correct=judgment == "correct",
-                    judge_reason=reason.strip(),
-                    extra_content_error=judgment == "incorrect" and raw.get("extra_content_error") is True,
-                )
-            )
-            seen.add(question_id)
-        return result
 
     @staticmethod
     def _unsupported_model_message(model: object) -> str:

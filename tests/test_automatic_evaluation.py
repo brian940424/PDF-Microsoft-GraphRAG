@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import re
 import os
 import tempfile
 import threading
@@ -63,6 +64,10 @@ class AnswerRunner:
         )
 
 
+def case_id(prompt: str) -> str:
+    return json.loads(prompt.split("Evaluation case:", 1)[1])["question_id"]
+
+
 class FakeJudge:
     def __init__(self, responses: list[object]) -> None:
         self.responses = responses
@@ -71,8 +76,7 @@ class FakeJudge:
         self.calls_by_question: dict[str, int] = {}
 
     def __call__(self, base_url: str, api_key: str, model: str, prompt: str) -> object:
-        cases = json.loads(prompt.split("評測案例：", 1)[1])
-        question_id = cases[0]["question_id"]
+        question_id = case_id(prompt)
         with self.lock:
             self.calls.append((base_url, api_key, model, prompt))
             response_index = self.calls_by_question.get(question_id, 0)
@@ -80,7 +84,7 @@ class FakeJudge:
             response = self.responses[min(response_index, len(self.responses) - 1)]
         if isinstance(response, dict) and isinstance(response.get("items"), list):
             matching = [item for item in response["items"] if item.get("question_id") == question_id]
-            return {"items": matching or response["items"]}
+            return {"item": (matching or response["items"])[0]}
         return response
 
 
@@ -137,13 +141,13 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             "items": [
                 {
                     "question_id": "Q0001",
-                    "result": "incorrect" if q1_score < 4 else "correct",
+                    "level": 3 if extra_content_error else (0 if q1_score < 4 else 5),
                     "reason": "第一題評語",
                     "extra_content_error": extra_content_error,
                 },
                 {
                     "question_id": "Q0002",
-                    "result": "correct",
+                    "level": 5,
                     "reason": "第二題評語",
                     "extra_content_error": True,  # ignored: a correct answer never earns a bonus
                 },
@@ -167,8 +171,8 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertNotIn("汽車維修", result.judge_prompt)
         self.assertNotIn("answer_score", result.judge_prompt)
         self.assertNotIn("evidence_support_score", result.judge_prompt)
-        self.assertIn("必要步驟", result.judge_prompt)
-        self.assertIn("額外步驟", result.judge_prompt)
+        self.assertIn("missing a required step", result.judge_prompt)
+        self.assertIn("Mode: strict", result.judge_prompt)
         self.assertEqual(service.last_result("L33-SM3E", self.question_set_id), result)
 
         ReviewService(self.store, self.question_sets).save(
@@ -202,7 +206,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             {(url, key, model) for url, key, model, _prompt in judge.calls},
             {("http://localhost:4000/v1", "sk-litellm", "claude-judge")},
         )
-        grade_judge = lambda *_args, **_kwargs: {"item": {"question_id": "Q0001", "result": 2, "reason": "ok"}}
+        grade_judge = lambda *_args, **_kwargs: {"item": {"question_id": "Q0001", "level": 5, "reason": "ok"}}
         service.client = grade_judge
         grade = service.evaluate_single_answer_grade(
             "L33-SM3E", "Q0001", "問題一", "參考答案一", "系統答案1", "claude-judge"
@@ -215,20 +219,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
     def test_judge_panel_scores_every_question_with_each_model_and_averages(self) -> None:
         verdicts = {
-            ("gpt-4.1-mini", "Q0001"): "correct", ("gpt-4.1-mini", "Q0002"): "correct",
-            ("claude-judge", "Q0001"): "incorrect", ("claude-judge", "Q0002"): "correct",
-            ("gemini-flash", "Q0002"): "correct",
+            ("gpt-4.1-mini", "Q0001"): 5, ("gpt-4.1-mini", "Q0002"): 5,
+            ("claude-judge", "Q0001"): 0, ("claude-judge", "Q0002"): 5,
+            ("gemini-flash", "Q0002"): 5,
         }
         prompts: dict[str, set[str]] = {}
         lock = threading.Lock()
 
         def client(_url, _key, model, prompt, reasoning_effort="medium"):
-            question_id = json.loads(prompt.split("評測案例：", 1)[1])[0]["question_id"]
+            question_id = case_id(prompt)
             with lock:
                 prompts.setdefault(question_id, set()).add(prompt)
             if (model, question_id) not in verdicts:
                 raise RuntimeError("proxy timeout")
-            return {"items": [{"question_id": question_id, "result": verdicts[(model, question_id)], "reason": model}]}
+            return {"item": {"question_id": question_id, "level": verdicts[(model, question_id)], "reason": model}}
         self.connections.save("http://localhost:4000", "sk", "claude-judge", "text-embedding-3-small", ["gpt-4.1-mini", "claude-judge", "gemini-flash"], [])
         service = AutomaticEvaluationService(
             self.store, self.question_sets, self.connections, client
@@ -394,10 +398,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
     def test_question_fails_only_when_every_judge_fails(self) -> None:
         def client(_url, _key, model, prompt):
-            question_id = json.loads(prompt.split("評測案例：", 1)[1])[0]["question_id"]
+            question_id = case_id(prompt)
             if question_id == "Q0001":
                 raise RuntimeError(f"{model} down")
-            return {"items": [{"question_id": question_id, "result": "correct", "reason": "ok"}]}
+            return {"item": {"question_id": question_id, "level": 5, "reason": "ok"}}
 
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, client)
         with self.assertRaisesRegex(ProjectError, "Q0001: gpt-4o-mini .*gpt-4.1-mini"):
@@ -435,7 +439,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
         def client(_url, _key, model, _prompt, reasoning_effort="medium"):
             efforts.append((model, reasoning_effort))
-            return {"item": {"question_id": "Q0001", "result": 1, "reason": "partial"}}
+            return {"item": {"question_id": "Q0001", "level": 2, "reason": "partial"}}
 
         service = AutomaticEvaluationService(
             self.store, self.question_sets, self.connections, client
@@ -447,7 +451,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(efforts, [("claude-judge", "high"), ("plain", None)])
 
     def test_plain_text_judge_reply_extracts_first_json_object(self) -> None:
-        reply = '判定如下：\n```json\n{"item": {"question_id": "Q0001", "result": 2, "reason": "ok"}}\n```'
+        reply = '判定如下：\n```json\n{"item": {"question_id": "Q0001", "level": 5, "reason": "ok"}}\n```'
         service = AutomaticEvaluationService(
             self.store, self.question_sets, self.connections, lambda *_args, **_kwargs: reply
         )
@@ -669,21 +673,54 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
         self.assertTrue(result.is_correct)
         prompt = judge.calls[0][3]
-        self.assertIn("使用寬鬆的語意比對", prompt)
-        self.assertIn("必須接受同義詞", prompt)
-        self.assertIn("不要只因回答比正確答案更詳細", prompt)
-        self.assertNotIn("額外步驟／實質資訊，判為 incorrect", prompt)
+        self.assertIn("Mode: lenient", prompt)
+        self.assertNotIn("Mode: strict", prompt)
         self.assertNotIn('"retrieved_evidence"', prompt)
 
     def test_strict_and_lenient_prompts_have_distinct_criteria(self) -> None:
         question = BatchQuestion("Q1", "問題", "標準答案", answer="回答")
-        strict = AutomaticEvaluationService._build_prompt([question])
-        lenient = AutomaticEvaluationService._build_prompt([question], "lenient")
+        strict = AutomaticEvaluationService._build_prompt(question)
+        lenient = AutomaticEvaluationService._build_prompt(question, "lenient")
 
-        self.assertIn("加入正確答案未支持的額外步驟／實質資訊", strict)
-        self.assertIn("合理補充", lenient)
-        self.assertIn("只有在回答漏掉核心資訊", lenient)
-        self.assertNotIn("額外步驟／實質資訊，判為 incorrect", lenient)
+        self.assertIn("Mode: strict", strict)
+        self.assertIn("Mode: lenient", lenient)
+        for prompt in (strict, lenient):
+            for level in range(6):
+                self.assertIn(f"Level {level} (", prompt)
+            self.assertIn("Write \"reason\" in Traditional Chinese", prompt)
+            self.assertIn("is a contradiction, not added content", prompt)
+
+    def test_prompt_instructions_are_english_and_only_case_data_keeps_its_language(self) -> None:
+        question = BatchQuestion("Q1", "問題", "標準答案", answer="回答")
+        for mode in ("strict", "lenient"):
+            prompt = AutomaticEvaluationService._build_prompt(question, mode)
+            instructions = prompt.split("Evaluation case:", 1)[0]
+            self.assertIsNone(re.search(r"[\u3400-\u9fff]", instructions))
+            self.assertNotIn("retrieved_evidence", prompt)
+
+    def test_levels_map_to_scores_and_correctness_starts_at_level_four(self) -> None:
+        for level, score, grade, correct in (
+            (5, 1.0, 2.0, True), (4, 0.8, 1.6, True), (3, 0.6, 1.2, False),
+            (2, 0.4, 0.8, False), (1, 0.2, 0.4, False), (0, 0.0, 0.0, False),
+        ):
+            service = AutomaticEvaluationService(
+                self.store, self.question_sets, self.connections,
+                lambda *_args, **_kwargs: {"item": {"question_id": "Q1", "level": level, "reason": "依據"}},
+            )
+            args = ("L33-SM3E", "Q1", "題目", "答案", "回答", "gpt-4o-mini")
+            item = service.evaluate_single_answer(*args)
+            self.assertEqual((item.score, item.is_correct, item.judge_reason), (score, correct, "依據"))
+            self.assertEqual(service.evaluate_single_answer_grade(*args).score, grade)
+
+    def test_rejects_invalid_level_and_missing_reason(self) -> None:
+        parse = AutomaticEvaluationService._parse_verdict
+        self.assertEqual(parse({"item": {"question_id": "Q1", "level": "4", "reason": "r"}}, "Q1").level, 4)
+        for level in (6, -1, 2.5, True, None, "high"):
+            with self.assertRaisesRegex(ProjectError, "level 必須是 0 到 5"):
+                parse({"item": {"question_id": "Q1", "level": level, "reason": "r"}}, "Q1")
+        for reason in ("", "  ", None):
+            with self.assertRaisesRegex(ProjectError, "缺少評分理由"):
+                parse({"item": {"question_id": "Q1", "level": 5, "reason": reason}}, "Q1")
 
     def test_only_previous_failures_rejudges_subset_and_merges_result(self) -> None:
         second_response = {"items": [self.judged(5)["items"][0]]}
@@ -707,12 +744,12 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
     def test_rejects_invalid_or_invented_judge_result(self) -> None:
         response = {
-            "items": [{"question_id": "INVENTED", "result": "correct", "reason": "錯誤題號"}]
+            "items": [{"question_id": "INVENTED", "level": 5, "reason": "錯誤題號"}]
         }
         judge = FakeJudge([response])
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
 
-        with self.assertRaisesRegex(ProjectError, "未知或重複"):
+        with self.assertRaisesRegex(ProjectError, "正確的 question_id"):
             service.evaluate("L33-SM3E", self.question_set_id)
 
     def test_evaluation_concurrency_limits_parallel_requests(self) -> None:
@@ -723,15 +760,14 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
                 self.lock = threading.Lock()
 
             def __call__(self, base_url, api_key, model, prompt):
-                cases = json.loads(prompt.split("評測案例：", 1)[1])
-                question_id = cases[0]["question_id"]
+                question_id = case_id(prompt)
                 with self.lock:
                     self.active += 1
                     self.maximum = max(self.maximum, self.active)
                 time.sleep(0.02)
                 with self.lock:
                     self.active -= 1
-                return {"items": [{"question_id": question_id, "result": "correct", "reason": "符合"}]}
+                return {"item": {"question_id": question_id, "level": 5, "reason": "符合"}}
 
         judge = SlowJudge()
         service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
@@ -760,10 +796,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
 
         # Both answers cite the gold page; Q1 is wrong only through added content, Q2 is correct.
         self.assertEqual([item.source_score for item in result.items], [1.0, 1.0])
-        self.assertEqual([item.combined_score for item in result.items], [0.1, 1.0])
+        self.assertEqual([item.combined_score for item in result.items], [0.7, 1.0])
         self.assertEqual(result.source_weight, 0.1)
         self.assertEqual(result.average_source_score, 1.0)
-        self.assertEqual(result.average_combined_score, 0.55)
+        self.assertEqual(result.average_combined_score, 0.85)
         self.assertEqual(result.correct_count, 1)  # correctness still follows the judge only
 
         updated = service.update_manual_results("L33-SM3E", self.question_set_id, {"Q0001": 1})
@@ -773,13 +809,13 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(partial.items[0].combined_score, 0.5)  # a manual score is final
 
         weighted = service.evaluate("L33-SM3E", self.question_set_id, source_weight=0.5)
-        self.assertEqual(weighted.items[0].combined_score, 0.5)
+        self.assertEqual(weighted.items[0].combined_score, 1.0)
         with self.assertRaisesRegex(ProjectError, "0 到 1"):
             service.evaluate("L33-SM3E", self.question_set_id, source_weight=2)
 
         json_path, csv_path = service.export("L33-SM3E", self.question_set_id)
         payload = json.loads(json_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["summary"]["average_combined_score"], 0.75)
+        self.assertEqual(payload["summary"]["average_combined_score"], 1.0)
         with csv_path.open(encoding="utf-8", newline="") as source:
             rows = list(csv.DictReader(source))
         self.assertEqual(rows[0]["source_score"], "1.0")
@@ -816,19 +852,20 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
     def test_prompts_ask_for_the_extra_content_flag(self) -> None:
         question = BatchQuestion("Q1", "題目", "答案", answer="回答")
         for mode in ("strict", "lenient"):
-            self.assertIn("extra_content_error", AutomaticEvaluationService._build_prompt([question], mode))
-            self.assertIn("extra_content_error", AutomaticEvaluationService._build_grade_prompt(question, mode))
+            self.assertIn("extra_content_error", AutomaticEvaluationService._build_prompt(question, mode))
 
-    def test_grade_flag_is_ignored_for_a_full_grade(self) -> None:
-        def respond(score, flag):
+    def test_extra_content_flag_only_counts_at_level_three(self) -> None:
+        def respond(level, flag):
             return lambda *args: {"item": {
-                "question_id": "Q1", "result": score, "reason": "r", "extra_content_error": flag,
+                "question_id": "Q1", "level": level, "reason": "r", "extra_content_error": flag,
             }}
 
-        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, respond(2, True))
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, respond(5, True))
         args = ("L33-SM3E", "Q1", "題目", "答案", "回答", self.connections.get_chat_model())
         self.assertFalse(service.evaluate_single_answer_grade(*args).extra_content_error)
-        service.client = respond(1, True)
+        service.client = respond(2, True)
+        self.assertFalse(service.evaluate_single_answer_grade(*args).extra_content_error)
+        service.client = respond(3, True)
         self.assertTrue(service.evaluate_single_answer_grade(*args).extra_content_error)
 
     def test_uncited_answers_score_zero_source_and_legacy_records_fall_back(self) -> None:

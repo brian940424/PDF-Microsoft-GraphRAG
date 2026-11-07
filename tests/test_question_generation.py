@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from dataclasses import replace
@@ -99,8 +100,11 @@ class QuestionGenerationServiceTests(unittest.TestCase):
         self.assertEqual(batch.questions[0].gold_evidence[0].chunk_ids, (sample_ids[0],))
         self.assertEqual(service.get("L33-SM3E", batch.generation_batch_id), batch)
         self.assertLess(len(client.calls[0][3]), 3000)
-        self.assertIn("必須使用繁體中文", client.calls[0][3])
-        self.assertIn("參考答案要完整且具體", client.calls[0][3])
+        prompt = client.calls[0][3]
+        self.assertIn("in Traditional Chinese", prompt)
+        instructions = prompt.split("Sources:", 1)[0]
+        self.assertIsNone(re.search(r"[\u3400-\u9fff]", instructions))
+        self.assertIn("Reference answers must be complete and specific", client.calls[0][3])
 
     def test_generate_rejects_unknown_source_id_from_model(self) -> None:
         client = FakeGenerationClient(
@@ -154,7 +158,7 @@ class QuestionGenerationServiceTests(unittest.TestCase):
 
         self.assertEqual(client.calls[0][2], "gpt-4.1-mini")
         self.assertEqual(len(client.calls), 1)
-        self.assertIn("生成 1 題", client.calls[0][3])
+        self.assertIn("Generate 1 questions", client.calls[0][3])
         self.assertEqual(len(questions), 1)
         self.assertEqual(questions[0].gold_evidence[0].document_id, "WW.pdf")
 

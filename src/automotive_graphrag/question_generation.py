@@ -164,7 +164,8 @@ class QuestionGenerationService:
         )
         if excluded_questions:
             prompt += (
-                "\n以下既有題目禁止重複或只換同義詞，請生成不同考點的問題："
+                "\nDo not repeat these existing questions or merely reword them with synonyms. "
+                "Generate questions that test different points: "
                 + json.dumps(list(excluded_questions), ensure_ascii=False)
             )
         api_key = self.connections.apply_to_environment(project_id)
@@ -307,18 +308,25 @@ class QuestionGenerationService:
             for item in batch.samples
         ]
         return (
-            "你是汽車維修手冊題目設計器。只能使用提供的原文，不可加入外部知識。\n"
-            "問題與參考答案必須使用繁體中文；零件名稱、縮寫、DTC、單位與原廠術語可保留英文。"
-            "不得因翻譯加入原文沒有的資訊。\n"
-            f"生成 {count} 題，難度固定為 {difficulty}。問題不可直接暴露答案；參考答案必須可由引用原文完整支持。\n"
-            "參考答案要完整且具體，不可只給一句結論或過度簡化；整理原文中直接回答問題的必要細節。"
-            "若原文有，必須保留操作步驟與順序、前置條件、判定標準、數值與單位、注意事項及警告；"
-            "適合時用條列或編號呈現。只在原文本身資訊有限時才給簡短答案，不可為了增加長度加入原文未載內容。\n"
-            "只輸出 JSON object，格式為 "
+            "You design questions from automotive service manuals. Use only the supplied source text "
+            "and do not add outside knowledge.\n"
+            "Write every question and reference answer in Traditional Chinese. Part names, abbreviations, "
+            "DTCs, units, and OEM terminology may stay in English. Do not introduce information that is "
+            "absent from the source text while translating.\n"
+            f"Generate {count} questions at the fixed difficulty {difficulty}. A question must not directly "
+            "reveal its answer. Each reference answer must be fully supported by the cited source text.\n"
+            "Reference answers must be complete and specific, not a one-sentence conclusion or an "
+            "oversimplification. Organize the details from the source text that directly answer the question. "
+            "When the source text has them, keep procedure steps and their order, preconditions, acceptance "
+            "criteria, values and units, cautions, and warnings. Use bullets or numbered lists when suitable. "
+            "Give a short answer only when the source text itself has limited information, and never add "
+            "content absent from the source text to increase length.\n"
+            "Output only a JSON object in this format: "
             '{"questions":[{"question":"...","reference_answer":"...","question_source_sample_ids":["..."],'
-            '"answer_source_sample_ids":["..."]}]}。\n'
-            "simple 每題只能引用一筆來源；medium 每題至少兩筆來源；cross_section 每題至少引用兩個不同 section。\n"
-            f"來源：{json.dumps(sources, ensure_ascii=False)}"
+            '"answer_source_sample_ids":["..."]}]}\n'
+            "For simple, each question cites exactly one source. For medium, each question cites at least two "
+            "sources. For cross_section, each question cites at least two different sections.\n"
+            f"Sources: {json.dumps(sources, ensure_ascii=False)}"
         )
 
     def _parse_response(
