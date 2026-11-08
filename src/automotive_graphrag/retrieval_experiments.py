@@ -47,7 +47,8 @@ from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
-from .strategy_routing import SearchOutcome, StrategyRouter, search_with_fallback
+from .answer_prompts import install_answer_prompts
+from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
@@ -1373,7 +1374,9 @@ class RetrievalExperimentService:
                         answer_value, context_value = run_strategy(strategy)
                     except Exception as exc:
                         return SearchOutcome("", str(exc))
-                    return SearchOutcome(str(answer_value), None, context_value)
+                    return SearchOutcome(
+                        str(answer_value), None, context_value, context_source_count(context_value),
+                    )
 
                 fallback = search_with_fallback(
                     self.router.route(question.question, group.answer_model, api_base, api_key, effort),
@@ -1857,6 +1860,7 @@ class RetrievalExperimentService:
 
         with tempfile.TemporaryDirectory(prefix="graphrag-experiment-") as temporary:
             root = Path(temporary)
+            install_answer_prompts(settings, root)
             (root / "settings.yaml").write_text(yaml.safe_dump(settings, allow_unicode=True, sort_keys=False), encoding="utf-8")
             (root / "output").symlink_to(project_path / "output", target_is_directory=True)
             worker_payload = json.dumps(

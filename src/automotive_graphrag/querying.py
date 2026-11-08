@@ -24,7 +24,8 @@ from .connections import ConnectionSettings, configure_completion_model, configu
 from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
-from .strategy_routing import SearchOutcome, StrategyRouter, search_with_fallback
+from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
+from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
@@ -128,7 +129,7 @@ class QueryService:
             "reasoning_effort": reasoning_effort,
             "response_type": response_type,
             "requested_method": requested_method,
-            "prompt_version": None,
+            "prompt_version": ANSWER_PROMPT_VERSION,
             "model_call_count": None,
             "estimated_cost_usd": None,
             "cost_status": "unknown_usage_not_returned_by_query_adapter",
@@ -151,7 +152,10 @@ class QueryService:
                     return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
                 if execution.returncode != 0:
                     return SearchOutcome("", self._last_error(execution), execution)
-                return SearchOutcome((execution.stdout or "").strip(), None, execution)
+                return SearchOutcome(
+                    (execution.stdout or "").strip(), None, execution,
+                    context_source_count(getattr(execution, "context", None)),
+                )
 
             fallback = search_with_fallback(
                 self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort),
@@ -386,6 +390,7 @@ class QueryService:
             configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
             configure_embedding_model(model, embedding_model)
+        install_answer_prompts(value, settings_path.parent)
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:

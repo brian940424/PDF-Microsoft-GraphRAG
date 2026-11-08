@@ -5,11 +5,14 @@ from pathlib import Path
 from automotive_graphrag.app import create_app
 from automotive_graphrag.projects import ProjectError
 from automotive_graphrag.strategy_routing import (
+    ANSWER_CHECK_PROMPT,
     AnswerCheck,
+    LOCAL_MIN_SOURCES,
     NOT_FOUND_ANSWER,
     SearchOutcome,
     StrategyDecision,
     StrategyRouter,
+    context_source_count,
     search_with_fallback,
 )
 
@@ -158,6 +161,67 @@ class SearchWithFallbackTests(unittest.TestCase):
         self.assertFalse(result.found)
         self.assertEqual((result.method, result.outcome.answer), ("basic", NOT_FOUND_ANSWER))
         self.assertIsNone(result.outcome.error)
+
+    def test_local_with_too_few_sources_falls_back_without_checking(self) -> None:
+        checked: list[str] = []
+
+        def search(method: str) -> SearchOutcome:
+            if method == "local":
+                return SearchOutcome("來源未說明，只提到相簿群組", source_count=LOCAL_MIN_SOURCES - 1)
+            return SearchOutcome("聯絡人群組步驟", source_count=2)
+
+        def check(answer: str) -> AnswerCheck:
+            checked.append(answer)
+            return AnswerCheck(True, "ok")
+
+        result = search_with_fallback(StrategyDecision("local", "原因"), search, check)
+
+        self.assertEqual((result.method, result.found), ("basic", True))
+        self.assertEqual(checked, ["聯絡人群組步驟"])
+        self.assertEqual(result.attempts[0]["status"], "not_found")
+        self.assertIn(f"只取得 {LOCAL_MIN_SOURCES - 1} 個原文段落", result.attempts[0]["detail"])
+        self.assertIn("Local 未找到答案，改用 Basic 找到答案", result.reason)
+
+    def test_local_with_enough_or_unknown_sources_is_checked_normally(self) -> None:
+        for count in (LOCAL_MIN_SOURCES, None):
+            with self.subTest(count=count):
+                tried: list[str] = []
+
+                def search(method: str) -> SearchOutcome:
+                    tried.append(method)
+                    return SearchOutcome("答案", source_count=count)
+
+                result = search_with_fallback(
+                    StrategyDecision("local", "原因"), search, lambda _: AnswerCheck(True, "ok"),
+                )
+                self.assertEqual((tried, result.found), (["local"], True))
+
+
+class AnswerCheckPromptTests(unittest.TestCase):
+    def test_prompt_treats_unstated_or_other_feature_answers_as_not_found(self) -> None:
+        self.assertIn("even when the answer also contains other related or unrelated information", ANSWER_CHECK_PROMPT)
+        self.assertIn("提供的資料未說明", ANSWER_CHECK_PROMPT)
+        self.assertIn("different feature, app, setting or procedure", ANSWER_CHECK_PROMPT)
+        self.assertIn("minor detail", ANSWER_CHECK_PROMPT)
+
+
+class ContextSourceCountTests(unittest.TestCase):
+    def test_counts_distinct_in_context_sources_including_nested(self) -> None:
+        context = {
+            "sources": [{"id": "1"}, {"id": "1"}, {"id": "2", "in_context": False}],
+            "drift": [{"sources": [{"id": "3"}]}],
+        }
+        self.assertEqual(context_source_count(context), 2)
+        self.assertEqual(context_source_count({"sources": []}), 0)
+
+    def test_context_without_sources_table_counts_zero(self) -> None:
+        self.assertEqual(context_source_count({}), 0)
+        self.assertEqual(context_source_count({"entities": [{"id": "1"}]}), 0)
+
+    def test_unknown_without_context(self) -> None:
+        for context in (None, "raw"):
+            with self.subTest(context=context):
+                self.assertIsNone(context_source_count(context))
 
 
 class QueryTabAutoStrategyTests(unittest.TestCase):

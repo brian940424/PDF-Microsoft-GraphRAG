@@ -150,6 +150,10 @@ class QueryServiceTests(unittest.TestCase):
             settings["embedding_models"]["default_embedding_model"]["model"],
             "text-embedding-3-small",
         )
+        local_prompt = Path(settings["local_search"]["prompt"])
+        self.assertTrue(local_prompt.is_absolute())
+        self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v1")
 
     def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
         runner = FakeQueryRunner()
@@ -190,6 +194,22 @@ class QueryServiceTests(unittest.TestCase):
             [("basic", "not_found"), ("local", "failed"), ("global", "found")],
         )
         self.assertEqual(service.history("L33-SM3E"), [result])
+
+    def test_auto_query_skips_local_answer_built_on_too_few_sources(self) -> None:
+        runner = ScriptedRunner({"local": "相簿群組的步驟", "basic": "聯絡人群組的步驟", "global": "不該執行", "drift": "不該執行"})
+        router = FakeRouter(StrategyDecision("local", "具體事實"))
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
+        )
+
+        result = service.ask("L33-SM3E", "如何建立聯絡人群組？", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(runner.methods, ["local", "basic"])
+        self.assertEqual(router.checked, ["聯絡人群組的步驟"])
+        self.assertEqual((result.method, result.answer), ("basic", "聯絡人群組的步驟"))
+        attempts = result.execution_metadata["strategy_attempts"]
+        self.assertEqual([(item["method"], item["status"]) for item in attempts], [("local", "not_found"), ("basic", "found")])
+        self.assertIn("只取得 1 個原文段落", attempts[0]["detail"])
 
     def test_auto_query_reports_not_found_after_all_methods(self) -> None:
         runner = ScriptedRunner({"local": "沒有", "basic": "沒有", "global": None, "drift": "沒有"})
