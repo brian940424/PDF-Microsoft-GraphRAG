@@ -6,6 +6,16 @@
 
 需要 Node.js 20 以上（本機以 nvm 安裝的 v24 驗證）。
 
+最快的方式是在 VS Code 執行工作（`Tasks: Run Task`）「專案儀表板」，或直接執行腳本：
+
+```bash
+./progress-dashboard/start.sh
+```
+
+腳本會在 `PATH` 找不到 node 時改用 nvm 內的最新版本、首次啟動時安裝相依套件、以開發模式啟動，並在伺服器就緒後開啟瀏覽器；儀表板已在執行時只開啟瀏覽器。設定 `OPEN_BROWSER=0` 可停用自動開啟。
+
+也可以手動啟動：
+
 ```bash
 cd progress-dashboard
 npm install

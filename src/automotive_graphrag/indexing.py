@@ -17,7 +17,7 @@ from typing import Callable
 
 import yaml
 
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, configure_completion_model
+from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .documents import INDEXED_DOCUMENTS_FILE
 from .projects import ProjectError, ProjectStore
 from .source_metadata import SourceMetadataService
@@ -131,7 +131,10 @@ class IndexingService:
             raise ProjectError("GraphRAG 初始化後未產生 settings.yaml")
         self._configure_jsonl_input(settings)
         self._configure_api_base(settings, self.connection_settings.get_api_base_url())
-        self._configure_models(settings, chat_model, embedding_model, reasoning_effort)
+        self._configure_models(
+            settings, chat_model, embedding_model,
+            self.connection_settings.reasoning_effort_for(chat_model, reasoning_effort),
+        )
         self._sync_input(project_path, graph_root)
         return settings
 
@@ -145,7 +148,7 @@ class IndexingService:
         project = self.projects.get(project_id)
         if project.status not in {"READY", "STALE", "FAILED", "INDEXED"}:
             raise ProjectError(f"專案狀態 {project.status} 不允許建圖")
-        if chat_model is not None and chat_model not in ALLOWED_CHAT_MODELS:
+        if chat_model is not None and chat_model not in self.connection_settings.available_chat_models():
             raise ProjectError(f"不支援的建圖模型：{chat_model}")
         project_path = self.projects.path_for(project_id)
         graph_root = project_path / "graphrag"
@@ -318,13 +321,13 @@ class IndexingService:
     @staticmethod
     def _configure_models(
         settings_path: Path, chat_model: str, embedding_model: str,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
     ) -> None:
         value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
         for model in value.get("completion_models", {}).values():
             configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
-            model["model"] = embedding_model
+            configure_embedding_model(model, embedding_model)
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
 
     @staticmethod

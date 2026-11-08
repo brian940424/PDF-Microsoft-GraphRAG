@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,14 +20,16 @@ from typing import Any, Callable
 import pandas as pd
 import yaml
 
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, configure_completion_model
+from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
+from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
-from .strategy_routing import StrategyRouter
+from .strategy_routing import SearchOutcome, StrategyRouter, search_with_fallback
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
 AUTO_METHOD = "auto"
+AGENTIC_METHOD = "agentic"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +61,7 @@ class QueryResult:
     requested_method: str | None = None
     routing_reason: str | None = None
     source: str | None = None
+    execution_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class QueryService:
@@ -67,12 +72,15 @@ class QueryService:
         connection_settings: ConnectionSettings | None = None,
         evidence_service: EvidenceService | None = None,
         router: StrategyRouter | None = None,
+        agentic_search: AgenticSearch | None = None,
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
+        self._custom_runner = runner is not None
         self.connection_settings = connection_settings or ConnectionSettings(projects.root)
         self.evidence_service = evidence_service or EvidenceService(projects)
         self.router = router or StrategyRouter()
+        self.agentic_search = agentic_search or AgenticSearch()
         self._history_lock = threading.Lock()
 
     def ask(
@@ -93,49 +101,89 @@ class QueryService:
             raise ProjectError(f"專案狀態 {project.status} 尚未完成建圖，無法查詢")
         if not prompt:
             raise ProjectError("問題為必填")
-        if normalized_method not in QUERY_METHODS | {AUTO_METHOD}:
+        if normalized_method not in QUERY_METHODS | {AUTO_METHOD, AGENTIC_METHOD}:
             raise ProjectError(f"不支援的查詢方法：{method}")
         selected_model = chat_model or self.connection_settings.get_chat_model()
-        if selected_model not in ALLOWED_CHAT_MODELS:
+        if selected_model not in self.connection_settings.available_chat_models():
             raise ProjectError(f"不支援的 Chat 模型：{selected_model}")
         graph_root = project_path / "graphrag"
         if not (graph_root / "output").is_dir():
             raise ProjectError("找不到此專案的 GraphRAG 索引輸出")
         self.connection_settings.apply_to_environment(project_id)
+        applied_effort = self.connection_settings.reasoning_effort_for(selected_model, reasoning_effort)
         self._configure_connection(
             graph_root / "settings.yaml",
             self.connection_settings.get_api_base_url(),
             selected_model,
             self.connection_settings.get_embedding_model(),
-            reasoning_effort,
+            applied_effort,
         )
         started = datetime.now(timezone.utc)
         started_clock = time.monotonic()
         requested_method = normalized_method
         routing_reason = None
+        execution_metadata: dict[str, Any] = {
+            "trace_schema_version": "1",
+            "model": selected_model,
+            "reasoning_effort": reasoning_effort,
+            "response_type": response_type,
+            "requested_method": requested_method,
+            "prompt_version": None,
+            "model_call_count": None,
+            "estimated_cost_usd": None,
+            "cost_status": "unknown_usage_not_returned_by_query_adapter",
+            "settings_sha256": hashlib.sha256((graph_root / "settings.yaml").read_bytes()).hexdigest(),
+        }
+        def query_command(search_method: str, search_question: str) -> list[str]:
+            return [
+                sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
+                "--method", search_method, "--response-type", response_type, search_question,
+            ]
+
         if normalized_method == AUTO_METHOD:
-            decision = self.router.route(
+            api_base_url = self.connection_settings.get_api_base_url()
+            api_key = self.connection_settings.get_api_key(project_id)
+
+            def search(search_method: str) -> SearchOutcome:
+                try:
+                    execution = self.runner(query_command(search_method, prompt))
+                except ProjectError as exc:
+                    return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
+                if execution.returncode != 0:
+                    return SearchOutcome("", self._last_error(execution), execution)
+                return SearchOutcome((execution.stdout or "").strip(), None, execution)
+
+            fallback = search_with_fallback(
+                self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort),
+                search,
+                lambda answer: self.router.check_answer(
+                    prompt, answer, selected_model, api_base_url, api_key, applied_effort,
+                ),
+            )
+            normalized_method, routing_reason = fallback.method, fallback.reason
+            execution_metadata["strategy_attempts"] = list(fallback.attempts)
+            result = fallback.outcome.payload or QueryExecution(0, fallback.outcome.answer, "")
+        elif normalized_method == AGENTIC_METHOD:
+            def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
+                search_command = query_command(search_method, search_question)
+                if not self._custom_runner:
+                    return self._run(search_command, timeout_seconds=timeout_seconds)
+                return self.runner(search_command)
+
+            decision = self.agentic_search.run(
                 prompt,
                 selected_model,
                 self.connection_settings.get_api_base_url(),
                 self.connection_settings.get_api_key(project_id),
-                reasoning_effort,
+                execute_search,
+                applied_effort,
             )
-            normalized_method, routing_reason = decision.method, decision.reason
-        command = [
-            sys.executable,
-            "-m",
-            "graphrag",
-            "query",
-            "--root",
-            str(graph_root),
-            "--method",
-            normalized_method,
-            "--response-type",
-            response_type,
-            prompt,
-        ]
-        result = self.runner(command)
+            result = QueryExecution(decision.returncode, decision.answer, decision.error or "", decision.context)
+            routing_reason = decision.stop_reason
+            execution_metadata.update(decision.execution_metadata)
+            execution_metadata["requested_method"] = requested_method
+        else:
+            result = self.runner(query_command(normalized_method, prompt))
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -147,13 +195,15 @@ class QueryService:
             except (ProjectError, OSError, ValueError) as exc:
                 context = dict(context)
                 context["_evidence_warning"] = str(exc)
+        if requested_method == AGENTIC_METHOD and answer:
+            answer = self._align_agentic_citations(answer, context, evidence)
         if result.returncode == 0 and not answer:
             error = "GraphRAG 未回傳回答"
         query_result = QueryResult(
             query_id=uuid.uuid4().hex,
             project_id=project_id,
             question=prompt,
-            method=normalized_method,
+            method=AGENTIC_METHOD if requested_method == AGENTIC_METHOD else normalized_method,
             status="COMPLETED" if error is None else "FAILED",
             answer=answer,
             error=error,
@@ -166,6 +216,7 @@ class QueryService:
             requested_method=requested_method,
             routing_reason=routing_reason,
             source=source,
+            execution_metadata=execution_metadata,
         )
         try:
             self._append_record(project_path / "runs" / "queries.jsonl", query_result)
@@ -201,13 +252,34 @@ class QueryService:
         }
 
     @staticmethod
+    def _align_agentic_citations(answer: str, context: dict[str, Any], evidence: tuple[Evidence, ...]) -> str:
+        """Map planner-visible citations to the Evidence IDs actually shown by the UI."""
+        source_by_citation: dict[str, str] = {}
+        for step in context.get("agentic_steps", []):
+            if not isinstance(step, dict):
+                continue
+            for item in step.get("evidence", []):
+                if isinstance(item, dict) and item.get("citation_id") and item.get("source_id"):
+                    source_by_citation[str(item["citation_id"])] = str(item["source_id"])
+        visible_id_by_source = {item.context_id: item.evidence_id for item in evidence if item.context_id}
+
+        def replace(match: re.Match[str]) -> str:
+            citation = match.group(1)
+            source_id = source_by_citation.get(citation)
+            visible_id = visible_id_by_source.get(source_id or "")
+            return f"[{visible_id}]" if visible_id else "[來源未映射]"
+
+        return re.sub(r"\[(E\d+)\]", replace, answer)
+
+    @staticmethod
     def _result_from_dict(value: dict[str, Any]) -> QueryResult:
         value["evidence"] = tuple(Evidence(**item) for item in value.get("evidence", []))
         value.setdefault("context", {})
+        value.setdefault("execution_metadata", {})
         return QueryResult(**value)
 
     @staticmethod
-    def _run(command: list[str]) -> subprocess.CompletedProcess[str] | QueryExecution:
+    def _run(command: list[str], timeout_seconds: float | None = None) -> subprocess.CompletedProcess[str] | QueryExecution:
         method = command[command.index("--method") + 1]
         root = Path(command[command.index("--root") + 1])
         question = command[-1]
@@ -249,6 +321,7 @@ class QueryService:
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=timeout_seconds,
             )
             response = json.loads(completed.stdout)
             if not isinstance(response, dict):
@@ -263,6 +336,8 @@ class QueryService:
                 completed.stderr or "",
                 context if isinstance(context, dict) else {},
             )
+        except subprocess.TimeoutExpired:
+            return QueryExecution(124, "", "Agentic GraphRAG 搜尋超過單題時間上限")
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             detail = (completed.stderr or completed.stdout).strip().splitlines() if "completed" in locals() else []
             error = detail[-1] if detail else str(exc)
@@ -298,7 +373,7 @@ class QueryService:
         api_base_url: str,
         chat_model: str,
         embedding_model: str,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
     ) -> None:
         try:
             value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
@@ -310,7 +385,7 @@ class QueryService:
         for model in value.get("completion_models", {}).values():
             configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
-            model["model"] = embedding_model
+            configure_embedding_model(model, embedding_model)
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:

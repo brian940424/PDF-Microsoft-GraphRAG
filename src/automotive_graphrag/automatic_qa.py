@@ -8,7 +8,6 @@ from datetime import datetime
 from typing import Callable
 
 from .automatic_evaluation import AutomaticEvaluationResult, AutomaticEvaluationService
-from .connections import ALLOWED_CHAT_MODELS
 from .projects import ProjectError, ProjectStore
 from .question_generation import QuestionGenerationService, normalize_question
 from .question_sets import BatchQuestion, QuestionSet, QuestionSetService
@@ -62,8 +61,6 @@ class AutomaticQATestService:
     ) -> QuestionSet:
         if questions_per_pdf < 1:
             raise ProjectError("每份 PDF 題數必須是正整數")
-        if generation_model not in ALLOWED_CHAT_MODELS:
-            raise ProjectError(f"不支援的生題模型：{generation_model}")
         project = self.projects.get(project_id)
         if project.status != "INDEXED":
             raise ProjectError(f"專案狀態 {project.status} 尚未完成建圖")
@@ -248,7 +245,11 @@ class AutomaticQATestService:
         response_type: str = "Single Paragraph",
         progress_callback: Callable[[int, int], None] | None = None,
         reasoning_effort: str = "medium",
+        enable_llm_judge: bool = True,
+        enable_classic_metrics: bool = False,
     ) -> AutomaticQAReport:
+        if not enable_llm_judge and not enable_classic_metrics:
+            raise ProjectError("至少啟用一種評測方式")
         question_set = self.question_sets.get(project_id, question_set_id)
         if question_set.response_type != response_type:
             raise ProjectError("回答格式與已生成答案不同；請先使用目前格式重新生成回答")
@@ -264,14 +265,19 @@ class AutomaticQATestService:
                 project_id, question_set_id, model=judge_model, concurrency=concurrency,
                 progress_callback=progress_callback,
                 reasoning_effort=reasoning_effort,
+                enable_llm_judge=enable_llm_judge,
+                enable_classic_metrics=enable_classic_metrics,
             )
+            judge_error = judge.judge_error
         except ProjectError as exc:
             judge_error = str(exc)
         retrieval = None
         retrieval_error = None
         try:
+            # Score the evidence of the strategy that produced the saved answers; the page's
+            # method selector may have been reset (e.g. to Local) since answers were generated.
             retrieval = self.retrieval.evaluate(
-                project_id, question_set_id, top_k=top_k, method=method
+                project_id, question_set_id, top_k=top_k, method=question_set.method or method
             )
         except ProjectError as exc:
             retrieval_error = str(exc)

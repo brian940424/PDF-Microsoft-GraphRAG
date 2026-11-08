@@ -25,6 +25,7 @@ class Evidence:
     block_id: str
     text: str
     score: float | None = None
+    source_type: str = "text_unit"
 
 
 class EvidenceService:
@@ -57,6 +58,7 @@ class EvidenceService:
                 if source_metadata is None or text_unit_id in seen:
                     continue
                 seen.add(text_unit_id)
+                # This is the UI display order only; GraphRAG does not provide a relevance score here.
                 rank = len(result) + 1
                 result.append(
                     Evidence(
@@ -89,6 +91,7 @@ class EvidenceService:
             if not context_id or not text or context_id in seen:
                 continue
             seen.add(context_id)
+            # This is the UI display order only; it is not a relevance rank.
             rank = len(result) + 1
             community = str(report.get("community") or "")
             title = str(report.get("title") or f"Community Report {context_id}")
@@ -105,6 +108,7 @@ class EvidenceService:
                     page=None,
                     block_id="",
                     text=text,
+                    source_type="community_report",
                 )
             )
         return result

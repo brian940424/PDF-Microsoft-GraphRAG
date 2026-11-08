@@ -76,6 +76,24 @@ class QuestionSetServiceTests(unittest.TestCase):
         self.assertEqual(question_set.questions[0].status, "PENDING")
         self.assertEqual(self.service.get("L33-SM3E", question_set.question_set_id), question_set)
 
+    def test_answer_aliases_import_export_and_default_for_old_question_sets(self) -> None:
+        value = self.valid_value()
+        value["questions"][0]["answer_aliases"] = ["參考答案別名"]  # type: ignore[index]
+        question_set = self.service.import_file("L33-SM3E", self.write_question_set(value))
+        self.assertEqual(question_set.questions[0].answer_aliases, ("參考答案別名",))
+
+        exported = json.loads(self.service.export("L33-SM3E", question_set.question_set_id).read_text(encoding="utf-8"))
+        self.assertEqual(exported["questions"][0]["answer_aliases"], ["參考答案別名"])
+        reloaded = self.service.get("L33-SM3E", question_set.question_set_id)
+        self.assertEqual(reloaded.questions[0].answer_aliases, ("參考答案別名",))
+        self.assertEqual(reloaded.questions[1].answer_aliases, ())
+
+    def test_answer_aliases_must_be_string_array(self) -> None:
+        value = self.valid_value()
+        value["questions"][0]["answer_aliases"] = "不是陣列"  # type: ignore[index]
+        with self.assertRaisesRegex(ProjectError, "answer_aliases.*字串陣列"):
+            self.service.import_file("L33-SM3E", self.write_question_set(value))
+
     def test_create_set_and_append_question_with_answer(self) -> None:
         question_set = self.service.create("L33-SM3E", "單次問答收藏", "滿意的回答")
 

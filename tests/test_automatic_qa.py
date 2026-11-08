@@ -5,7 +5,9 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from automotive_graphrag.automatic_evaluation import AutomaticEvaluationService
 from automotive_graphrag.automatic_qa import AutomaticQATestService
+from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.question_generation import GeneratedQuestion
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
@@ -106,6 +108,65 @@ class ConcurrentGeneration:
 
 
 class AutomaticQATests(unittest.TestCase):
+    def test_evaluate_existing_supports_classic_only_without_judge_requests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "projects")
+            store.create(project_id="TEST", display_name="Test", vehicle_name="Vehicle", manual_version="Version")
+            store.update_status("TEST", "INDEXED")
+            sets = QuestionSetService(store)
+            question_set = sets.create_with_questions(
+                "TEST", "automatic", [BatchQuestion("Q0001", "問題", "回答")]
+            )
+            query = ConcurrentQuery()
+            connections = ConnectionSettings(store.root)
+            judging = AutomaticEvaluationService(
+                store, sets, connections,
+                client=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Judge should not run")),
+            )
+            service = AutomaticQATestService(
+                store, object(), object(), query, sets, judging, NoRetrieval()
+            )
+            service.answer_existing(
+                "TEST", question_set.question_set_id, "gpt-4o-mini", "local", 1
+            )
+
+            report = service.evaluate_existing(
+                "TEST", question_set.question_set_id, "gpt-4o-mini", "gpt-4o-mini", "local",
+                enable_llm_judge=False, enable_classic_metrics=True,
+            )
+
+            self.assertIsNotNone(report.judge)
+            self.assertEqual(report.judge.items, ())
+            self.assertEqual(report.judge.average_answer_em, 1.0)
+            self.assertEqual(report.judge.average_answer_f1, 1.0)
+            self.assertEqual(len(query.models), 1)
+
+    def test_evaluate_existing_scores_retrieval_with_strategy_that_produced_answers(self):
+        class RecordingRetrieval:
+            def __init__(self):
+                self.methods = []
+
+            def evaluate(self, project_id, question_set_id, top_k=5, method="local"):
+                self.methods.append(method)
+                raise ProjectError("recorded")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "projects")
+            store.create(project_id="TEST", display_name="Test", vehicle_name="Vehicle", manual_version="Version")
+            store.update_status("TEST", "INDEXED")
+            sets = QuestionSetService(store)
+            question_set = sets.create_with_questions("TEST", "automatic", [BatchQuestion("Q0001", "問題", "回答")])
+            retrieval = RecordingRetrieval()
+            service = AutomaticQATestService(
+                store, object(), object(), ConcurrentQuery(), sets, NoJudge(), retrieval
+            )
+            service.answer_existing("TEST", question_set.question_set_id, "gpt-4o-mini", "auto", 1)
+
+            # The page selector was reset to Local after reloading, but answers came from auto.
+            service.evaluate_existing("TEST", question_set.question_set_id, "gpt-4o-mini", "gpt-4o-mini", "local")
+
+            self.assertEqual(retrieval.methods, ["auto"])
+
     def test_luna_can_run_and_evaluate_with_drift(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = ProjectStore(Path(temporary) / "projects")
@@ -175,6 +236,30 @@ class AutomaticQATests(unittest.TestCase):
             )
             self.assertEqual(len(query.models), 1)
             self.assertIn("test judge unavailable", evaluated.judge_error)
+
+    def test_answer_existing_accepts_agentic_search_method(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "projects")
+            store.create(
+                project_id="TEST", display_name="Test", vehicle_name="Vehicle", manual_version="Version"
+            )
+            store.update_status("TEST", "INDEXED")
+            sets = QuestionSetService(store)
+            question_set = sets.create_with_questions(
+                "TEST", "automatic", [BatchQuestion("Q0001", "問題", "正解")]
+            )
+            query = ConcurrentQuery()
+            service = AutomaticQATestService(
+                store, object(), object(), query, sets, NoJudge(), NoRetrieval()
+            )
+
+            report = service.answer_existing(
+                "TEST", question_set.question_set_id, "gpt-4.1-mini", "agentic", 1,
+            )
+
+            self.assertEqual(query.models, ["gpt-4.1-mini"])
+            self.assertEqual(report.question_set.method, "agentic")
+            self.assertEqual(report.question_set.questions[0].status, "COMPLETED")
 
     def test_answer_concurrency_and_model_are_applied_to_all_questions(self):
         with tempfile.TemporaryDirectory() as temporary:

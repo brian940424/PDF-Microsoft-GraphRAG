@@ -126,8 +126,8 @@ class CaseServiceTests(unittest.TestCase):
         self.assertIn("維修問題", portal_labels)
         self.assertIn("回答採用的 Evidence", portal_labels)
         self.assertIn("案例 JSON", portal_labels)
-        self.assertNotIn("API Base URL", portal_labels)
-        self.assertIn("API Base URL", admin_labels)
+        self.assertNotIn("LiteLLM Base URL", portal_labels)
+        self.assertIn("LiteLLM Base URL", admin_labels)
         self.assertNotIn("車型／專案", admin_labels)
         portal_project_dropdowns = [
             component.get_config()

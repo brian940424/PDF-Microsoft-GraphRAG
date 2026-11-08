@@ -48,6 +48,7 @@ class BatchQuestion:
     source_documents: tuple[str, ...] = ()
     routed_method: str = ""
     routing_reason: str = ""
+    answer_aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +179,7 @@ class QuestionSetService:
                     question_id=item.question_id,
                     question=item.question,
                     reference_answer=item.reference_answer,
+                    answer_aliases=item.answer_aliases,
                     status=result.status,
                     answer=result.answer,
                     error=result.error,
@@ -306,6 +308,7 @@ class QuestionSetService:
                     item.question_id,
                     item.question,
                     reference_answer=item.reference_answer,
+                    answer_aliases=item.answer_aliases,
                     gold_evidence=item.gold_evidence,
                 )
                 if item.question_id in targets
@@ -322,6 +325,7 @@ class QuestionSetService:
                 item.question_id,
                 item.question,
                 reference_answer=item.reference_answer,
+                answer_aliases=item.answer_aliases,
                 status="RUNNING",
                 gold_evidence=item.gold_evidence,
             )
@@ -333,6 +337,7 @@ class QuestionSetService:
                     question_id=item.question_id,
                     question=item.question,
                     reference_answer=item.reference_answer,
+                    answer_aliases=item.answer_aliases,
                     status=result.status,
                     answer=result.answer,
                     error=result.error,
@@ -346,6 +351,7 @@ class QuestionSetService:
                     question_id=item.question_id,
                     question=item.question,
                     reference_answer=item.reference_answer,
+                    answer_aliases=item.answer_aliases,
                     status="FAILED",
                     error=str(exc),
                     completed_at=datetime.now(timezone.utc).isoformat(),
@@ -395,6 +401,7 @@ class QuestionSetService:
                 "number": number,
                 "question": item.question,
                 "expected_answer": item.reference_answer,
+                "answer_aliases": list(item.answer_aliases),
                 "question_sources": QuestionSetService._portable_sources_payload(question_sources),
                 "answer_sources": QuestionSetService._portable_sources_payload(answer_sources),
             })
@@ -444,7 +451,7 @@ class QuestionSetService:
         questions: list[BatchQuestion] = []
         seen: set[str] = set()
         allowed_question_fields = {
-            "number", "question", "expected_answer", "question_sources", "answer_sources"
+            "number", "question", "expected_answer", "answer_aliases", "question_sources", "answer_sources"
         }
         for index, raw in enumerate(raw_questions):
             location = f"questions[{index}]"
@@ -480,6 +487,10 @@ class QuestionSetService:
             reference_answer = raw.get("expected_answer")
             if not isinstance(reference_answer, str) or not reference_answer.strip():
                 errors.append(f"{location}.expected_answer：必須是非空白字串")
+            aliases = raw.get("answer_aliases", [])
+            if not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
+                errors.append(f"{location}.answer_aliases：必須是字串陣列")
+                aliases = []
             if (
                 isinstance(number, int)
                 and number > 0
@@ -493,6 +504,7 @@ class QuestionSetService:
                         question_id,
                         question.strip(),
                         reference_answer=reference_answer.strip(),
+                        answer_aliases=tuple(alias.strip() for alias in aliases if alias.strip()),
                         gold_evidence=answer_sources,
                         question_source_evidence=question_sources,
                         answer_source_evidence=answer_sources,
@@ -695,6 +707,7 @@ class QuestionSetService:
                         raw_sources, source_key
                     ) if raw_sources is not None else ()
             item["source_documents"] = tuple(item.get("source_documents", []))
+            item["answer_aliases"] = tuple(item.get("answer_aliases", []))
             questions.append(BatchQuestion(**item))
         return QuestionSet(**value, questions=tuple(questions))
 

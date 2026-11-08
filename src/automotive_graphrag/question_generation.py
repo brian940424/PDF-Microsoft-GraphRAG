@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .connections import ALLOWED_CHAT_MODELS, ConnectionSettings, chat_completion_api_params
+from .connections import ConnectionSettings, chat_completion_api_params, extract_json_object, llm_request_headers
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 from .source_sampling import SourceSample, SourceSampleBatch, SourceSamplingService
@@ -92,7 +92,11 @@ class QuestionGenerationService:
         api_base_url = self.connections.get_api_base_url()
         model = self.connections.get_chat_model()
         try:
-            response = self.client(api_base_url, api_key, model, prompt)
+            args = (api_base_url, api_key, model, prompt)
+            if "reasoning_effort" in inspect.signature(self.client).parameters:
+                response = self.client(*args, reasoning_effort=self.connections.reasoning_effort_for(model))
+            else:
+                response = self.client(*args)
         except ProjectError:
             raise
         except Exception as exc:
@@ -132,7 +136,7 @@ class QuestionGenerationService:
             raise ProjectError("每份 PDF 生成題數必須是正整數")
         if maximum_source_characters < 200:
             raise ProjectError("每筆來源字數上限不可小於 200")
-        if model not in ALLOWED_CHAT_MODELS:
+        if model not in self.connections.available_chat_models():
             raise ProjectError(f"不支援的題目生成模型：{model}")
         document_samples = tuple(item for item in samples if item.document_id == document_id)
         if not document_samples:
@@ -160,14 +164,17 @@ class QuestionGenerationService:
         )
         if excluded_questions:
             prompt += (
-                "\n以下既有題目禁止重複或只換同義詞，請生成不同考點的問題："
+                "\nDo not repeat these existing questions or merely reword them with synonyms. "
+                "Generate questions that test different points: "
                 + json.dumps(list(excluded_questions), ensure_ascii=False)
             )
         api_key = self.connections.apply_to_environment(project_id)
         try:
             args = (self.connections.get_api_base_url(), api_key, model, prompt)
             if "reasoning_effort" in inspect.signature(self.client).parameters:
-                response = self.client(*args, reasoning_effort=reasoning_effort)
+                response = self.client(
+                    *args, reasoning_effort=self.connections.reasoning_effort_for(model, reasoning_effort)
+                )
             else:
                 response = self.client(*args)
         except ProjectError:
@@ -301,18 +308,25 @@ class QuestionGenerationService:
             for item in batch.samples
         ]
         return (
-            "你是汽車維修手冊題目設計器。只能使用提供的原文，不可加入外部知識。\n"
-            "問題與參考答案必須使用繁體中文；零件名稱、縮寫、DTC、單位與原廠術語可保留英文。"
-            "不得因翻譯加入原文沒有的資訊。\n"
-            f"生成 {count} 題，難度固定為 {difficulty}。問題不可直接暴露答案；參考答案必須可由引用原文完整支持。\n"
-            "參考答案要完整且具體，不可只給一句結論或過度簡化；整理原文中直接回答問題的必要細節。"
-            "若原文有，必須保留操作步驟與順序、前置條件、判定標準、數值與單位、注意事項及警告；"
-            "適合時用條列或編號呈現。只在原文本身資訊有限時才給簡短答案，不可為了增加長度加入原文未載內容。\n"
-            "只輸出 JSON object，格式為 "
+            "You design questions from automotive service manuals. Use only the supplied source text "
+            "and do not add outside knowledge.\n"
+            "Write every question and reference answer in Traditional Chinese. Part names, abbreviations, "
+            "DTCs, units, and OEM terminology may stay in English. Do not introduce information that is "
+            "absent from the source text while translating.\n"
+            f"Generate {count} questions at the fixed difficulty {difficulty}. A question must not directly "
+            "reveal its answer. Each reference answer must be fully supported by the cited source text.\n"
+            "Reference answers must be complete and specific, not a one-sentence conclusion or an "
+            "oversimplification. Organize the details from the source text that directly answer the question. "
+            "When the source text has them, keep procedure steps and their order, preconditions, acceptance "
+            "criteria, values and units, cautions, and warnings. Use bullets or numbered lists when suitable. "
+            "Give a short answer only when the source text itself has limited information, and never add "
+            "content absent from the source text to increase length.\n"
+            "Output only a JSON object in this format: "
             '{"questions":[{"question":"...","reference_answer":"...","question_source_sample_ids":["..."],'
-            '"answer_source_sample_ids":["..."]}]}。\n'
-            "simple 每題只能引用一筆來源；medium 每題至少兩筆來源；cross_section 每題至少引用兩個不同 section。\n"
-            f"來源：{json.dumps(sources, ensure_ascii=False)}"
+            '"answer_source_sample_ids":["..."]}]}\n'
+            "For simple, each question cites exactly one source. For medium, each question cites at least two "
+            "sources. For cross_section, each question cites at least two different sections.\n"
+            f"Sources: {json.dumps(sources, ensure_ascii=False)}"
         )
 
     def _parse_response(
@@ -415,17 +429,19 @@ class QuestionGenerationService:
         )
 
     @staticmethod
-    def _openai_chat(api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str = "medium") -> object:
+    def _openai_chat(
+        api_base_url: str, api_key: str, model: str, prompt: str, reasoning_effort: str | None = None,
+    ) -> object:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
         }
-        payload.update(chat_completion_api_params(model, 4000, reasoning_effort))
+        payload.update(chat_completion_api_params(4000, reasoning_effort))
         request = urllib.request.Request(
             f"{api_base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=llm_request_headers(api_key),
             method="POST",
         )
         try:
@@ -441,9 +457,12 @@ class QuestionGenerationService:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ProjectError("題目生成 API 無法連線或回應格式錯誤") from exc
         try:
-            return json.loads(value["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            parsed = extract_json_object(value["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ProjectError("題目生成 API 回應缺少有效 JSON 內容") from exc
+        if parsed is None:
+            raise ProjectError("題目生成 API 回應缺少有效 JSON 內容")
+        return parsed
 
     def _path(self, project_id: str, generation_batch_id: str) -> Path:
         return self.projects.path_for(project_id) / "runs" / f"generated-questions-{generation_batch_id}.json"

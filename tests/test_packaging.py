@@ -1,25 +1,35 @@
 import tomllib
 import unittest
 from pathlib import Path
+from packaging.requirements import Requirement
 
 
 class PackagingConfigurationTests(unittest.TestCase):
-    def test_docker_pins_match_supported_dependency_families(self) -> None:
+    def test_docker_requirements_match_supported_dependency_families(self) -> None:
         root = Path(__file__).parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
         dependencies = project["dependencies"]
         docker_requirements = (root / "requirements.docker.txt").read_text(encoding="utf-8").splitlines()
-        pins = {line.split("==", 1)[0]: line for line in docker_requirements if line and not line.startswith("#")}
+        requirements = [
+            Requirement(line)
+            for line in docker_requirements
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        requirements_by_name = {requirement.name: requirement for requirement in requirements}
 
         self.assertEqual(
-            set(pins),
+            set(requirements_by_name),
             {"graphrag", "gradio", "pandas", "pyarrow", "pymupdf", "python-dotenv"},
         )
-        for package in pins:
+        for package in requirements_by_name:
             self.assertTrue(
                 any(dependency.startswith(package) for dependency in dependencies),
-                f"Docker pin {package} is missing from pyproject.toml",
+                f"Docker requirement {package} is missing from pyproject.toml",
             )
+
+        dotenv = requirements_by_name["python-dotenv"]
+        self.assertTrue(dotenv.specifier.contains("1.2.0"))
+        self.assertFalse(dotenv.specifier.contains("2.0.0"))
 
     def test_dockerfile_caches_dependencies_before_copying_source(self) -> None:
         dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")

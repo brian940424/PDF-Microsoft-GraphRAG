@@ -11,7 +11,17 @@ import yaml
 import numpy as np
 import gradio as gr
 
-from automotive_graphrag.app import _experiment_dataset_summary_rows, _sort_experiment_results, create_app
+from automotive_graphrag.app import (
+    EXPERIMENT_STRATEGY_LABELS,
+    _experiment_classic_metric_rows,
+    _experiment_dataset_summary_rows,
+    _experiment_grade_label,
+    _experiment_judge_cell,
+    _experiment_judge_detail_models,
+    _experiment_judge_detail_rows,
+    _sort_experiment_results,
+    create_app,
+)
 from automotive_graphrag.automatic_evaluation import AutomaticEvaluationItem, AutomaticEvaluationService
 from automotive_graphrag.connections import ConnectionSettings, DEFAULT_REASONING_EFFORT
 from automotive_graphrag.evidence import Evidence
@@ -25,13 +35,14 @@ from automotive_graphrag.retrieval_experiments import (
     RetrievalExperimentService,
 )
 from automotive_graphrag.source_metadata import SourceMetadata
-from automotive_graphrag.strategy_routing import StrategyDecision
+from automotive_graphrag.strategy_routing import AnswerCheck, NOT_FOUND_ANSWER, StrategyDecision
 
 
 class FakeJudge:
-    def __init__(self, lenient_result: bool | None = None):
+    def __init__(self, lenient_result: bool | None = None, extra_content_error: bool = False):
         self.calls = []
         self.lenient_result = lenient_result
+        self.extra_content_error = extra_content_error
 
     def evaluate_single_answer(self, project_id, question_id, question, correct, actual, model, evaluation_mode="strict"):
         self.calls.append((project_id, question_id, question, correct, actual, model, evaluation_mode))
@@ -51,7 +62,10 @@ class FakeJudge:
         if evaluation_mode == "lenient" and self.lenient_result is not None:
             score = 2 if self.lenient_result else 0
         reason = f"寬鬆評分 model={model}" if evaluation_mode == "lenient" else f"model={model}"
-        return SimpleNamespace(question_id=question_id, score=score, judge_reason=reason)
+        return SimpleNamespace(
+            question_id=question_id, score=score, judge_reason=reason,
+            extra_content_error=self.extra_content_error and score != 2,
+        )
 
 
 class RetrievalExperimentTests(unittest.TestCase):
@@ -82,6 +96,25 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.question_file = self.root / "questions.json"
         example = Path(__file__).parents[1] / "docs" / "檢索實驗格式範例.json"
         self.question_file.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def test_judge_model_must_be_in_the_saved_model_list(self):
+        service = RetrievalExperimentService(
+            self.projects, self.question_sets, self.connections,
+            AutomaticEvaluationService(
+                self.projects, self.question_sets, self.connections
+            ),
+            query_function=lambda *args: ("", {}),
+        )
+        groups = [ExperimentGroup(group_id="G01", name="G01", answer_model="gpt-4.1-mini", method="local")]
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(ProjectError, "全域評測模型不支援"):
+                service.save_configuration("project", groups, "question-set-id", 2, "claude-judge")
+            self.connections.save("http://localhost:4000", "sk-litellm", "claude-judge", "text-embedding-3-small", ["claude-judge", "gpt-4.1-mini"], ["claude-judge"])
+            service.save_configuration("project", groups, "question-set-id", 2, "claude-judge")
+            self.assertTrue(service._supports_judge_reasoning("claude-judge"))
+            self.connections.save("http://localhost:4000", "k", "claude-judge", "text-embedding-3-small", ["claude-judge", "gpt-4.1-mini"], [])
+            self.assertFalse(service._supports_judge_reasoning("claude-judge"))
+        self.assertEqual(service.load("project")["judge_model"], "claude-judge")
 
     def test_experiment_results_sort_by_group_then_question_set_order(self):
         groups = [{"group_id": "G01"}, {"group_id": "G02"}]
@@ -115,6 +148,83 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(question.question_source_evidence[0].pages, (330,))
         self.assertEqual(len(question.answer_source_evidence), 1)
         self.assertEqual(self.service.load("project")["question_set_id"], question_set.question_set_id)
+
+    def test_result_tables_split_judge_scores_reasons_and_classic_metrics(self):
+        base = {
+            "group_name": "A", "dataset_name": "Set", "dataset_id": "abcdef123456", "question_id": "Q1",
+            "source_documents": ["WW.pdf"], "question": "問", "actual_answer": "答", "correct_answer": "正解",
+            "method": "local",
+        }
+        panel = {
+            **base, "evaluation_result": "部分正確", "manual_override": True,
+            "judge_scores": [
+                {"model": "judge-a", "score": 2.0, "reason": "完整"},
+                {"model": "judge-b", "score": None, "reason": "", "error": "timeout"},
+            ],
+            "answer_em": 0.0, "answer_f1": 0.5, "answer_term_hit": 0.0, "answer_term_coverage": 0.25,
+        }
+        legacy = {**base, "question_id": "Q2", "evaluation_result": "全對",
+                  "judge_model": "judge-a", "evaluation_reason": "舊版理由"}
+        pending = {**base, "question_id": "Q3", "evaluation_result": "待評測"}
+        results = [panel, legacy, pending]
+
+        self.assertEqual(_experiment_judge_cell(panel), "* judge-a : 100%\n* judge-b : 失敗\n* 人工修改得分")
+        self.assertEqual(_experiment_judge_cell(pending), "")
+        self.assertEqual(_experiment_judge_detail_models(results), ["judge-a", "judge-b"])
+        question_cells = ["A", "Set (abcdef12)", "Q1", "WW.pdf", "問", "答", "正解"]
+        self.assertEqual(
+            _experiment_judge_detail_rows(results, "judge-a", EXPERIMENT_STRATEGY_LABELS),
+            [
+                [*question_cells, "100%", "完整", "Microsoft GraphRAG Local"],
+                [*question_cells[:2], "Q2", *question_cells[3:], "100%", "舊版理由", "Microsoft GraphRAG Local"],
+            ],
+        )
+        self.assertEqual(
+            _experiment_judge_detail_rows(results, "judge-b", EXPERIMENT_STRATEGY_LABELS),
+            [[*question_cells, "失敗", "timeout", "Microsoft GraphRAG Local"]],
+        )
+        self.assertEqual(
+            _experiment_classic_metric_rows(results),
+            [[*question_cells, "0.0%", "50.0%", "0.0%", "25.0%"]],
+        )
+
+    def test_classic_only_scores_aliases_and_exports_per_question_and_average_metrics(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        first = replace(
+            question_set.questions[0],
+            reference_answer="主要答案以外的文字",
+            answer_aliases=("先確認設備已關閉，準備指定工具，並依序完成安全檢查。",),
+        )
+        self.question_sets.update_questions(
+            "project", question_set.question_set_id, (first, *question_set.questions[1:])
+        )
+        group = ExperimentGroup("G01", "實驗組1", "gpt-4o-mini", "local")
+        self.service.save_configuration(
+            "project", [group], question_set.question_set_id, 2, "gpt-4.1-mini"
+        )
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=2)
+
+        run = self.service.evaluate_answers(
+            "project", question_set.question_set_id,
+            enable_llm_judge=False, enable_classic_metrics=True,
+        )
+
+        self.assertEqual(self.service.judging.calls, [])
+        self.assertFalse(run.enable_llm_judge)
+        self.assertTrue(run.enable_classic_metrics)
+        self.assertEqual(run.results[0].answer_em, 1.0)
+        self.assertEqual(run.results[0].answer_f1, 1.0)
+        self.assertEqual(run.results[0].evaluation_result, "未啟用")
+        self.assertEqual(run.groups[0].average_answer_em, 1.0)
+        self.assertEqual(run.groups[0].average_answer_f1, 1.0)
+
+        summary_path, details_path = self.service.export("project")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        details = json.loads(details_path.read_text(encoding="utf-8"))
+        self.assertFalse(summary["evaluation"]["enable_llm_judge"])
+        self.assertTrue(summary["evaluation"]["enable_classic_metrics"])
+        self.assertEqual(summary["summary"]["average_answer_em"], 1.0)
+        self.assertEqual(details["question_results"][0]["answer_em"], 1.0)
 
     def test_failed_replacement_keeps_existing_sets_when_source_pages_are_empty(self):
         existing = self.service.import_question_set("project", self.question_file)
@@ -188,7 +298,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(len(dataset_summaries), 2)
         self.assertEqual({row[1].split(" (")[0] for row in dataset_summaries}, {"questions", "second-dataset"})
-        self.assertTrue(all(row[4:12] == [2, 2, 2, 2, 0, 0, "100.0%", "100.0%"] for row in dataset_summaries))
+        self.assertTrue(all(row[4:8] == [2, 2, 2, "100.0%"] for row in dataset_summaries))
 
         self.service.update_manual_judgments(
             "project", [("實驗組1", dataset_ids[0], run.results[0].question_id, False)]
@@ -288,15 +398,76 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(summary.evidence_precision, 1.0)
         self.assertEqual(summary.document_hit_rate, 1.0)
 
+    def test_cited_source_bonus_applies_only_to_extra_content_errors(self):
+        self.service.judging.extra_content_error = True
+        question_set = self.service.import_question_set("project", self.question_file)
+        question = question_set.questions[0]
+        gold = question.answer_source_evidence[0]
+        cited = Evidence(
+            evidence_id="E1", rank=1, context_id="7", text_unit_id="tu-7",
+            chunk_id="chunk-7", section_id="section", section_name="Section",
+            document_id=gold.document_id, page=gold.pages[0] + 1, block_id="block", text="gold source",
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        # The answer differs from the reference, so FakeJudge grades it 0 while its citation hits.
+        self.service.query_function = lambda *args: (
+            "錯誤的回答 [Data: Sources (7)]", {"sources": [{"id": "7", "text": "source"}]}
+        )
+        with patch.object(self.service, "_resolved_evidence", return_value=(cited,)):
+            generated = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+        evaluated = self.service._evaluate_case("project", group, question, "gpt-4.1-mini", generated)
+        self.assertEqual(evaluated.evaluation_result, 0)
+        self.assertEqual(evaluated.source_score, 1.0)
+        self.assertIn("來源分數 : 100%", _experiment_judge_cell(asdict(evaluated)))
+        self.assertIn("來源加分 : 適用", _experiment_judge_cell(asdict(evaluated)))
+
+        run = self.service._persist_run(
+            "project", question_set.question_set_id, [group], "gpt-4.1-mini", 1,
+            "started", "completed", {(group.group_id, question.question_id): evaluated},
+        )
+        summary = run.groups[0]
+        self.assertEqual(summary.score_accuracy, 0.0)
+        self.assertEqual(summary.average_source_score, 1.0)
+        # Two questions in the set; only Q0001 is evaluated: (0 + 0.1 * 1) / 2.
+        self.assertEqual(summary.combined_score_accuracy, 0.05)
+
+        self.service.update_manual_judgments("project", [("Local", "Q0001", 2)])
+        group_value = self.service.load("project")["run"]["groups"][0]
+        self.assertEqual(group_value["combined_score_accuracy"], 0.5)
+        payload = json.loads(self.service.export("project")[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["evaluation"]["source_weight"], 0.1)
+        self.assertEqual(payload["groups"][0]["summary"]["average_source_score"], 1.0)
+        self.assertEqual(payload["summary"]["combined_score_accuracy"], 0.5)
+
+        # A manual grade is final: the judge's flag no longer earns a bonus.
+        self.service.update_manual_judgments("project", [("Local", "Q0001", 1)])
+        group_value = self.service.load("project")["run"]["groups"][0]
+        self.assertEqual(group_value["combined_score_accuracy"], 0.25)
+
+    def test_ordinary_wrong_answer_gets_no_source_bonus(self):
+        run_items = [{
+            "evaluation_result": 0, "source_score": 1.0,
+            "judge_scores": [{"model": "a", "score": 0.0, "reason": "wrong"}],
+        }]
+        self.assertEqual(self.service._source_stats(run_items, 1), (1.0, 0.0))
+        self.assertNotIn("來源加分", _experiment_judge_cell(run_items[0] | {"question_id": "Q1"}))
+
+    def test_full_grade_ignores_source_score(self):
+        run_items = [{"evaluation_result": 2, "source_score": 0.0, "judge_scores": []}]
+        self.assertEqual(self.service._source_stats(run_items, 1), (0.0, 1.0))
+
     def test_auto_group_routes_each_question_and_uses_routed_strategy_parameters(self):
         question_set = self.service.import_question_set("project", self.question_file)
         question = question_set.questions[0]
         routed = []
 
         class FakeRouter:
-            def route(self, question_text, model, api_base_url, api_key):
+            def route(self, question_text, model, api_base_url, api_key, reasoning_effort=None):
                 routed.append((question_text, model, api_key))
                 return StrategyDecision("basic", "單一數值查詢")
+
+            def check_answer(self, *_):
+                return AnswerCheck(True, "已回答")
 
         received = []
         self.service.router = FakeRouter()  # type: ignore[assignment]
@@ -317,6 +488,67 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(result.effective_method, "basic")
         self.assertEqual(result.routing_reason, "單一數值查詢")
         self.assertIn("已映射", result.retrieval_metrics_status)
+
+    def _auto_group(self, ranking, refusals=()):
+        question = self.service.import_question_set("project", self.question_file).questions[0]
+
+        class FakeRouter:
+            def route(self, *_):
+                return StrategyDecision(ranking[0], "選擇原因", ranking)
+
+            def check_answer(self, _question, answer, *_):
+                return AnswerCheck(answer not in refusals, "檢查")
+
+        self.service.router = FakeRouter()  # type: ignore[assignment]
+        state = self.service.add_group("project")
+        group_id = state["groups"][0]["group_id"]
+        self.service.set_group_method("project", group_id, "auto")
+        self.service.set_group_strategy_parameter("project", group_id, "global", "data_max_tokens", 9000)
+        return ExperimentGroup(**self.service.load("project")["groups"][0]), question
+
+    def test_auto_group_falls_back_with_next_strategy_parameters(self):
+        group, question = self._auto_group(("basic", "local", "global", "drift"), refusals=("沒有",))
+        received = []
+
+        def query(*args):
+            received.append(args)
+            if args[2] == "local":
+                raise ProjectError("Local 壞了")
+            return ("沒有" if args[2] == "basic" else "回答", {})
+
+        self.service.query_function = query
+
+        result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+
+        self.assertEqual([args[2] for args in received], ["basic", "local", "global"])
+        self.assertEqual(received[2][6]["data_max_tokens"], 9000)
+        self.assertEqual((result.status, result.routed_method, result.actual_answer), ("answered", "global", "回答"))
+        self.assertIn("改用 Global 找到答案", result.routing_reason)
+        self.assertEqual(
+            [(item["method"], item["status"]) for item in result.execution_trace["strategy_attempts"]],
+            [("basic", "not_found"), ("local", "failed"), ("global", "found")],
+        )
+
+    def test_auto_group_reports_not_found_and_all_failures(self):
+        group, question = self._auto_group(("local", "basic", "global", "drift"), refusals=("沒有",))
+        self.service.query_function = lambda *args: ("沒有", {})
+
+        result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+
+        self.assertEqual((result.status, result.actual_answer), ("answered", NOT_FOUND_ANSWER))
+        self.assertEqual(result.routed_method, "local")
+        self.assertEqual(result.retrieved_evidence, ())
+
+        def fail(*_):
+            raise ProjectError("查詢壞了")
+
+        self.service.query_function = fail
+
+        failed = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+
+        self.assertNotEqual(failed.status, "answered")
+        self.assertIn("查詢壞了", failed.error)
+        self.assertEqual(len(failed.execution_trace["strategy_attempts"]), 4)
 
     def test_auto_group_metrics_skip_questions_routed_to_global(self):
         question_set = self.service.import_question_set("project", self.question_file)
@@ -436,7 +668,10 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(local_group["accuracy"], 0.0)
         self.assertEqual(local_group["score_accuracy"], 0.25)
         self.assertEqual(edited_result["evaluation_result"], 0)
-        self.assertEqual(edited_result["evaluation_reason"], "")
+        # Manual edits override the question score but keep the judge's own verdict.
+        self.assertTrue(edited_result["manual_override"])
+        self.assertEqual(edited_result["evaluation_reason"], "model=gpt-4.1-mini")
+        self.assertEqual([item["model"] for item in edited_result["judge_scores"]], ["gpt-4.1-mini"])
         updated_summary, updated_details = self.service.export("project")
         updated_summary = json.loads(updated_summary.read_text(encoding="utf-8"))
         updated_details = json.loads(updated_details.read_text(encoding="utf-8"))
@@ -490,6 +725,75 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(len(judge.calls), 1)
         self.assertEqual(len(self.calls), 1, "evaluation must not repeat GraphRAG retrieval")
         self.assertEqual(self.service.load("project")["run"]["status"], "completed")
+
+    def test_judge_panel_averages_grades_and_keeps_each_judge_score(self):
+        class PanelJudge:
+            def __init__(self):
+                self.calls = []
+
+            def evaluate_single_answer_grade(self, project_id, question_id, question, correct, actual, model,
+                                             evaluation_mode="strict", reasoning_effort="medium"):
+                self.calls.append((question_id, question, correct, actual, model, evaluation_mode))
+                if model == "gpt-6-luna" and question_id == "Q2":
+                    raise ProjectError("timeout")
+                score = {"gpt-4o-mini": 2, "gpt-4.1-mini": 1, "gpt-6-luna": 2}[model]
+                return SimpleNamespace(
+                    question_id=question_id, score=score, judge_reason=f"{model} 理由", extra_content_error=False,
+                )
+
+        judge = PanelJudge()
+        self.service.judging = judge
+        question_set = self.question_sets.create_with_questions(
+            "project", "panel", [BatchQuestion("Q1", "問題一", "答案一"), BatchQuestion("Q2", "問題二", "答案二")]
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        panel = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-6-luna"]
+        self.service.save_configuration("project", [group], question_set.question_set_id, 1, panel)
+        self.assertEqual(self.service.load("project")["judge_model"], "gpt-4o-mini, gpt-4.1-mini, gpt-6-luna")
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=1)
+
+        run = self.service.evaluate_answers("project", question_set.question_set_id, judge_model=panel, max_concurrency=1)
+
+        # Same grading inputs for every judge; only the model differs.
+        self.assertEqual(len({call[:4] + (call[5],) for call in judge.calls if call[0] == "Q1"}), 1)
+        self.assertEqual(len(judge.calls), 6)
+        first, second = sorted(run.results, key=lambda item: item.question_id)
+        self.assertAlmostEqual(first.evaluation_result, 1.6667)
+        self.assertEqual([item.score for item in first.judge_scores], [2.0, 1.0, 2.0])
+        self.assertEqual(second.evaluation_result, 1.5)
+        self.assertIsNone(second.judge_scores[2].score)
+        self.assertIn("gpt-6-luna：失敗｜timeout", second.evaluation_reason)
+        summary = run.groups[0]
+        self.assertEqual((summary.correct_count, summary.partial_correct_count, summary.incorrect_count), (0, 2, 0))
+        self.assertAlmostEqual(summary.score_accuracy, (1.6667 + 1.5) / 4, places=4)
+        self.assertEqual(summary.judge_average_scores, {"gpt-4o-mini": 2.0, "gpt-4.1-mini": 1.0, "gpt-6-luna": 2.0})
+        self.assertEqual(summary.judge_disagreement_count, 2)
+
+        # Re-saving the displayed table value (two decimals) is not treated as a manual edit.
+        self.assertEqual(_experiment_grade_label(first.evaluation_result), "83.3%")
+        self.assertEqual(_experiment_grade_label(2), "100%")
+        self.assertEqual(_experiment_grade_label(1), "50%")
+        self.assertEqual(_experiment_grade_label(0), "0%")
+        # Tables saved before labels were removed still parse.
+        self.assertEqual(RetrievalExperimentService._parse_grade("100%（全對）"), 2)
+        self.assertEqual(RetrievalExperimentService._parse_grade("50%（部分對）"), 1)
+        self.service.update_manual_judgments("project", [("Local", "Q1", "83.3%")])
+        saved = next(item for item in self.service.load("project")["run"]["results"] if item["question_id"] == "Q1")
+        self.assertFalse(saved.get("manual_override"))
+        self.service.update_manual_judgments("project", [("Local", "Q1", "1.67")])
+        saved = next(item for item in self.service.load("project")["run"]["results"] if item["question_id"] == "Q1")
+        self.assertFalse(saved.get("manual_override"))
+        self.service.update_manual_judgments("project", [("Local", "Q1", "2")])
+        saved = next(item for item in self.service.load("project")["run"]["results"] if item["question_id"] == "Q1")
+        self.assertTrue(saved["manual_override"])
+        self.assertEqual(saved["evaluation_result"], 2)
+        self.assertEqual([item["score"] for item in saved["judge_scores"]], [2.0, 1.0, 2.0])
+
+        _summary_path, details_path = self.service.export("project")
+        details = json.loads(details_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(details["question_results"][0]["judge_scores"]), 3)
+        with self.assertRaisesRegex(ProjectError, "最多選擇 5"):
+            self.service.save_configuration("project", [group], question_set.question_set_id, 1, [*panel, *(f"x{i}" for i in range(3))])
 
     def test_lenient_evaluation_uses_lenient_judge_prompt_and_persists_mode(self):
         judge = FakeJudge(lenient_result=True)
@@ -741,12 +1045,17 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         self.assertIn("回答模型", labels)
         self.assertIn("答案評分方式", labels)
+        self.assertIn("啟用 LLM Judge", labels)
+        self.assertIn("啟用 EM／F1 傳統指標", labels)
         self.assertEqual(len(app.renderables), 1)
         self.assertIn("測試最大並行請求數", labels)
         self.assertIn("回答生成進度", labels)
         self.assertIn("實驗組摘要", labels)
         self.assertIn("實驗組 × 題目集摘要", labels)
-        self.assertIn("逐題實驗結果（請將等級欄編輯為 0 錯誤、1 部分對、2 全對）", labels)
+        self.assertIn(
+            "逐題實驗結果（不執行模型評測也可手動編輯得分與品質欄位；得分可填百分比或 0／1／2；拒答欄填正確／錯誤／不適用）",
+            labels,
+        )
         button_values = [
             component.get_config().get("value")
             for component in app.blocks.values()
@@ -783,14 +1092,36 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評測等級（0/1/2）", "評判理由", "實際檢索策略"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
+        self.assertEqual(experiment_results["datatype"][8], "markdown")
         self.assertTrue(experiment_results["interactive"])
         self.assertEqual(
             experiment_results["column_widths"],
-            ["7%", "10%", "5%", "9%", "12%", "17%", "15%", "6%", "9%", "10%"],
+            ["6%", "8%", "4%", "8%", "10%", "15%", "12%", "5%", "9%", "7%", "6%", "4%", "3%", "3%"],
         )
+        judge_detail = next(
+            config for config in component_configs
+            if config.get("label") == "各評審評分細節" and config["headers"][0] == "實驗組名稱"
+        )
+        self.assertEqual(
+            judge_detail["headers"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+        )
+        classic_table = next(
+            config for config in component_configs
+            if config.get("label") == "傳統指標結果" and config["headers"][0] == "實驗組名稱"
+        )
+        self.assertEqual(
+            classic_table["headers"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+        )
+        summary_table = next(config for config in component_configs if config.get("label") == "實驗組摘要")
+        self.assertEqual(summary_table["headers"][-2:], ["Average Term Hit", "Average Term Coverage"])
+        dataset_table = next(config for config in component_configs if config.get("label") == "實驗組 × 題目集摘要")
+        for table in (summary_table, dataset_table):
+            self.assertFalse({"全對", "部分對", "錯誤", "全對率"} & set(table["headers"]))
         block_values = list(app.blocks.values())
         result_table_position = next(
             index for index, component in enumerate(block_values)

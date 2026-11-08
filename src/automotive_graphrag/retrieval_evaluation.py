@@ -122,7 +122,7 @@ class RetrievalEvaluationService:
                 "依文件 ID／頁碼比對 Gold Evidence，不使用檢索排名"
                 if routed else "不可計算：自動模式未選到可映射來源的策略（Local／DRIFT／Basic）"
             )
-        elif method not in {"local", "basic", "drift"} or not strategy_matches:
+        elif method not in {"local", "basic", "drift", "agentic"} or not strategy_matches:
             items = tuple(self._evaluate_question(item, supported=False) for item in eligible)
             metrics = (None, None, None)
             status = (

@@ -11,9 +11,10 @@ from unittest.mock import patch
 from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.evidence import Evidence, EvidenceService
+from automotive_graphrag.agentic_search import AgenticDecision
 from automotive_graphrag.querying import QueryExecution, QueryService
 from automotive_graphrag.source_metadata import SourceMetadata
-from automotive_graphrag.strategy_routing import StrategyDecision
+from automotive_graphrag.strategy_routing import AnswerCheck, NOT_FOUND_ANSWER, StrategyDecision
 
 
 class FakeQueryRunner:
@@ -53,18 +54,50 @@ class FakeEvidenceService:
 
 
 class FakeRouter:
-    def __init__(self, decision: StrategyDecision) -> None:
+    def __init__(self, decision: StrategyDecision, refusals: tuple[str, ...] = ()) -> None:
         self.decision = decision
-        self.calls: list[tuple[str, str, str, str | None]] = []
+        self.refusals = refusals
+        self.checked: list[str] = []
+        self.calls: list[tuple[str, str, str, str | None, str]] = []
 
-    def route(self, question: str, model: str, api_base_url: str, api_key: str | None) -> StrategyDecision:
-        self.calls.append((question, model, api_base_url, api_key))
+    def route(self, question: str, model: str, api_base_url: str, api_key: str | None, reasoning_effort: str = "medium") -> StrategyDecision:
+        self.calls.append((question, model, api_base_url, api_key, reasoning_effort))
         return self.decision
+
+    def check_answer(self, question: str, answer: str, *_: object) -> AnswerCheck:
+        self.checked.append(answer)
+        return AnswerCheck(answer not in self.refusals, "檢查結果")
+
+
+class ScriptedRunner:
+    """Answer per --method; a None answer simulates a failed GraphRAG process."""
+
+    def __init__(self, answers: dict[str, str | None]) -> None:
+        self.answers = answers
+        self.methods: list[str] = []
+
+    def __call__(self, command: list[str]) -> QueryExecution:
+        method = command[command.index("--method") + 1]
+        self.methods.append(method)
+        answer = self.answers[method]
+        if answer is None:
+            return QueryExecution(1, "", f"{method} failed\n")
+        return QueryExecution(0, answer, "", {"sources": [{"id": method, "text": "來源"}]})
 
 
 class FailingEvidenceService:
     def from_context(self, project_id: str, context: dict[str, object]) -> list[Evidence]:
         raise ProjectError(f"找不到專案：{project_id}")
+
+
+class FakeAgenticSearch:
+    def __init__(self, decision: AgenticDecision) -> None:
+        self.decision = decision
+        self.calls = []
+
+    def run(self, question, model, api_base_url, api_key, search, reasoning_effort="medium"):
+        self.calls.append((question, model, api_base_url, api_key, reasoning_effort))
+        return self.decision
 
 
 class QueryServiceTests(unittest.TestCase):
@@ -125,13 +158,64 @@ class QueryServiceTests(unittest.TestCase):
 
         result = service.ask("L33-SM3E", " 手冊涵蓋哪些系統？ ", method="auto", chat_model="gpt-4.1-mini")
 
-        self.assertEqual(router.calls, [("手冊涵蓋哪些系統？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key")])
+        self.assertEqual(router.calls, [("手冊涵蓋哪些系統？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key", None)])
         command = runner.commands[0]
         self.assertEqual(command[command.index("--method") + 1], "global")
         self.assertEqual(result.method, "global")
         self.assertEqual(result.requested_method, "auto")
         self.assertEqual(result.routing_reason, "問題要求整體主題歸納")
         self.assertEqual(service.history("L33-SM3E"), [result])
+
+    def test_auto_query_falls_back_in_ranked_order_and_stops_at_first_answer(self) -> None:
+        runner = ScriptedRunner({"basic": "資料中沒有", "local": None, "global": "找到了", "drift": "不該執行"})
+        router = FakeRouter(
+            StrategyDecision("basic", "單一數值", ("basic", "local", "global", "drift")),
+            refusals=("資料中沒有",),
+        )
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
+        )
+
+        result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(runner.methods, ["basic", "local", "global"])
+        self.assertEqual(router.checked, ["資料中沒有", "找到了"])
+        self.assertEqual((result.status, result.method, result.answer), ("COMPLETED", "global", "找到了"))
+        self.assertEqual(result.requested_method, "auto")
+        self.assertEqual(result.context["sources"][0]["id"], "global")
+        self.assertEqual(len(result.evidence), 1)
+        self.assertIn("Basic 未找到答案、Local 查詢失敗，改用 Global 找到答案", result.routing_reason)
+        self.assertEqual(
+            [(item["method"], item["status"]) for item in result.execution_metadata["strategy_attempts"]],
+            [("basic", "not_found"), ("local", "failed"), ("global", "found")],
+        )
+        self.assertEqual(service.history("L33-SM3E"), [result])
+
+    def test_auto_query_reports_not_found_after_all_methods(self) -> None:
+        runner = ScriptedRunner({"local": "沒有", "basic": "沒有", "global": None, "drift": "沒有"})
+        router = FakeRouter(StrategyDecision("local", "具體事實"), refusals=("沒有",))
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
+        )
+
+        result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(runner.methods, ["local", "basic", "global", "drift"])
+        self.assertEqual((result.status, result.answer, result.method), ("COMPLETED", NOT_FOUND_ANSWER, "local"))
+        self.assertEqual(result.evidence, ())
+        self.assertEqual(result.context, {})
+        self.assertIn("Global 查詢失敗", result.routing_reason)
+
+    def test_auto_query_fails_when_every_method_fails(self) -> None:
+        runner = ScriptedRunner(dict.fromkeys(("local", "basic", "global", "drift")))
+        router = FakeRouter(StrategyDecision("local", "具體事實"))
+        service = QueryService(self.store, runner, self.connections, router=router)
+
+        result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(len(runner.methods), 4)
+        self.assertEqual((result.status, result.error), ("FAILED", "drift failed"))
+        self.assertEqual(router.checked, [])
 
     def test_fixed_method_does_not_call_router(self) -> None:
         router = FakeRouter(StrategyDecision("global", "unused"))
@@ -143,6 +227,46 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.method, "basic")
         self.assertEqual(result.requested_method, "basic")
         self.assertIsNone(result.routing_reason)
+
+    def test_agentic_query_runs_through_orchestrator_and_records_search_plan(self) -> None:
+        runner = ContextQueryRunner()
+        decision = AgenticDecision(
+            "local", "根據手冊先檢查保險絲 [E1]。",
+            {"agentic_steps": [{"method": "local", "query": "保險絲檢查", "purpose": "尋找程序", "evidence": [{"citation_id": "E1", "source_id": "7"}], "context": {"sources": [{"id": "7", "text": "來源"}]}}]},
+            ({"method": "local", "query": "保險絲檢查", "purpose": "尋找程序", "evidence": [{"citation_id": "E1", "source_id": "7"}], "context": {"sources": [{"id": "7", "text": "來源"}]}},),
+            "檢索證據足以回答",
+        )
+        agentic = FakeAgenticSearch(decision)
+        service = QueryService(self.store, runner, self.connections, evidence_service=FakeEvidenceService(), agentic_search=agentic)
+
+        result = service.ask("L33-SM3E", "如何檢查保險絲？", method="agentic", chat_model="gpt-4.1-mini", reasoning_effort="high")
+
+        self.assertEqual(agentic.calls, [("如何檢查保險絲？", "gpt-4.1-mini", "https://api.openai.com/v1", "test-key", None)])
+        self.assertEqual(result.requested_method, "agentic")
+        self.assertEqual(result.method, "agentic")
+        self.assertEqual(result.answer, "根據手冊先檢查保險絲 [E1]。")
+        self.assertEqual(result.routing_reason, "檢索證據足以回答")
+        self.assertEqual(result.evidence[0].page, 25)
+        self.assertEqual(result.execution_metadata["model"], "gpt-4.1-mini")
+        self.assertEqual(result.execution_metadata["reasoning_effort"], "high")
+        self.assertIsNone(result.execution_metadata["model_call_count"])
+        self.assertRegex(result.execution_metadata["settings_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("agentic_steps", result.context)
+
+    def test_agentic_citations_are_aligned_to_visible_evidence_ids(self) -> None:
+        context = {"agentic_steps": [{"evidence": [
+            {"citation_id": "E1", "source_id": "tu-1"},
+            {"citation_id": "E2", "source_id": "unmapped"},
+        ]}]}
+        visible = (Evidence(
+            evidence_id="E2", rank=2, context_id="tu-1", text_unit_id="full-tu-1",
+            chunk_id="chunk", section_id="section", section_name="section",
+            document_id="manual.pdf", page=12, block_id="block", text="evidence",
+        ),)
+
+        answer = QueryService._align_agentic_citations("依據 [E1]；另一處 [E2]。", context, visible)
+
+        self.assertEqual(answer, "依據 [E2]；另一處 [來源未映射]。")
 
     def test_history_without_routing_fields_still_loads(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)
@@ -156,6 +280,15 @@ class QueryServiceTests(unittest.TestCase):
 
         self.assertEqual(loaded.query_id, result.query_id)
         self.assertIsNone(loaded.routing_reason)
+        self.assertEqual(loaded.execution_metadata["model"], "gpt-6-luna")
+
+    def test_community_report_evidence_keeps_its_source_type(self) -> None:
+        evidence = EvidenceService(self.store).from_context(
+            "L33-SM3E",
+            {"reports": [{"id": "report-1", "summary": "系統摘要"}]},
+        )
+        self.assertEqual(evidence[0].source_type, "community_report")
+        self.assertIsNone(evidence[0].page)
 
     def test_query_source_is_saved_and_defaults_to_none(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(), self.connections)

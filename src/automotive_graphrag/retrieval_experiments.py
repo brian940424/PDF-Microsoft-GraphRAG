@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -18,25 +19,41 @@ from typing import Callable, Sequence
 
 import yaml
 
-from .automatic_evaluation import AutomaticEvaluationService
+from .agentic_search import AgenticSearch
+from .automatic_evaluation import (
+    AutomaticEvaluationService,
+    JudgeScore,
+    average_judge_score,
+    combined_judge_reason,
+    extra_error_share,
+    judge_panel_summary,
+    judge_scores_from_dicts,
+    project_document_only_score,
+)
 from .connections import (
-    ALLOWED_CHAT_MODELS,
     DEFAULT_REASONING_EFFORT,
-    GPT6_LUNA_MODEL,
     REASONING_EFFORT_OPTIONS,
     ConnectionSettings,
+    MAX_JUDGE_MODELS,
     configure_completion_model,
+    configure_embedding_model,
+    format_judge_models,
+    parse_judge_models,
 )
 from .evidence import Evidence, EvidenceService
+from .evaluation.classic_metrics import answer_term_scores, exact_match_score, f1_score, metric_max_over_ground_truths
+from .evaluation.source_scoring import DEFAULT_SOURCE_WEIGHT, combined_score, source_score
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
-from .strategy_routing import StrategyRouter
+from .querying import QueryExecution
+from .strategy_routing import SearchOutcome, StrategyRouter, search_with_fallback
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
 EXPERIMENT_AUTO_METHOD = "auto"
-EXPERIMENT_GROUP_METHODS = (*EXPERIMENT_METHODS, EXPERIMENT_AUTO_METHOD)
+EXPERIMENT_AGENTIC_METHOD = "agentic"
+EXPERIMENT_GROUP_METHODS = (*EXPERIMENT_METHODS, EXPERIMENT_AGENTIC_METHOD, EXPERIMENT_AUTO_METHOD)
 EVIDENCE_METHODS = frozenset({"local", "basic", "drift"})
 DEFAULT_EXPERIMENT_RESPONSE_TYPE = "Single Paragraph"
 EXPERIMENT_RESPONSE_TYPE_OPTIONS = (
@@ -156,6 +173,18 @@ class ExperimentQuestionResult:
     answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     routed_method: str = ""
     routing_reason: str = ""
+    execution_trace: dict[str, object] = field(default_factory=dict)
+    duration_seconds: float | None = None
+    answer_point_coverage_percent: float | None = None
+    unsupported_claim_count: int | None = None
+    refusal_correctness: str | None = None
+    answer_em: float | None = None
+    answer_f1: float | None = None
+    judge_scores: tuple[JudgeScore, ...] = ()
+    manual_override: bool = False
+    answer_term_hit: float | None = None
+    answer_term_coverage: float | None = None
+    source_score: float | None = None
 
     @property
     def effective_method(self) -> str:
@@ -185,6 +214,25 @@ class ExperimentGroupSummary:
     response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
     answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     strategy_parameters: dict[str, object] = field(default_factory=dict)
+    average_latency_seconds: float | None = None
+    p95_latency_seconds: float | None = None
+    average_search_steps: float | None = None
+    average_agent_model_calls: float | None = None
+    estimated_cost_usd: float | None = None
+    cost_status: str = "此適配器未提供 Token 用量，成本未知"
+    answer_point_coverage_percent: float | None = None
+    unsupported_answer_rate: float | None = None
+    average_unsupported_claim_count: float | None = None
+    refusal_accuracy: float | None = None
+    quality_reviewed_count: int = 0
+    average_answer_em: float | None = None
+    average_answer_f1: float | None = None
+    judge_average_scores: dict[str, float] = field(default_factory=dict)
+    judge_disagreement_count: int = 0
+    average_answer_term_hit: float | None = None
+    average_answer_term_coverage: float | None = None
+    average_source_score: float | None = None
+    combined_score_accuracy: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +250,9 @@ class RetrievalExperimentRun:
     results: tuple[ExperimentQuestionResult, ...]
     question_set_ids: tuple[str, ...] = ()
     question_set_names: tuple[str, ...] = ()
+    enable_llm_judge: bool = True
+    enable_classic_metrics: bool = False
+    source_weight: float = DEFAULT_SOURCE_WEIGHT
 
 
 QueryFunction = Callable[..., tuple[str, dict[str, object]]]
@@ -217,6 +268,7 @@ class RetrievalExperimentService:
         judging: AutomaticEvaluationService,
         query_function: QueryFunction | None = None,
         router: StrategyRouter | None = None,
+        agentic_search: AgenticSearch | None = None,
     ) -> None:
         self.projects = projects
         self.question_sets = question_sets
@@ -224,8 +276,67 @@ class RetrievalExperimentService:
         self.judging = judging
         self.query_function = query_function or self._graphrag_query
         self.router = router or StrategyRouter()
+        self.agentic_search = agentic_search or AgenticSearch()
         self._lock = threading.RLock()
         self._stop_events: dict[str, threading.Event] = {}
+
+    def _supports_judge_model(self, model: object) -> bool:
+        supports = getattr(self.judging, "supports_judge_model", None)
+        return supports(model) if callable(supports) else model in self.connections.available_chat_models()
+
+    def _supports_judge_reasoning(self, model: object) -> bool:
+        """True when any model of the judge panel accepts reasoning_effort."""
+        supports = getattr(self.judging, "supports_judge_reasoning", None)
+        return any(
+            supports(item) if callable(supports) else self.connections.supports_reasoning(item)
+            for item in parse_judge_models(model)
+        )
+
+    def _validate_judge_models(self, value: object) -> str:
+        """Validate a judge panel and return its saved comma-joined form."""
+        models = parse_judge_models(value)
+        if not models:
+            raise ProjectError("請至少選擇一個評測模型")
+        if len(models) > MAX_JUDGE_MODELS:
+            raise ProjectError(f"評測模型最多選擇 {MAX_JUDGE_MODELS} 個")
+        if not all(self._supports_judge_model(item) for item in models):
+            raise ProjectError("全域評測模型不支援")
+        return format_judge_models(models)
+
+    @classmethod
+    def _grade_counts(cls, values) -> tuple[int, int, int, float]:
+        """Full (2), partial (between 0 and 2) and incorrect (0) counts plus the score sum."""
+        grades = [grade for grade in (cls._parse_grade(value) for value in values) if grade is not None]
+        full = sum(grade == 2 for grade in grades)
+        incorrect = sum(grade == 0 for grade in grades)
+        return full, len(grades) - full - incorrect, incorrect, float(sum(grades))
+
+    @classmethod
+    def _source_stats(
+        cls, items, total: int, weight: float = DEFAULT_SOURCE_WEIGHT,
+    ) -> tuple[float | None, float | None]:
+        """Average cited-source score and the combined (judge 0–2 → 0–1, plus source bonus) accuracy.
+
+        ``items`` are result dicts or ``ExperimentQuestionResult`` objects; questions without a
+        judge grade contribute 0 to the combined accuracy, like ``score_accuracy``.
+        """
+        def value(item, key):
+            return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+
+        sources = [value(item, "source_score") for item in items]
+        combined_sum = 0.0
+        for item in items:
+            grade = cls._parse_grade(value(item, "evaluation_result"))
+            if grade is not None:
+                bonus_share = 0.0 if value(item, "manual_override") else extra_error_share(
+                    judge_scores_from_dicts(value(item, "judge_scores"))
+                )
+                combined_sum += combined_score(grade / 2, value(item, "source_score"), weight, bonus_share)
+        average_source = cls._mean_present(sources)
+        return (
+            round(average_source, 4) if average_source is not None else None,
+            round(combined_sum / total, 4) if total else None,
+        )
 
     def load(self, project_id: str) -> dict[str, object]:
         self.projects.get(project_id)
@@ -233,7 +344,8 @@ class RetrievalExperimentService:
             value = json.loads(self._path(project_id).read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {"groups": [], "question_set_id": "", "question_set_ids": [], "max_concurrency": 5,
-                    "judge_model": self.connections.get_chat_model(), "evaluation_mode": "strict", "run": None}
+                    "judge_model": self.connections.get_chat_model(), "evaluation_mode": "strict",
+                    "enable_llm_judge": True, "enable_classic_metrics": False, "run": None}
         except (OSError, json.JSONDecodeError) as exc:
             raise ProjectError("檢索實驗保存資料無法讀取") from exc
         value.setdefault("groups", [])
@@ -243,6 +355,8 @@ class RetrievalExperimentService:
         )
         value.setdefault("max_concurrency", 5)
         value.setdefault("evaluation_mode", "strict")
+        value.setdefault("enable_llm_judge", True)
+        value.setdefault("enable_classic_metrics", False)
         if value["evaluation_mode"] not in {"strict", "lenient"}:
             value["evaluation_mode"] = "strict"
         value.setdefault("run", None)
@@ -283,15 +397,25 @@ class RetrievalExperimentService:
                     migrated = True
             for group in run.get("groups", []):
                 group_results = [item for item in run.get("results", []) if item.get("group_id") == group.get("group_id")]
-                judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
-                full = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
-                partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
-                incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
+                full, partial, incorrect, score_sum = self._grade_counts(
+                    item.get("evaluation_result") for item in group_results
+                )
                 total = int(group.get("question_count", len(group_results)))
+                judge_enabled = bool(run.get("enable_llm_judge", True))
+                average_source, combined_accuracy = self._source_stats(
+                    group_results, total, float(run.get("source_weight", DEFAULT_SOURCE_WEIGHT)),
+                )
                 updated = {
                     "correct_count": full, "partial_correct_count": partial,
-                    "incorrect_count": incorrect, "accuracy": full / total if total else None,
-                    "score_accuracy": (2 * full + partial) / (2 * total) if total else None,
+                    "incorrect_count": incorrect,
+                    "accuracy": full / total if total and judge_enabled else None,
+                    "score_accuracy": score_sum / (2 * total) if total and judge_enabled else None,
+                    "average_answer_em": self._mean_present(item.get("answer_em") for item in group_results),
+                    "average_answer_f1": self._mean_present(item.get("answer_f1") for item in group_results),
+                    "average_answer_term_hit": self._mean_present(item.get("answer_term_hit") for item in group_results),
+                    "average_answer_term_coverage": self._mean_present(item.get("answer_term_coverage") for item in group_results),
+                    "average_source_score": average_source,
+                    "combined_score_accuracy": combined_accuracy if judge_enabled else None,
                 }
                 if any(group.get(key) != field for key, field in updated.items()):
                     group.update(updated)
@@ -307,6 +431,8 @@ class RetrievalExperimentService:
         question_set_id: str | Sequence[str],
         max_concurrency: int,
         judge_model: str | None = None,
+        enable_llm_judge: bool | None = None,
+        enable_classic_metrics: bool | None = None,
     ) -> None:
         if not 1 <= max_concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
@@ -314,13 +440,15 @@ class RetrievalExperimentService:
         current = self.load(project_id)
         current["groups"] = [asdict(group) for group in groups]
         if judge_model is not None:
-            if judge_model not in ALLOWED_CHAT_MODELS:
-                raise ProjectError("全域評測模型不支援")
-            current["judge_model"] = judge_model
+            current["judge_model"] = self._validate_judge_models(judge_model)
         question_set_ids = self._normalize_question_set_ids(question_set_id)
         current["question_set_ids"] = question_set_ids
         current["question_set_id"] = question_set_ids[0] if question_set_ids else ""
         current["max_concurrency"] = max_concurrency
+        if enable_llm_judge is not None:
+            current["enable_llm_judge"] = bool(enable_llm_judge)
+        if enable_classic_metrics is not None:
+            current["enable_classic_metrics"] = bool(enable_classic_metrics)
         self._write(project_id, current)
 
     def set_evaluation_mode(self, project_id: str, evaluation_mode: str) -> dict[str, object]:
@@ -439,7 +567,7 @@ class RetrievalExperimentService:
                     continue
                 value = str(raw_value).strip()
                 if value:
-                    if field_name == "answer_model" and value not in ALLOWED_CHAT_MODELS:
+                    if field_name == "answer_model" and value not in self.connections.available_chat_models():
                         raise ProjectError(f"{group.get('group_id')} 的回答模型不支援")
                     group[field_name] = value
             if len(row) >= 4:
@@ -500,7 +628,7 @@ class RetrievalExperimentService:
         return current
 
     def set_group_answer_model(self, project_id: str, group_id: str, answer_model: str) -> dict[str, object]:
-        if answer_model not in ALLOWED_CHAT_MODELS:
+        if answer_model not in self.connections.available_chat_models():
             raise ProjectError("不支援的回答模型")
         current = self.load(project_id)
         matched = False
@@ -529,13 +657,13 @@ class RetrievalExperimentService:
         self, project_id: str, group_id: str, reasoning_effort: str
     ) -> dict[str, object]:
         if reasoning_effort not in REASONING_EFFORT_OPTIONS:
-            raise ProjectError("不支援的 Luna 推理深度")
+            raise ProjectError("不支援的推理深度")
         current = self.load(project_id)
         matched = False
         for group in current["groups"]:
             if group.get("group_id") == group_id:
-                if group.get("answer_model") != GPT6_LUNA_MODEL:
-                    raise ProjectError("只有回答模型為 gpt-6-luna 時可以設定推理深度")
+                if not self.connections.supports_reasoning(group.get("answer_model")):
+                    raise ProjectError("此回答模型不支援推理深度")
                 group["answer_reasoning_effort"] = reasoning_effort
                 matched = True
         if matched:
@@ -564,9 +692,9 @@ class RetrievalExperimentService:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
         self._validate_groups(groups)
         state = self.load(project_id)
-        judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
-        if judge_model not in ALLOWED_CHAT_MODELS:
-            raise ProjectError("全域評測模型不支援")
+        judge_model = self._validate_judge_models(
+            judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
+        )
         project = self.projects.get(project_id)
         question_set_ids = self._normalize_question_set_ids(question_set_id)
         if not question_set_ids:
@@ -689,8 +817,12 @@ class RetrievalExperimentService:
         update_callback: UpdateFunction | None = None,
         evaluation_mode: str | None = None,
         judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        enable_llm_judge: bool = True,
+        enable_classic_metrics: bool = False,
     ) -> RetrievalExperimentRun:
         """Evaluate previously saved answers without repeating GraphRAG retrieval."""
+        if not enable_llm_judge and not enable_classic_metrics:
+            raise ProjectError("至少啟用一種評測方式")
         state = self.load(project_id)
         evaluation_mode = evaluation_mode or str(state.get("evaluation_mode", "strict"))
         if evaluation_mode not in {"strict", "lenient"}:
@@ -707,12 +839,15 @@ class RetrievalExperimentService:
         if not groups:
             raise ProjectError("請先新增至少一個實驗組")
         judge_model = judge_model or str(state.get("judge_model", self.connections.get_chat_model()))
-        if judge_model not in ALLOWED_CHAT_MODELS:
-            raise ProjectError("全域評測模型不支援")
+        judge_model = (
+            self._validate_judge_models(judge_model) if enable_llm_judge else format_judge_models(judge_model)
+        )
         concurrency = int(max_concurrency or state.get("max_concurrency", 5))
         if not 1 <= concurrency <= 32:
             raise ProjectError("最大並行請求數必須介於 1 到 32")
         state["evaluation_mode"] = evaluation_mode
+        state["enable_llm_judge"] = enable_llm_judge
+        state["enable_classic_metrics"] = enable_classic_metrics
         self._write(project_id, state)
         question_sets = [self.question_sets.get(project_id, item) for item in question_set_ids]
         dataset_by_id = {item.question_set_id: item for item in question_sets}
@@ -748,6 +883,7 @@ class RetrievalExperimentService:
         self._persist_run(
             project_id, question_set_ids, groups, judge_model, concurrency,
             started_at, "evaluating", results, evaluation_mode=evaluation_mode,
+            enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
         )
         futures: dict[Future[ExperimentQuestionResult], tuple[ExperimentGroup, object, BatchQuestion]] = {}
         work_iter = iter(work)
@@ -761,7 +897,7 @@ class RetrievalExperimentService:
                     return
                 future = executor.submit(
                     self._evaluate_case, project_id, group, question, judge_model, result, evaluation_mode,
-                    judge_reasoning_effort,
+                    judge_reasoning_effort, enable_llm_judge, enable_classic_metrics,
                 )
                 futures[future] = (group, question_set, question)
 
@@ -782,6 +918,7 @@ class RetrievalExperimentService:
                     updated = self._persist_run(
                         project_id, question_set_ids, groups, judge_model, concurrency,
                         started_at, status, results, evaluation_mode=evaluation_mode,
+                        enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
                     )
                     if update_callback:
                         update_callback(updated)
@@ -793,6 +930,7 @@ class RetrievalExperimentService:
             self._persist_run(
                 project_id, question_set_ids, groups, judge_model, concurrency,
                 started_at, "stopped", results, evaluation_mode=evaluation_mode,
+                enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
             )
             raise
         finally:
@@ -804,6 +942,7 @@ class RetrievalExperimentService:
             project_id, question_set_ids, groups, judge_model, concurrency,
             started_at, run_status, results, datetime.now(timezone.utc).isoformat(),
             evaluation_mode=evaluation_mode,
+            enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
         )
 
     def stop(self, project_id: str) -> bool:
@@ -844,25 +983,134 @@ class RetrievalExperimentService:
                 next_result = score
                 if item.get("evaluation_result") == "評判失敗":
                     continue
-                if item.get("evaluation_result") != next_result:
+                current = self._parse_grade(item.get("evaluation_result"))
+                # Fractional averages are shown with two decimals; an untouched cell is not an edit.
+                if current is None or abs(current - next_result) >= 0.005:
                     item["evaluation_result"] = next_result
-                    item["evaluation_reason"] = ""
+                    if item.get("judge_scores"):
+                        # Keep each judge's own score and reason; only the question score is overridden.
+                        item["manual_override"] = True
+                    else:
+                        item["evaluation_reason"] = ""
                     item["error"] = None
                     item["status"] = "completed"
                     changed = True
         if changed:
             for group in run.get("groups", []):
                 group_results = [item for item in results if item.get("group_id") == group.get("group_id")]
-                judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
-                full = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
-                partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
-                incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
+                full, partial, incorrect, score_sum = self._grade_counts(
+                    item.get("evaluation_result") for item in group_results
+                )
                 total = int(group.get("question_count", len(group_results)))
+                average_source, combined_accuracy = self._source_stats(
+                    group_results, total, float(run.get("source_weight", DEFAULT_SOURCE_WEIGHT)),
+                )
                 group.update(correct_count=full, partial_correct_count=partial, incorrect_count=incorrect,
                              accuracy=full / total if total else None,
-                             score_accuracy=(2 * full + partial) / (2 * total) if total else None)
+                             score_accuracy=score_sum / (2 * total) if total else None,
+                             average_source_score=average_source,
+                             combined_score_accuracy=combined_accuracy)
             self._write(project_id, state)
         return run
+
+    def update_quality_annotations(
+        self, project_id: str, annotations: Sequence[tuple[str, ...]]
+    ) -> dict[str, object]:
+        """Persist human review metrics without invoking any model."""
+        normalized = []
+        for annotation in annotations:
+            if len(annotation) != 6:
+                continue
+            group_name, dataset_id, question_id, raw_coverage, raw_unsupported, raw_refusal = annotation
+            coverage = self._optional_annotation_number(raw_coverage, "答案要點覆蓋率", 0, 100)
+            unsupported = self._optional_annotation_number(raw_unsupported, "無根據主張數", 0, None, integer=True)
+            refusal_text = str(raw_refusal or "").strip().casefold()
+            refusal_values = {
+                "正確": "correct", "correct": "correct",
+                "錯誤": "incorrect", "incorrect": "incorrect",
+                "不適用": "not_applicable", "not_applicable": "not_applicable",
+                "": None, "nan": None,
+            }
+            if refusal_text not in refusal_values:
+                raise ProjectError("拒答判定只接受：正確、錯誤、不適用或留白")
+            normalized.append((str(group_name), str(dataset_id), str(question_id), coverage, unsupported, refusal_values[refusal_text]))
+
+        state = self.load(project_id)
+        run = state.get("run")
+        if not isinstance(run, dict):
+            raise ProjectError("目前沒有可標註的檢索實驗結果")
+        results = run.get("results", [])
+        changed = False
+        for group_name, dataset_id, question_id, coverage, unsupported, refusal in normalized:
+            for item in results:
+                if (
+                    item.get("group_name") != group_name
+                    or item.get("question_id") != question_id
+                    or (dataset_id and item.get("dataset_id") != dataset_id)
+                ):
+                    continue
+                values = {
+                    "answer_point_coverage_percent": coverage,
+                    "unsupported_claim_count": unsupported,
+                    "refusal_correctness": refusal,
+                }
+                for key, value in values.items():
+                    if item.get(key) != value:
+                        item[key] = value
+                        changed = True
+        for summary in run.get("groups", []):
+            selected = [item for item in results if item.get("group_id") == summary.get("group_id")]
+            summary.update(self._quality_annotation_summary(selected))
+        if changed or run.get("groups"):
+            self._write(project_id, state)
+        return run
+
+    @staticmethod
+    def _optional_annotation_number(
+        value: object, label: str, minimum: int | float, maximum: int | float | None,
+        integer: bool = False,
+    ) -> int | float | None:
+        if value is None or str(value).strip().casefold() in {"", "nan", "none"}:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ProjectError(f"{label}必須是數字或留白") from exc
+        if not math.isfinite(number) or number < minimum or (maximum is not None and number > maximum):
+            raise ProjectError(f"{label}超出允許範圍")
+        if integer and not number.is_integer():
+            raise ProjectError(f"{label}必須是整數")
+        return int(number) if integer else number
+
+    @staticmethod
+    def _quality_annotation_summary(items: Sequence[dict[str, object]]) -> dict[str, object]:
+        coverages = [float(item["answer_point_coverage_percent"]) for item in items
+                     if isinstance(item.get("answer_point_coverage_percent"), (int, float))]
+        unsupported_counts = [int(item["unsupported_claim_count"]) for item in items
+                              if isinstance(item.get("unsupported_claim_count"), int)]
+        refusal_labels = [item.get("refusal_correctness") for item in items]
+        refusal_scored = [item for item in refusal_labels if item in {"correct", "incorrect"}]
+        reviewed = sum(
+            item.get("answer_point_coverage_percent") is not None
+            or item.get("unsupported_claim_count") is not None
+            or item.get("refusal_correctness") is not None
+            for item in items
+        )
+        return {
+            "answer_point_coverage_percent": sum(coverages) / len(coverages) if coverages else None,
+            "unsupported_answer_rate": (
+                sum(count > 0 for count in unsupported_counts) / len(unsupported_counts)
+                if unsupported_counts else None
+            ),
+            "average_unsupported_claim_count": (
+                sum(unsupported_counts) / len(unsupported_counts) if unsupported_counts else None
+            ),
+            "refusal_accuracy": (
+                sum(label == "correct" for label in refusal_scored) / len(refusal_scored)
+                if refusal_scored else None
+            ),
+            "quality_reviewed_count": reviewed,
+        }
 
     def export(self, project_id: str) -> tuple[Path, Path]:
         state = self.load(project_id)
@@ -876,17 +1124,18 @@ class RetrievalExperimentService:
         run_results = run.get("results", [])
         group_rows = []
         evaluated_count = full_count = partial_count = incorrect_count = 0
+        score_total = 0.0
         for summary in run_groups:
             group_results = [item for item in run_results if item.get("group_id") == summary.get("group_id")]
-            judged = [item for item in group_results if self._parse_grade(item.get("evaluation_result")) is not None]
-            group_correct = sum(self._parse_grade(item.get("evaluation_result")) == 2 for item in judged)
-            group_partial = sum(self._parse_grade(item.get("evaluation_result")) == 1 for item in judged)
-            group_incorrect = sum(self._parse_grade(item.get("evaluation_result")) == 0 for item in judged)
-            group_evaluated = len(judged)
+            group_correct, group_partial, group_incorrect, group_score = self._grade_counts(
+                item.get("evaluation_result") for item in group_results
+            )
+            group_evaluated = group_correct + group_partial + group_incorrect
             evaluated_count += group_evaluated
             full_count += group_correct
             partial_count += group_partial
             incorrect_count += group_incorrect
+            score_total += group_score
             group_total = int(summary.get("question_count", len(group_results)))
             group_rows.append({
                 "name": summary.get("group_name"),
@@ -896,7 +1145,7 @@ class RetrievalExperimentService:
                     "response_type": summary.get("response_type", DEFAULT_EXPERIMENT_RESPONSE_TYPE),
                     "answer_reasoning_effort": (
                         summary.get("answer_reasoning_effort", DEFAULT_REASONING_EFFORT)
-                        if summary.get("answer_model") == GPT6_LUNA_MODEL
+                        if self.connections.supports_reasoning(summary.get("answer_model"))
                         else None
                     ),
                     "strategy_parameters": summary.get("strategy_parameters", {}),
@@ -911,11 +1160,30 @@ class RetrievalExperimentService:
                     "incorrect_count": group_incorrect,
                     "fully_correct_total": f"{group_correct} / {group_total}",
                     "accuracy": group_correct / group_total if group_total else None,
-                    "score_accuracy": (2 * group_correct + group_partial) / (2 * group_total) if group_total else None,
+                    "score_accuracy": group_score / (2 * group_total) if group_total else None,
+                    "average_source_score": summary.get("average_source_score"),
+                    "combined_score_accuracy": summary.get("combined_score_accuracy"),
+                    "judge_average_scores": summary.get("judge_average_scores", {}),
+                    "judge_disagreement_count": summary.get("judge_disagreement_count", 0),
                     "evidence_hit_rate": summary.get("evidence_hit_rate"),
                     "evidence_precision": summary.get("evidence_precision"),
                     "document_hit_rate": summary.get("document_hit_rate"),
                     "no_evidence_question_count": summary.get("no_evidence_question_count", 0),
+                    "average_latency_seconds": summary.get("average_latency_seconds"),
+                    "p95_latency_seconds": summary.get("p95_latency_seconds"),
+                    "average_search_steps": summary.get("average_search_steps"),
+                    "average_agent_model_calls": summary.get("average_agent_model_calls"),
+                    "estimated_cost_usd": summary.get("estimated_cost_usd"),
+                    "cost_status": summary.get("cost_status"),
+                    "answer_point_coverage_percent": summary.get("answer_point_coverage_percent"),
+                    "average_answer_em": summary.get("average_answer_em"),
+                    "average_answer_f1": summary.get("average_answer_f1"),
+                    "average_answer_term_hit": summary.get("average_answer_term_hit"),
+                    "average_answer_term_coverage": summary.get("average_answer_term_coverage"),
+                    "unsupported_answer_rate": summary.get("unsupported_answer_rate"),
+                    "average_unsupported_claim_count": summary.get("average_unsupported_claim_count"),
+                    "refusal_accuracy": summary.get("refusal_accuracy"),
+                    "quality_reviewed_count": summary.get("quality_reviewed_count", 0),
                 },
             })
         expected_count = sum(int(item.get("question_count", 0)) for item in run_groups)
@@ -926,26 +1194,46 @@ class RetrievalExperimentService:
             "max_concurrent_requests": state.get("max_concurrency", 5),
             "evaluation": {
                 "judge_model": state.get("judge_model", ""),
+                "judge_models": list(parse_judge_models(state.get("judge_model", ""))),
+                "enable_llm_judge": run.get("enable_llm_judge", state.get("enable_llm_judge", True)),
+                "enable_classic_metrics": run.get("enable_classic_metrics", state.get("enable_classic_metrics", False)),
                 "mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
+                "source_weight": run.get("source_weight", DEFAULT_SOURCE_WEIGHT),
                 "judge_reasoning_effort": (
                     DEFAULT_REASONING_EFFORT
-                    if state.get("judge_model") == GPT6_LUNA_MODEL
+                    if self._supports_judge_reasoning(state.get("judge_model"))
                     else None
                 ),
             },
             "summary": {
                 "question_count": expected_count,
                 "evaluated_count": evaluated_count,
+                "classic_evaluated_count": sum(
+                    isinstance(item.get("answer_em"), (int, float))
+                    and isinstance(item.get("answer_f1"), (int, float))
+                    for item in run_results
+                ),
                 "fully_correct_count": full_count,
                 "correct_count": full_count,
                 "partial_correct_count": partial_count,
                 "incorrect_count": incorrect_count,
                 "fully_correct_total": f"{full_count} / {expected_count}",
                 "accuracy": full_count / expected_count if expected_count else None,
-                "score_accuracy": (2 * full_count + partial_count) / (2 * expected_count) if expected_count else None,
+                "score_accuracy": score_total / (2 * expected_count) if expected_count else None,
+                "average_source_score": self._average_metric(run_results, "source_score"),
+                "combined_score_accuracy": self._source_stats(
+                    run_results, expected_count, float(run.get("source_weight", DEFAULT_SOURCE_WEIGHT)),
+                )[1],
+                "average_answer_em": self._average_metric(run_results, "answer_em"),
+                "average_answer_f1": self._average_metric(run_results, "answer_f1"),
+                "average_answer_term_hit": self._average_metric(run_results, "answer_term_hit"),
+                "average_answer_term_coverage": self._average_metric(run_results, "answer_term_coverage"),
                 "evidence_hit_rate": self._average_metric(run_groups, "evidence_hit_rate"),
                 "evidence_precision": self._average_metric(run_groups, "evidence_precision"),
                 "document_hit_rate": self._average_metric(run_groups, "document_hit_rate"),
+                "average_latency_seconds": self._average_metric(run_groups, "average_latency_seconds"),
+                "estimated_cost_usd": None,
+                "cost_status": "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
             },
             "groups": group_rows,
             "datasets": [
@@ -962,6 +1250,8 @@ class RetrievalExperimentService:
             "project": payload["project"],
             "execution_status": run.get("status"),
             "evaluation_mode": run.get("evaluation_mode", state.get("evaluation_mode", "strict")),
+            "enable_llm_judge": run.get("enable_llm_judge", state.get("enable_llm_judge", True)),
+            "enable_classic_metrics": run.get("enable_classic_metrics", state.get("enable_classic_metrics", False)),
             "question_set_id": state.get("question_set_id", ""),
             "question_set_ids": run.get("question_set_ids", [run.get("question_set_id", "")]),
             "datasets": payload["datasets"],
@@ -992,6 +1282,7 @@ class RetrievalExperimentService:
             "global": "Microsoft GraphRAG Global",
             "drift": "Microsoft GraphRAG DRIFT",
             "basic": "Microsoft GraphRAG Basic",
+            "agentic": "Agentic Search（實驗）",
             "auto": "自動（回答模型逐題選擇 Microsoft GraphRAG 策略）",
         }.get(method)
 
@@ -1004,21 +1295,42 @@ class RetrievalExperimentService:
         return sum(values) / len(values) if values else None
 
     @staticmethod
-    def _parse_grade(value: object) -> int | None:
+    def _mean_present(values) -> float | None:
+        numbers = [float(value) for value in values if isinstance(value, (int, float)) and math.isfinite(float(value))]
+        return sum(numbers) / len(numbers) if numbers else None
+
+    @staticmethod
+    def _parse_grade(value: object) -> int | float | None:
+        """Question grade on the 0–2 scale; a judge-panel average may be fractional."""
         if isinstance(value, bool):
             return 2 if value else 0
-        if isinstance(value, int) and value in {0, 1, 2}:
-            return value
+        if isinstance(value, (int, float)):
+            if not math.isfinite(value) or not 0 <= value <= 2:
+                return None
+            return int(value) if float(value).is_integer() else round(float(value), 4)
         text = str(value or "").strip()
         legacy = {"正確": 2, "全對": 2, "錯誤": 0, "部分對": 1}
         if text in legacy:
             return legacy[text]
-        if text in {"0", "1", "2"}:
-            return int(text)
         for prefix, score in (("0 ", 0), ("1 ", 1), ("2 ", 2)):
             if text.startswith(prefix):
                 return score
-        return None
+        if "%" in text:
+            # Percent display of the 0–2 grade, e.g. "83.3%" or "100%（全對）".
+            try:
+                number = float(text.split("%", 1)[0]) / 50
+            except ValueError:
+                return None
+            if not math.isfinite(number) or not 0 <= number <= 2:
+                return None
+            return int(number) if number.is_integer() else round(number, 4)
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(number) or not 0 <= number <= 2:
+            return None
+        return int(number) if number.is_integer() else round(number, 4)
 
     def _run_case(
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
@@ -1033,41 +1345,119 @@ class RetrievalExperimentService:
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
         dataset_id: str = "", dataset_name: str = "",
     ) -> ExperimentQuestionResult:
+        started_clock = time.monotonic()
         routed_method = routing_reason = ""
         method = group.method
+        execution_trace: dict[str, object] = {}
         try:
+            def run_strategy(strategy: str) -> tuple[str, dict[str, object]]:
+                query_arguments = (
+                    project_id, question.question, strategy, group.answer_model, group.response_type,
+                    group.answer_reasoning_effort,
+                )
+                parameters = inspect.signature(self.query_function).parameters.values()
+                accepts_strategy_parameters = any(
+                    item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
+                ) or len(inspect.signature(self.query_function).parameters) >= 7
+                if accepts_strategy_parameters:
+                    return self.query_function(*query_arguments, group.strategy_parameters.get(strategy, {}))
+                return self.query_function(*query_arguments)
+
             if group.method == EXPERIMENT_AUTO_METHOD:
-                decision = self.router.route(
-                    question.question,
-                    group.answer_model,
-                    self.connections.get_api_base_url(),
-                    self.connections.get_api_key(project_id),
+                api_base = self.connections.get_api_base_url()
+                api_key = self.connections.get_api_key(project_id)
+                effort = self.connections.reasoning_effort_for(group.answer_model, group.answer_reasoning_effort)
+
+                def search(strategy: str) -> SearchOutcome:
+                    try:
+                        answer_value, context_value = run_strategy(strategy)
+                    except Exception as exc:
+                        return SearchOutcome("", str(exc))
+                    return SearchOutcome(str(answer_value), None, context_value)
+
+                fallback = search_with_fallback(
+                    self.router.route(question.question, group.answer_model, api_base, api_key, effort),
+                    search,
+                    lambda candidate: self.router.check_answer(
+                        question.question, candidate, group.answer_model, api_base, api_key, effort,
+                    ),
                 )
-                method = routed_method = decision.method
-                routing_reason = decision.reason
-            query_arguments = (
-                project_id, question.question, method, group.answer_model, group.response_type,
-                group.answer_reasoning_effort,
-            )
-            parameters = inspect.signature(self.query_function).parameters.values()
-            accepts_strategy_parameters = any(
-                item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
-            ) or len(inspect.signature(self.query_function).parameters) >= 7
-            if accepts_strategy_parameters:
-                answer, context = self.query_function(
-                    *query_arguments, group.strategy_parameters.get(method, {})
+                method = routed_method = fallback.method
+                routing_reason = fallback.reason
+                execution_trace = {"strategy_attempts": list(fallback.attempts)}
+                if fallback.outcome.error:
+                    raise ProjectError(fallback.outcome.error)
+                answer, context = fallback.outcome.answer, fallback.outcome.payload or {}
+            elif group.method == EXPERIMENT_AGENTIC_METHOD:
+                api_base = self.connections.get_api_base_url()
+                api_key = self.connections.get_api_key(project_id)
+
+                def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
+                    arguments = (
+                        project_id, search_question, search_method, group.answer_model,
+                        group.response_type, group.answer_reasoning_effort,
+                    )
+                    signature = inspect.signature(self.query_function)
+                    accepts_parameters = any(
+                        item.kind == inspect.Parameter.VAR_POSITIONAL
+                        for item in signature.parameters.values()
+                    ) or len(signature.parameters) >= 7
+                    kwargs = {}
+                    if "timeout_seconds" in signature.parameters:
+                        kwargs["timeout_seconds"] = timeout_seconds
+                    if accepts_parameters:
+                        answer_value, context_value = self.query_function(
+                            *arguments, group.strategy_parameters.get(search_method, {}), **kwargs
+                        )
+                    else:
+                        answer_value, context_value = self.query_function(*arguments, **kwargs)
+                    return QueryExecution(0, str(answer_value), "", context_value)
+
+                decision = self.agentic_search.run(
+                    question.question, group.answer_model, api_base, api_key,
+                    execute_search,
+                    self.connections.reasoning_effort_for(group.answer_model, group.answer_reasoning_effort),
                 )
+                method = EXPERIMENT_AGENTIC_METHOD
+                answer = decision.answer
+                context = dict(decision.context)
+                execution_trace = context
+                if decision.returncode != 0 and not answer.strip():
+                    failed = self._failed_result(
+                        group, question, judge_model,
+                        decision.error or decision.stop_reason, dataset_id, dataset_name,
+                    )
+                    return replace(
+                        failed,
+                        routing_reason=decision.stop_reason,
+                        execution_trace=execution_trace,
+                        duration_seconds=round(time.monotonic() - started_clock, 3),
+                    )
+                routing_reason = decision.stop_reason
+                step_contexts = [
+                    step.get("context", {}) for step in context.get("agentic_steps", [])
+                    if isinstance(step, dict) and isinstance(step.get("context"), dict)
+                ]
+                context["sources"] = [
+                    source for step_context in step_contexts
+                    for source in (step_context.get("sources") if isinstance(step_context.get("sources"), list) else [])
+                ]
+                context["reports"] = [
+                    report for step_context in step_contexts
+                    for report in (step_context.get("reports") if isinstance(step_context.get("reports"), list) else [])
+                ]
+                execution_trace = context
             else:
-                answer, context = self.query_function(*query_arguments)
+                answer, context = run_strategy(method)
         except Exception as exc:
             return replace(
                 self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name),
-                routed_method=routed_method, routing_reason=routing_reason,
+                routed_method=routed_method, routing_reason=routing_reason, execution_trace=execution_trace,
             )
         try:
             retrieved_evidence: tuple[Evidence, ...] = ()
             mapping_error = None
-            if method in EVIDENCE_METHODS:
+            if method in EVIDENCE_METHODS or method == EXPERIMENT_AGENTIC_METHOD:
                 try:
                     retrieved_evidence = self._resolved_evidence(project_id, context)
                     raw_sources = EvidenceService.source_records(context)
@@ -1088,7 +1478,11 @@ class RetrievalExperimentService:
             retrieval_status = (
                 f"不可計算：{mapping_error}" if mapping_error else
                 "已映射至原始文件／頁碼；不使用 context 順序作排名"
-                if method in EVIDENCE_METHODS else UNSUPPORTED_RETRIEVAL_METRICS
+                if method in EVIDENCE_METHODS or (
+                    method == EXPERIMENT_AGENTIC_METHOD
+                    and any(getattr(item, "source_type", "text_unit") == "text_unit" for item in retrieved_evidence)
+                )
+                else UNSUPPORTED_RETRIEVAL_METRICS
             )
             return ExperimentQuestionResult(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
@@ -1101,6 +1495,8 @@ class RetrievalExperimentService:
                 dataset_name=dataset_name,
                 routed_method=routed_method,
                 routing_reason=routing_reason,
+                execution_trace=execution_trace,
+                duration_seconds=round(time.monotonic() - started_clock, 3),
             )
         except Exception as exc:
             return replace(
@@ -1117,31 +1513,95 @@ class RetrievalExperimentService:
         generated: ExperimentQuestionResult,
         evaluation_mode: str = "strict",
         judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        enable_llm_judge: bool = True,
+        enable_classic_metrics: bool = False,
     ) -> ExperimentQuestionResult:
-        try:
-            judged = self.judging.evaluate_single_answer_grade(
-                project_id, question.question_id, question.question,
-                question.reference_answer, generated.actual_answer, judge_model,
-                evaluation_mode=evaluation_mode,
-                reasoning_effort=judge_reasoning_effort,
-            )
-            return replace(
-                generated,
-                judge_model=judge_model,
-                evaluation_result=judged.score,
-                evaluation_reason=judged.judge_reason,
+        result = replace(
+            generated,
+            answer_em=None if not enable_classic_metrics else generated.answer_em,
+            answer_f1=None if not enable_classic_metrics else generated.answer_f1,
+            answer_term_hit=None if not enable_classic_metrics else generated.answer_term_hit,
+            answer_term_coverage=None if not enable_classic_metrics else generated.answer_term_coverage,
+            source_score=source_score(
+                generated.actual_answer, generated.retrieved_evidence,
+                question.answer_source_evidence or question.gold_evidence,
+                project_document_only_score(self.projects, project_id),
+            ),
+        )
+        if enable_llm_judge:
+            # Every judge gets the identical grading prompt; judges run one after another so the
+            # case still occupies a single slot of the experiment's concurrency limit.
+            judges = []
+            for model in parse_judge_models(judge_model):
+                try:
+                    judged = self.judging.evaluate_single_answer_grade(
+                        project_id, question.question_id, question.question,
+                        question.reference_answer, generated.actual_answer, model,
+                        evaluation_mode=evaluation_mode,
+                        reasoning_effort=judge_reasoning_effort,
+                    )
+                    judges.append(JudgeScore(
+                        model, float(judged.score), judged.judge_reason,
+                        extra_content_error=judged.extra_content_error,
+                    ))
+                except Exception as exc:
+                    judges.append(JudgeScore(model, None, "", str(exc)))
+            average = average_judge_score(judges)
+            if average is None:
+                error = "；".join(
+                    (f"{item.model}: " if len(judges) > 1 else "") + str(item.error) for item in judges
+                )
+                result = replace(
+                    result,
+                    judge_model=judge_model,
+                    evaluation_result="評判失敗",
+                    evaluation_reason=error,
+                    status="evaluation_failed",
+                    error=error,
+                    judge_scores=tuple(judges),
+                    manual_override=False,
+                )
+            else:
+                result = replace(
+                    result,
+                    judge_model=judge_model,
+                    evaluation_result=self._parse_grade(average),
+                    evaluation_reason=combined_judge_reason(judges),
+                    status="completed",
+                    error=None,
+                    judge_scores=tuple(judges),
+                    manual_override=False,
+                )
+        else:
+            result = replace(
+                result,
+                judge_model="—",
+                evaluation_result="未啟用",
+                evaluation_reason="",
                 status="completed",
                 error=None,
             )
-        except Exception as exc:
-            return replace(
-                generated,
-                judge_model=judge_model,
-                evaluation_result="評判失敗",
-                evaluation_reason=str(exc),
-                status="evaluation_failed",
-                error=str(exc),
+
+        if enable_classic_metrics:
+            ground_truths = [question.reference_answer, *question.answer_aliases]
+            result = replace(
+                result,
+                answer_em=metric_max_over_ground_truths(
+                    exact_match_score, generated.actual_answer, ground_truths
+                ),
+                answer_f1=metric_max_over_ground_truths(
+                    f1_score, generated.actual_answer, ground_truths
+                ),
+                answer_term_hit=metric_max_over_ground_truths(
+                    lambda prediction, truth: answer_term_scores(prediction, truth)[0],
+                    generated.actual_answer, ground_truths,
+                ),
+                answer_term_coverage=metric_max_over_ground_truths(
+                    lambda prediction, truth: answer_term_scores(prediction, truth)[1],
+                    generated.actual_answer, ground_truths,
+                ),
             )
+        return result
 
     def _failed_result(
         self, group: ExperimentGroup, question: BatchQuestion, judge_model: str, error: str,
@@ -1182,26 +1642,37 @@ class RetrievalExperimentService:
         results: dict[tuple[str, ...], ExperimentQuestionResult],
         completed_at: str | None = None,
         evaluation_mode: str | None = None,
+        enable_llm_judge: bool | None = None,
+        enable_classic_metrics: bool | None = None,
     ) -> RetrievalExperimentRun:
         question_set_ids = self._normalize_question_set_ids(question_set_id)
         question_sets = [self.question_sets.get(project_id, item) for item in question_set_ids]
         dataset_by_id = {item.question_set_id: item for item in question_sets}
         project = self.projects.get(project_id)
+        state = self.load(project_id)
+        enable_llm_judge = state.get("enable_llm_judge", True) if enable_llm_judge is None else enable_llm_judge
+        enable_classic_metrics = state.get("enable_classic_metrics", False) if enable_classic_metrics is None else enable_classic_metrics
         summaries = []
         result_items = tuple(results.values())
         for group in groups:
             group_items = [item for item in result_items if item.group_id == group.group_id]
-            judged = [item for item in group_items if self._parse_grade(item.evaluation_result) is not None]
-            correct = sum(self._parse_grade(item.evaluation_result) == 2 for item in judged)
-            partial = sum(self._parse_grade(item.evaluation_result) == 1 for item in judged)
-            incorrect = sum(self._parse_grade(item.evaluation_result) == 0 for item in judged)
+            correct, partial, incorrect, score_sum = self._grade_counts(item.evaluation_result for item in group_items)
+            judge_averages, disagreements = judge_panel_summary(group_items, lambda item: item.judge_scores)
             total = sum(len(question_set.questions) for question_set in question_sets)
             answered = sum(bool(item.actual_answer.strip()) for item in group_items)
-            if group.method in EVIDENCE_METHODS or group.method == EXPERIMENT_AUTO_METHOD:
+            if group.method in EVIDENCE_METHODS or group.method in {EXPERIMENT_AUTO_METHOD, EXPERIMENT_AGENTIC_METHOD}:
                 # Auto groups only score questions that were routed to an evidence-mapping strategy.
                 metric_results = [
                     item for item in group_items
-                    if item.status != "failed" and item.effective_method in EVIDENCE_METHODS
+                    if item.status != "failed"
+                    and (
+                        item.effective_method in EVIDENCE_METHODS
+                        if group.method == EXPERIMENT_AUTO_METHOD
+                        else group.method != EXPERIMENT_AGENTIC_METHOD or any(
+                            getattr(evidence, "source_type", "text_unit") == "text_unit"
+                            for evidence in item.retrieved_evidence
+                        )
+                    )
                     and not item.retrieval_metrics_status.startswith("不可計算：")
                 ]
                 metric_samples = []
@@ -1219,15 +1690,47 @@ class RetrievalExperimentService:
                 )
                 if metric_results and group.method == EXPERIMENT_AUTO_METHOD:
                     metrics_status += "；自動選擇 Global 的題目不計入"
+                elif group.method == EXPERIMENT_AGENTIC_METHOD and not metric_results:
+                    metrics_status = "不可計算：本組未取得可映射頁碼的 Text Unit Evidence；Community Report 不計入 Gold Evidence 指標"
             else:
                 evidence_hit_rate = evidence_precision = document_hit_rate = None
                 no_evidence_count = 0
                 metrics_status = UNSUPPORTED_RETRIEVAL_METRICS
+            durations = [item.duration_seconds for item in group_items if item.duration_seconds is not None]
+            sorted_durations = sorted(durations)
+            p95_latency = (
+                sorted_durations[max(0, math.ceil(0.95 * len(sorted_durations)) - 1)]
+                if sorted_durations else None
+            )
+            agentic_results = [item for item in group_items if item.execution_trace]
+            step_counts = [
+                float(item.execution_trace.get("agentic_metadata", {}).get("search_step_count", 0))
+                for item in agentic_results
+                if isinstance(item.execution_trace.get("agentic_metadata"), dict)
+            ]
+            model_calls = [
+                float(item.execution_trace.get("agentic_metadata", {}).get("model_call_count", 0))
+                for item in agentic_results
+                if isinstance(item.execution_trace.get("agentic_metadata"), dict)
+            ]
+            quality_summary = self._quality_annotation_summary([
+                {
+                    "answer_point_coverage_percent": item.answer_point_coverage_percent,
+                    "unsupported_claim_count": item.unsupported_claim_count,
+                    "refusal_correctness": item.refusal_correctness,
+                }
+                for item in group_items
+            ])
+            answer_em = self._mean_present(item.answer_em for item in group_items)
+            answer_f1 = self._mean_present(item.answer_f1 for item in group_items)
+            answer_term_hit = self._mean_present(item.answer_term_hit for item in group_items)
+            answer_term_coverage = self._mean_present(item.answer_term_coverage for item in group_items)
+            average_source, combined_accuracy = self._source_stats(group_items, total)
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 total, answered, correct, partial, incorrect,
-                correct / total if total else None,
-                (2 * correct + partial) / (2 * total) if total else None,
+                correct / total if total and enable_llm_judge else None,
+                score_sum / (2 * total) if total and enable_llm_judge else None,
                 evidence_hit_rate, evidence_precision, document_hit_rate,
                 no_evidence_count, metrics_status, group.response_type, group.answer_reasoning_effort,
                 (
@@ -1235,6 +1738,21 @@ class RetrievalExperimentService:
                     if group.method == EXPERIMENT_AUTO_METHOD
                     else dict(group.strategy_parameters.get(group.method, {}))
                 ),
+                sum(durations) / len(durations) if durations else None,
+                p95_latency,
+                sum(step_counts) / len(step_counts) if step_counts else None,
+                sum(model_calls) / len(model_calls) if model_calls else None,
+                None,
+                "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
+                **quality_summary,
+                average_answer_em=answer_em,
+                average_answer_f1=answer_f1,
+                judge_average_scores=judge_averages,
+                judge_disagreement_count=disagreements,
+                average_answer_term_hit=answer_term_hit,
+                average_answer_term_coverage=answer_term_coverage,
+                average_source_score=average_source,
+                combined_score_accuracy=combined_accuracy if enable_llm_judge else None,
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
@@ -1243,14 +1761,16 @@ class RetrievalExperimentService:
             max_concurrency, sum(len(item.questions) for item in question_sets), started_at, completed_at,
             tuple(summaries), result_items, tuple(question_set_ids),
             tuple(item.name for item in question_sets),
+            bool(enable_llm_judge), bool(enable_classic_metrics),
         )
-        state = self.load(project_id)
         state["question_set_ids"] = question_set_ids
         state["question_set_id"] = question_set_ids[0] if question_set_ids else ""
         state["judge_model"] = judge_model
         run_value = asdict(run)
         if evaluation_mode is not None:
             run_value["evaluation_mode"] = evaluation_mode
+        run_value["enable_llm_judge"] = bool(enable_llm_judge)
+        run_value["enable_classic_metrics"] = bool(enable_classic_metrics)
         state["run"] = run_value
         self._write(project_id, state)
         return run
@@ -1283,6 +1803,7 @@ class RetrievalExperimentService:
     def _result_from_dict(value: dict[str, object]) -> ExperimentQuestionResult:
         data = dict(value)
         data.setdefault("retrieved_evidence", [])
+        data["judge_scores"] = judge_scores_from_dicts(data.get("judge_scores"))
         data["retrieved_evidence"] = tuple(
             item if isinstance(item, Evidence) else Evidence(**item)
             for item in data["retrieved_evidence"]
@@ -1298,13 +1819,14 @@ class RetrievalExperimentService:
         response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         strategy_parameters: dict[str, object] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[str, dict[str, object]]:
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
         if response_type not in EXPERIMENT_RESPONSE_TYPES:
             raise ProjectError("不支援的 GraphRAG 回答格式")
         if reasoning_effort not in REASONING_EFFORT_OPTIONS:
-            raise ProjectError("不支援的 Luna 推理深度")
+            raise ProjectError("不支援的推理深度")
         defaults = default_strategy_parameters()[method]
         selected_parameters = {**defaults, **(strategy_parameters or {})}
         allowed_names = {item[0] for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS[method]}
@@ -1320,7 +1842,11 @@ class RetrievalExperimentService:
             for config in settings.get(section, {}).values():
                 config["api_base"] = self.connections.get_api_base_url()
         for config in settings.get("completion_models", {}).values():
-            configure_completion_model(config, model, reasoning_effort)
+            configure_completion_model(
+                config, model, self.connections.reasoning_effort_for(model, reasoning_effort)
+            )
+        for config in settings.get("embedding_models", {}).values():
+            configure_embedding_model(config)
         settings_section = {"local": "local_search", "global": "global_search", "drift": "drift_search", "basic": "basic_search"}[method]
         section = settings.setdefault(settings_section, {})
         for key in EXPERIMENT_STRATEGY_CONFIG_KEYS[method]:
@@ -1359,6 +1885,7 @@ class RetrievalExperimentService:
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=timeout_seconds,
             )
         try:
             response = json.loads(result.stdout)
@@ -1380,14 +1907,14 @@ class RetrievalExperimentService:
             seen.add(group.group_id)
             if not group.name.strip():
                 raise ProjectError(f"{group.group_id} 的實驗組名稱不可空白")
-            if group.answer_model not in ALLOWED_CHAT_MODELS:
+            if group.answer_model not in self.connections.available_chat_models():
                 raise ProjectError(f"{group.group_id} 的回答模型不支援")
             if group.method not in EXPERIMENT_GROUP_METHODS:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 策略不支援")
             if group.response_type not in EXPERIMENT_RESPONSE_TYPES:
                 raise ProjectError(f"{group.group_id} 的 GraphRAG 回答格式不支援")
             if group.answer_reasoning_effort not in REASONING_EFFORT_OPTIONS:
-                raise ProjectError(f"{group.group_id} 的 Luna 推理深度不支援")
+                raise ProjectError(f"{group.group_id} 的推理深度不支援")
             strategy_parameters = group.strategy_parameters or default_strategy_parameters()
             for method, parameters in strategy_parameters.items():
                 specs = {item[0]: item for item in EXPERIMENT_STRATEGY_PARAMETER_SPECS.get(method, ())}
