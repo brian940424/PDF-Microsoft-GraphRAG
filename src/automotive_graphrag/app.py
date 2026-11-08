@@ -532,6 +532,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     connections = ConnectionSettings(store.root)
     documents = DocumentService(store)
     indexing = IndexingService(store, connection_settings=connections)
+    indexing.recover_interrupted_builds()
     querying = QueryService(store, connection_settings=connections)
     question_sets = QuestionSetService(store, querying)
     reviews = ReviewService(store, question_sets)

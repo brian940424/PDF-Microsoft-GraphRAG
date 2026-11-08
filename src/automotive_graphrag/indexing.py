@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -19,7 +20,7 @@ import yaml
 
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .documents import INDEXED_DOCUMENTS_FILE
-from .projects import ProjectError, ProjectStore
+from .projects import ProjectError, ProjectStore, indexing_lock_held, indexing_lock_path
 from .source_metadata import SourceMetadataService
 
 
@@ -152,8 +153,8 @@ class IndexingService:
             raise ProjectError(f"不支援的建圖模型：{chat_model}")
         project_path = self.projects.path_for(project_id)
         graph_root = project_path / "graphrag"
-        lock_path = graph_root / ".indexing.lock"
-        lock_descriptor = self._acquire_lock(lock_path)
+        lock_path = indexing_lock_path(project_path)
+        lock_descriptor, stale_lock = self._acquire_lock(lock_path)
         started = datetime.now(timezone.utc)
         started_clock = time.monotonic()
         log_path = graph_root / "indexing.log"
@@ -164,6 +165,8 @@ class IndexingService:
             self._active_log = log_path
             self._active_log.write_text("", encoding="utf-8")
             self._log_callback = log_callback
+            if stale_lock is not None:
+                self._write_log(f"已清除過期的建圖鎖（{stale_lock}）\n")
             self._initialize(project_id, chat_model, reasoning_effort)
             indexed_documents = self._processed_documents(project_path)
             self.projects.update_status(project_id, "INDEXING")
@@ -211,8 +214,9 @@ class IndexingService:
         finally:
             self._active_log = None
             self._log_callback = None
-            os.close(lock_descriptor)
+            # Unlink while still holding the flock so no other build can lock this inode first.
             lock_path.unlink(missing_ok=True)
+            os.close(lock_descriptor)
 
         completed = datetime.now(timezone.utc)
         indexing_result = IndexingResult(
@@ -227,6 +231,52 @@ class IndexingService:
         )
         self._write_result(graph_root / "last_index_run.json", indexing_result)
         return indexing_result
+
+    def recover_interrupted_builds(self) -> list[str]:
+        """Mark INDEXING projects whose build process is gone as FAILED.
+
+        A build killed outright never reaches the ``finally`` in :meth:`build`, leaving the
+        status at INDEXING, a lock file and possibly partial output. Mirror the failure path:
+        drop the partial output, restore the last successful one and clear the stale lock.
+        """
+        recovered: list[str] = []
+        for project in self.projects.list():
+            if project.status != "INDEXING":
+                continue
+            project_path = self.projects.path_for(project.project_id)
+            lock_path = indexing_lock_path(project_path)
+            if indexing_lock_held(lock_path):
+                continue
+            graph_root = project_path / "graphrag"
+            output = graph_root / "output"
+            backup = graph_root / ".last-successful-output"
+            if backup.exists():
+                if output.exists():
+                    shutil.rmtree(output)
+                backup.replace(output)
+            lock_path.unlink(missing_ok=True)
+            self.projects.update_status(project.project_id, "FAILED")
+            now = datetime.now(timezone.utc).isoformat()
+            message = "建圖程序已中斷（程序被終止），已將狀態改為 FAILED，請重新建圖"
+            log_path = graph_root / "indexing.log"
+            if log_path.is_file():
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write(f"\n{message}\n")
+            self._write_result(
+                graph_root / "last_index_run.json",
+                IndexingResult(
+                    project_id=project.project_id,
+                    status="FAILED",
+                    started_at=project.updated_at,
+                    completed_at=now,
+                    duration_seconds=0.0,
+                    return_code=-1,
+                    last_message=message,
+                    log_file=log_path.name,
+                ),
+            )
+            recovered.append(project.project_id)
+        return recovered
 
     def last_result(self, project_id: str) -> IndexingResult | None:
         path = self.projects.path_for(project_id) / "graphrag" / "last_index_run.json"
@@ -331,11 +381,49 @@ class IndexingService:
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
 
     @staticmethod
-    def _acquire_lock(path: Path) -> int:
-        try:
-            return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            raise ProjectError("此專案已有建圖工作正在執行") from exc
+    def _acquire_lock(path: Path) -> tuple[int, str | None]:
+        """Take the project's indexing lock; return its descriptor and any stale owner found.
+
+        The lock is an exclusive ``flock`` held for the whole build, so it disappears with the
+        process even when ``finally`` never runs. A leftover file that nobody holds is stale and
+        is taken over.
+        """
+        while True:
+            try:
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+                created = True
+            except FileExistsError:
+                try:
+                    descriptor = os.open(path, os.O_RDWR)
+                except FileNotFoundError:
+                    continue
+                created = False
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.close(descriptor)
+                raise ProjectError("此專案已有建圖工作正在執行") from exc
+            try:
+                same_file = os.stat(path).st_ino == os.fstat(descriptor).st_ino
+            except FileNotFoundError:
+                same_file = False
+            if same_file:
+                break
+            # The previous holder unlinked this file before we locked it; retry on the new path.
+            os.close(descriptor)
+        stale_lock = None
+        if not created:
+            previous = os.read(descriptor, 4096).decode("utf-8", errors="replace").strip()
+            stale_lock = previous or "空白鎖檔"
+        owner = json.dumps(
+            {"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()},
+            ensure_ascii=False,
+        )
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.write(descriptor, owner.encode("utf-8"))
+        os.fsync(descriptor)
+        return descriptor, stale_lock
 
     @staticmethod
     def _failure_message(prefix: str, result: subprocess.CompletedProcess[str]) -> str:

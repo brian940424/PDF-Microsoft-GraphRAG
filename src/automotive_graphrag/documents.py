@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
 
 import pymupdf
 
-from .projects import ProjectError, ProjectStore
+from .projects import ProjectError, ProjectStore, project_indexing_locked
 from .vision import PageAnalyzer, VisionAbort, VisionSettings, analyze_page, detect_document_language, page_needs_vision, render_page
 
 
@@ -205,7 +205,7 @@ class DocumentService:
         project_path = self.projects.path_for(project_id)
         if not filename or Path(filename).name != filename or Path(filename).suffix.lower() != ".pdf":
             raise ProjectError("PDF 檔名格式不正確")
-        if (project_path / "graphrag" / ".indexing.lock").exists():
+        if project_indexing_locked(project_path):
             raise ProjectError("建圖工作執行中，無法移除 PDF")
         source = project_path / "source" / filename
         if not source.is_file():
@@ -519,7 +519,7 @@ class DocumentService:
     ) -> PageReview:
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
-        if (project_path / "graphrag" / ".indexing.lock").exists():
+        if project_indexing_locked(project_path):
             raise ProjectError("建圖工作執行中，無法修改頁面內容")
         document_report = self._processed_report(project_id, filename)
         if page_number not in self._report_page_numbers(document_report):

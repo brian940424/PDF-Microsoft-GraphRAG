@@ -1,5 +1,9 @@
+import fcntl
 import json
+import os
+import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -224,19 +228,117 @@ class IndexingServiceTests(unittest.TestCase):
         self.assertEqual((output / "previous.parquet").read_bytes(), b"previous")
         self.assertFalse((output / "partial.txt").exists())
 
+    def service(self, runner: FakeGraphRag | None = None) -> IndexingService:
+        return IndexingService(
+            self.store,
+            runner or FakeGraphRag(),
+            connection_settings=self.connections,
+            metadata_builder=self.build_metadata,
+        )
+
     def test_existing_lock_prevents_duplicate_index_job(self) -> None:
         lock = self.store.path_for("L33-SM3E") / "graphrag" / ".indexing.lock"
-        lock.write_text("busy")
+        lock.write_text('{"pid": 1}')
 
-        with self.assertRaisesRegex(ProjectError, "正在執行"):
-            IndexingService(
-                self.store,
-                FakeGraphRag(),
-                connection_settings=self.connections,
-                metadata_builder=self.build_metadata,
-            ).build("L33-SM3E")
+        with lock.open("r") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(ProjectError, "正在執行"):
+                self.service().build("L33-SM3E")
 
         self.assertEqual(self.store.get("L33-SM3E").status, "READY")
+        self.assertEqual(lock.read_text(), '{"pid": 1}')
+
+    def test_lock_held_by_another_process_prevents_index_job(self) -> None:
+        lock = self.store.path_for("L33-SM3E") / "graphrag" / ".indexing.lock"
+        holder = self._spawn_lock_holder(lock)
+        try:
+            with self.assertRaisesRegex(ProjectError, "正在執行"):
+                self.service().build("L33-SM3E")
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_empty_stale_lock_is_replaced(self) -> None:
+        graph_root = self.store.path_for("L33-SM3E") / "graphrag"
+        (graph_root / ".indexing.lock").write_text("")
+
+        result = self.service().build("L33-SM3E")
+
+        self.assertEqual(result.status, "INDEXED")
+        self.assertIn("已清除過期的建圖鎖", (graph_root / "indexing.log").read_text(encoding="utf-8"))
+        self.assertFalse((graph_root / ".indexing.lock").exists())
+
+    def test_lock_left_by_killed_build_process_is_replaced(self) -> None:
+        graph_root = self.store.path_for("L33-SM3E") / "graphrag"
+        lock = graph_root / ".indexing.lock"
+        holder = self._spawn_lock_holder(lock)
+        holder.send_signal(signal.SIGKILL)
+        holder.wait()
+        self.assertIn(f'"pid": {holder.pid}', lock.read_text())
+
+        result = self.service().build("L33-SM3E")
+
+        self.assertEqual(result.status, "INDEXED")
+        self.assertIn(f'"pid": {holder.pid}', (graph_root / "indexing.log").read_text(encoding="utf-8"))
+
+    def test_startup_recovery_fails_orphaned_build_and_restores_output(self) -> None:
+        graph_root = self.store.path_for("L33-SM3E") / "graphrag"
+        output = graph_root / "output"
+        backup = graph_root / ".last-successful-output"
+        backup.mkdir()
+        (backup / "previous.parquet").write_bytes(b"previous")
+        output.mkdir()
+        (output / "text_units.parquet").write_bytes(b"partial")
+        (graph_root / ".indexing.lock").write_text("")
+        self.store.update_status("L33-SM3E", "INDEXING")
+
+        recovered = self.service().recover_interrupted_builds()
+
+        self.assertEqual(recovered, ["L33-SM3E"])
+        self.assertEqual(self.store.get("L33-SM3E").status, "FAILED")
+        self.assertEqual((output / "previous.parquet").read_bytes(), b"previous")
+        self.assertFalse((output / "text_units.parquet").exists())
+        self.assertFalse(backup.exists())
+        self.assertFalse((graph_root / ".indexing.lock").exists())
+        last = self.service().last_result("L33-SM3E")
+        self.assertEqual(last.status, "FAILED")
+        self.assertIn("中斷", last.last_message)
+        self.assertEqual(self.service().build("L33-SM3E").status, "INDEXED")
+
+    def test_startup_recovery_keeps_build_with_live_lock_holder(self) -> None:
+        graph_root = self.store.path_for("L33-SM3E") / "graphrag"
+        self.store.update_status("L33-SM3E", "INDEXING")
+        holder = self._spawn_lock_holder(graph_root / ".indexing.lock")
+        try:
+            self.assertEqual(self.service().recover_interrupted_builds(), [])
+        finally:
+            holder.kill()
+            holder.wait()
+
+        self.assertEqual(self.store.get("L33-SM3E").status, "INDEXING")
+
+    @staticmethod
+    def _spawn_lock_holder(lock: Path) -> subprocess.Popen[str]:
+        """Run a process that takes the indexing lock like a build and then sleeps."""
+        script = (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from automotive_graphrag.indexing import IndexingService\n"
+            "IndexingService._acquire_lock(Path(sys.argv[1]))\n"
+            "print('locked', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(lock)],
+            stdout=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        )
+        assert process.stdout is not None
+        if process.stdout.readline().strip() != "locked":
+            process.kill()
+            raise AssertionError("lock holder failed to start")
+        return process
 
     def test_build_rejects_project_that_is_not_ready(self) -> None:
         self.store.update_status("L33-SM3E", "UPLOADED")

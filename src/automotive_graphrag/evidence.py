@@ -42,7 +42,13 @@ class EvidenceService:
             text_units_path = output / "text_units.parquet"
             if not text_units_path.is_file():
                 raise ProjectError("找不到 GraphRAG text_units.parquet")
-            text_units = pd.read_parquet(text_units_path, columns=["id", "human_readable_id"])
+            try:
+                text_units = pd.read_parquet(text_units_path, columns=["id", "human_readable_id"])
+            except (KeyError, ValueError) as exc:
+                # A build killed midway can leave text_units.parquet without these columns.
+                raise ProjectError(
+                    "索引輸出不完整（text_units.parquet 缺少 id／human_readable_id 欄位），請重新建圖"
+                ) from exc
             full_id_by_short_id = {
                 str(row["human_readable_id"]): str(row["id"])
                 for row in text_units.to_dict(orient="records")

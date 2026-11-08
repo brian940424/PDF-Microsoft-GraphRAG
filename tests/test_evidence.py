@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from automotive_graphrag.evidence import EvidenceService
-from automotive_graphrag.projects import ProjectStore
+from automotive_graphrag.projects import ProjectError, ProjectStore
 
 
 class EvidenceServiceTests(unittest.TestCase):
@@ -73,6 +73,13 @@ class EvidenceServiceTests(unittest.TestCase):
         self.assertEqual((evidence[0].document_id, evidence[0].page), ("PG.pdf", 42))
         self.assertEqual(evidence[1].chunk_id, "L33-SM3E-WW-p0025-b01")
         self.assertIsNone(evidence[0].score)
+
+    def test_text_units_missing_columns_asks_for_rebuild(self) -> None:
+        pd.DataFrame([{"id": "full-tu-1"}]).to_parquet(self.output / "text_units.parquet")
+        context = {"sources": [{"id": "7", "text": "檢查雨刷保險絲", "in_context": True}]}
+
+        with self.assertRaisesRegex(ProjectError, "索引輸出不完整.*請重新建圖"):
+            EvidenceService(self.store).from_context("L33-SM3E", context)
 
     def test_candidate_source_not_in_context_is_excluded(self) -> None:
         context = {
