@@ -20,6 +20,7 @@ from typing import Any, Callable
 import pandas as pd
 import yaml
 
+from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
@@ -111,7 +112,10 @@ class QueryService:
         response_type: str = "Single Paragraph",
         source: str | None = None,
         reasoning_effort: str = "medium",
+        stop_event: threading.Event | None = None,
     ) -> QueryResult:
+        """Answer one question; setting `stop_event` terminates the query worker and raises JobStopped."""
+        raise_if_stopped(stop_event)
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
         prompt = question.strip()
@@ -156,6 +160,12 @@ class QueryService:
         retrieval_query = expand_manual_query(prompt)
         if retrieval_query != prompt:
             execution_metadata["expanded_retrieval_query"] = retrieval_query
+        def run_query(command: list[str]) -> subprocess.CompletedProcess[str] | QueryExecution:
+            if self._custom_runner:
+                raise_if_stopped(stop_event)
+                return self.runner(command)
+            return self._run(command, stop_event=stop_event)
+
         def query_command(search_method: str, search_question: str) -> list[str]:
             return [
                 sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
@@ -168,7 +178,7 @@ class QueryService:
 
             def search(search_method: str) -> SearchOutcome:
                 try:
-                    execution = self.runner(query_command(search_method, retrieval_query))
+                    execution = run_query(query_command(search_method, retrieval_query))
                 except ProjectError as exc:
                     return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
                 if execution.returncode != 0:
@@ -192,7 +202,8 @@ class QueryService:
             def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
                 search_command = query_command(search_method, search_question)
                 if not self._custom_runner:
-                    return self._run(search_command, timeout_seconds=timeout_seconds)
+                    return self._run(search_command, timeout_seconds=timeout_seconds, stop_event=stop_event)
+                raise_if_stopped(stop_event)
                 return self.runner(search_command)
 
             decision = self.agentic_search.run(
@@ -208,7 +219,7 @@ class QueryService:
             execution_metadata.update(decision.execution_metadata)
             execution_metadata["requested_method"] = requested_method
         else:
-            result = self.runner(query_command(normalized_method, retrieval_query))
+            result = run_query(query_command(normalized_method, retrieval_query))
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -304,7 +315,11 @@ class QueryService:
         return QueryResult(**value)
 
     @staticmethod
-    def _run(command: list[str], timeout_seconds: float | None = None) -> subprocess.CompletedProcess[str] | QueryExecution:
+    def _run(
+        command: list[str],
+        timeout_seconds: float | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> subprocess.CompletedProcess[str] | QueryExecution:
         method = command[command.index("--method") + 1]
         root = Path(command[command.index("--root") + 1])
         question = command[-1]
@@ -338,16 +353,7 @@ class QueryService:
             ensure_ascii=False,
         )
         try:
-            completed = subprocess.run(
-                [sys.executable, "-m", "automotive_graphrag.graph_query_worker"],
-                cwd=package_root,
-                env=environment,
-                input=worker_payload,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout_seconds,
-            )
+            completed = QueryService._run_worker(environment, package_root, worker_payload, timeout_seconds, stop_event)
             response = json.loads(completed.stdout)
             if not isinstance(response, dict):
                 raise ValueError("工作程序結果不是 JSON 物件")
@@ -367,6 +373,43 @@ class QueryService:
             detail = (completed.stderr or completed.stdout).strip().splitlines() if "completed" in locals() else []
             error = detail[-1] if detail else str(exc)
             return QueryExecution(1, "", error)
+
+    @staticmethod
+    def _run_worker(
+        environment: dict[str, str],
+        package_root: Path,
+        payload: str,
+        timeout_seconds: float | None,
+        stop_event: threading.Event | None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, "-m", "automotive_graphrag.graph_query_worker"]
+        if stop_event is None:
+            return subprocess.run(
+                command, cwd=package_root, env=environment, input=payload, text=True,
+                capture_output=True, check=False, timeout=timeout_seconds,
+            )
+        raise_if_stopped(stop_event)
+        process = subprocess.Popen(
+            command,
+            cwd=package_root,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            # Its own process group, so a stop also ends any helper the worker started.
+            start_new_session=True,
+        )
+        with ProcessStopWatcher(process, stop_event) as watcher:
+            try:
+                stdout, stderr = process.communicate(payload, timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise
+        if watcher.stopped:
+            raise JobStopped("查詢已由使用者停止")
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     @staticmethod
     def _last_error(result: subprocess.CompletedProcess[str] | QueryExecution) -> str:

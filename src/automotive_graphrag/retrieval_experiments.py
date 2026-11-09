@@ -279,7 +279,6 @@ class RetrievalExperimentService:
         self.router = router or StrategyRouter()
         self.agentic_search = agentic_search or AgenticSearch()
         self._lock = threading.RLock()
-        self._stop_events: dict[str, threading.Event] = {}
 
     def _supports_judge_model(self, model: object) -> bool:
         supports = getattr(self.judging, "supports_judge_model", None)
@@ -686,7 +685,9 @@ class RetrievalExperimentService:
         update_callback: UpdateFunction | None = None,
         judge_model: str | None = None,
         evaluate: bool = True,
+        stop_event: threading.Event | None = None,
     ) -> RetrievalExperimentRun:
+        """Setting `stop_event` sends no new requests; requests already sent finish and are saved."""
         if not groups:
             raise ProjectError("請先新增至少一個實驗組")
         if not 1 <= max_concurrency <= 32:
@@ -713,9 +714,7 @@ class RetrievalExperimentService:
         if missing_answers:
             raise ProjectError("以下題目缺少正確答案，無法評測：" + ", ".join(missing_answers))
         question_count = sum(len(item.questions) for item in question_sets)
-        stop_event = threading.Event()
-        with self._lock:
-            self._stop_events[project_id] = stop_event
+        stop_event = stop_event or threading.Event()
 
         start = datetime.now(timezone.utc).isoformat()
         results: dict[tuple[str, str, str], ExperimentQuestionResult] = {}
@@ -770,9 +769,6 @@ class RetrievalExperimentService:
             executor.shutdown(wait=True, cancel_futures=True)
             self._persist_run(project_id, question_set_ids, groups, judge_model, max_concurrency, start, "stopped", results)
             raise
-        finally:
-            with self._lock:
-                self._stop_events.pop(project_id, None)
 
         if stop_event.is_set():
             run_status = "stopped"
@@ -797,6 +793,7 @@ class RetrievalExperimentService:
         max_concurrency: int = 5,
         update_callback: UpdateFunction | None = None,
         judge_model: str | None = None,
+        stop_event: threading.Event | None = None,
     ) -> RetrievalExperimentRun:
         """Run retrieval and answer generation only; judging is a separate action."""
         return self.run(
@@ -807,6 +804,7 @@ class RetrievalExperimentService:
             update_callback,
             judge_model,
             evaluate=False,
+            stop_event=stop_event,
         )
 
     def evaluate_answers(
@@ -820,8 +818,11 @@ class RetrievalExperimentService:
         judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         enable_llm_judge: bool = True,
         enable_classic_metrics: bool = False,
+        stop_event: threading.Event | None = None,
     ) -> RetrievalExperimentRun:
-        """Evaluate previously saved answers without repeating GraphRAG retrieval."""
+        """Evaluate previously saved answers without repeating GraphRAG retrieval.
+
+        Setting `stop_event` sends no new judge requests; finished evaluations are saved."""
         if not enable_llm_judge and not enable_classic_metrics:
             raise ProjectError("至少啟用一種評測方式")
         state = self.load(project_id)
@@ -877,9 +878,7 @@ class RetrievalExperimentService:
                         raise ProjectError(f"{question_set.name} 的題目 {question.question_id} 已變更；請重新生成答案")
                     work.append((group, question_set, question, result))
 
-        stop_event = threading.Event()
-        with self._lock:
-            self._stop_events[project_id] = stop_event
+        stop_event = stop_event or threading.Event()
         started_at = str(run_state.get("started_at") or datetime.now(timezone.utc).isoformat())
         self._persist_run(
             project_id, question_set_ids, groups, judge_model, concurrency,
@@ -934,9 +933,6 @@ class RetrievalExperimentService:
                 enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
             )
             raise
-        finally:
-            with self._lock:
-                self._stop_events.pop(project_id, None)
 
         run_status = "stopped" if stop_event.is_set() else "completed"
         return self._persist_run(
@@ -945,14 +941,6 @@ class RetrievalExperimentService:
             evaluation_mode=evaluation_mode,
             enable_llm_judge=enable_llm_judge, enable_classic_metrics=enable_classic_metrics,
         )
-
-    def stop(self, project_id: str) -> bool:
-        with self._lock:
-            event = self._stop_events.get(project_id)
-        if event is None:
-            return False
-        event.set()
-        return True
 
     def update_manual_judgments(
         self, project_id: str, judgments: Sequence[tuple[str, ...]]

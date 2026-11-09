@@ -1,6 +1,7 @@
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -882,14 +883,15 @@ class RetrievalExperimentTests(unittest.TestCase):
             ],
         )
         group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        stop_event = threading.Event()
 
         def stop_after_first(run):
             if run.results:
-                self.service.stop("project")
+                stop_event.set()
 
         run = self.service.run(
             "project", question_set.question_set_id, [group], max_concurrency=1,
-            update_callback=stop_after_first,
+            update_callback=stop_after_first, stop_event=stop_event,
         )
 
         self.assertEqual(run.status, "stopped")

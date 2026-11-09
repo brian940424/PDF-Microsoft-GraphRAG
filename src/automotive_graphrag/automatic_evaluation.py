@@ -12,12 +12,14 @@ import tempfile
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .cancellation import JobStopped, raise_if_stopped
 from .evaluation.classic_metrics import (
     answer_term_scores,
     exact_match_score,
@@ -186,6 +188,7 @@ class AutomaticEvaluationResult:
     source_weight: float = DEFAULT_SOURCE_WEIGHT
     average_source_score: float | None = None
     average_combined_score: float | None = None
+    stopped: bool = False
 
 
 def average_judge_score(judges: Sequence[JudgeScore]) -> float | None:
@@ -300,10 +303,14 @@ class AutomaticEvaluationService:
         enable_llm_judge: bool = True,
         enable_classic_metrics: bool = False,
         source_weight: float = DEFAULT_SOURCE_WEIGHT,
+        stop_event: threading.Event | None = None,
     ) -> AutomaticEvaluationResult:
         """Judge saved answers; with several models every judge scores each question and the
         question score is the average of the judges that succeeded. The combined score mixes
-        that judge score with the cited-source score by ``source_weight``."""
+        that judge score with the cited-source score by ``source_weight``.
+
+        Setting `stop_event` sends no new judge requests (requests already sent finish); only
+        questions scored by every judge are saved and the result is marked ``stopped``."""
         if not enable_llm_judge and not enable_classic_metrics:
             raise ProjectError("至少啟用一種評測方式")
         try:
@@ -348,15 +355,22 @@ class AutomaticEvaluationService:
         failures: list[str] = []
         partial_failures: list[str] = []
         total_calls = len(eligible) * len(models)
+        stopped = False
         if progress_callback and enable_llm_judge:
             progress_callback(0, total_calls)
         if enable_llm_judge:
             verdicts: dict[str, dict[str, JudgeScore]] = {item.question_id: {} for item in eligible}
             finished = 0
+
+            def judge_one(*args, **kwargs):
+                # Queued requests check the stop flag before calling the judge API.
+                raise_if_stopped(stop_event)
+                return self.evaluate_single_answer(*args, **kwargs)
+
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 futures = {
                     pool.submit(
-                        self.evaluate_single_answer,
+                        judge_one,
                         project_id,
                         item.question_id,
                         item.question,
@@ -370,18 +384,25 @@ class AutomaticEvaluationService:
                 }
                 for future in as_completed(futures):
                     question, judge_model = futures[future]
+                    if stop_event is not None and stop_event.is_set() and not stopped:
+                        stopped = True
+                        pool.shutdown(wait=False, cancel_futures=True)
                     try:
                         single = future.result()
                         verdicts[question.question_id][judge_model] = JudgeScore(
                             judge_model, single.score, single.judge_reason,
                             extra_content_error=single.extra_content_error,
                         )
+                    except (JobStopped, CancelledError):
+                        continue
                     except Exception as exc:
                         verdicts[question.question_id][judge_model] = JudgeScore(judge_model, None, "", str(exc))
                     finished += 1
                     if progress_callback:
                         progress_callback(finished, total_calls)
             for question in eligible:
+                if len(verdicts[question.question_id]) < len(models):
+                    continue  # Not finished before the stop; the question stays unjudged.
                 judges = tuple(verdicts[question.question_id][judge_model] for judge_model in models)
                 failed = [item for item in judges if item.score is None]
                 if len(failed) == len(judges):
@@ -405,7 +426,9 @@ class AutomaticEvaluationService:
                     source_score=source,
                     combined_score=combined_score(average, source, source_weight, extra_error_share(judges)),
                 )
-        if failures and not enable_classic_metrics:
+        if stopped:
+            eligible = [item for item in eligible if item.question_id in judged_by_id]
+        if failures and not enable_classic_metrics and not stopped:
             raise ProjectError("自動評測部分請求失敗：" + "；".join(failures))
         if enable_llm_judge and selected_ids is not None and previous is not None:
             items_by_id = {item.question_id: item for item in previous.items}
@@ -471,6 +494,7 @@ class AutomaticEvaluationService:
             source_weight=source_weight,
             average_source_score=self._mean_present(item.source_score for item in items),
             average_combined_score=self._average_final_score(items),
+            stopped=stopped,
         )
         self._write(result)
         return result
