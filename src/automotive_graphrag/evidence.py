@@ -26,6 +26,7 @@ class Evidence:
     text: str
     score: float | None = None
     source_type: str = "text_unit"
+    section_path: str = ""
 
 
 class EvidenceService:
@@ -79,6 +80,7 @@ class EvidenceService:
                         page=source_metadata.page,
                         block_id=source_metadata.block_id,
                         text=source_metadata.text,
+                        section_path=source_metadata.section_path,
                     )
                 )
         if result:

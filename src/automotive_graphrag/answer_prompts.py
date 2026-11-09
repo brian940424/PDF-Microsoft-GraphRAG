@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v1"
+ANSWER_PROMPT_VERSION = "answer-requirements-v2"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -20,6 +20,9 @@ ANSWER_REQUIREMENTS = """---Answer requirements---
 
 - Answer about the exact feature, app, setting or procedure in the question. When the data describes similarly named functions (for example the same feature name in another app, or another way to do a similar task), use only the passages about the one asked and do not mix in the others.
 - When a relevant passage contains a list of steps, precautions, warnings, conditions or items, include every item of that list, not just the first few.
+- Keep each answer within the single section that directly answers the question. Include that section's relevant notes, limitations, alternatives and follow-up branches, but do not combine adjacent sections just because they share a page.
+- Preserve the source order of procedure steps. Do not move a later registration or setup step before the instruction that introduces it.
+- Use citation identifiers exactly as supplied in the source context. Printed page numbers inside source text are content, not citation identifiers.
 - Include the follow-up branches that the passage gives for the asked task, such as "To ...", "If ..." or "After ..." instructions (for example how to restore, undo, continue or set up next), unless the question clearly asks for only one part.
 - Do not add anything the data does not state, such as extra steps, conditions, costs, side effects or general knowledge, and do not add neighbouring content that the question did not ask about.
 - Keep the certainty of the source wording: if the data says something will happen, do not soften it to "may"; if it says "may", do not make it definite.

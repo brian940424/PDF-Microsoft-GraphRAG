@@ -38,6 +38,7 @@ class EvidenceServiceTests(unittest.TestCase):
                 "page": 25,
                 "block_id": "b01",
                 "text": "檢查雨刷保險絲",
+                "section_path": "WW > 更換雨刷",
             },
             {
                 "text_unit_id": "full-tu-2",
@@ -72,6 +73,7 @@ class EvidenceServiceTests(unittest.TestCase):
         self.assertEqual([item.evidence_id for item in evidence], ["E1", "E2"])
         self.assertEqual((evidence[0].document_id, evidence[0].page), ("PG.pdf", 42))
         self.assertEqual(evidence[1].chunk_id, "L33-SM3E-WW-p0025-b01")
+        self.assertEqual(evidence[1].section_path, "WW > 更換雨刷")
         self.assertIsNone(evidence[0].score)
 
     def test_text_units_missing_columns_asks_for_rebuild(self) -> None:

@@ -32,6 +32,24 @@ QUERY_METHODS = {"local", "global", "drift", "basic"}
 AUTO_METHOD = "auto"
 AGENTIC_METHOD = "agentic"
 
+_MANUAL_QUERY_ALIASES = {
+    "翻譯": ("懸浮翻譯", "翻譯助理", "即時翻譯"),
+    "選擇語言": ("語言設定", "變更語言", "系統語言"),
+    "未知號碼": ("封鎖未知號碼", "來電封鎖", "封鎖來電"),
+    "指紋": ("指紋辨識", "註冊指紋", "指紋解鎖"),
+}
+
+
+def expand_manual_query(question: str) -> str:
+    """Add a small deterministic alias set when a manual uses a related feature name."""
+    additions: list[str] = []
+    for term, aliases in _MANUAL_QUERY_ALIASES.items():
+        if term in question:
+            additions.extend(alias for alias in aliases if alias not in question and alias not in additions)
+    if not additions:
+        return question
+    return f"{question}\nRelated manual terms: {'; '.join(additions)}"
+
 
 @dataclass(frozen=True, slots=True)
 class QueryExecution:
@@ -135,6 +153,9 @@ class QueryService:
             "cost_status": "unknown_usage_not_returned_by_query_adapter",
             "settings_sha256": hashlib.sha256((graph_root / "settings.yaml").read_bytes()).hexdigest(),
         }
+        retrieval_query = expand_manual_query(prompt)
+        if retrieval_query != prompt:
+            execution_metadata["expanded_retrieval_query"] = retrieval_query
         def query_command(search_method: str, search_question: str) -> list[str]:
             return [
                 sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
@@ -147,7 +168,7 @@ class QueryService:
 
             def search(search_method: str) -> SearchOutcome:
                 try:
-                    execution = self.runner(query_command(search_method, prompt))
+                    execution = self.runner(query_command(search_method, retrieval_query))
                 except ProjectError as exc:
                     return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
                 if execution.returncode != 0:
@@ -187,7 +208,7 @@ class QueryService:
             execution_metadata.update(decision.execution_metadata)
             execution_metadata["requested_method"] = requested_method
         else:
-            result = self.runner(query_command(normalized_method, prompt))
+            result = self.runner(query_command(normalized_method, retrieval_query))
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)

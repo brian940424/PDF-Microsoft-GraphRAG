@@ -25,6 +25,7 @@ class SourceMetadata:
     page: int
     block_id: str
     text: str
+    section_path: str = ""
 
 
 class SourceMetadataService:
@@ -85,6 +86,7 @@ class SourceMetadataService:
                     page=int(source["page"]),
                     block_id=str(source["block_id"]),
                     text=str(row["text"]),
+                    section_path=str(source.get("section_path") or source.get("section_name") or ""),
                 )
             )
         if missing_documents:

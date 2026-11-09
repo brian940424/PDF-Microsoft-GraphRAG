@@ -12,7 +12,7 @@ from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.evidence import Evidence, EvidenceService
 from automotive_graphrag.agentic_search import AgenticDecision
-from automotive_graphrag.querying import QueryExecution, QueryService
+from automotive_graphrag.querying import QueryExecution, QueryService, expand_manual_query
 from automotive_graphrag.source_metadata import SourceMetadata
 from automotive_graphrag.strategy_routing import AnswerCheck, NOT_FOUND_ANSWER, StrategyDecision
 
@@ -153,7 +153,7 @@ class QueryServiceTests(unittest.TestCase):
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v1")
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v2")
 
     def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
         runner = FakeQueryRunner()
@@ -517,6 +517,19 @@ class QueryServiceTests(unittest.TestCase):
             service.ask("L33-SM3E", "  ")
         with self.assertRaisesRegex(ProjectError, "不支援"):
             service.ask("L33-SM3E", "測試問題", "unknown")
+
+    def test_manual_query_expansion_adds_feature_aliases_without_extra_calls(self) -> None:
+        expanded = expand_manual_query("如何開啟翻譯功能？")
+
+        self.assertIn("懸浮翻譯", expanded)
+        self.assertIn("翻譯助理", expanded)
+        self.assertIn("即時翻譯", expanded)
+
+    def test_manual_query_expansion_is_idempotent_and_leaves_other_queries_alone(self) -> None:
+        question = "如何清潔螢幕？"
+        self.assertEqual(expand_manual_query(question), question)
+        expanded = expand_manual_query("如何註冊指紋？")
+        self.assertEqual(expanded.count("註冊指紋"), 1)
 
 
 if __name__ == "__main__":

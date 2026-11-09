@@ -38,6 +38,8 @@ class AnswerPromptTests(unittest.TestCase):
         for phrase in (
             "similarly named functions", "include every item of that list", '"To ..."',
             "Do not add anything the data does not state", "do not soften it", "different device models",
+            "single section that directly answers the question", "Preserve the source order",
+            "Printed page numbers inside source text are content",
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 
