@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
@@ -117,13 +117,14 @@ class AutomaticQATestService:
                         finished += 1
                         try:
                             generated[doc] = future.result()
-                        except (JobStopped, CancelledError):
+                        except JobStopped:
                             pass
                         except Exception as exc:
                             errors.append(f"{doc}：{exc}")
                         if stop_event is not None and stop_event.is_set() and not stopped:
                             stopped = True
-                            pool.shutdown(wait=False, cancel_futures=True)
+                            # Queued tasks check the stop flag before any request; cancelling them
+                            # instead would leave as_completed waiting forever.
                         if progress_callback:
                             fraction = min(0.95, ((_attempt * len(pdf_ids)) + finished) / (3 * len(pdf_ids)))
                             progress_callback(fraction, f"第 {_attempt + 1} 輪：已完成 {finished}/{len(pending)} 份 PDF")
@@ -368,10 +369,11 @@ class AutomaticQATestService:
                 item = futures[future]
                 if stop_event is not None and stop_event.is_set() and not stopped:
                     stopped = True
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    # Queued tasks check the stop flag before any request; cancelling them
+                    # instead would leave as_completed waiting forever.
                 try:
                     results[item.question_id] = future.result()
-                except (JobStopped, CancelledError):
+                except JobStopped:
                     continue
                 except Exception as exc:
                     # QueryService normally converts GraphRAG process failures to QueryResult;

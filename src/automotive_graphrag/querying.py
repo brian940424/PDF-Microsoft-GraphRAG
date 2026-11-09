@@ -84,6 +84,10 @@ class QueryResult:
     execution_metadata: dict[str, Any] = field(default_factory=dict)
 
 
+def _query_worker_command() -> list[str]:
+    return [sys.executable, "-m", "automotive_graphrag.graph_query_worker"]
+
+
 class QueryService:
     def __init__(
         self,
@@ -382,7 +386,7 @@ class QueryService:
         timeout_seconds: float | None,
         stop_event: threading.Event | None,
     ) -> subprocess.CompletedProcess[str]:
-        command = [sys.executable, "-m", "automotive_graphrag.graph_query_worker"]
+        command = _query_worker_command()
         if stop_event is None:
             return subprocess.run(
                 command, cwd=package_root, env=environment, input=payload, text=True,

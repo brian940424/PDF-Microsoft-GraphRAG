@@ -1,3 +1,4 @@
+import inspect
 import json
 import subprocess
 import tempfile
@@ -1052,10 +1053,10 @@ class RetrievalExperimentTests(unittest.TestCase):
         ui_group_id = ui_service.load("ui-project")["groups"][0]["group_id"]
         ui_service.set_group_method("ui-project", ui_group_id, "drift")
         app = create_app(ui_root)
-        generate_answers_handler = next(
+        generate_answers_handler = inspect.unwrap(next(
             fn.fn for fn in app.fns.values()
             if getattr(fn.fn, "__name__", "") == "generate_retrieval_experiment_answers"
-        )
+        ))
         resolve_question_set_id = next(
             cell.cell_contents for cell in generate_answers_handler.__closure__ or ()
             if getattr(cell.cell_contents, "__name__", "") == "resolve_experiment_question_set_id"

@@ -1,3 +1,4 @@
+import inspect
 import csv
 import io
 import json
@@ -970,9 +971,10 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
             component for component in app.blocks.values()
             if hasattr(component, "get_config") and component.get_config().get("label") == "模型評測結果概覽"
         )
-        handler = next(
+        # The registered event wraps the handler as a stoppable job; test the handler itself.
+        handler = inspect.unwrap(next(
             fn.fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "evaluate_automatic_answers"
-        )
+        ))
         cells = dict(zip(handler.__code__.co_freevars, handler.__closure__))
         sources = lambda item: "；".join(
             f"{source.document_id}: {', '.join(str(page) for page in source.pages)}" for source in item.gold_evidence

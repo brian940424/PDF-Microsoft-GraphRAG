@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 import threading
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -386,14 +386,15 @@ class AutomaticEvaluationService:
                     question, judge_model = futures[future]
                     if stop_event is not None and stop_event.is_set() and not stopped:
                         stopped = True
-                        pool.shutdown(wait=False, cancel_futures=True)
+                        # Queued tasks check the stop flag before any request; cancelling them
+                        # instead would leave as_completed waiting forever.
                     try:
                         single = future.result()
                         verdicts[question.question_id][judge_model] = JudgeScore(
                             judge_model, single.score, single.judge_reason,
                             extra_content_error=single.extra_content_error,
                         )
-                    except (JobStopped, CancelledError):
+                    except JobStopped:
                         continue
                     except Exception as exc:
                         verdicts[question.question_id][judge_model] = JudgeScore(judge_model, None, "", str(exc))
