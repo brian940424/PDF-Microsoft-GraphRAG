@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import inspect
 import io
 import json
 import math
@@ -626,6 +627,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         run.__name__ = handler.__name__
         run.__qualname__ = handler.__qualname__
         run.__wrapped__ = handler
+        # Gradio fills every defaulted parameter of the visible signature, so `job` must not appear in it.
+        signature = inspect.signature(handler)
+        run.__signature__ = signature.replace(
+            parameters=[parameter for name, parameter in signature.parameters.items() if name != "job"]
+        )
         return run
 
     def bind_job(kind: str, start_button, stop_button, handler, inputs, outputs, message_index: int = 0, **kwargs):

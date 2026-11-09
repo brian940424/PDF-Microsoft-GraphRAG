@@ -480,6 +480,25 @@ class JobButtonTests(unittest.TestCase):
         # A failed start releases the job so the restore step shows the start button again.
         self.assertFalse(self.jobs.is_running("P", "index"))
 
+    def test_gradio_passes_only_event_inputs_to_job_handlers(self) -> None:
+        from gradio.helpers import special_args
+
+        wrapped = [
+            event for event in self.app.fns.values()
+            if getattr(event.fn, "__wrapped__", None) is not None
+            and any(output.get_config().get("value") in [labels[1] for labels in JOB_BUTTON_LABELS.values()]
+                    for output in event.outputs)
+            and len(event.outputs) > 2
+        ]
+        self.assertEqual(len(wrapped), len(JOB_BUTTON_LABELS))
+        for event in wrapped:
+            with self.subTest(handler=event.fn.__name__):
+                # Gradio fills defaulted parameters it sees; `job` must not be one of them.
+                args, *_ = special_args(event.fn, [None] * len(event.inputs))
+                self.assertEqual(len(args), len(event.inputs))
+                first = next(iter(event.fn(*args)))
+                self.assertEqual(len(first), len(event.outputs))
+
     def test_second_start_while_running_is_rejected(self) -> None:
         job = self.jobs.begin("P", "index")
         build = self.events["build_index"].fn
