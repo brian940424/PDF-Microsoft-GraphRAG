@@ -238,7 +238,7 @@ class SearchWithFallbackTests(unittest.TestCase):
                 self.assertEqual(tried[:2], ["local", "basic"])
                 self.assertEqual((result.method, result.found), ("basic", True))
 
-    def test_unsupported_drift_reuses_basic_and_records_attempt(self) -> None:
+    def test_unsupported_drift_does_not_override_rejected_basic_answer(self) -> None:
         tried: list[str] = []
         def search(method: str) -> SearchOutcome:
             tried.append(method)
@@ -251,10 +251,13 @@ class SearchWithFallbackTests(unittest.TestCase):
             StrategyDecision("local", "原因", ("local", "basic", "drift")), search,
             lambda _: AnswerCheck(False, "答案檢查未通過"), question="如何設定？",
         )
-        self.assertEqual(tried, ["local", "basic", "drift"])
-        self.assertEqual((result.method, result.outcome.answer), ("basic", "Basic 正確答案"))
-        self.assertEqual(result.attempts[-1]["status"], "found")
-        self.assertIn("Basic", result.attempts[-1]["detail"])
+        self.assertEqual(tried, ["local", "basic", "drift", "global"])
+        self.assertFalse(result.found)
+        self.assertEqual(result.outcome.answer, NOT_FOUND_ANSWER)
+        self.assertEqual(
+            [item["status"] for item in result.attempts],
+            ["not_found", "not_found", "not_found", "not_found"],
+        )
 
 
 class AnswerCheckPromptTests(unittest.TestCase):

@@ -40,6 +40,8 @@ class AnswerPromptTests(unittest.TestCase):
             "Do not add anything the data does not state", "do not soften it", "different device models",
             "single section that directly answers the question", "Preserve the source order",
             "Printed page numbers inside source text are content",
+            "Answer only the requested parts", "immediate first action",
+            "Do not add relevant but unrequested details",
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 

@@ -241,13 +241,6 @@ def search_with_fallback(
                 f"（{earlier}，改用 {METHOD_LABELS[method]} 找到答案）" if earlier else ""
             )
             return FallbackResult(method, outcome, True, reason, tuple(attempts))
-        if drift_unsupported and "basic" in outcomes and not outcomes["basic"].error and outcomes["basic"].answer.strip():
-            basic = outcomes["basic"]
-            attempts.append({
-                "method": "basic", "status": "found", "detail": "DRIFT 回答缺少證據，改用先前 Basic 結果",
-                "duration_seconds": 0,
-            })
-            return FallbackResult("basic", basic, True, f"{decision.reason}（DRIFT 回答缺少證據，改用 Basic）", tuple(attempts))
     reason = f"{decision.reason}（{_attempt_summary(attempts)}）"
     if answered:
         return FallbackResult(answered[0], SearchOutcome(NOT_FOUND_ANSWER), False, reason, tuple(attempts))
