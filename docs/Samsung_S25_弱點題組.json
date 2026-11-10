@@ -1,0 +1,670 @@
+{
+  "questions": [
+    {
+      "number": 1,
+      "question": "裝置當機且無法回應時，要如何強制重啟？",
+      "expected_answer": "同時按住側邊按鈕和音量降低按鈕超過 7 秒，即可重新啟動。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            29
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            29,
+            197
+          ]
+        }
+      ]
+    },
+    {
+      "number": 2,
+      "question": "擷取螢幕截圖後，若畫面底部沒有出現截圖工具列，應如何開啟？",
+      "expected_answer": "開啟設定，輕觸進階功能 → 截圖與螢幕錄影檔，然後輕觸「截圖後顯示工具列」開關以開啟。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            43
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            44
+          ]
+        }
+      ]
+    },
+    {
+      "number": 3,
+      "question": "如何錄製螢幕畫面？",
+      "expected_answer": "開啟快速設定面板，輕觸展開圖示後輕觸螢幕錄影；選擇音效設定並輕觸開始錄影，倒數計時結束後即開始錄製；完成時輕觸停止圖示。錄好的影片可在媒體瀏覽器中查看。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            44
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            44
+          ]
+        }
+      ]
+    },
+    {
+      "number": 4,
+      "question": "要從哪裡開啟繪圖智慧助理功能？",
+      "expected_answer": "將側螢幕面板側拉標籤往螢幕中央拖曳，然後輕觸繪圖智慧助理；Galaxy S25 Ultra、Galaxy S24 Ultra 也可輕觸感應快捷環面板上的繪圖智慧助理。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            55
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            55
+          ]
+        }
+      ]
+    },
+    {
+      "number": 5,
+      "question": "在媒體瀏覽器中建立相簿時，可以選擇哪些相簿類型？",
+      "expected_answer": "可選擇相簿（建立新相簿並手動加入圖像和影片）、自動更新相簿（自動收集所選人物的圖像）、群組（建立相關相簿群組）、共享相簿（建立可與他人分享的相簿）。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            98
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            98
+          ]
+        }
+      ]
+    },
+    {
+      "number": 6,
+      "question": "在聯絡人應用程式中，如何一次刪除多位聯絡人？若只要刪除一位聯絡人呢？",
+      "expected_answer": "開啟聯絡人應用程式，輕觸更多選項圖示 → 選擇，選擇聯絡人後輕觸刪除；若要逐一刪除，從聯絡人清單輕觸該聯絡人，再輕觸更多 → 刪除。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            72
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            72
+          ]
+        }
+      ]
+    },
+    {
+      "number": 7,
+      "question": "如何使用 S Pen 的懸浮翻譯功能？",
+      "expected_answer": "有欲翻譯的文字時，開啟感應快捷環面板並輕觸懸浮翻譯，透過螢幕頂部的翻譯面板選擇語言，再將 S Pen 懸停在欲翻譯的文字上；也能轉換文字中的單位。輕觸句子圖示或字詞圖示可切換字詞與句子翻譯。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            62,
+            63
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            63
+          ]
+        }
+      ]
+    },
+    {
+      "number": 8,
+      "question": "如何註冊臉部以使用臉部辨識？",
+      "expected_answer": "建議在室內並避開直射光線註冊。在設定螢幕上輕觸安全性與隱私權 → 螢幕鎖定與生物辨識 → 臉部辨識，設定螢幕鎖定方式，閱讀螢幕上的說明並輕觸繼續，再輕觸註冊並將臉部置於螢幕上的方框內，相機隨即掃描臉部。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            150
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            150,
+            151
+          ]
+        }
+      ]
+    },
+    {
+      "number": 9,
+      "question": "如何設定以指紋解除螢幕鎖定？",
+      "expected_answer": "在設定螢幕上輕觸安全性與隱私權 → 螢幕鎖定與生物辨識，使用預設螢幕鎖定方式解除鎖定，輕觸指紋並開啟指紋解鎖開關；之後在鎖定螢幕將手指放在指紋辨識感應器上掃描即可解鎖。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            153
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            153
+          ]
+        }
+      ]
+    },
+    {
+      "number": 10,
+      "question": "聯絡人清單中有重複的聯絡人時，如何合併？",
+      "expected_answer": "開啟聯絡人應用程式，輕觸更多選項圖示 → 設定 → 合併重複的聯絡人，然後勾選聯絡人並輕觸合併。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            73
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            73
+          ]
+        }
+      ]
+    },
+    {
+      "number": 11,
+      "question": "如何封鎖特定號碼的來電？被封鎖的號碼來電時會怎樣？",
+      "expected_answer": "開啟電話應用程式，輕觸更多選項圖示 → 設定 → 封鎖號碼，選取聯絡人或手機號碼加入封鎖號碼名單。被封鎖的號碼試圖聯繫時不會收到通知，但來電會收錄於通話記錄。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            69
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            69
+          ]
+        }
+      ]
+    },
+    {
+      "number": 12,
+      "question": "如何設定安全資料夾？設定過程中出現詢問是否以三星帳號重設鎖定類型的視窗時該怎麼做？",
+      "expected_answer": "開啟設定並輕觸安全性與隱私權 → 更多安全性設定 → 安全資料夾，依螢幕說明完成設定。出現該視窗時輕觸允許，日後忘記鎖定類型可用三星帳號重設；未開啟此功能則忘記密碼時無法重設鎖定類型。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            156
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            156
+          ]
+        }
+      ]
+    },
+    {
+      "number": 13,
+      "question": "如何註冊 Samsung Pass？",
+      "expected_answer": "在設定螢幕上輕觸安全性與隱私權 → 更多安全性設定 → 密碼、密碼金鑰與自動填入 → Samsung Pass，然後依照螢幕上的說明完成設定。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            158
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            158
+          ]
+        }
+      ]
+    },
+    {
+      "number": 14,
+      "question": "使用無線充電時有哪些注意事項？",
+      "expected_answer": "裝置背面與保護套之間放有信用卡或 RFID 卡片（如交通卡、門禁卡）時，勿將裝置放上無線充電器；金屬物品或磁鐵等導電材質位於裝置與充電器之間時，勿放上充電器；在網路訊號不佳的場所使用無線充電器可能收不到網路訊號；建議使用經三星核可的無線充電器，使用其他充電器可能導致充電效率不佳。未遵守時裝置可能無法正確充電、過熱，或裝置與卡片受損。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            21
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            21
+          ]
+        }
+      ]
+    },
+    {
+      "number": 15,
+      "question": "裝置接觸到水分或汙染物後，應遵循哪些準則？",
+      "expected_answer": "以乾淨的軟布徹底拭乾裝置；麥克風或揚聲器未乾透時，通話聲音可能聽不清楚；在水中使用時螢幕及其他功能可能無法正常運作；裝置乾透之前不要連接充電器或任何配件，否則多功能插孔未乾時連接可能損壞裝置。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            176
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            176
+          ]
+        }
+      ]
+    },
+    {
+      "number": 16,
+      "question": "哪些情況可能影響螢幕指紋辨識的效能？要如何改善？",
+      "expected_answer": "受皺紋或傷疤影響的指紋、較小或較細的手指可能無法識別；彎曲手指或使用指尖也可能無法識別。改善方式：註冊最常用的手指；確認螢幕中央底部感應器區域的保護貼或螢幕未被硬幣、鑰匙、筆和項鍊等刮擦或損壞；保持感應器區域和手指乾淨乾燥；按下螢幕讓指紋完整分布在識別區域上。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            153
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            153
+          ]
+        }
+      ]
+    },
+    {
+      "number": 17,
+      "question": "使用臉部辨識解鎖前須注意什麼？如何讓臉部辨識更有效？",
+      "expected_answer": "與您相貌相似的人物或物件可能可以解鎖裝置，且臉部辨識的安全性低於圖形、PIN 碼或密碼。要有效辨識，請留意註冊當下是否戴眼鏡、帽子、面具、蓄鬍或化濃妝，註冊時位於明亮區域且相機鏡頭潔淨，並確認影像沒有模糊。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            150
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            150
+          ]
+        }
+      ]
+    },
+    {
+      "number": 18,
+      "question": "使用無線電力共享為另一部裝置充電時有哪些注意事項？",
+      "expected_answer": "共享電力時勿使用耳機，可能影響附近裝置；充電線圈位置因裝置而異，需調整裝置使線圈正確連接；部分功能在共享電力時無法使用；另一部裝置必須支援無線充電，有些裝置可能無法充電；充電時勿移動或使用任一裝置；另一部裝置獲得的電力可能低於分享的電力；手機同時在充電時，視充電器類型充電速度可能變慢或另一部裝置可能無法正確充電；充電速度或效率會因手機狀態或周遭環境而不同。另建議先移除裝置的配件或上蓋。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            22
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            22
+          ]
+        }
+      ]
+    },
+    {
+      "number": 19,
+      "question": "電池充電時裝置過熱，應如何處理？",
+      "expected_answer": "將充電器與裝置中斷連接並關閉執行中的應用程式，等待裝置降溫後再重新充電；若裝置下半部過熱，可能是 USB 傳輸線損壞，請更換新的傳輸線（建議使用經三星核可的 USB 傳輸線）；使用無線充電器時，勿在裝置與充電器之間放置金屬物體、磁鐵、磁卡等異物。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            177
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            177
+          ]
+        }
+      ]
+    },
+    {
+      "number": 20,
+      "question": "如何關閉裝置？若要重新啟動呢？",
+      "expected_answer": "同時按住側邊按鈕和音量降低按鈕，或開啟快速設定面板輕觸關機圖示，然後輕觸電源關閉 → 電源關閉。若要重新啟動，輕觸重新啟動 → 重新啟動。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            29
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            29
+          ]
+        }
+      ]
+    },
+    {
+      "number": 21,
+      "question": "如何將影像移動到安全資料夾？",
+      "expected_answer": "開啟安全資料夾應用程式並輕觸更多選項圖示 → 新增檔案，輕觸圖像並勾選欲移動的影像後輕觸完成，再輕觸移動，所選項目會自原始資料夾刪除並移至安全資料夾。若要複製項目，則輕觸複製。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            156
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            156
+          ]
+        }
+      ]
+    },
+    {
+      "number": 22,
+      "question": "如何隱藏安全資料夾？",
+      "expected_answer": "開啟快速設定面板並輕觸展開圖示 → 安全資料夾 → 隱藏；或開啟安全資料夾應用程式，輕觸更多選項圖示 → 隱藏安全資料夾 → 隱藏安全資料夾。若要再次顯示並開啟，開啟快速面板輕觸展開圖示 → 安全資料夾，再以預設的安全資料夾鎖定方式解鎖。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            157
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            157
+          ]
+        }
+      ]
+    },
+    {
+      "number": 23,
+      "question": "如何解除安裝安全資料夾？",
+      "expected_answer": "開啟安全資料夾應用程式，輕觸更多選項圖示 → 設定 → 更多設定 → 解除安裝。若要先備份內容，勾選將媒體檔案移出安全資料夾再輕觸解除安裝，備份資料可在我的檔案的內部儲存空間 → Download → Secure Folder 找到；Samsung Notes 中的筆記不會備份。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            158
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            158
+          ]
+        }
+      ]
+    },
+    {
+      "number": 24,
+      "question": "如何撥打國際電話？",
+      "expected_answer": "開啟電話應用程式並輕觸鍵盤，輕觸並按住 0 直到出現 + 號，輸入國家代碼、區域號碼和電話號碼，然後輕觸通話圖示。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            69
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            69
+          ]
+        }
+      ]
+    },
+    {
+      "number": 25,
+      "question": "拒接來電時，如何同時傳送訊息給對方？",
+      "expected_answer": "來電時向上拖曳傳送訊息列，並選擇欲傳送的訊息。",
+      "answer_aliases": [
+        "拒接來電時向上拖曳傳送訊息列並選擇要傳送的訊息；若輕觸提醒圖示再傳送訊息，一小時後會收到提醒。"
+      ],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            69
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            69
+          ]
+        }
+      ]
+    },
+    {
+      "number": 26,
+      "question": "無線電力共享的電量上限有什麼作用？如何設定？",
+      "expected_answer": "可讓裝置在剩餘電力低於特定範圍時自動停止電力共享。開啟設定，輕觸電池 → 無線電力共享 → 電量上限，然後設定限制。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            22
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            22
+          ]
+        }
+      ]
+    },
+    {
+      "number": 27,
+      "question": "如何變更螢幕鎖定方式？",
+      "expected_answer": "開啟設定，輕觸鎖定螢幕與 AOD → 螢幕鎖定與生物辨識，然後選擇螢幕鎖定方式。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            37
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            37
+          ]
+        }
+      ]
+    },
+    {
+      "number": 28,
+      "question": "如何從裝置卸除 S Pen？用完後如何存放？適用哪些機型？",
+      "expected_answer": "按下 S Pen 的末端解除固定，再從插槽抽出 S Pen；存放時將其重新插入插槽並推至固定位置。此功能適用於 Galaxy S25 Ultra 與 Galaxy S24 Ultra。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            59
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            58,
+            59
+          ]
+        }
+      ]
+    },
+    {
+      "number": 29,
+      "question": "哪個機型的 S Pen 需要充電？如何充電？若關閉遠端遙控會有什麼不同？",
+      "expected_answer": "Galaxy S24 Ultra 的 S Pen 需要充電，才能使用 S Pen 按鈕遠端控制應用程式。將 S Pen 插入插槽後隨即開始充電；若關閉遠端遙控，S Pen 僅會在裝置充電時開始充電。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            59
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            59
+          ]
+        }
+      ]
+    },
+    {
+      "number": 30,
+      "question": "裝置附近有磁性物品時，Galaxy S25 Ultra 與 Galaxy S24 Ultra 的 S Pen 分別會受到什麼影響？",
+      "expected_answer": "Galaxy S25 Ultra：可能無法使用如輕觸螢幕等 S Pen 動作。Galaxy S24 Ultra：如充電或輕觸螢幕等部分 S Pen 動作可能無法使用。",
+      "answer_aliases": [],
+      "question_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            58
+          ]
+        }
+      ],
+      "answer_sources": [
+        {
+          "document_name": "SAMSUNG_Galaxy_S25_Ultra.pdf",
+          "pages": [
+            58
+          ]
+        }
+      ]
+    }
+  ]
+}

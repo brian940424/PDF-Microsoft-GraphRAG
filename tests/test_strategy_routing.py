@@ -5,11 +5,14 @@ from pathlib import Path
 from automotive_graphrag.app import create_app
 from automotive_graphrag.projects import ProjectError
 from automotive_graphrag.strategy_routing import (
+    ANSWER_CHECK_PROMPT,
     AnswerCheck,
+    LOCAL_MIN_SOURCES,
     NOT_FOUND_ANSWER,
     SearchOutcome,
     StrategyDecision,
     StrategyRouter,
+    context_source_count,
     search_with_fallback,
 )
 
@@ -75,6 +78,8 @@ class StrategyRankingTests(unittest.TestCase):
 
         self.assertEqual(decision.attempt_order, ("drift", "global", "basic", "local"))
         self.assertIn('"methods"', prompts[0])
+        self.assertIn("Do not rank drift first for a single setting", prompts[0])
+        self.assertIn("Reserve drift for questions that must combine information from distinct sections", prompts[0])
 
     def test_partial_ranking_is_completed_with_default_order_without_duplicates(self) -> None:
         response = {"methods": ["global", "global", "basic"], "reason": "x"}
@@ -158,6 +163,130 @@ class SearchWithFallbackTests(unittest.TestCase):
         self.assertFalse(result.found)
         self.assertEqual((result.method, result.outcome.answer), ("basic", NOT_FOUND_ANSWER))
         self.assertIsNone(result.outcome.error)
+
+    def test_local_with_too_few_sources_falls_back_without_checking(self) -> None:
+        checked: list[str] = []
+
+        def search(method: str) -> SearchOutcome:
+            if method == "local":
+                return SearchOutcome("來源未說明，只提到相簿群組", source_count=LOCAL_MIN_SOURCES - 1)
+            return SearchOutcome("聯絡人群組步驟", source_count=2)
+
+        def check(answer: str) -> AnswerCheck:
+            checked.append(answer)
+            return AnswerCheck(True, "ok")
+
+        result = search_with_fallback(StrategyDecision("local", "原因"), search, check)
+
+        self.assertEqual((result.method, result.found), ("basic", True))
+        self.assertEqual(checked, ["聯絡人群組步驟"])
+        self.assertEqual(result.attempts[0]["status"], "not_found")
+        self.assertIn(f"只取得 {LOCAL_MIN_SOURCES - 1} 個原文段落", result.attempts[0]["detail"])
+        self.assertIn("Local 未找到答案，改用 Basic 找到答案", result.reason)
+
+    def test_local_with_enough_or_unknown_sources_is_checked_normally(self) -> None:
+        for count in (LOCAL_MIN_SOURCES, None):
+            with self.subTest(count=count):
+                tried: list[str] = []
+
+                def search(method: str) -> SearchOutcome:
+                    tried.append(method)
+                    return SearchOutcome("答案", source_count=count)
+
+                result = search_with_fallback(
+                    StrategyDecision("local", "原因"), search, lambda _: AnswerCheck(True, "ok"),
+                )
+                self.assertEqual((tried, result.found), (["local"], True))
+
+    def test_matching_section_title_accepts_answer_without_overstrict_check(self) -> None:
+        checked: list[str] = []
+        result = search_with_fallback(
+            StrategyDecision("basic", "原因"),
+            lambda method: SearchOutcome("回答", payload={}, section_titles=("關閉螢幕時辨識指紋",)),
+            lambda answer: checked.append(answer) or AnswerCheck(False, "未找到"),
+            question="螢幕關閉時辨識指紋如何設定？",
+        )
+        self.assertEqual((result.method, result.found), ("basic", True))
+        self.assertEqual(checked, [])
+
+    def test_generic_s_pen_title_does_not_stop_fallback_for_specific_questions(self) -> None:
+        questions = (
+            "使用 S Pen 的懸浮翻譯時，要如何切換逐字或整句翻譯？",
+            "螢幕錄影時，如何在畫面上顯示 S Pen 游標？",
+            "如何用 S Pen 按鈕遠端拍照？拍照時要如何變更拍攝模式？",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                tried: list[str] = []
+
+                def search(method: str) -> SearchOutcome:
+                    tried.append(method)
+                    if method == "local":
+                        return SearchOutcome(
+                            "提供的資料未說明這項操作。", source_count=8,
+                            section_titles=("使用 S Pen",),
+                        )
+                    return SearchOutcome(
+                        "找到具體操作步驟。", source_count=3,
+                        section_titles=("使用 S Pen 拍照",),
+                    )
+
+                result = search_with_fallback(
+                    StrategyDecision("local", "specific manual lookup"), search,
+                    lambda answer: AnswerCheck("未說明" not in answer, "answer check"),
+                    question,
+                )
+
+                self.assertEqual(tried[:2], ["local", "basic"])
+                self.assertEqual((result.method, result.found), ("basic", True))
+
+    def test_unsupported_drift_does_not_override_rejected_basic_answer(self) -> None:
+        tried: list[str] = []
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            if method == "local":
+                return SearchOutcome("Local answer")
+            if method == "basic":
+                return SearchOutcome("Basic 正確答案", payload={"sources": [{"id": "1"}]})
+            return SearchOutcome("手冊未提供此設定，請查閱使用手冊。", payload={"sources": [{"id": "2"}]})
+        result = search_with_fallback(
+            StrategyDecision("local", "原因", ("local", "basic", "drift")), search,
+            lambda _: AnswerCheck(False, "答案檢查未通過"), question="如何設定？",
+        )
+        self.assertEqual(tried, ["local", "basic", "drift", "global"])
+        self.assertFalse(result.found)
+        self.assertEqual(result.outcome.answer, NOT_FOUND_ANSWER)
+        self.assertEqual(
+            [item["status"] for item in result.attempts],
+            ["not_found", "not_found", "not_found", "not_found"],
+        )
+
+
+class AnswerCheckPromptTests(unittest.TestCase):
+    def test_prompt_treats_unstated_or_other_feature_answers_as_not_found(self) -> None:
+        self.assertIn("even when the answer also contains other related or unrelated information", ANSWER_CHECK_PROMPT)
+        self.assertIn("提供的資料未說明", ANSWER_CHECK_PROMPT)
+        self.assertIn("different feature, app, setting or procedure", ANSWER_CHECK_PROMPT)
+        self.assertIn("minor detail", ANSWER_CHECK_PROMPT)
+
+
+class ContextSourceCountTests(unittest.TestCase):
+    def test_counts_distinct_in_context_sources_including_nested(self) -> None:
+        context = {
+            "sources": [{"id": "1"}, {"id": "1"}, {"id": "2", "in_context": False}],
+            "drift": [{"sources": [{"id": "3"}]}],
+        }
+        self.assertEqual(context_source_count(context), 2)
+        self.assertEqual(context_source_count({"sources": []}), 0)
+
+    def test_context_without_sources_table_counts_zero(self) -> None:
+        self.assertEqual(context_source_count({}), 0)
+        self.assertEqual(context_source_count({"entities": [{"id": "1"}]}), 0)
+
+    def test_unknown_without_context(self) -> None:
+        for context in (None, "raw"):
+            with self.subTest(context=context):
+                self.assertIsNone(context_source_count(context))
 
 
 class QueryTabAutoStrategyTests(unittest.TestCase):

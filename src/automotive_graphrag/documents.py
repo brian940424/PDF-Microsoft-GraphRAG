@@ -15,7 +15,9 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
 
 import pymupdf
 
-from .projects import ProjectError, ProjectStore
+from .cancellation import JobStopped, raise_if_stopped
+from .projects import ProjectError, ProjectStore, project_indexing_locked
+from .sectioning import remove_leading_printed_page_number, section_identifier, split_into_sections
 from .vision import PageAnalyzer, VisionAbort, VisionSettings, analyze_page, detect_document_language, page_needs_vision, render_page
 
 
@@ -54,6 +56,7 @@ class DocumentInfo:
 ProgressCallback = Callable[[int, int, str], None]
 
 INDEXED_DOCUMENTS_FILE = "indexed_documents.json"
+SECTIONING_FORMAT_VERSION = 2
 # Manual page edits and review marks, kept across preprocessing runs.
 PAGE_EDITS_FILE = "page_edits.json"
 PAGE_RENDER_SCALE = 1.5
@@ -88,6 +91,9 @@ class ProcessingReport:
     vision_fallback_pages: int = 0
     vision_abort_reason: str | None = None
     edited_pages: int = 0
+    stopped: bool = False
+    completed_documents: tuple[str, ...] = ()
+    unprocessed_documents: tuple[str, ...] = ()
 
 
 class DocumentService:
@@ -205,7 +211,7 @@ class DocumentService:
         project_path = self.projects.path_for(project_id)
         if not filename or Path(filename).name != filename or Path(filename).suffix.lower() != ".pdf":
             raise ProjectError("PDF 檔名格式不正確")
-        if (project_path / "graphrag" / ".indexing.lock").exists():
+        if project_indexing_locked(project_path):
             raise ProjectError("建圖工作執行中，無法移除 PDF")
         source = project_path / "source" / filename
         if not source.is_file():
@@ -231,11 +237,16 @@ class DocumentService:
         filenames: Iterable[str] | None = None,
         progress_callback: ProgressCallback | None = None,
         vision: VisionSettings | None = None,
+        stop_event: threading.Event | None = None,
     ) -> ProcessingReport:
         """Preprocess all PDFs, or only `filenames` while keeping other PDFs' previous output.
 
         With `vision`, pages selected by its scope are transcribed by the vision
         model; a page whose transcription fails keeps its PDF text layer.
+
+        Setting `stop_event` stops before the next page (no new Vision requests; requests already
+        sent finish). PDFs finished by then are saved; the PDF in progress and the rest keep their
+        previous preprocessing output, and the report lists them as unprocessed.
         """
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
@@ -257,11 +268,6 @@ class DocumentService:
         self.projects.update_status(project_id, "PROCESSING")
         processed_directory = project_path / "processed"
         previous_reports = self._document_reports(project_id)
-        kept_records = [
-            record
-            for record in self._read_jsonl(processed_directory / "input.jsonl")
-            if record.get("document_id") in source_names - selected_names
-        ]
         records: list[dict[str, Any]] = []
         document_reports: list[dict[str, Any]] = []
         totals = {
@@ -274,29 +280,64 @@ class DocumentService:
             {source.name: self._page_estimate(source, previous_reports, options_by_filename) for source in sources},
         )
 
+        stopped = False
         try:
             for source in sources:
-                document_report = self._process_document(
-                    project_id,
-                    source,
-                    records,
-                    totals,
-                    (options_by_filename or {}).get(source.name, {}),
-                    progress,
-                    vision,
-                    all_edits.setdefault(source.name, {}),
-                )
+                # A PDF stopped half-way is rolled back, so its previous output stays untouched.
+                record_count = len(records)
+                totals_before = dict(totals)
+                document_edits = json.loads(json.dumps(all_edits.get(source.name, {})))
+                try:
+                    raise_if_stopped(stop_event)
+                    document_report = self._process_document(
+                        project_id,
+                        source,
+                        records,
+                        totals,
+                        (options_by_filename or {}).get(source.name, {}),
+                        progress,
+                        vision,
+                        document_edits,
+                        stop_event,
+                    )
+                except JobStopped:
+                    del records[record_count:]
+                    totals.clear()
+                    totals.update(totals_before)
+                    stopped = True
+                    break
+                all_edits[source.name] = document_edits
                 document_reports.append(document_report)
+            completed_names = {item["filename"] for item in document_reports}
+            unprocessed = tuple(source.name for source in sources if source.name not in completed_names)
+            if stopped and not document_reports:
+                self.projects.update_status(project_id, project.status)
+                return ProcessingReport(
+                    project_id=project_id, documents=0, pages=0, successful_pages=0, empty_pages=0,
+                    error_pages=0, documents_with_errors=0, output="input.jsonl",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    vision_model=vision.model if vision else None,
+                    stopped=True, unprocessed_documents=unprocessed,
+                )
+            kept_names = source_names - completed_names
+            kept_records = [
+                record
+                for record in self._read_jsonl(processed_directory / "input.jsonl")
+                if record.get("document_id") in kept_names
+            ]
             completed_at = datetime.now(timezone.utc).isoformat()
             for document_report in document_reports:
                 document_report["processed_at"] = completed_at
             reports_by_name = {
-                name: item for name, item in previous_reports.items() if name in source_names - selected_names
+                name: item for name, item in previous_reports.items() if name in kept_names
             }
             reports_by_name.update((item["filename"], item) for item in document_reports)
             report = ProcessingReport(
                 project_id=project_id,
-                documents=len(sources),
+                documents=len(document_reports),
+                stopped=stopped,
+                completed_documents=tuple(item["filename"] for item in document_reports),
+                unprocessed_documents=unprocessed,
                 documents_with_errors=sum(1 for item in document_reports if item["error"] or item["error_pages"]),
                 output="input.jsonl",
                 completed_at=completed_at,
@@ -324,6 +365,9 @@ class DocumentService:
                 project.status if isinstance(exc, ProjectError) else "FAILED",
             )
             raise
+        except BaseException:
+            self.projects.update_status(project_id, project.status)
+            raise
 
     def _process_document(
         self,
@@ -335,8 +379,12 @@ class DocumentService:
         progress: _PageProgress | None = None,
         vision: VisionSettings | None = None,
         edits: dict[str, dict[str, Any]] | None = None,
+        stop_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        """Extract the selected pages; pages with a manual edit in `edits` keep the edited text."""
+        """Extract the selected pages; pages with a manual edit in `edits` keep the edited text.
+
+        Raises JobStopped when `stop_event` is set before the PDF is finished.
+        """
         edits = {} if edits is None else edits
         report: dict[str, Any] = {
             "filename": source.name,
@@ -402,17 +450,24 @@ class DocumentService:
                 report.update(vision_model=vision.model, vision_scope=vision.scope)
                 vision_texts = self._transcribe_pages(
                     selected, texts, report, totals, header_ignore_percent, footer_ignore_percent, vision, progress,
+                    stop_event,
                 )
             else:
                 for page_number, page in selected:
+                    raise_if_stopped(stop_event)
                     if progress is not None:
                         progress.advance()
                     self._read_page_text(page, page_number, texts, report, totals, header_ignore_percent, footer_ignore_percent)
         finally:
             self._close_document(document)
         report["edited_pages"] = []
+        previous_heading = ""
         for page_number, _ in selected:
             extracted = (vision_texts.get(page_number) or texts[page_number]) if page_number in texts else ""
+            extracted = remove_leading_printed_page_number(extracted)
+            incoming_heading = previous_heading
+            extracted_sections, extracted_heading = split_into_sections(extracted, incoming_heading)
+            extracted = "\n\n".join(section_text for _, section_text in extracted_sections)
             entry = edits.get(str(page_number))
             if entry is not None and entry.get("extracted_text", "") != extracted:
                 # A changed extraction outdates the review mark; an edit is kept but flagged.
@@ -426,17 +481,25 @@ class DocumentService:
                 entry = None
             if entry is not None and "text" in entry:
                 text = entry["text"]
+                sections, previous_heading = split_into_sections(text, incoming_heading)
                 report["edited_pages"].append(page_number)
                 totals["edited_pages"] += 1
             elif page_number not in texts:
                 continue
             else:
                 text = extracted
+                sections, previous_heading = extracted_sections, extracted_heading
             if not text:
                 report["empty_pages"] += 1
                 totals["empty_pages"] += 1
                 continue
-            records.append(self._page_record(project_id, source.name, page_number, text))
+            for block_number, (heading, section_text) in enumerate(sections, start=1):
+                records.append(
+                    self._page_record(
+                        project_id, source.name, page_number, section_text,
+                        block_number=block_number, heading=heading,
+                    )
+                )
             totals["successful_pages"] += 1
         if report["error_pages"]:
             report["status"] = "PROCESSED_WITH_ERRORS"
@@ -445,29 +508,39 @@ class DocumentService:
         return report
 
     @classmethod
-    def _page_record(cls, project_id: str, filename: str, page_number: int, text: str) -> dict[str, Any]:
+    def _page_record(
+        cls, project_id: str, filename: str, page_number: int, text: str,
+        block_number: int = 1, heading: str = "",
+    ) -> dict[str, Any]:
         stem = Path(filename).stem
         document_stem = cls._safe_identifier(stem)
+        block_id = f"b{block_number:02d}"
+        section_name = heading or stem
         return {
-            "id": f"{project_id}-{document_stem}-p{page_number:04d}",
-            "chunk_id": f"{project_id}-{document_stem}-p{page_number:04d}-b01",
+            "id": f"{project_id}-{document_stem}-p{page_number:04d}-{block_id}",
+            "chunk_id": f"{project_id}-{document_stem}-p{page_number:04d}-{block_id}",
             "project_id": project_id,
-            "section_id": document_stem,
-            "section_name": stem,
-            "title": f"{filename} - Page {page_number}",
+            "section_id": section_identifier(heading, document_stem),
+            "section_name": section_name,
+            "section_path": f"{stem} > {section_name}" if heading else stem,
+            "title": f"{filename} - Page {page_number} - {section_name}",
             "text": text,
             "document_id": filename,
             "page": page_number,
-            "block_id": "b01",
+            "block_id": block_id,
+            "sectioning_version": SECTIONING_FORMAT_VERSION,
         }
 
     def page_reviews(self, project_id: str, filename: str) -> list[PageReview]:
         """Every selected page of a preprocessed PDF with its final text and review state."""
         document_report = self._processed_report(project_id, filename)
+        page_chunks: dict[int, list[dict[str, Any]]] = {}
+        for record in self._read_jsonl(self.projects.path_for(project_id) / "processed" / "input.jsonl"):
+            if record.get("document_id") == filename:
+                page_chunks.setdefault(int(record["page"]), []).append(record)
         texts = {
-            record["page"]: record["text"]
-            for record in self._read_jsonl(self.projects.path_for(project_id) / "processed" / "input.jsonl")
-            if record.get("document_id") == filename
+            page: "\n\n".join(item["text"] for item in sorted(chunks, key=lambda item: item.get("block_id", "")))
+            for page, chunks in page_chunks.items()
         }
         edits = self._read_edits(project_id).get(filename, {})
         errors = {item["page"]: item["error"] for item in document_report.get("page_errors", [])}
@@ -519,7 +592,7 @@ class DocumentService:
     ) -> PageReview:
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
-        if (project_path / "graphrag" / ".indexing.lock").exists():
+        if project_indexing_locked(project_path):
             raise ProjectError("建圖工作執行中，無法修改頁面內容")
         document_report = self._processed_report(project_id, filename)
         if page_number not in self._report_page_numbers(document_report):
@@ -529,10 +602,13 @@ class DocumentService:
         edits = self._read_edits(project_id)
         document_edits = edits.setdefault(filename, {})
         entry = document_edits.get(str(page_number), {})
-        record = next(
-            (item for item in records if item.get("document_id") == filename and item.get("page") == page_number), None
+        page_records = [
+            item for item in records
+            if item.get("document_id") == filename and item.get("page") == page_number
+        ]
+        extracted = entry["extracted_text"] if "extracted_text" in entry else "\n\n".join(
+            item.get("text", "") for item in sorted(page_records, key=lambda item: item.get("block_id", ""))
         )
-        extracted = entry["extracted_text"] if "extracted_text" in entry else (record or {}).get("text", "")
         text = new_text(extracted)
         entry = {"extracted_text": extracted, "reviewed": reviewed}
         if text != extracted:
@@ -541,9 +617,15 @@ class DocumentService:
             document_edits[str(page_number)] = entry
         else:
             document_edits.pop(str(page_number), None)
-        records = [item for item in records if item is not record]
+        records = [item for item in records if not (
+            item.get("document_id") == filename and item.get("page") == page_number
+        )]
         if text:
-            records.append(self._page_record(project_id, filename, page_number, text))
+            sections, _ = split_into_sections(text)
+            records.extend(
+                self._page_record(project_id, filename, page_number, section_text, block_number, heading)
+                for block_number, (heading, section_text) in enumerate(sections, start=1)
+            )
         # A new processed_at marks the PDF as changed since the last graph.
         report = self._read_report(project_id)
         for item in report.get("documents", []):
@@ -661,6 +743,7 @@ class DocumentService:
         footer_percent: float,
         vision: VisionSettings,
         progress: _PageProgress | None,
+        stop_event: threading.Event | None = None,
     ) -> dict[int, str]:
         """Read every page's text layer and transcribe the pages in scope with the vision model.
 
@@ -687,6 +770,8 @@ class DocumentService:
             advance()
 
         def analyze(page_number: int, image: str) -> str:
+            # A page queued before the user stopped must not reach the API.
+            raise_if_stopped(stop_event)
             if stop.is_set():
                 raise VisionAbort("Vision 解析已中止")
             try:
@@ -703,6 +788,8 @@ class DocumentService:
                 page_number = pending.pop(future)
                 try:
                     vision_texts[page_number] = future.result().strip()
+                except JobStopped:
+                    advance()
                 except VisionAbort:
                     fall_back(page_number, "Vision 解析已中止")
                 except Exception as exc:
@@ -715,6 +802,8 @@ class DocumentService:
         pending: dict[Future[str], int] = {}
         with ThreadPoolExecutor(max_workers=vision.max_workers) as pool:
             for page_number, page in selected:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 if page_number not in texts:
                     advance()
                     continue
@@ -736,6 +825,7 @@ class DocumentService:
                     collect(pending)
             while pending:
                 collect(pending)
+        raise_if_stopped(stop_event)
         report["vision_abort_reason"] = abort_reasons[0] if abort_reasons else None
         report["vision_pages"].sort()
         report["vision_fallback_pages"].sort(key=lambda item: item["page"])
@@ -819,7 +909,9 @@ class DocumentService:
 
     @staticmethod
     def _sorted_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return sorted(records, key=lambda record: (str(record.get("document_id", "")).casefold(), record.get("page", 0)))
+        return sorted(records, key=lambda record: (
+            str(record.get("document_id", "")).casefold(), record.get("page", 0), record.get("block_id", "")
+        ))
 
     @staticmethod
     def _read_jsonl(path: Path) -> list[dict[str, Any]]:

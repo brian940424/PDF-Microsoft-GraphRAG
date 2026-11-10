@@ -123,16 +123,18 @@ class DocumentServiceTests(unittest.TestCase):
         self.assertEqual(
             records[1],
             {
-                "id": "L33-SM3E-WW-p0001",
+                "id": "L33-SM3E-WW-p0001-b01",
                 "chunk_id": "L33-SM3E-WW-p0001-b01",
                 "project_id": "L33-SM3E",
                 "section_id": "WW",
                 "section_name": "WW",
-                "title": "WW.pdf - Page 1",
+                "section_path": "WW",
+                "title": "WW.pdf - Page 1 - WW",
                 "text": "雨刷檢修內容",
                 "document_id": "WW.pdf",
                 "page": 1,
                 "block_id": "b01",
+                "sectioning_version": 2,
             },
         )
         details = json.loads((processed / "report.json").read_text())
@@ -140,6 +142,50 @@ class DocumentServiceTests(unittest.TestCase):
         self.assertEqual(ww["page_errors"], [{"page": 3, "error": "damaged page"}])
         self.assertEqual(ww["status"], "PROCESSED_WITH_ERRORS")
         self.assertEqual(self.store.get("L33-SM3E").status, "READY")
+
+    def test_preprocess_splits_confident_section_headings_and_page_review_rejoins_them(self) -> None:
+        self.pages_by_filename["WW.pdf"] = FakeDocument([
+            FakePage("變更螢幕鎖定方式\n1. 開啟設定\n2. 選擇安全性\n強制重啟\n同時按住側鍵和音量鍵"),
+        ])
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
+
+        self.service.preprocess("L33-SM3E")
+
+        path = self.store.path_for("L33-SM3E") / "processed" / "input.jsonl"
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([item["section_name"] for item in records], ["變更螢幕鎖定方式", "強制重啟"])
+        self.assertEqual([item["block_id"] for item in records], ["b01", "b02"])
+        self.assertEqual(records[0]["section_path"], "WW > 變更螢幕鎖定方式")
+        review = self.service.page_reviews("L33-SM3E", "WW.pdf")[0]
+        self.assertIn("1. 開啟設定", review.text)
+        self.assertIn("強制重啟", review.text)
+
+    def test_page_edit_replaces_all_section_chunks_for_that_page(self) -> None:
+        self.pages_by_filename["WW.pdf"] = FakeDocument([
+            FakePage("變更螢幕鎖定方式\n開啟設定\n強制重啟\n同時按住側鍵"),
+        ])
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
+        self.service.preprocess("L33-SM3E")
+
+        self.service.save_page_text("L33-SM3E", "WW.pdf", 1, "強制重啟\n同時按住側鍵")
+
+        path = self.store.path_for("L33-SM3E") / "processed" / "input.jsonl"
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["section_name"], "強制重啟")
+
+    def test_reprocessing_same_sectioned_page_keeps_edit_without_stale_warning(self) -> None:
+        original = "變更螢幕鎖定方式\n開啟設定\n強制重啟\n同時按住側鍵"
+        self.pages_by_filename["WW.pdf"] = FakeDocument([FakePage(original)])
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
+        self.service.preprocess("L33-SM3E")
+        self.service.save_page_text("L33-SM3E", "WW.pdf", 1, "變更螢幕鎖定方式\n開啟設定\n強制重啟\n按住側鍵")
+
+        self.service.preprocess("L33-SM3E")
+
+        review = self.service.page_reviews("L33-SM3E", "WW.pdf")[0]
+        self.assertTrue(review.edited)
+        self.assertFalse(review.source_changed)
 
     def test_preprocess_requires_at_least_one_pdf(self) -> None:
         with self.assertRaisesRegex(ProjectError, "沒有可處理"):

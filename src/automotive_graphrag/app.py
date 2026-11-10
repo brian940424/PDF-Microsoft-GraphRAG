@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import inspect
 import io
 import json
 import math
@@ -10,7 +11,6 @@ import os
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +25,7 @@ from .automatic_evaluation import (
     judge_scores_from_dicts,
 )
 from .automatic_qa import AutomaticQATestService
+from .cancellation import Job, JobAlreadyRunning, JobRegistry, JobStopped
 from .connections import (
     DEFAULT_API_BASE_URL,
     DEFAULT_CHAT_MODELS,
@@ -39,6 +40,7 @@ from .connections import (
 from .dashboard3d import dashboard_iframe
 from .documents import DocumentInfo, DocumentService, PageReview
 from .downloads import stage_downloads
+from .evidence import evidence_page_label
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService, parse_indexing_progress
 from .evaluation.source_scoring import cited_sources, strip_citations
@@ -527,11 +529,25 @@ def _experiment_classic_metric_rows(results) -> list[list]:
     ]
 
 
+# Long-running jobs whose start button turns into a stop button while they run (F-45).
+JOB_BUTTON_LABELS = {
+    "preprocess": ("開始前處理", "停止前處理"),
+    "index": ("建立 Graph", "停止建圖"),
+    "qa_generate": ("生成題目", "停止生成題目"),
+    "qa_answer": ("檢索並生成回答", "停止生成回答"),
+    "qa_evaluate": ("評測回答", "停止評測回答"),
+    "retrieval_answer": ("檢索並生成答案", "停止生成答案"),
+    "retrieval_evaluate": ("評測答案", "停止評測答案"),
+}
+JOB_STOPPING_LABEL = "停止中…"
+
+
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     store = ProjectStore(project_root or os.environ.get("PROJECTS_ROOT", "projects"))
     connections = ConnectionSettings(store.root)
     documents = DocumentService(store)
     indexing = IndexingService(store, connection_settings=connections)
+    indexing.recover_interrupted_builds()
     querying = QueryService(store, connection_settings=connections)
     question_sets = QuestionSetService(store, querying)
     reviews = ReviewService(store, question_sets)
@@ -550,6 +566,107 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         store, source_sampling, question_generation, querying, question_sets,
         automatic_evaluation, retrieval_evaluation,
     )
+    jobs = JobRegistry()
+
+    def job_button_updates(project_id: str | None, kind: str):
+        """(start, stop) button updates for `kind`; only visibility changes, so a start button
+        disabled for other reasons (e.g. 評測回答 before answers exist) stays disabled."""
+        _start_label, stop_label = JOB_BUTTON_LABELS[kind]
+        job = jobs.get(project_id, kind)
+        if job is None:
+            return gr.update(visible=True), gr.update(visible=False, value=stop_label, interactive=True)
+        if job.stop_requested:
+            return gr.update(visible=False), gr.update(visible=True, value=JOB_STOPPING_LABEL, interactive=False)
+        return gr.update(visible=False), gr.update(visible=True, value=stop_label, interactive=True)
+
+    def running_job_views(project_id: str | None):
+        """Button pairs for every job kind, a notice and the polling timer, for a page opened
+        (or reloaded) while jobs started earlier are still running."""
+        running = [kind for kind in JOB_BUTTON_LABELS if jobs.is_running(project_id, kind)]
+        buttons = [update for kind in JOB_BUTTON_LABELS for update in job_button_updates(project_id, kind)]
+        notice = gr.update(
+            value="⏳ 執行中（重新整理前啟動）：" + "、".join(JOB_BUTTON_LABELS[kind][0] for kind in running)
+            + "。重新整理後不會顯示即時進度，可按對應的停止鍵停止；完成後請重新整理查看結果。",
+            visible=bool(running),
+        )
+        return (*buttons, notice, gr.Timer(active=bool(running)))
+
+    def job_handler(kind: str, handler, output_count: int, message_index: int = 0):
+        """Wrap a streaming handler so it runs as a registered, stoppable job.
+
+        The first yield hides the start button and shows the stop button; the event's ``.then``
+        restores them. The job is passed to `handler` as ``job`` and released when the worker it
+        is handed to ends, or when the handler returns without handing it off.
+        """
+        def run(*args):
+            project_id = args[0] if args else None
+            if not project_id:
+                outputs = iter(handler(*args))
+                for update in outputs:
+                    yield (*update, gr.skip(), gr.skip())
+                return
+            try:
+                job = jobs.begin(project_id, kind)
+            except JobAlreadyRunning as exc:
+                update = [gr.skip()] * output_count
+                update[message_index] = f"❌ {exc}"
+                yield (*update, *job_button_updates(project_id, kind))
+                return
+            stop_label = JOB_BUTTON_LABELS[kind][1]
+            try:
+                first = True
+                for update in handler(*args, job=job):
+                    if first:
+                        first = False
+                        yield (*update, gr.update(visible=False),
+                               gr.update(visible=True, value=stop_label, interactive=True))
+                    else:
+                        yield (*update, gr.skip(), gr.skip())
+            finally:
+                job.release_unless_handed_off()
+
+        run.__name__ = handler.__name__
+        run.__qualname__ = handler.__qualname__
+        run.__wrapped__ = handler
+        # Gradio fills every defaulted parameter of the visible signature, so `job` must not appear in it.
+        signature = inspect.signature(handler)
+        run.__signature__ = signature.replace(
+            parameters=[parameter for name, parameter in signature.parameters.items() if name != "job"]
+        )
+        return run
+
+    def bind_job(kind: str, start_button, stop_button, handler, inputs, outputs, message_index: int = 0, **kwargs):
+        """Bind a start/stop button pair; returns the event after the buttons are restored."""
+        project_input = inputs[0]
+        stop_button.click(
+            lambda project_id: (jobs.stop(project_id, kind), job_button_updates(project_id, kind))[1],
+            inputs=project_input,
+            outputs=[start_button, stop_button],
+            concurrency_limit=None,
+            show_progress="hidden",
+        )
+        return start_button.click(
+            job_handler(kind, handler, len(outputs), message_index),
+            inputs=inputs,
+            outputs=[*outputs, start_button, stop_button],
+            **kwargs,
+        ).then(
+            lambda project_id: job_button_updates(project_id, kind),
+            inputs=project_input,
+            outputs=[start_button, stop_button],
+            show_progress="hidden",
+        )
+
+    def start_worker(job: Job | None, target) -> threading.Thread:
+        """Run `target` in a daemon thread; with a job, the job ends when the thread does."""
+        if job is not None:
+            return job.run_in_thread(target)
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        return thread
+
+    def stop_event_of(job: Job | None):
+        return job.stop_event if job is not None else None
 
     def connection_status(project_id: str | None = None) -> str:
         try:
@@ -764,10 +881,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def active_project_label(project_id: str | None) -> str:
+        if not project_id:
+            return workspace_lock_reason(project_id)
+        try:
+            project = store.get(project_id)
+        except ProjectError:
+            return workspace_lock_reason(project_id)
+        if project.status == "INDEXED" and IndexingService.input_needs_rebuild(store.path_for(project_id)):
+            store.update_status(project_id, "STALE")
+            project = store.get(project_id)
         reason = workspace_lock_reason(project_id)
         if reason:
+            if project.status == "STALE":
+                if IndexingService.preprocessing_needs_refresh(store.path_for(project_id)):
+                    return f"{reason} 前處理格式已更新，請重新預處理 PDF，再重新建圖。"
+                return f"{reason} 目前專案索引需重新建圖。"
             return reason
-        project = store.get(project_id)
         return (
             f"目前開啟專案：**{project.display_name}** (`{project.project_id}`)｜"
             f"狀態：{project.status}（{PROJECT_STATUS_LABELS.get(project.status, project.status)}）"
@@ -864,7 +993,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, [], hidden
         evidence_values = [asdict(item) for item in query_result.evidence]
         evidence_rows = [
-            [item.rank, item.evidence_id, item.document_id, item.page or "—", item.chunk_id or "—", item.score]
+            [item.rank, item.evidence_id, item.document_id, evidence_page_label(item) or "—", item.chunk_id or "—", item.score]
             for item in query_result.evidence
         ]
         if query_result.evidence:
@@ -940,7 +1069,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         for item in evidence_values or []:
             if item.get("evidence_id") == evidence_id:
                 location = (
-                    f"第 {item['page']} 頁"
+                    f"第 {'、'.join(str(page) for page in (item.get('pages') or [item['page']]))} 頁"
                     if item.get("page") is not None
                     else "GraphRAG 社群報告（無單一 PDF 頁碼）"
                 )
@@ -1234,6 +1363,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 (_score_percent(judged.source_score) if judged.source_score is not None else "不適用") if judged else "",
                 _score_percent(judged.final_score) if judged else "",
                 autoqa_judge_scores(judged, judge.model) if judged else (
+                    "待評測" if judge and getattr(judge, "stopped", False) else None
+                ) or (
                     judge_error or question.error
                     or ("未啟用 LLM Judge" if judge and not judge.enable_llm_judge else "尚無評判結果")
                 ),
@@ -1856,17 +1987,29 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     hidden_progress = gr.update(visible=False)
 
-    def stream_with_progress(task, render):
-        """在背景執行 task(report)，每次 report(...) 時 yield render(...)，最後回傳 task 的結果。"""
+    def stream_with_progress(task, render, job: Job | None = None):
+        """在背景執行 task(report)，每次 report(...) 時 yield render(...)，最後回傳 task 的結果。
+
+        有 job 時工作結束才解除登記；頁面重新整理只會停止 yield，背景工作仍可被停止鍵停止。"""
         updates: queue.Queue = queue.Queue()
-        with ThreadPoolExecutor(max_workers=1) as runner:
-            future = runner.submit(task, lambda *args: updates.put(args))
-            while not (future.done() and updates.empty()):
-                try:
-                    yield render(*updates.get(timeout=0.5))
-                except queue.Empty:
-                    continue
-            return future.result()
+        outcome: dict[str, object] = {}
+
+        def target() -> None:
+            try:
+                outcome["value"] = task(lambda *args: updates.put(args))
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        worker = start_worker(job, target)
+        while worker.is_alive() or not updates.empty():
+            try:
+                yield render(*updates.get(timeout=0.5))
+            except queue.Empty:
+                continue
+        worker.join()
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
 
     def experiment_evaluation_progress_for_project(project_id: str | None):
         if not project_id:
@@ -2128,7 +2271,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def generate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
-        judge_model: str | None,
+        judge_model: str | None, job: Job | None = None,
     ):
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
@@ -2170,34 +2313,44 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 except queue.Full:
                     pass
 
-            with ThreadPoolExecutor(max_workers=1) as runner:
-                future = runner.submit(
-                    retrieval_experiments.generate_answers,
-                    project_id,
-                    question_set_id,
-                    groups,
-                    limit,
-                    update_callback=publish_progress,
-                    judge_model=judge_model,
-                )
-                while True:
-                    try:
-                        progress_run = progress_updates.get(timeout=0.5)
-                    except queue.Empty:
-                        if future.done():
-                            break
-                        continue
-                    completed = len(progress_run.results)
-                    progress_view = list(experiment_view(project_id))
-                    progress_view[0] = f"⏳ 檢索並生成回答中：{completed}/{total} 題"
-                    progress_view[8] = f"⏳ 已處理 {completed}/{total} 題；完成前無法評測。"
-                    progress_view[9] = gr.update(interactive=False)
-                    yield (
-                        *progress_view,
-                        experiment_progress_update(completed, total, "答案生成中"),
-                        hidden_progress,
+            outcome: dict[str, object] = {}
+
+            def generate_task() -> None:
+                try:
+                    outcome["run"] = retrieval_experiments.generate_answers(
+                        project_id,
+                        question_set_id,
+                        groups,
+                        limit,
+                        update_callback=publish_progress,
+                        judge_model=judge_model,
+                        stop_event=stop_event_of(job),
                     )
-                run = future.result()
+                except BaseException as exc:
+                    outcome["error"] = exc
+
+            worker = start_worker(job, generate_task)
+            while True:
+                try:
+                    progress_run = progress_updates.get(timeout=0.5)
+                except queue.Empty:
+                    if not worker.is_alive():
+                        break
+                    continue
+                completed = len(progress_run.results)
+                progress_view = list(experiment_view(project_id))
+                progress_view[0] = f"⏳ 檢索並生成回答中：{completed}/{total} 題"
+                progress_view[8] = f"⏳ 已處理 {completed}/{total} 題；完成前無法評測。"
+                progress_view[9] = gr.update(interactive=False)
+                yield (
+                    *progress_view,
+                    experiment_progress_update(completed, total, "停止中" if job and job.stop_requested else "答案生成中"),
+                    hidden_progress,
+                )
+            worker.join()
+            if "error" in outcome:
+                raise outcome["error"]
+            run = outcome["run"]
         except (ProjectError, TypeError, ValueError, OSError) as exc:
             view = list(experiment_view(project_id, f"❌ 答案生成失敗：{exc}"))
             view[9] = gr.update(interactive=False)
@@ -2206,7 +2359,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if run.status == "answers_completed":
             message = f"✅ 檢索並生成答案完成：{len(run.results)}/{len(groups) * run.question_count} 筆。"
         elif run.status == "stopped":
-            message = f"🛑 已停止並保存部分答案：{len(run.results)}/{len(groups) * run.question_count} 筆。"
+            message = f"🛑 已停止：完成 {len(run.results)} / {len(groups) * run.question_count} 筆，已保存部分答案。"
         else:
             message = f"⚠️ 答案生成部分完成：{len(run.results)}/{len(groups) * run.question_count} 筆；請檢查失敗項目並重試。"
         progress_status = {
@@ -2222,6 +2375,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         judge_model: str | None, evaluation_mode: str | None,
         judge_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         enable_llm_judge: bool = True, enable_classic_metrics: bool = False,
+        job: Job | None = None,
     ):
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
@@ -2273,13 +2427,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     judge_reasoning_effort=judge_reasoning_effort,
                     enable_llm_judge=enable_llm_judge,
                     enable_classic_metrics=enable_classic_metrics,
+                    stop_event=stop_event_of(job),
                 )
 
             def render_evaluation(finished):
                 pending[0] = f"⏳ 正在評測已保存的答案：{finished}/{total} 筆"
-                return (*pending, experiment_progress_update(finished, total, "評測中"))
+                status = "停止中" if job and job.stop_requested else "評測中"
+                return (*pending, experiment_progress_update(finished, total, status))
 
-            run = yield from stream_with_progress(evaluate_task, render_evaluation)
+            run = yield from stream_with_progress(evaluate_task, render_evaluation, job)
         except (ProjectError, TypeError, ValueError, OSError) as exc:
             view = list(experiment_view(project_id, f"❌ 評測失敗：{exc}"))
             yield (*view, experiment_evaluation_progress_for_project(project_id))
@@ -2290,17 +2446,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             for item in run.results
         )
         evaluation_label = "答案與傳統指標已計算" if enable_classic_metrics and not enable_llm_judge else "答案已評判"
+        if run.status == "stopped":
+            message = f"🛑 已停止：完成 {evaluated} / {len(run.results)} 筆，已保存完成的評測。"
+        else:
+            message = f"✅ 評測完成：{evaluated}/{len(run.results)} 筆{evaluation_label}。"
         yield (
-            *experiment_view(project_id, f"✅ 評測完成：{evaluated}/{len(run.results)} 筆{evaluation_label}。"),
-            experiment_progress_update(evaluated, len(run.results), "評測完成"),
+            *experiment_view(project_id, message),
+            experiment_progress_update(evaluated, len(run.results), "已停止" if run.status == "stopped" else "評測完成"),
         )
-
-    def stop_retrieval_experiment(project_id: str | None):
-        if not project_id:
-            return "請先開啟專案"
-        if retrieval_experiments.stop(project_id):
-            return "🛑 已要求停止；執行中的 API 請求完成後會保存部分結果。"
-        return "目前沒有正在執行的實驗。"
 
     def export_retrieval_experiment(project_id: str | None):
         if not project_id:
@@ -2365,7 +2518,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ 自動儲存失敗：{exc}"
         return "✅ 題目與來源已自動儲存至目前專案"
 
-    def generate_automatic_qa(project_id, count, parallel_generation, generation_model, generation_effort, method):
+    def generate_automatic_qa(
+        project_id, count, parallel_generation, generation_model, generation_effort, method, job: Job | None = None,
+    ):
         # 輸出最後三項依序為生題、回答、評測進度條；換題目後舊的回答與評測進度一併隱藏
         if not project_id:
             yield ("❌ 請先開啟專案", autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。",
@@ -2389,27 +2544,46 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     method,
                     reasoning_effort=generation_effort,
                     progress_callback=report,
+                    stop_event=stop_event_of(job),
                 ),
                 render_generation,
+                job,
             )
+        except JobStopped:
+            yield ("🛑 已停止：尚未生成任何題目，未建立題目集", *unchanged,
+                   gr.update(value=task_progress_markup(0, "已停止", "完成 0 題"), visible=True),
+                   hidden_progress, hidden_progress)
+            return
         except (ProjectError, ValueError) as exc:
             yield ("❌ " + str(exc), autoqa_rows_update([]), "", "", autoqa_rows_update([]), "尚未生成回答。",
                    gr.update(interactive=False), hidden_progress, hidden_progress, hidden_progress)
             return
+        generated = len(question_set.questions)
+        stopped = job is not None and job.stop_requested
+        if stopped:
+            target = int(count) * max(len(documents.list_documents_if_available(project_id)), 1)
+            headline = f"🛑 已停止：完成 {generated} / {target} 題，已將部分題目存成題目集。"
+            generation_progress = task_progress_markup(generated / target if target else 0, "已停止", f"完成 {generated} / {target} 題")
+        else:
+            headline = f"✅ 已生成 {generated} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。"
+            generation_progress = task_progress_markup(1, "生成完成", f"共 {generated} 題")
         yield (
-            f"✅ 已生成 {len(question_set.questions)} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。\n\n{question_set.description}",
+            f"{headline}\n\n{question_set.description}",
             autoqa_rows_update(autoqa_question_rows(question_set)),
             question_set.question_set_id,
             "",
             autoqa_rows_update([]),
             "尚未生成回答。完成前不能評測。",
             gr.update(interactive=False),
-            gr.update(value=task_progress_markup(1, "生成完成", f"共 {len(question_set.questions)} 題"), visible=True),
+            gr.update(value=generation_progress, visible=True),
             hidden_progress,
             hidden_progress,
         )
 
-    def generate_automatic_answers(project_id, question_set_id, rows, answer_model, answer_effort, method, concurrency, response_type):
+    def generate_automatic_answers(
+        project_id, question_set_id, rows, answer_model, answer_effort, method, concurrency, response_type,
+        job: Job | None = None,
+    ):
         # 輸出最後兩項為回答與評測進度條；重新生成回答後舊的評測進度隱藏
         if not project_id or not question_set_id:
             yield ("❌ 請先生成或匯入題目集", "", autoqa_rows_update([]), gr.update(interactive=False),
@@ -2430,8 +2604,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     project_id, question_set_id, answer_model, method, int(concurrency), response_type,
                     reasoning_effort=answer_effort,
                     progress_callback=progress,
+                    stop_event=stop_event_of(job),
                 ),
                 render_answers,
+                job,
             )
         except (ProjectError, ValueError) as exc:
             yield ("❌ " + str(exc), "", autoqa_rows_update([]), gr.update(interactive=False),
@@ -2445,7 +2621,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             item.status == "COMPLETED" and bool(item.answer.strip())
             for item in report.question_set.questions
         )
-        if ready:
+        if report.stopped:
+            status = (
+                f"🛑 已停止：完成 {completed} / {len(report.question_set.questions)} 題；"
+                "其餘題目維持未完成，全部完成後才能評測。"
+            )
+        elif ready:
             status = f"✅ 檢索並生成回答完成：{completed}/{len(report.question_set.questions)} 題。現在可以評測。"
         else:
             status = f"⚠️ 回答生成尚未全部完成：{completed}/{len(report.question_set.questions)} 題；請確認失敗題目後重試。"
@@ -2455,13 +2636,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f"回答模型：{answer_model}｜檢索模式：{method}｜回答格式：{response_type}｜尚未評測。",
             autoqa_rows_update([]),
             gr.update(interactive=ready),
-            experiment_progress_update(completed, total, "回答生成完成" if ready else "部分完成"),
+            experiment_progress_update(
+                completed, total, "已停止" if report.stopped else ("回答生成完成" if ready else "部分完成"),
+            ),
             hidden_progress,
         )
 
     def evaluate_automatic_answers(
         project_id, question_set_id, rows, answer_model, judge_model, judge_effort,
         method, concurrency, response_type, enable_llm_judge=True, enable_classic_metrics=False,
+        job: Job | None = None,
     ):
         if not project_id or not question_set_id:
             yield "❌ 請先生成或匯入題目集", "", autoqa_rows_update([]), hidden_progress
@@ -2486,12 +2670,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     progress_callback=progress,
                     enable_llm_judge=enable_llm_judge,
                     enable_classic_metrics=enable_classic_metrics,
+                    stop_event=stop_event_of(job),
                 ),
                 render_judging,
+                job,
             )
         except (ProjectError, ValueError) as exc:
             yield "❌ " + str(exc), "", autoqa_rows_update([]), hidden_progress
             return
+        stopped = bool(getattr(report, "stopped", False))
         status = "✅ 評測完成。" + (
             "各評審理由可在匯出的 JSON／CSV 查看。"
             if report.judge and report.judge.enable_llm_judge else ""
@@ -2500,10 +2687,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             len(report.judge.items) if report.judge else 0,
             len(report.judge.classic_items) if report.judge else 0,
         )
+        total = len(report.question_set.questions)
+        if stopped:
+            status = f"🛑 已停止：完成 {judged} / {total} 題；未評的題目維持「待評測」，Retrieval 指標未計算。"
         yield (
             status, automatic_qa_summary(report),
             autoqa_rows_update(automatic_qa_result_rows(report.question_set, report.judge, report.judge_error)),
-            experiment_progress_update(judged, len(report.question_set.questions), "評測完成" if report.judge else "評測失敗"),
+            experiment_progress_update(
+                judged, total, "已停止" if stopped else ("評測完成" if report.judge else "評測失敗"),
+            ),
         )
 
     def import_automatic_question_set(project_id, uploaded):
@@ -3070,11 +3262,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             api_key=api_key,
         )
 
-    def run_preprocess(project_id: str, option_rows, targets: list[str] | None, vision: VisionSettings | None = None):
+    def run_preprocess(
+        project_id: str, option_rows, targets: list[str] | None, vision: VisionSettings | None = None,
+        job: Job | None = None,
+    ):
         """Run preprocessing in a worker thread, yielding progress markup until it returns the report."""
         updates: queue.Queue[tuple[int, int, str]] = queue.Queue()
         result_holder: list[object] = []
-        error_holder: list[Exception] = []
+        error_holder: list[BaseException] = []
 
         def worker_task() -> None:
             try:
@@ -3085,13 +3280,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         filenames=targets or None,
                         progress_callback=lambda done, total, name: updates.put((done, total, name)),
                         vision=vision,
+                        stop_event=stop_event_of(job),
                     )
                 )
-            except Exception as exc:
+            except BaseException as exc:
                 error_holder.append(exc)
 
-        worker = threading.Thread(target=worker_task, daemon=True)
-        worker.start()
+        worker = start_worker(job, worker_task)
         yield task_progress_markup(0, "前處理中", "準備開啟 PDF…")
         latest: tuple[int, int, str] | None = None
         while worker.is_alive() or not updates.empty():
@@ -3109,6 +3304,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return result_holder[0]
 
     def preprocess_message(report) -> str:
+        if report.stopped:
+            total = len(report.completed_documents) + len(report.unprocessed_documents)
+            message = f"🛑 已停止：完成 {len(report.completed_documents)} / {total} 份 PDF"
+            if report.unprocessed_documents:
+                message += f"；未處理（維持原本的前處理結果）：{'、'.join(report.unprocessed_documents)}"
+            return message
         message = (
             f"✅ 前處理完成（{report.documents} 份 PDF）：成功 {report.successful_pages} 頁、"
             f"無文字 {report.empty_pages} 頁、錯誤 {report.error_pages} 頁"
@@ -3133,6 +3334,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         vision_model: str | None = None,
         vision_scope: str | None = None,
         reasoning_effort: str = "none",
+        job: Job | None = None,
     ):
         if not project_id:
             yield "❌ 請先到「專案與連線設定」開啟專案", "", *document_view(None)
@@ -3142,7 +3344,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError as exc:
             yield f"❌ {exc}", "", *document_view(project_id)
             return
-        steps = run_preprocess(project_id, option_rows, targets, vision)
+        steps = run_preprocess(project_id, option_rows, targets, vision, job)
         progress = ""
         try:
             while True:
@@ -3153,7 +3355,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except (ProjectError, OSError, TypeError, ValueError) as exc:
             yield f"❌ {exc}", progress, *document_view(project_id)
             return
-        yield preprocess_message(report), task_progress_markup(1, "前處理完成", f"共 {report.pages} 頁"), *document_view(project_id)
+        if report.stopped:
+            total = len(report.completed_documents) + len(report.unprocessed_documents)
+            final_progress = task_progress_markup(
+                len(report.completed_documents) / total if total else 0, "已停止",
+                f"完成 {len(report.completed_documents)} / {total} 份 PDF",
+            )
+        else:
+            final_progress = task_progress_markup(1, "前處理完成", f"共 {report.pages} 頁")
+        yield preprocess_message(report), final_progress, *document_view(project_id)
 
     def remove_documents(project_id: str | None, filenames: list[str] | None, confirmed: bool):
         if not project_id or not filenames:
@@ -3179,6 +3389,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         vision_scope: str | None = None,
         reasoning_effort: str = "none",
         indexing_reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        job: Job | None = None,
     ):
         if not project_id:
             yield "❌ 請先到「專案與連線設定」開啟專案", "", ""
@@ -3190,43 +3401,50 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return
         # Selected PDFs that were never preprocessed are preprocessed first, then the whole graph is rebuilt.
         pending = [item.filename for item in items if item.filename in set(targets or []) and not item.preprocessed]
-        progress = ""
+        vision = None
         if pending:
             try:
                 vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
             except ProjectError as exc:
-                yield f"❌ 前處理失敗：{exc}", "", progress
+                yield f"❌ 前處理失敗：{exc}", "", ""
                 return
-            steps = run_preprocess(project_id, option_rows, pending, vision)
-            try:
-                while True:
-                    progress = next(steps)
-                    yield f"⏳ 建圖前先前處理：{'、'.join(pending)}", "", progress
-            except StopIteration:
-                pass
-            except (ProjectError, OSError, TypeError, ValueError) as exc:
-                yield f"❌ 前處理失敗：{exc}", "", progress
-                return
-            items = documents.list_documents(project_id)
-        excluded = [item.filename for item in items if not item.preprocessed]
-        if len(excluded) == len(items):
-            yield "❌ 沒有已前處理的 PDF，請先選擇 PDF 並執行前處理", "", progress
+        elif all(not item.preprocessed for item in items):
+            yield "❌ 沒有已前處理的 PDF，請先選擇 PDF 並執行前處理", "", ""
             return
-        excluded_note = f"（未前處理、不納入圖譜：{'、'.join(excluded)}）" if excluded else ""
-        chunks: queue.Queue[str] = queue.Queue()
-        result_holder: list[object] = []
-        error_holder: list[Exception] = []
+        model_label = chat_model or connections.get_chat_model()
+        events: queue.Queue[tuple[str, object]] = queue.Queue()
+        outcome: dict[str, object] = {"phase": "preprocess" if pending else "index"}
+        stop_event = stop_event_of(job)
 
-        def run_index() -> None:
+        # One worker runs preprocessing and indexing, so the job stays registered (and
+        # stoppable) for the whole build even if the page is reloaded in between.
+        def run_build() -> None:
             try:
-                result_holder.append(
-                    indexing.build(
-                        project_id, log_callback=chunks.put, chat_model=chat_model,
-                        reasoning_effort=indexing_reasoning_effort,
+                if pending:
+                    report = documents.preprocess(
+                        project_id,
+                        preprocess_options(project_id, option_rows),
+                        filenames=pending,
+                        progress_callback=lambda done, total, name: events.put(("preprocess", (done, total, name))),
+                        vision=vision,
+                        stop_event=stop_event,
                     )
+                    if report.stopped:
+                        outcome["preprocess_report"] = report
+                        return
+                current = documents.list_documents(project_id)
+                excluded = [item.filename for item in current if not item.preprocessed]
+                if len(excluded) == len(current):
+                    raise ProjectError("沒有已前處理的 PDF，請先選擇 PDF 並執行前處理")
+                outcome["excluded"] = excluded
+                outcome["phase"] = "index"
+                events.put(("index", None))
+                outcome["result"] = indexing.build(
+                    project_id, log_callback=lambda chunk: events.put(("log", chunk)), chat_model=chat_model,
+                    reasoning_effort=indexing_reasoning_effort, stop_event=stop_event,
                 )
-            except Exception as exc:
-                error_holder.append(exc)
+            except BaseException as exc:
+                outcome["error"] = exc
 
         def index_progress(log: str, status: str = "建圖中") -> str:
             state = parse_indexing_progress(log)
@@ -3239,26 +3457,60 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 f"已完成 {state.completed_workflows} / {state.total_workflows} 個 workflow{current}",
             )
 
-        worker = threading.Thread(target=run_index, daemon=True)
-        worker.start()
+        def excluded_note() -> str:
+            excluded = outcome.get("excluded") or []
+            return f"（未前處理、不納入圖譜：{'、'.join(excluded)}）" if excluded else ""
+
+        worker = start_worker(job, run_build)
         log = ""
-        running = f"⏳ GraphRAG 建圖執行中…（模型：{chat_model or connections.get_chat_model()}）{excluded_note}"
-        yield running, log, index_progress(log)
-        while worker.is_alive() or not chunks.empty():
+        progress = ""
+        preprocessing = f"⏳ 建圖前先前處理：{'、'.join(pending)}"
+        if pending:
+            progress = task_progress_markup(0, "前處理中", "準備開啟 PDF…")
+            yield preprocessing, "", progress
+        else:
+            yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）", log, index_progress(log)
+        while worker.is_alive() or not events.empty():
             try:
-                log += chunks.get(timeout=0.25)
+                kind, value = events.get(timeout=0.25)
             except queue.Empty:
-                pass
-            yield running, log, index_progress(log)
+                if outcome["phase"] == "index":
+                    yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
+                continue
+            if kind == "preprocess":
+                done, total, name = value
+                progress = task_progress_markup(done / total if total else 0, "前處理中", f"{name}｜已處理 {done} / {total} 頁")
+                yield preprocessing, "", progress
+            elif kind == "log":
+                log += str(value)
+                yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
+            else:
+                yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
         worker.join()
-        if error_holder:
-            yield f"❌ {error_holder[0]}", log, index_progress(log, "建圖失敗")
+        if "error" in outcome:
+            error = outcome["error"]
+            if outcome["phase"] == "preprocess":
+                yield f"❌ 前處理失敗：{error}", "", progress
+            else:
+                yield f"❌ {error}", log, index_progress(log, "建圖失敗")
             return
-        result = result_holder[0]
+        if "preprocess_report" in outcome:
+            report = outcome["preprocess_report"]
+            yield f"{preprocess_message(report)}；未建圖", "", task_progress_markup(0, "已停止", "建圖前的前處理已停止")
+            return
+        result = outcome["result"]
+        if result.status == "STOPPED":
+            state = parse_indexing_progress(log)
+            yield (
+                f"🛑 已停止：完成 {state.completed_workflows} / {state.total_workflows} 個 workflow｜{result.last_message}",
+                log,
+                index_progress(log, "已停止"),
+            )
+            return
         icon = "✅" if result.status == "INDEXED" else "❌"
         summary = (
-            f"{icon} {result.status}｜建圖模型：{chat_model or connections.get_chat_model()}｜"
-            f"耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}{excluded_note}"
+            f"{icon} {result.status}｜建圖模型：{model_label}｜"
+            f"耗時 {result.duration_seconds:.1f} 秒｜{result.last_message}{excluded_note()}"
         )
         final_progress = (
             task_progress_markup(1, "建圖完成", "所有 workflow 已完成")
@@ -3319,6 +3571,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         gr.Markdown("# 汽車維修 GraphRAG 管理後台")
         active_project_id = gr.State(value=None)
         active_project_banner = gr.Markdown(active_project_label(None))
+        running_jobs_notice = gr.Markdown(visible=False)
+        running_jobs_timer = gr.Timer(2.0, active=False)
         document_project = active_project_id
         query_project = active_project_id
         batch_project = active_project_id
@@ -3472,7 +3726,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             cancel_upload_button = gr.Button("取消", elem_classes="rounded-button")
             with gr.Row():
                 preprocess_button = gr.Button("開始前處理", variant="primary")
+                preprocess_stop_button = gr.Button(JOB_BUTTON_LABELS["preprocess"][1], variant="stop", visible=False)
                 index_button = gr.Button("建立 Graph", variant="primary")
+                index_stop_button = gr.Button(JOB_BUTTON_LABELS["index"][1], variant="stop", visible=False)
                 document_refresh_button = gr.Button("重新整理")
                 remove_pdf_button = gr.Button("刪除所選 PDF", variant="stop")
             # 由刪除按鈕的確認對話框寫入，不顯示於畫面
@@ -3677,6 +3933,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
                 )
                 autoqa_generate_button = gr.Button("生成題目", variant="primary")
+                autoqa_generate_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_generate"][1], variant="stop", visible=False)
                 autoqa_generate_progress = gr.HTML(label="題目生成進度", visible=False)
                 autoqa_result = gr.Markdown()
                 autoqa_questions_table = gr.Dataframe(
@@ -3710,6 +3967,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="回答格式",
                     )
                 autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
+                autoqa_answer_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_answer"][1], variant="stop", visible=False)
                 autoqa_answer_progress = gr.HTML(label="檢索與回答進度", visible=False)
                 autoqa_answer_model.input(
                     update_autoqa_model_method_compatibility,
@@ -3752,6 +4010,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         info="同時送出的評測請求上限（題數 × 評審數會排隊執行）；調高較快，但容易碰到供應商速率限制（HTTP 429）",
                     )
                 autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
+                autoqa_judge_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_evaluate"][1], variant="stop", visible=False)
                 autoqa_judge_model.change(
                     lambda models: gr.update(visible=judge_supports_reasoning(models)),
                     inputs=autoqa_judge_model, outputs=autoqa_judge_effort,
@@ -4024,7 +4283,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
                 with gr.Row():
                     experiment_run_button = gr.Button("檢索並生成答案", variant="primary")
-                    experiment_stop_button = gr.Button("停止實驗", variant="stop")
+                    experiment_run_stop_button = gr.Button(JOB_BUTTON_LABELS["retrieval_answer"][1], variant="stop", visible=False)
                 experiment_generation_status = gr.Markdown("尚未生成答案。完成前不能評測。")
                 experiment_progress_bar = gr.HTML(
                     value=experiment_progress_markup(0, 0, "尚未開始"),
@@ -4073,6 +4332,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     outputs=[experiment_judge_model, experiment_judge_effort, experiment_evaluation_mode],
                 )
                 experiment_evaluate_button = gr.Button("評測答案", variant="primary", interactive=False)
+                experiment_evaluate_stop_button = gr.Button(JOB_BUTTON_LABELS["retrieval_evaluate"][1], variant="stop", visible=False)
                 experiment_evaluate_progress = gr.HTML(label="答案評測進度", visible=False)
                 experiment_status = gr.Markdown()
                 gr.Markdown(
@@ -4498,15 +4758,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             lambda: (gr.Group(visible=False), None),
             outputs=[upload_pdf_group, uploaded_files],
         )
-        preprocess_button.click(
-            preprocess_documents,
+        bind_job(
+            "preprocess", preprocess_button, preprocess_stop_button, preprocess_documents,
             inputs=[document_project, processing_options_table, target_documents, vision_model, vision_scope, vision_reasoning_effort],
             outputs=[document_result, document_progress, *document_view_outputs],
         ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document).then(
             review_refresh, inputs=review_inputs, outputs=review_outputs
         )
-        index_button.click(
-            build_index,
+        bind_job(
+            "index", index_button, index_stop_button, build_index,
             inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope, vision_reasoning_effort, indexing_reasoning_effort],
             outputs=[document_result, indexing_log, document_progress],
         ).then(document_view, inputs=document_project, outputs=document_view_outputs)
@@ -4574,7 +4834,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     experiment_enable_llm_judge, experiment_enable_classic_metrics],
             outputs=experiment_group_save_status,
         )
-        experiment_run_button.click(
+        bind_job(
+            "retrieval_answer", experiment_run_button, experiment_run_stop_button,
             generate_retrieval_experiment_answers,
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
@@ -4584,7 +4845,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_progress_bar, experiment_evaluate_progress],
             show_progress="hidden",
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(**experiment_table_refresh)
-        experiment_evaluate_button.click(
+        bind_job(
+            "retrieval_evaluate", experiment_evaluate_button, experiment_evaluate_stop_button,
             evaluate_retrieval_experiment_answers,
             inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model,
                     experiment_evaluation_mode, experiment_judge_effort,
@@ -4602,17 +4864,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[experiment_status, experiment_summary_table,
                      experiment_dataset_summary_table, experiment_result_table],
         ).then(**experiment_table_refresh)
-        experiment_stop_button.click(
-            stop_retrieval_experiment,
-            inputs=active_project_id,
-            outputs=experiment_status,
-        )
         experiment_export_button.click(
             export_retrieval_experiment,
             inputs=active_project_id,
             outputs=[experiment_export_status, experiment_summary_export_file, experiment_details_export_file],
         )
-        autoqa_generate_button.click(
+        bind_job(
+            "qa_generate", autoqa_generate_button, autoqa_generate_stop_button,
             generate_automatic_qa,
             inputs=[
                 automatic_project, autoqa_questions_per_pdf, autoqa_parallel_generation,
@@ -4675,7 +4933,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
             outputs=autoqa_result,
         )
-        autoqa_answer_button.click(
+        bind_job(
+            "qa_answer", autoqa_answer_button, autoqa_answer_stop_button,
             generate_automatic_answers,
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
@@ -4686,7 +4945,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      autoqa_answer_progress, autoqa_judge_progress],
             show_progress="hidden",
         ).then(**autoqa_table_refresh)
-        autoqa_judge_button.click(
+        bind_job(
+            "qa_evaluate", autoqa_judge_button, autoqa_judge_stop_button,
             evaluate_automatic_answers,
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
@@ -4959,6 +5219,26 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             show_progress="hidden",
         )
         active_project_id.change(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
+        running_job_outputs = [
+            preprocess_button, preprocess_stop_button,
+            index_button, index_stop_button,
+            autoqa_generate_button, autoqa_generate_stop_button,
+            autoqa_answer_button, autoqa_answer_stop_button,
+            autoqa_judge_button, autoqa_judge_stop_button,
+            experiment_run_button, experiment_run_stop_button,
+            experiment_evaluate_button, experiment_evaluate_stop_button,
+            running_jobs_notice, running_jobs_timer,
+        ]
+        # A reloaded page reopens the project; jobs started before the reload show their stop
+        # button, and the timer follows them until they end.
+        for trigger in (active_project_id.change, running_jobs_timer.tick):
+            trigger(
+                running_job_views, inputs=active_project_id, outputs=running_job_outputs,
+                concurrency_limit=None, show_progress="hidden",
+            )
+        demo.load(
+            running_job_views, inputs=active_project_id, outputs=running_job_outputs, show_progress="hidden",
+        )
         dashboard_refresh_button.click(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
     return demo
 

@@ -248,10 +248,10 @@ class RetrievalEvaluationService:
 
     @staticmethod
     def _is_relevant(evidence: Evidence, gold_evidence: tuple[GoldEvidence, ...]) -> bool:
+        retrieved_pages = set(evidence.pages or ((evidence.page,) if evidence.page is not None else ()))
         return any(
             evidence.document_id == gold.document_id
-            and evidence.page is not None
-            and evidence.page in gold.pages
+            and bool(retrieved_pages.intersection(gold.pages))
             for gold in gold_evidence
         )
 
@@ -265,9 +265,10 @@ class RetrievalEvaluationService:
         unique = []
         seen = set()
         for item in evidence:
+            pages = tuple(sorted(set(item.pages or ((item.page,) if item.page is not None else ()))))
             key = (
-                (item.document_id, "page", item.page)
-                if item.page is not None
+                (item.document_id, "pages", pages)
+                if pages
                 else (item.document_id, "unpaged", item.evidence_id or item.text_unit_id or item.rank)
             )
             if key in seen:

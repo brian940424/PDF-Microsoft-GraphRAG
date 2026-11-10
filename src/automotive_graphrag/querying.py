@@ -20,16 +20,55 @@ from typing import Any, Callable
 import pandas as pd
 import yaml
 
+from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
 from .projects import ProjectError, ProjectStore
-from .strategy_routing import SearchOutcome, StrategyRouter, search_with_fallback
+from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
+from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
 AUTO_METHOD = "auto"
 AGENTIC_METHOD = "agentic"
+
+_MANUAL_QUERY_ALIASES = {
+    "翻譯": ("懸浮翻譯", "翻譯助理", "即時翻譯"),
+    "選擇語言": ("語言設定", "變更語言", "系統語言"),
+    "未知號碼": ("封鎖未知號碼", "來電封鎖", "封鎖來電"),
+    "指紋": ("指紋辨識", "註冊指紋", "指紋解鎖"),
+    "解鎖碼": (
+        "變更螢幕鎖定方式", "鎖定螢幕與 AOD", "安全鎖定設定", "預設螢幕鎖定方式",
+        "連續輸入錯誤解鎖碼", "錯誤解鎖碼達到嘗試上限", "自動原廠重設", "自動原廠重設開關",
+    ),
+    "藍牙無法正常運作": ("重設 Wi-Fi 與藍牙設定", "已註冊的資訊可能會遺失"),
+    "過熱": ("裝置使用時發生過熱情形", "裝置過熱時的處理步驟"),
+    "懸浮翻譯": ("切換逐字或整句翻譯", "聆聽原文發音"),
+    "螢幕錄影": ("S Pen 游標", "顯示游標圖示"),
+    "遠端拍照": (
+        "使用 S Pen 拍照", "按住 S Pen 按鈕連拍", "拍攝多張相片",
+        "變更拍攝模式", "切換相機",
+    ),
+    "隨手便利貼": (
+        "釘選至 Always On Display", "備忘錄尚未儲存", "儲存至 Samsung Notes",
+        "將 S Pen 重新插入插槽",
+    ),
+    "具備超寬頻": (
+        "設定 連接 藍牙 超寬頻 (UWB)", "使用此功能將增加電池用量",
+    ),
+}
+
+
+def expand_manual_query(question: str) -> str:
+    """Add a small deterministic alias set when a manual uses a related feature name."""
+    additions: list[str] = []
+    for term, aliases in _MANUAL_QUERY_ALIASES.items():
+        if term in question:
+            additions.extend(alias for alias in aliases if alias not in question and alias not in additions)
+    if not additions:
+        return question
+    return f"{question}\nRelated manual terms: {'; '.join(additions)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +103,10 @@ class QueryResult:
     execution_metadata: dict[str, Any] = field(default_factory=dict)
 
 
+def _query_worker_command() -> list[str]:
+    return [sys.executable, "-m", "automotive_graphrag.graph_query_worker"]
+
+
 class QueryService:
     def __init__(
         self,
@@ -92,7 +135,10 @@ class QueryService:
         response_type: str = "Single Paragraph",
         source: str | None = None,
         reasoning_effort: str = "medium",
+        stop_event: threading.Event | None = None,
     ) -> QueryResult:
+        """Answer one question; setting `stop_event` terminates the query worker and raises JobStopped."""
+        raise_if_stopped(stop_event)
         project = self.projects.get(project_id)
         project_path = self.projects.path_for(project_id)
         prompt = question.strip()
@@ -128,12 +174,21 @@ class QueryService:
             "reasoning_effort": reasoning_effort,
             "response_type": response_type,
             "requested_method": requested_method,
-            "prompt_version": None,
+            "prompt_version": ANSWER_PROMPT_VERSION,
             "model_call_count": None,
             "estimated_cost_usd": None,
             "cost_status": "unknown_usage_not_returned_by_query_adapter",
             "settings_sha256": hashlib.sha256((graph_root / "settings.yaml").read_bytes()).hexdigest(),
         }
+        retrieval_query = expand_manual_query(prompt)
+        if retrieval_query != prompt:
+            execution_metadata["expanded_retrieval_query"] = retrieval_query
+        def run_query(command: list[str]) -> subprocess.CompletedProcess[str] | QueryExecution:
+            if self._custom_runner:
+                raise_if_stopped(stop_event)
+                return self.runner(command)
+            return self._run(command, stop_event=stop_event)
+
         def query_command(search_method: str, search_question: str) -> list[str]:
             return [
                 sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
@@ -146,12 +201,22 @@ class QueryService:
 
             def search(search_method: str) -> SearchOutcome:
                 try:
-                    execution = self.runner(query_command(search_method, prompt))
+                    execution = run_query(query_command(search_method, retrieval_query))
                 except ProjectError as exc:
                     return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
                 if execution.returncode != 0:
                     return SearchOutcome("", self._last_error(execution), execution)
-                return SearchOutcome((execution.stdout or "").strip(), None, execution)
+                try:
+                    section_titles = tuple(item.section_name for item in self.evidence_service.from_context(
+                        project_id, getattr(execution, "context", {}) or {},
+                    ))
+                except ProjectError:
+                    section_titles = ()
+                return SearchOutcome(
+                    (execution.stdout or "").strip(), None, execution,
+                    context_source_count(getattr(execution, "context", None)),
+                    section_titles,
+                )
 
             fallback = search_with_fallback(
                 self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort),
@@ -159,6 +224,7 @@ class QueryService:
                 lambda answer: self.router.check_answer(
                     prompt, answer, selected_model, api_base_url, api_key, applied_effort,
                 ),
+                prompt,
             )
             normalized_method, routing_reason = fallback.method, fallback.reason
             execution_metadata["strategy_attempts"] = list(fallback.attempts)
@@ -167,7 +233,8 @@ class QueryService:
             def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
                 search_command = query_command(search_method, search_question)
                 if not self._custom_runner:
-                    return self._run(search_command, timeout_seconds=timeout_seconds)
+                    return self._run(search_command, timeout_seconds=timeout_seconds, stop_event=stop_event)
+                raise_if_stopped(stop_event)
                 return self.runner(search_command)
 
             decision = self.agentic_search.run(
@@ -183,7 +250,7 @@ class QueryService:
             execution_metadata.update(decision.execution_metadata)
             execution_metadata["requested_method"] = requested_method
         else:
-            result = self.runner(query_command(normalized_method, prompt))
+            result = run_query(query_command(normalized_method, retrieval_query))
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -279,7 +346,11 @@ class QueryService:
         return QueryResult(**value)
 
     @staticmethod
-    def _run(command: list[str], timeout_seconds: float | None = None) -> subprocess.CompletedProcess[str] | QueryExecution:
+    def _run(
+        command: list[str],
+        timeout_seconds: float | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> subprocess.CompletedProcess[str] | QueryExecution:
         method = command[command.index("--method") + 1]
         root = Path(command[command.index("--root") + 1])
         question = command[-1]
@@ -313,16 +384,7 @@ class QueryService:
             ensure_ascii=False,
         )
         try:
-            completed = subprocess.run(
-                [sys.executable, "-m", "automotive_graphrag.graph_query_worker"],
-                cwd=package_root,
-                env=environment,
-                input=worker_payload,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout_seconds,
-            )
+            completed = QueryService._run_worker(environment, package_root, worker_payload, timeout_seconds, stop_event)
             response = json.loads(completed.stdout)
             if not isinstance(response, dict):
                 raise ValueError("工作程序結果不是 JSON 物件")
@@ -342,6 +404,43 @@ class QueryService:
             detail = (completed.stderr or completed.stdout).strip().splitlines() if "completed" in locals() else []
             error = detail[-1] if detail else str(exc)
             return QueryExecution(1, "", error)
+
+    @staticmethod
+    def _run_worker(
+        environment: dict[str, str],
+        package_root: Path,
+        payload: str,
+        timeout_seconds: float | None,
+        stop_event: threading.Event | None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = _query_worker_command()
+        if stop_event is None:
+            return subprocess.run(
+                command, cwd=package_root, env=environment, input=payload, text=True,
+                capture_output=True, check=False, timeout=timeout_seconds,
+            )
+        raise_if_stopped(stop_event)
+        process = subprocess.Popen(
+            command,
+            cwd=package_root,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            # Its own process group, so a stop also ends any helper the worker started.
+            start_new_session=True,
+        )
+        with ProcessStopWatcher(process, stop_event) as watcher:
+            try:
+                stdout, stderr = process.communicate(payload, timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise
+        if watcher.stopped:
+            raise JobStopped("查詢已由使用者停止")
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     @staticmethod
     def _last_error(result: subprocess.CompletedProcess[str] | QueryExecution) -> str:
@@ -386,6 +485,7 @@ class QueryService:
             configure_completion_model(model, chat_model, reasoning_effort)
         for model in value.get("embedding_models", {}).values():
             configure_embedding_model(model, embedding_model)
+        install_answer_prompts(value, settings_path.parent)
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:

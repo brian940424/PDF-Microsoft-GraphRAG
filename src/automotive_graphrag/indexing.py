@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -9,17 +10,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import yaml
 
+from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
-from .documents import INDEXED_DOCUMENTS_FILE
-from .projects import ProjectError, ProjectStore
+from .documents import INDEXED_DOCUMENTS_FILE, SECTIONING_FORMAT_VERSION
+from .projects import ProjectError, ProjectStore, indexing_lock_held, indexing_lock_path
 from .source_metadata import SourceMetadataService
 
 
@@ -79,6 +82,7 @@ class IndexingResult:
 
 
 class IndexingService:
+    MAX_CONTINUATION_PAGES = 2
     def __init__(
         self,
         projects: ProjectStore,
@@ -96,6 +100,7 @@ class IndexingService:
         self.metadata_builder = metadata_builder or SourceMetadataService(projects).build
         self._active_log: Path | None = None
         self._log_callback: Callable[[str], None] | None = None
+        self._stop_event: threading.Event | None = None
 
     def initialize(self, project_id: str) -> Path:
         return self._initialize(project_id, self.chat_model)
@@ -144,34 +149,46 @@ class IndexingService:
         log_callback: Callable[[str], None] | None = None,
         chat_model: str | None = None,
         reasoning_effort: str = "medium",
+        stop_event: threading.Event | None = None,
     ) -> IndexingResult:
+        """Run `graphrag index`; setting `stop_event` terminates it and restores the previous output."""
         project = self.projects.get(project_id)
         if project.status not in {"READY", "STALE", "FAILED", "INDEXED"}:
             raise ProjectError(f"專案狀態 {project.status} 不允許建圖")
         if chat_model is not None and chat_model not in self.connection_settings.available_chat_models():
             raise ProjectError(f"不支援的建圖模型：{chat_model}")
         project_path = self.projects.path_for(project_id)
+        if self.preprocessing_needs_refresh(project_path):
+            raise ProjectError("前處理格式已更新，請重新預處理 PDF，再重新建圖")
         graph_root = project_path / "graphrag"
-        lock_path = graph_root / ".indexing.lock"
-        lock_descriptor = self._acquire_lock(lock_path)
+        lock_path = indexing_lock_path(project_path)
+        lock_descriptor, stale_lock = self._acquire_lock(lock_path)
         started = datetime.now(timezone.utc)
         started_clock = time.monotonic()
         log_path = graph_root / "indexing.log"
         output = graph_root / "output"
         backup = graph_root / ".last-successful-output"
         previous_index = output.exists() and project.status in {"STALE", "FAILED", "INDEXED"}
+        index_started = False
         try:
             self._active_log = log_path
             self._active_log.write_text("", encoding="utf-8")
             self._log_callback = log_callback
+            self._stop_event = stop_event
+            if stale_lock is not None:
+                self._write_log(f"已清除過期的建圖鎖（{stale_lock}）\n")
             self._initialize(project_id, chat_model, reasoning_effort)
             indexed_documents = self._processed_documents(project_path)
             self.projects.update_status(project_id, "INDEXING")
+            raise_if_stopped(stop_event)
+            index_started = True
             if backup.exists():
                 shutil.rmtree(backup)
             if previous_index:
                 output.replace(backup)
             result = self.runner([sys.executable, "-m", "graphrag", "index", "--root", str(graph_root), "--verbose"])
+            if getattr(result, "stopped", False):
+                raise JobStopped("建圖已由使用者停止")
             if self.runner != self._run:
                 for line in ((result.stdout or "") + (result.stderr or "")).splitlines(keepends=True):
                     self._write_log(line)
@@ -190,15 +207,24 @@ class IndexingService:
             self.projects.update_status(project_id, status)
             last_message = self._last_message(result) or "GraphRAG index completed"
             return_code = result.returncode
-        except Exception as exc:
-            if output.exists():
+        except (Exception, JobStopped) as exc:
+            # Before `graphrag index` starts, the output is still the previous graph and stays.
+            if index_started and output.exists():
                 shutil.rmtree(output)
-            if backup.exists():
+            restored = previous_index and (not index_started or backup.exists())
+            if index_started and backup.exists():
                 backup.replace(output)
-            self.projects.update_status(project_id, "FAILED")
-            status = "FAILED"
+            # Any failure after a stop request (e.g. a killed `graphrag init`) counts as the stop.
+            stopped = isinstance(exc, JobStopped) or (stop_event is not None and stop_event.is_set())
+            # A user stop with the previous graph restored leaves the project as it was before the build.
+            self.projects.update_status(project_id, project.status if stopped and restored else "FAILED")
+            status = "STOPPED" if stopped else "FAILED"
             return_code = getattr(exc, "returncode", 1)
-            if isinstance(exc, subprocess.CalledProcessError):
+            if stopped:
+                return_code = -1
+                last_message = "建圖已由使用者停止" + ("，已還原上次成功的圖譜" if restored else "")
+                self._write_log(f"\n{last_message}\n")
+            elif isinstance(exc, subprocess.CalledProcessError):
                 failed_result = subprocess.CompletedProcess(
                     exc.cmd,
                     exc.returncode,
@@ -211,8 +237,10 @@ class IndexingService:
         finally:
             self._active_log = None
             self._log_callback = None
-            os.close(lock_descriptor)
+            self._stop_event = None
+            # Unlink while still holding the flock so no other build can lock this inode first.
             lock_path.unlink(missing_ok=True)
+            os.close(lock_descriptor)
 
         completed = datetime.now(timezone.utc)
         indexing_result = IndexingResult(
@@ -227,6 +255,52 @@ class IndexingService:
         )
         self._write_result(graph_root / "last_index_run.json", indexing_result)
         return indexing_result
+
+    def recover_interrupted_builds(self) -> list[str]:
+        """Mark INDEXING projects whose build process is gone as FAILED.
+
+        A build killed outright never reaches the ``finally`` in :meth:`build`, leaving the
+        status at INDEXING, a lock file and possibly partial output. Mirror the failure path:
+        drop the partial output, restore the last successful one and clear the stale lock.
+        """
+        recovered: list[str] = []
+        for project in self.projects.list():
+            if project.status != "INDEXING":
+                continue
+            project_path = self.projects.path_for(project.project_id)
+            lock_path = indexing_lock_path(project_path)
+            if indexing_lock_held(lock_path):
+                continue
+            graph_root = project_path / "graphrag"
+            output = graph_root / "output"
+            backup = graph_root / ".last-successful-output"
+            if backup.exists():
+                if output.exists():
+                    shutil.rmtree(output)
+                backup.replace(output)
+            lock_path.unlink(missing_ok=True)
+            self.projects.update_status(project.project_id, "FAILED")
+            now = datetime.now(timezone.utc).isoformat()
+            message = "建圖程序已中斷（程序被終止），已將狀態改為 FAILED，請重新建圖"
+            log_path = graph_root / "indexing.log"
+            if log_path.is_file():
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write(f"\n{message}\n")
+            self._write_result(
+                graph_root / "last_index_run.json",
+                IndexingResult(
+                    project_id=project.project_id,
+                    status="FAILED",
+                    started_at=project.updated_at,
+                    completed_at=now,
+                    duration_seconds=0.0,
+                    return_code=-1,
+                    last_message=message,
+                    log_file=log_path.name,
+                ),
+            )
+            recovered.append(project.project_id)
+        return recovered
 
     def last_result(self, project_id: str) -> IndexingResult | None:
         path = self.projects.path_for(project_id) / "graphrag" / "last_index_run.json"
@@ -244,14 +318,19 @@ class IndexingService:
             bufsize=1,
             # Unbuffered output lets the UI follow workflow progress live.
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            # A process group of its own lets a stop terminate graphrag's workers too.
+            start_new_session=True,
         )
         output: list[str] = []
         assert process.stdout is not None
-        for line in process.stdout:
-            output.append(line)
-            self._write_log(line)
-        return_code = process.wait()
-        return subprocess.CompletedProcess(command, return_code, "".join(output), "")
+        with ProcessStopWatcher(process, self._stop_event) as watcher:
+            for line in process.stdout:
+                output.append(line)
+                self._write_log(line)
+            return_code = process.wait()
+        completed = subprocess.CompletedProcess(command, return_code, "".join(output), "")
+        completed.stopped = watcher.stopped  # type: ignore[attr-defined]
+        return completed
 
     def _write_log(self, text: str) -> None:
         if self._active_log is not None and text:
@@ -304,11 +383,82 @@ class IndexingService:
         handle, temporary_name = tempfile.mkstemp(dir=input_directory, prefix=".input-", suffix=".jsonl")
         os.close(handle)
         try:
-            shutil.copy2(source, temporary_name)
+            records = IndexingService._merge_continuation_records(
+                [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+            )
+            with open(temporary_name, "w", encoding="utf-8") as target:
+                target.writelines(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n" for record in records)
             os.replace(temporary_name, destination)
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+    @staticmethod
+    def _merge_continuation_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Coalesce one neighboring page when its first chunk continues the same section."""
+        merged: list[dict[str, Any]] = []
+        for record in records:
+            page = record.get("page")
+            if not isinstance(page, int):
+                merged.append(record)
+                continue
+            previous = merged[-1] if merged else None
+            previous_pages = list(previous.get("pages") or [previous.get("page")]) if previous else []
+            first_line = next((line.strip() for line in str(record.get("text", "")).splitlines() if line.strip()), "")
+            continues_section = (
+                previous is not None
+                and previous.get("document_id") == record.get("document_id")
+                and previous.get("section_id") == record.get("section_id")
+                and previous.get("section_path") == record.get("section_path")
+                and " > " in str(record.get("section_path", ""))
+                and isinstance(previous_pages[-1], int)
+                and page == previous_pages[-1] + 1
+                and record.get("block_id") == "b01"
+                and IndexingService._first_nonempty_line(previous.get("text", ""))
+                == str(previous.get("section_name", "")).strip()
+                and first_line != str(record.get("section_name", "")).strip()
+                and len(previous_pages) < IndexingService.MAX_CONTINUATION_PAGES
+            )
+            if not continues_section:
+                merged.append(record)
+                continue
+            previous["text"] = f'{previous.get("text", "")}\n\n{record.get("text", "")}'.strip()
+            previous["pages"] = previous_pages + list(record.get("pages") or [page])
+            page_labels = ", ".join(str(item) for item in previous["pages"])
+            previous["title"] = f'{record.get("document_id", "")} - Pages {page_labels} - {previous.get("section_name", "")}'
+        return merged
+
+    @staticmethod
+    def _first_nonempty_line(text: str) -> str:
+        return next((line.strip() for line in str(text).splitlines() if line.strip()), "")
+
+    @staticmethod
+    def preprocessing_needs_refresh(project_path: Path) -> bool:
+        """Detect processed records created before the current section heading rules."""
+        source = project_path / "processed" / "input.jsonl"
+        if not source.is_file():
+            return False
+        return any(
+            record.get("sectioning_version") != SECTIONING_FORMAT_VERSION
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+            for record in (json.loads(line),)
+        )
+
+    @staticmethod
+    def input_needs_rebuild(project_path: Path) -> bool:
+        """Detect an existing graph input that predates continuation-page coalescing."""
+        source = project_path / "processed" / "input.jsonl"
+        indexed = project_path / "graphrag" / "input" / "input.jsonl"
+        if IndexingService.preprocessing_needs_refresh(project_path):
+            return True
+        if not source.is_file() or not indexed.is_file():
+            return False
+        current_records = [json.loads(line) for line in indexed.read_text(encoding="utf-8").splitlines() if line.strip()]
+        expected_records = IndexingService._merge_continuation_records(
+            [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        )
+        return current_records != expected_records
 
     @staticmethod
     def _configure_api_base(settings_path: Path, api_base_url: str) -> None:
@@ -331,11 +481,49 @@ class IndexingService:
         IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
 
     @staticmethod
-    def _acquire_lock(path: Path) -> int:
-        try:
-            return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            raise ProjectError("此專案已有建圖工作正在執行") from exc
+    def _acquire_lock(path: Path) -> tuple[int, str | None]:
+        """Take the project's indexing lock; return its descriptor and any stale owner found.
+
+        The lock is an exclusive ``flock`` held for the whole build, so it disappears with the
+        process even when ``finally`` never runs. A leftover file that nobody holds is stale and
+        is taken over.
+        """
+        while True:
+            try:
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+                created = True
+            except FileExistsError:
+                try:
+                    descriptor = os.open(path, os.O_RDWR)
+                except FileNotFoundError:
+                    continue
+                created = False
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.close(descriptor)
+                raise ProjectError("此專案已有建圖工作正在執行") from exc
+            try:
+                same_file = os.stat(path).st_ino == os.fstat(descriptor).st_ino
+            except FileNotFoundError:
+                same_file = False
+            if same_file:
+                break
+            # The previous holder unlinked this file before we locked it; retry on the new path.
+            os.close(descriptor)
+        stale_lock = None
+        if not created:
+            previous = os.read(descriptor, 4096).decode("utf-8", errors="replace").strip()
+            stale_lock = previous or "空白鎖檔"
+        owner = json.dumps(
+            {"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()},
+            ensure_ascii=False,
+        )
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.write(descriptor, owner.encode("utf-8"))
+        os.fsync(descriptor)
+        return descriptor, stale_lock
 
     @staticmethod
     def _failure_message(prefix: str, result: subprocess.CompletedProcess[str]) -> str:

@@ -1,6 +1,8 @@
+import inspect
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -529,6 +531,27 @@ class RetrievalExperimentTests(unittest.TestCase):
             [("basic", "not_found"), ("local", "failed"), ("global", "found")],
         )
 
+    def test_auto_group_skips_local_answer_built_on_too_few_sources(self):
+        group, question = self._auto_group(("local", "basic", "global", "drift"))
+        received = []
+
+        def query(*args):
+            received.append(args[2])
+            if args[2] == "local":
+                return ("來源未說明，只提到別的功能", {"sources": [{"id": str(index)} for index in range(3)]})
+            return ("回答", {"sources": [{"id": str(index)} for index in range(10)]})
+
+        self.service.query_function = query
+
+        result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
+
+        self.assertEqual(received, ["local", "basic"])
+        self.assertEqual((result.routed_method, result.actual_answer), ("basic", "回答"))
+        self.assertEqual(
+            [(item["method"], item["status"]) for item in result.execution_trace["strategy_attempts"]],
+            [("local", "not_found"), ("basic", "found")],
+        )
+
     def test_auto_group_reports_not_found_and_all_failures(self):
         group, question = self._auto_group(("local", "basic", "global", "drift"), refusals=("沒有",))
         self.service.query_function = lambda *args: ("沒有", {})
@@ -861,14 +884,15 @@ class RetrievalExperimentTests(unittest.TestCase):
             ],
         )
         group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        stop_event = threading.Event()
 
         def stop_after_first(run):
             if run.results:
-                self.service.stop("project")
+                stop_event.set()
 
         run = self.service.run(
             "project", question_set.question_set_id, [group], max_concurrency=1,
-            update_callback=stop_after_first,
+            update_callback=stop_after_first, stop_event=stop_event,
         )
 
         self.assertEqual(run.status, "stopped")
@@ -943,6 +967,7 @@ class RetrievalExperimentTests(unittest.TestCase):
             payload = json.loads(kwargs["input"])
             root = Path(payload["root_dir"])
             captured["settings"] = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
+            captured["basic_prompt"] = Path(captured["settings"]["basic_search"]["prompt"]).read_text(encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, json.dumps({"answer": "ok", "context": {}}), "")
 
         with patch("automotive_graphrag.retrieval_experiments.subprocess.run", side_effect=run_worker):
@@ -950,6 +975,7 @@ class RetrievalExperimentTests(unittest.TestCase):
                 "project", "q", "basic", "gpt-4.1-mini",
                 strategy_parameters={"k": 17, "max_context_tokens": 8000},
             )
+        self.assertIn("---Answer requirements---", captured["basic_prompt"])
         self.assertEqual(captured["settings"]["basic_search"]["k"], 17)
         self.assertEqual(captured["settings"]["basic_search"]["max_context_tokens"], 8000)
 
@@ -1027,10 +1053,10 @@ class RetrievalExperimentTests(unittest.TestCase):
         ui_group_id = ui_service.load("ui-project")["groups"][0]["group_id"]
         ui_service.set_group_method("ui-project", ui_group_id, "drift")
         app = create_app(ui_root)
-        generate_answers_handler = next(
+        generate_answers_handler = inspect.unwrap(next(
             fn.fn for fn in app.fns.values()
             if getattr(fn.fn, "__name__", "") == "generate_retrieval_experiment_answers"
-        )
+        ))
         resolve_question_set_id = next(
             cell.cell_contents for cell in generate_answers_handler.__closure__ or ()
             if getattr(cell.cell_contents, "__name__", "") == "resolve_experiment_question_set_id"

@@ -62,6 +62,18 @@ class SourceMetadataServiceTests(unittest.TestCase):
         saved = json.loads((self.output / "source_metadata.jsonl").read_text().strip())
         self.assertEqual(saved["section_id"], "WW")
 
+    def test_build_preserves_all_pages_for_a_merged_section(self) -> None:
+        self.write_parquets({
+            "chunk_id": "L33-SM3E-WW-p0125-b01", "project_id": "L33-SM3E",
+            "section_id": "DEX", "section_name": "DeX", "document_id": "WW.pdf",
+            "page": 125, "pages": [125, 126], "block_id": "b01",
+        })
+
+        metadata = self.service.build("L33-SM3E")[0]
+
+        self.assertEqual((metadata.page, metadata.pages), (125, (125, 126)))
+        self.assertEqual(self.service.load("L33-SM3E"), [metadata])
+
     def test_build_rejects_text_unit_without_source_metadata(self) -> None:
         self.write_parquets(raw_data={"document_id": "WW.pdf"})
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -36,6 +37,38 @@ PROJECT_STATUSES = {
 
 class ProjectError(ValueError):
     """A project request cannot be completed safely."""
+
+
+INDEXING_LOCK_FILE = ".indexing.lock"
+
+
+def indexing_lock_path(project_path: Path) -> Path:
+    return project_path / "graphrag" / INDEXING_LOCK_FILE
+
+
+def indexing_lock_held(lock_path: Path) -> bool:
+    """Whether a live process holds the indexing lock.
+
+    The holder keeps an exclusive ``flock`` on the file, which the kernel releases when the
+    process dies, so a lock file left behind by a killed build is reported as not held.
+    """
+    try:
+        descriptor = os.open(lock_path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def project_indexing_locked(project_path: Path) -> bool:
+    return indexing_lock_held(indexing_lock_path(project_path))
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +212,7 @@ class ProjectStore:
         project_path = self.path_for(project_id)
         if project_path.is_symlink():
             raise ProjectError("拒絕刪除符號連結專案")
-        if (project_path / "graphrag" / ".indexing.lock").exists():
+        if project_indexing_locked(project_path):
             raise ProjectError("建圖工作執行中，無法刪除專案")
         shutil.rmtree(project_path)
 

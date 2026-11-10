@@ -60,7 +60,7 @@ def cited_evidence(answer: str, retrieved: Sequence[object]) -> list[object]:
         item for item in text_units
         if str(getattr(item, "context_id", "")) in source_ids
         or str(getattr(item, "evidence_id", "")) in evidence_ids
-        or str(getattr(item, "page", None)) in page_citations
+        or bool(set(str(page) for page in (getattr(item, "pages", ()) or (getattr(item, "page", None),))) & page_citations)
     ]
 
 
@@ -69,9 +69,8 @@ def cited_sources(answer: str, retrieved: Sequence[object]) -> list[dict[str, ob
     pages_by_document: dict[str, set[int]] = {}
     for item in cited_evidence(answer, retrieved):
         pages = pages_by_document.setdefault(str(getattr(item, "document_id", "")), set())
-        page = getattr(item, "page", None)
-        if isinstance(page, int):
-            pages.add(page)
+        item_pages = getattr(item, "pages", ()) or (getattr(item, "page", None),)
+        pages.update(page for page in item_pages if isinstance(page, int))
     return [
         {"document_id": document, "document_name": document, "pages": sorted(pages)}
         for document, pages in pages_by_document.items()
@@ -100,9 +99,8 @@ def source_score(
     cited_pages: dict[str, set[int]] = {}
     for item in cited:
         pages = cited_pages.setdefault(str(getattr(item, "document_id", "")), set())
-        page = getattr(item, "page", None)
-        if isinstance(page, int):
-            pages.add(page)
+        item_pages = getattr(item, "pages", ()) or (getattr(item, "page", None),)
+        pages.update(page for page in item_pages if isinstance(page, int))
     gold_documents = {str(getattr(item, "document_id", "")) for item in gold}
     document_hit = bool(gold_documents & set(cited_pages))
     gold_pages = {

@@ -11,6 +11,7 @@ import gradio as gr
 from .cases import CaseService
 from .connections import ConnectionSettings
 from .downloads import stage_downloads
+from .evidence import evidence_page_label
 from .projects import Project, ProjectError, ProjectStore
 from .querying import QueryResult, QueryService
 
@@ -56,7 +57,7 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
         for item in values or []:
             if item.get("evidence_id") == evidence_id:
                 location = (
-                    f"第 {item['page']} 頁"
+                    f"第 {'、'.join(str(page) for page in (item.get('pages') or [item['page']]))} 頁"
                     if item.get("page") is not None
                     else "GraphRAG 社群報告（無單一 PDF 頁碼）"
                 )
@@ -103,7 +104,7 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
             return
         values = [asdict(item) for item in result.evidence]
         rows = [
-            [item.rank, item.evidence_id, item.document_id, item.page or "—", item.chunk_id or "—", item.score]
+            [item.rank, item.evidence_id, item.document_id, evidence_page_label(item) or "—", item.chunk_id or "—", item.score]
             for item in result.evidence
         ]
         selected = result.evidence[0].evidence_id if result.evidence else None

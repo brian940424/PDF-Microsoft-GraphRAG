@@ -1,9 +1,20 @@
+import fcntl
 import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 from automotive_graphrag.projects import PROJECT_DIRECTORIES, ProjectError, ProjectStore
+
+
+@contextmanager
+def held_indexing_lock(path: Path):
+    """Hold the indexing lock the way a running build does."""
+    path.write_text('{"pid": 1}')
+    with path.open("r") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 class ProjectStoreTests(unittest.TestCase):
@@ -107,12 +118,20 @@ class ProjectStoreTests(unittest.TestCase):
     def test_delete_rejects_project_with_active_index_job(self) -> None:
         project = self.create_project()
         project_path = self.store.path_for(project.project_id)
-        (project_path / "graphrag" / ".indexing.lock").write_text("busy")
-
-        with self.assertRaisesRegex(ProjectError, "執行中"):
-            self.store.delete(project.project_id)
+        with held_indexing_lock(project_path / "graphrag" / ".indexing.lock"):
+            with self.assertRaisesRegex(ProjectError, "執行中"):
+                self.store.delete(project.project_id)
 
         self.assertTrue(project_path.exists())
+
+    def test_delete_ignores_stale_lock_left_by_killed_index_job(self) -> None:
+        project = self.create_project()
+        project_path = self.store.path_for(project.project_id)
+        (project_path / "graphrag" / ".indexing.lock").write_text("")
+
+        self.store.delete(project.project_id)
+
+        self.assertFalse(project_path.exists())
 
 
 if __name__ == "__main__":

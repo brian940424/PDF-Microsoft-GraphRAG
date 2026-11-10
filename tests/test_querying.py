@@ -12,7 +12,7 @@ from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.evidence import Evidence, EvidenceService
 from automotive_graphrag.agentic_search import AgenticDecision
-from automotive_graphrag.querying import QueryExecution, QueryService
+from automotive_graphrag.querying import QueryExecution, QueryService, expand_manual_query
 from automotive_graphrag.source_metadata import SourceMetadata
 from automotive_graphrag.strategy_routing import AnswerCheck, NOT_FOUND_ANSWER, StrategyDecision
 
@@ -150,6 +150,10 @@ class QueryServiceTests(unittest.TestCase):
             settings["embedding_models"]["default_embedding_model"]["model"],
             "text-embedding-3-small",
         )
+        local_prompt = Path(settings["local_search"]["prompt"])
+        self.assertTrue(local_prompt.is_absolute())
+        self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v6")
 
     def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
         runner = FakeQueryRunner()
@@ -190,6 +194,22 @@ class QueryServiceTests(unittest.TestCase):
             [("basic", "not_found"), ("local", "failed"), ("global", "found")],
         )
         self.assertEqual(service.history("L33-SM3E"), [result])
+
+    def test_auto_query_skips_local_answer_built_on_too_few_sources(self) -> None:
+        runner = ScriptedRunner({"local": "相簿群組的步驟", "basic": "聯絡人群組的步驟", "global": "不該執行", "drift": "不該執行"})
+        router = FakeRouter(StrategyDecision("local", "具體事實"))
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
+        )
+
+        result = service.ask("L33-SM3E", "如何建立聯絡人群組？", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(runner.methods, ["local", "basic"])
+        self.assertEqual(router.checked, ["聯絡人群組的步驟"])
+        self.assertEqual((result.method, result.answer), ("basic", "聯絡人群組的步驟"))
+        attempts = result.execution_metadata["strategy_attempts"]
+        self.assertEqual([(item["method"], item["status"]) for item in attempts], [("local", "not_found"), ("basic", "found")])
+        self.assertIn("只取得 1 個原文段落", attempts[0]["detail"])
 
     def test_auto_query_reports_not_found_after_all_methods(self) -> None:
         runner = ScriptedRunner({"local": "沒有", "basic": "沒有", "global": None, "drift": "沒有"})
@@ -497,6 +517,44 @@ class QueryServiceTests(unittest.TestCase):
             service.ask("L33-SM3E", "  ")
         with self.assertRaisesRegex(ProjectError, "不支援"):
             service.ask("L33-SM3E", "測試問題", "unknown")
+
+    def test_manual_query_expansion_adds_feature_aliases_without_extra_calls(self) -> None:
+        expanded = expand_manual_query("如何開啟翻譯功能？")
+
+        self.assertIn("懸浮翻譯", expanded)
+        self.assertIn("翻譯助理", expanded)
+        self.assertIn("即時翻譯", expanded)
+
+    def test_manual_query_expansion_adds_exact_terms_for_weak_retrieval_cases(self) -> None:
+        unlock = expand_manual_query("錯誤解鎖碼達到上限要如何自動重設？")
+        bluetooth = expand_manual_query("藍牙無法正常運作時，如何重設 Wi-Fi 與藍牙設定？")
+        heat = expand_manual_query("裝置使用中過熱要怎麼辦？")
+        translation = expand_manual_query("S Pen 懸浮翻譯如何切換逐字？")
+        recording = expand_manual_query("螢幕錄影時如何顯示 S Pen 游標？")
+        dex = expand_manual_query("如何用 S Pen 遠端拍照？")
+        note = expand_manual_query("隨手便利貼要如何釘選到 Always On Display？釘選後備忘錄是否已經儲存？")
+        uwb = expand_manual_query("使用具備超寬頻 (UWB) 功能的數位鑰匙需要符合哪些條件？")
+
+        self.assertIn("自動原廠重設", unlock)
+        self.assertIn("安全鎖定設定", unlock)
+        self.assertIn("變更螢幕鎖定方式", unlock)
+        self.assertIn("自動原廠重設開關", unlock)
+        self.assertIn("連續輸入錯誤解鎖碼", unlock)
+        self.assertIn("重設 Wi-Fi 與藍牙設定", bluetooth)
+        self.assertIn("已註冊的資訊可能會遺失", bluetooth)
+        self.assertIn("裝置使用時發生過熱情形", heat)
+        self.assertIn("切換逐字或整句翻譯", translation)
+        self.assertIn("顯示游標圖示", recording)
+        self.assertIn("使用 S Pen 拍照", dex)
+        self.assertIn("按住 S Pen 按鈕連拍", dex)
+        self.assertIn("儲存至 Samsung Notes", note)
+        self.assertIn("使用此功能將增加電池用量", uwb)
+
+    def test_manual_query_expansion_is_idempotent_and_leaves_other_queries_alone(self) -> None:
+        question = "如何清潔螢幕？"
+        self.assertEqual(expand_manual_query(question), question)
+        expanded = expand_manual_query("如何註冊指紋？")
+        self.assertEqual(expanded.count("註冊指紋"), 1)
 
 
 if __name__ == "__main__":

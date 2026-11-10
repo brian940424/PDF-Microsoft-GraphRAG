@@ -39,7 +39,11 @@ class DocumentProgressTests(unittest.TestCase):
         outputs = list(self.preprocess_documents("L33-SM3E", None, ["A.pdf"]))
 
         self.assertTrue(all("<progress" in output[1] for output in outputs))
-        message, progress, table, _, targets, notice = outputs[-1]
+        # The job wrapper appends the start/stop button pair: the first update swaps them.
+        start, stop = outputs[0][-2:]
+        self.assertFalse(start["visible"])
+        self.assertTrue(stop["visible"])
+        message, progress, table, _, targets, notice, _start, _stop = outputs[-1]
         rows = table["value"]
         self.assertIn("✅ 前處理完成（1 份 PDF）", message)
         self.assertIn("100%", progress)

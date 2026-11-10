@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
+from .cancellation import JobStopped, raise_if_stopped
 from .automatic_evaluation import AutomaticEvaluationResult, AutomaticEvaluationService
 from .projects import ProjectError, ProjectStore
 from .question_generation import QuestionGenerationService, normalize_question
@@ -28,6 +30,7 @@ class AutomaticQAReport:
     judge_error: str | None
     retrieval: RetrievalEvaluationResult | None
     retrieval_error: str | None
+    stopped: bool = False
 
 
 class AutomaticQATestService:
@@ -58,7 +61,13 @@ class AutomaticQATestService:
         method: str = "local",
         reasoning_effort: str = "medium",
         progress_callback: Callable[[float, str], None] | None = None,
+        stop_event: threading.Event | None = None,
     ) -> QuestionSet:
+        """Generate and save a question set.
+
+        Setting `stop_event` sends no further generation requests (requests already sent finish)
+        and saves the questions generated so far; with none, JobStopped is raised and nothing is saved.
+        """
         if questions_per_pdf < 1:
             raise ProjectError("每份 PDF 題數必須是正整數")
         project = self.projects.get(project_id)
@@ -80,12 +89,14 @@ class AutomaticQATestService:
             progress_callback(0, f"準備為 {len(pdf_ids)} 份 PDF 生成題目")
         # Each wave submits at most one request for any PDF. Waves only advance
         # after all previous requests finish, so retries can safely see all results.
+        stopped = False
         for _attempt in range(3):
             pending = [item for item in pdf_ids if len(accepted[item]) < questions_per_pdf]
-            if not pending:
+            if not pending or stopped:
                 break
             excluded = [question.question for questions in accepted.values() for question in questions]
             def generate_one(document_id: str):
+                raise_if_stopped(stop_event)
                 needed = questions_per_pdf - len(accepted[document_id])
                 return self.generation.generate_for_document(
                     project_id,
@@ -106,14 +117,23 @@ class AutomaticQATestService:
                         finished += 1
                         try:
                             generated[doc] = future.result()
+                        except JobStopped:
+                            pass
                         except Exception as exc:
                             errors.append(f"{doc}：{exc}")
+                        if stop_event is not None and stop_event.is_set() and not stopped:
+                            stopped = True
+                            # Queued tasks check the stop flag before any request; cancelling them
+                            # instead would leave as_completed waiting forever.
                         if progress_callback:
                             fraction = min(0.95, ((_attempt * len(pdf_ids)) + finished) / (3 * len(pdf_ids)))
                             progress_callback(fraction, f"第 {_attempt + 1} 輪：已完成 {finished}/{len(pending)} 份 PDF")
             else:
                 generated = {}
                 for position, doc in enumerate(pending, start=1):
+                    if stop_event is not None and stop_event.is_set():
+                        stopped = True
+                        break
                     if progress_callback:
                         progress_callback(0, f"第 {_attempt + 1} 輪：正在生成 {position}/{len(pending)} — {doc}")
                     try:
@@ -131,8 +151,9 @@ class AutomaticQATestService:
                     seen.add(normalized)
                     accepted[doc].append(question)
 
+        stopped = stopped or bool(stop_event is not None and stop_event.is_set())
         if progress_callback:
-            progress_callback(1, "題目生成完成，正在儲存題目集")
+            progress_callback(1, "已停止，正在儲存已生成的題目" if stopped else "題目生成完成，正在儲存題目集")
 
         batch_questions: list[BatchQuestion] = []
         for questions in accepted.values():
@@ -147,6 +168,8 @@ class AutomaticQATestService:
                         answer_source_evidence=question.answer_source_evidence or question.gold_evidence,
                     )
                 )
+        if not batch_questions and stopped:
+            raise JobStopped("已停止，尚未生成任何題目")
         if not batch_questions:
             detail = "；".join(errors[:4])
             raise ProjectError("所有 PDF 均未能生成有效題目" + (f"：{detail}" if detail else ""))
@@ -156,7 +179,8 @@ class AutomaticQATestService:
             f"自動問答測試-{stamp}",
             batch_questions,
             description=(
-                f"每份 PDF 目標 {questions_per_pdf} 題；生題模型 {generation_model}。"
+                ("已停止，部分題目。" if stopped else "")
+                + f"每份 PDF 目標 {questions_per_pdf} 題；生題模型 {generation_model}。"
                 + ("未完成項目：" + "；".join(errors) if errors else "")
             ),
             method=method,
@@ -214,6 +238,7 @@ class AutomaticQATestService:
         response_type: str = "Single Paragraph",
         progress_callback: Callable[[int, int], None] | None = None,
         reasoning_effort: str = "medium",
+        stop_event: threading.Event | None = None,
     ) -> AutomaticQAReport:
         """Generate and persist answers only; judging is a separate user action."""
         report = self._run_existing(
@@ -229,6 +254,7 @@ class AutomaticQATestService:
             response_type=response_type,
             progress_callback=progress_callback,
             reasoning_effort=reasoning_effort,
+            stop_event=stop_event,
         )
         self.judging.clear_result(project_id, question_set_id)
         return report
@@ -247,7 +273,9 @@ class AutomaticQATestService:
         reasoning_effort: str = "medium",
         enable_llm_judge: bool = True,
         enable_classic_metrics: bool = False,
+        stop_event: threading.Event | None = None,
     ) -> AutomaticQAReport:
+        """Judge saved answers; a stop keeps the scores finished so far and skips the retrieval metrics."""
         if not enable_llm_judge and not enable_classic_metrics:
             raise ProjectError("至少啟用一種評測方式")
         question_set = self.question_sets.get(project_id, question_set_id)
@@ -267,12 +295,20 @@ class AutomaticQATestService:
                 reasoning_effort=reasoning_effort,
                 enable_llm_judge=enable_llm_judge,
                 enable_classic_metrics=enable_classic_metrics,
+                stop_event=stop_event,
             )
             judge_error = judge.judge_error
         except ProjectError as exc:
             judge_error = str(exc)
+        stopped = bool(judge and judge.stopped)
         retrieval = None
         retrieval_error = None
+        if stopped:
+            return AutomaticQAReport(
+                question_set=question_set, generation_model="—", answer_model=answer_model,
+                judge_model=judge_model, generation_errors=(), answers=(), judge=judge,
+                judge_error=judge_error, retrieval=None, retrieval_error=None, stopped=True,
+            )
         try:
             # Score the evidence of the strategy that produced the saved answers; the page's
             # method selector may have been reset (e.g. to Local) since answers were generated.
@@ -308,25 +344,37 @@ class AutomaticQATestService:
         response_type: str = "Single Paragraph",
         progress_callback: Callable[[int, int], None] | None = None,
         reasoning_effort: str = "medium",
+        stop_event: threading.Event | None = None,
     ) -> AutomaticQAReport:
+        """Answer every question. Setting `stop_event` sends no new questions and terminates the
+        running query workers; answered questions are saved and the rest go back to PENDING."""
         if concurrency < 1 or concurrency > 32:
             raise ProjectError("回答並行數必須介於 1 到 32")
         pending = [item for item in question_set.questions]
         results: dict[str, QueryResult] = {}
         def answer(item: BatchQuestion) -> QueryResult:
+            raise_if_stopped(stop_event)
+            kwargs = {"stop_event": stop_event} if stop_event is not None else {}
             return self.querying.ask(
                 question_set.project_id, item.question, method,
                 chat_model=answer_model, response_type=response_type, source="automatic_qa",
-                reasoning_effort=reasoning_effort,
+                reasoning_effort=reasoning_effort, **kwargs,
             )
         if progress_callback:
             progress_callback(0, len(pending))
+        stopped = False
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {pool.submit(answer, item): item for item in pending}
             for future in as_completed(futures):
                 item = futures[future]
+                if stop_event is not None and stop_event.is_set() and not stopped:
+                    stopped = True
+                    # Queued tasks check the stop flag before any request; cancelling them
+                    # instead would leave as_completed waiting forever.
                 try:
                     results[item.question_id] = future.result()
+                except JobStopped:
+                    continue
                 except Exception as exc:
                     # QueryService normally converts GraphRAG process failures to QueryResult;
                     # unexpected setup errors remain visible through the report.
@@ -337,22 +385,24 @@ class AutomaticQATestService:
                     )
                 if progress_callback:
                     progress_callback(len(results), len(pending))
+        unfinished = [item.question_id for item in pending if item.question_id not in results] if stopped else []
         updated = self.question_sets.update_answers(
             question_set.project_id, question_set.question_set_id, results, method,
-            response_type=response_type,
+            response_type=response_type, reset_question_ids=unfinished,
         )
-        if not evaluate:
+        if not evaluate or stopped:
             return AutomaticQAReport(
                 question_set=updated,
                 generation_model=generation_model,
                 answer_model=answer_model,
                 judge_model=judge_model,
                 generation_errors=generation_errors,
-                answers=tuple(results[item.question_id] for item in updated.questions),
+                answers=tuple(results[item.question_id] for item in updated.questions if item.question_id in results),
                 judge=None,
                 judge_error=None,
                 retrieval=None,
                 retrieval_error=None,
+                stopped=stopped,
             )
         judge = None
         judge_error = None

@@ -166,11 +166,26 @@ class QuestionSetService:
         results: Mapping[str, QueryResult],
         method: str,
         response_type: str | None = None,
+        reset_question_ids: Sequence[str] = (),
     ) -> QuestionSet:
+        """Save `results`; questions in `reset_question_ids` go back to PENDING without an answer."""
         question_set = self.get(project_id, question_set_id)
+        reset = set(reset_question_ids)
         questions: list[BatchQuestion] = []
         for item in question_set.questions:
             result = results.get(item.question_id)
+            if result is None and item.question_id in reset:
+                questions.append(BatchQuestion(
+                    question_id=item.question_id,
+                    question=item.question,
+                    reference_answer=item.reference_answer,
+                    answer_aliases=item.answer_aliases,
+                    gold_evidence=item.gold_evidence,
+                    question_source_evidence=item.question_source_evidence,
+                    answer_source_evidence=item.answer_source_evidence,
+                    source_documents=item.source_documents,
+                ))
+                continue
             if result is None:
                 questions.append(item)
                 continue
