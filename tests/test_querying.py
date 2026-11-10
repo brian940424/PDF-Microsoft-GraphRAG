@@ -153,7 +153,7 @@ class QueryServiceTests(unittest.TestCase):
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v4")
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v5")
 
     def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
         runner = FakeQueryRunner()
@@ -527,19 +527,27 @@ class QueryServiceTests(unittest.TestCase):
 
     def test_manual_query_expansion_adds_exact_terms_for_weak_retrieval_cases(self) -> None:
         unlock = expand_manual_query("錯誤解鎖碼達到上限要如何自動重設？")
+        bluetooth = expand_manual_query("藍牙無法正常運作時，如何重設 Wi-Fi 與藍牙設定？")
         heat = expand_manual_query("裝置使用中過熱要怎麼辦？")
         translation = expand_manual_query("S Pen 懸浮翻譯如何切換逐字？")
         recording = expand_manual_query("螢幕錄影時如何顯示 S Pen 游標？")
         dex = expand_manual_query("如何用 S Pen 遠端拍照？")
+        note = expand_manual_query("隨手便利貼要如何釘選到 Always On Display？釘選後備忘錄是否已經儲存？")
+        uwb = expand_manual_query("使用具備超寬頻 (UWB) 功能的數位鑰匙需要符合哪些條件？")
 
         self.assertIn("自動原廠重設", unlock)
         self.assertIn("安全鎖定設定", unlock)
         self.assertIn("變更螢幕鎖定方式", unlock)
         self.assertIn("自動原廠重設開關", unlock)
+        self.assertIn("連續輸入錯誤解鎖碼", unlock)
+        self.assertIn("重設 Wi-Fi 與藍牙設定", bluetooth)
+        self.assertIn("已註冊的資訊可能會遺失", bluetooth)
         self.assertIn("裝置使用時發生過熱情形", heat)
         self.assertIn("切換逐字或整句翻譯", translation)
         self.assertIn("顯示游標圖示", recording)
         self.assertIn("使用 S Pen 拍照", dex)
+        self.assertIn("儲存至 Samsung Notes", note)
+        self.assertIn("使用此功能將增加電池用量", uwb)
 
     def test_manual_query_expansion_is_idempotent_and_leaves_other_queries_alone(self) -> None:
         question = "如何清潔螢幕？"

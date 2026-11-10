@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v4"
+ANSWER_PROMPT_VERSION = "answer-requirements-v5"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -20,12 +20,14 @@ ANSWER_REQUIREMENTS = """---Answer requirements---
 
 - Answer about the exact feature, app, setting or procedure in the question. When the data describes similarly named functions (for example the same feature name in another app, or another way to do a similar task), use only the passages about the one asked and do not mix in the others.
 - Answer only the requested parts. Do not add a feature overview, examples, rationale, or prerequisite navigation unless the question asks for them or they are required to perform the requested operation.
+- Treat each clause of the question as the scope boundary. Include a source detail only when it answers one of those clauses or is necessary to complete a requested step; being in the same section is not enough. Do not add related troubleshooting, feature behavior, purchase information, or optional alternatives that the question did not ask for.
+- Ground every claim in the supplied context. Do not fill gaps with general knowledge or assumptions. If a requested detail is absent from the context, say it is not specified instead of adding a likely answer.
 - When a relevant passage contains a list of steps, precautions, warnings, conditions or items, include every item of that list, not just the first few.
 - For troubleshooting questions, include the immediate first action stated before any later checklist, then include the requested follow-up steps. Do not replace that first action with a later step.
 - Keep each answer within the single section that directly answers the question. Include that section's relevant notes, limitations, alternatives and follow-up branches, but do not combine adjacent sections just because they share a page.
 - Preserve the source order of procedure steps. Do not move a later registration or setup step before the instruction that introduces it.
 - Use citation identifiers exactly as supplied in the source context. Printed page numbers inside source text are content, not citation identifiers.
-- Include the follow-up branches that the passage gives for the asked task, such as "To ...", "If ..." or "After ..." instructions (for example how to restore, undo, continue or set up next), unless the question clearly asks for only one part.
+- Include follow-up branches such as "To ...", "If ..." or "After ..." only when they answer a requested part or are necessary to complete the requested operation. Omit branches that are merely adjacent or optional.
 - Do not add anything the data does not state, such as extra steps, conditions, costs, side effects or general knowledge, and do not add neighbouring content that the question did not ask about.
 - Do not add relevant but unrequested details from the passage just because they are available in context; keep the answer within the scope explicitly requested.
 - Keep the certainty of the source wording: if the data says something will happen, do not soften it to "may"; if it says "may", do not make it definite.

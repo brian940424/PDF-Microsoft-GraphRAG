@@ -42,6 +42,9 @@ class AnswerPromptTests(unittest.TestCase):
             "Printed page numbers inside source text are content",
             "Answer only the requested parts", "immediate first action",
             "Do not add relevant but unrequested details",
+            "Treat each clause of the question as the scope boundary",
+            "Ground every claim in the supplied context",
+            "only when they answer a requested part",
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 
