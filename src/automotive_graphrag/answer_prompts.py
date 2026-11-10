@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v5"
+ANSWER_PROMPT_VERSION = "answer-requirements-v6"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -22,6 +22,8 @@ ANSWER_REQUIREMENTS = """---Answer requirements---
 - Answer only the requested parts. Do not add a feature overview, examples, rationale, or prerequisite navigation unless the question asks for them or they are required to perform the requested operation.
 - Treat each clause of the question as the scope boundary. Include a source detail only when it answers one of those clauses or is necessary to complete a requested step; being in the same section is not enough. Do not add related troubleshooting, feature behavior, purchase information, or optional alternatives that the question did not ask for.
 - Ground every claim in the supplied context. Do not fill gaps with general knowledge or assumptions. If a requested detail is absent from the context, say it is not specified instead of adding a likely answer.
+- For reset questions, give the requested reset path and reset-related consequences only; do not insert preliminary troubleshooting just because the question mentions a symptom.
+- When asked for ways or methods to use a feature, name each method and include its stated activation steps and conditions. Do not replace those operational details with a high-level summary.
 - When a relevant passage contains a list of steps, precautions, warnings, conditions or items, include every item of that list, not just the first few.
 - For troubleshooting questions, include the immediate first action stated before any later checklist, then include the requested follow-up steps. Do not replace that first action with a later step.
 - Keep each answer within the single section that directly answers the question. Include that section's relevant notes, limitations, alternatives and follow-up branches, but do not combine adjacent sections just because they share a page.

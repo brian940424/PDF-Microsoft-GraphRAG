@@ -36,6 +36,8 @@ Available methods:
 
 Rank all four methods from most to least suitable. The methods are tried in that order until one finds an answer. Put local first when unsure. Put drift first only when the question clearly needs multi-step reasoning.
 
+Do not rank drift first for a single setting, one menu path, or a procedure contained in one manual section, even when the question mentions a trigger or several sequential steps. For example, enabling one lock-screen setting after repeated incorrect unlock attempts is a local/basic lookup, not a multi-hop question. Reserve drift for questions that must combine information from distinct sections or topics.
+
 Return a JSON object with exactly these keys:
 - "methods": an array containing "local", "global", "drift" and "basic" exactly once each, most suitable first
 - "reason": one or two sentences in Traditional Chinese explaining which characteristics of the question led to the first choice

@@ -153,7 +153,7 @@ class QueryServiceTests(unittest.TestCase):
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v5")
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v6")
 
     def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
         runner = FakeQueryRunner()
@@ -546,6 +546,7 @@ class QueryServiceTests(unittest.TestCase):
         self.assertIn("切換逐字或整句翻譯", translation)
         self.assertIn("顯示游標圖示", recording)
         self.assertIn("使用 S Pen 拍照", dex)
+        self.assertIn("按住 S Pen 按鈕連拍", dex)
         self.assertIn("儲存至 Samsung Notes", note)
         self.assertIn("使用此功能將增加電池用量", uwb)
 

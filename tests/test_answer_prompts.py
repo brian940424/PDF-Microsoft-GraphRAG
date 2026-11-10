@@ -45,6 +45,8 @@ class AnswerPromptTests(unittest.TestCase):
             "Treat each clause of the question as the scope boundary",
             "Ground every claim in the supplied context",
             "only when they answer a requested part",
+            "For reset questions, give the requested reset path",
+            "include its stated activation steps and conditions",
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 

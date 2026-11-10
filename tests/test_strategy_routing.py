@@ -78,6 +78,8 @@ class StrategyRankingTests(unittest.TestCase):
 
         self.assertEqual(decision.attempt_order, ("drift", "global", "basic", "local"))
         self.assertIn('"methods"', prompts[0])
+        self.assertIn("Do not rank drift first for a single setting", prompts[0])
+        self.assertIn("Reserve drift for questions that must combine information from distinct sections", prompts[0])
 
     def test_partial_ranking_is_completed_with_default_order_without_duplicates(self) -> None:
         response = {"methods": ["global", "global", "basic"], "reason": "x"}
