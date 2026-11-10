@@ -196,6 +196,35 @@ class SearchWithFallbackTests(unittest.TestCase):
                 )
                 self.assertEqual((tried, result.found), (["local"], True))
 
+    def test_matching_section_title_accepts_answer_without_overstrict_check(self) -> None:
+        checked: list[str] = []
+        result = search_with_fallback(
+            StrategyDecision("basic", "原因"),
+            lambda method: SearchOutcome("回答", payload={}, section_titles=("關閉螢幕時辨識指紋",)),
+            lambda answer: checked.append(answer) or AnswerCheck(False, "未找到"),
+            question="螢幕關閉時辨識指紋如何設定？",
+        )
+        self.assertEqual((result.method, result.found), ("basic", True))
+        self.assertEqual(checked, [])
+
+    def test_unsupported_drift_reuses_basic_and_records_attempt(self) -> None:
+        tried: list[str] = []
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            if method == "local":
+                return SearchOutcome("Local answer")
+            if method == "basic":
+                return SearchOutcome("Basic 正確答案", payload={"sources": [{"id": "1"}]})
+            return SearchOutcome("手冊未提供此設定，請查閱使用手冊。", payload={"sources": [{"id": "2"}]})
+        result = search_with_fallback(
+            StrategyDecision("local", "原因", ("local", "basic", "drift")), search,
+            lambda _: AnswerCheck(False, "答案檢查未通過"), question="如何設定？",
+        )
+        self.assertEqual(tried, ["local", "basic", "drift"])
+        self.assertEqual((result.method, result.outcome.answer), ("basic", "Basic 正確答案"))
+        self.assertEqual(result.attempts[-1]["status"], "found")
+        self.assertIn("Basic", result.attempts[-1]["detail"])
+
 
 class AnswerCheckPromptTests(unittest.TestCase):
     def test_prompt_treats_unstated_or_other_feature_answers_as_not_found(self) -> None:

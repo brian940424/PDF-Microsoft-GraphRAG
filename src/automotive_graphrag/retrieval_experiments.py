@@ -1372,6 +1372,7 @@ class RetrievalExperimentService:
                     lambda candidate: self.router.check_answer(
                         question.question, candidate, group.answer_model, api_base, api_key, effort,
                     ),
+                    question.question,
                 )
                 method = routed_method = fallback.method
                 routing_reason = fallback.reason

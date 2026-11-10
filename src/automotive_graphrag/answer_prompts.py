@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v2"
+ANSWER_PROMPT_VERSION = "answer-requirements-v3"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -27,6 +27,7 @@ ANSWER_REQUIREMENTS = """---Answer requirements---
 - Do not add anything the data does not state, such as extra steps, conditions, costs, side effects or general knowledge, and do not add neighbouring content that the question did not ask about.
 - Keep the certainty of the source wording: if the data says something will happen, do not soften it to "may"; if it says "may", do not make it definite.
 - When the data gives different information for different device models, state which model each piece applies to.
+- Do not tell the user to consult, check or refer to the manual or user guide. Answer from the supplied passages; if they do not contain the answer, state that limitation directly without directing the user elsewhere.
 
 """
 

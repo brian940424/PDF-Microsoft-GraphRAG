@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -90,6 +91,7 @@ class SearchOutcome:
     payload: Any = None
     # Text units the search put in its context; None when the context is unavailable.
     source_count: int | None = None
+    section_titles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,14 +202,18 @@ def search_with_fallback(
     decision: StrategyDecision,
     search: Callable[[str], SearchOutcome],
     check: Callable[[str], AnswerCheck],
+    question: str = "",
 ) -> FallbackResult:
     """Try each method in ranked order once and stop at the first one that finds an answer."""
     attempts: list[dict[str, Any]] = []
     answered: list[str] = []
+    outcomes: dict[str, SearchOutcome] = {}
     last_failure: SearchOutcome | None = None
     for method in decision.attempt_order:
         started = time.monotonic()
         outcome = search(method)
+        outcomes[method] = outcome
+        drift_unsupported = False
         if outcome.error or not outcome.answer.strip():
             status, detail = "failed", outcome.error or "GraphRAG 未回傳回答"
             last_failure = replace(outcome, error=detail)
@@ -216,7 +222,13 @@ def search_with_fallback(
             detail = f"Local 只取得 {outcome.source_count} 個原文段落（少於 {LOCAL_MIN_SOURCES} 個），證據不足"
             answered.append(method)
         else:
-            verdict = check(outcome.answer)
+            title_match = method != "drift" and any(
+                _section_title_matches(question, title) for title in outcome.section_titles
+            )
+            verdict = AnswerCheck(True, "檢索到與題目功能名稱相符的小節標題") if title_match else check(outcome.answer)
+            if method == "drift" and _drift_answer_is_unsupported(outcome):
+                drift_unsupported = True
+                verdict = AnswerCheck(False, "DRIFT 回答引用未出現在證據中的來源，或表示手冊未提供資訊")
             status, detail = ("found" if verdict.found else "not_found"), verdict.reason
             answered.append(method)
         attempts.append({
@@ -229,6 +241,13 @@ def search_with_fallback(
                 f"（{earlier}，改用 {METHOD_LABELS[method]} 找到答案）" if earlier else ""
             )
             return FallbackResult(method, outcome, True, reason, tuple(attempts))
+        if drift_unsupported and "basic" in outcomes and not outcomes["basic"].error and outcomes["basic"].answer.strip():
+            basic = outcomes["basic"]
+            attempts.append({
+                "method": "basic", "status": "found", "detail": "DRIFT 回答缺少證據，改用先前 Basic 結果",
+                "duration_seconds": 0,
+            })
+            return FallbackResult("basic", basic, True, f"{decision.reason}（DRIFT 回答缺少證據，改用 Basic）", tuple(attempts))
     reason = f"{decision.reason}（{_attempt_summary(attempts)}）"
     if answered:
         return FallbackResult(answered[0], SearchOutcome(NOT_FOUND_ANSWER), False, reason, tuple(attempts))
@@ -248,6 +267,36 @@ def context_source_count(context: object) -> int | None:
         if item.get("in_context") is not False
     }
     return len(ids)
+
+
+def _section_title_matches(question: str, title: str) -> bool:
+    """Accept a title only when it shares a meaningful feature phrase with the question."""
+    normalize = lambda value: re.sub(r"[\W_]+", "", value.casefold())
+    q, t = normalize(question), normalize(title)
+    if not q or not t:
+        return False
+    # Exact title occurrence is strong evidence; otherwise require a meaningful title (>=4 chars)
+    # to occur in the question, or a substantial question phrase to occur in the title.
+    if t in q and len(t) >= 4:
+        return True
+    if len(t) >= 5:
+        shared = sum(1 for char in set(t) if char in q)
+        if shared / len(set(t)) >= 0.7:
+            return True
+    terms = [normalize(term) for term in re.findall(r"[\u3400-\u9fff]{2,}|[A-Za-z0-9]{3,}", question)]
+    meaningful = [term for term in terms if len(term) >= 3]
+    return bool(meaningful and sum(term in t for term in meaningful) >= min(2, len(meaningful)))
+
+
+def _drift_answer_is_unsupported(outcome: SearchOutcome) -> bool:
+    answer = outcome.answer.casefold()
+    if any(phrase in answer for phrase in ("手冊未提供", "手冊沒有提供", "請查閱手冊", "請查閱使用手冊", "資料未提供", "資料未說明")):
+        return True
+    context = outcome.payload.context if hasattr(outcome.payload, "context") else outcome.payload
+    source_ids = {str(item.get("id", "")) for item in EvidenceService.source_records(context) if item.get("id") is not None}
+    citations = re.findall(r"\[Data:\s*Sources\s*\(([^)]*)\)\]", outcome.answer, flags=re.IGNORECASE)
+    cited_ids = {value.strip() for citation in citations for value in citation.split(",") if value.strip()}
+    return bool(citations and source_ids and not cited_ids.issubset(source_ids))
 
 
 def _attempt_summary(attempts: list[dict[str, Any]]) -> str:

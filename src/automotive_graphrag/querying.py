@@ -187,9 +187,16 @@ class QueryService:
                     return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
                 if execution.returncode != 0:
                     return SearchOutcome("", self._last_error(execution), execution)
+                try:
+                    section_titles = tuple(item.section_name for item in self.evidence_service.from_context(
+                        project_id, getattr(execution, "context", {}) or {},
+                    ))
+                except ProjectError:
+                    section_titles = ()
                 return SearchOutcome(
                     (execution.stdout or "").strip(), None, execution,
                     context_source_count(getattr(execution, "context", None)),
+                    section_titles,
                 )
 
             fallback = search_with_fallback(
@@ -198,6 +205,7 @@ class QueryService:
                 lambda answer: self.router.check_answer(
                     prompt, answer, selected_model, api_base_url, api_key, applied_effort,
                 ),
+                prompt,
             )
             normalized_method, routing_reason = fallback.method, fallback.reason
             execution_metadata["strategy_attempts"] = list(fallback.attempts)

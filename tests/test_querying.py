@@ -153,7 +153,7 @@ class QueryServiceTests(unittest.TestCase):
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v2")
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v3")
 
     def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
         runner = FakeQueryRunner()
