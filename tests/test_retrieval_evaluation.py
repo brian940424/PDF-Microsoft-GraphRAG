@@ -56,6 +56,12 @@ class EvaluationQueryRunner:
 
 
 class RetrievalEvaluationServiceTests(unittest.TestCase):
+    def test_cross_page_chunk_is_relevant_to_either_original_page(self) -> None:
+        retrieved = replace(evidence(1, "combined", page=125), pages=(125, 126))
+        gold = (GoldEvidence("WW.pdf", (126,), ("second-page-chunk",)),)
+
+        self.assertTrue(RetrievalEvaluationService._is_relevant(retrieved, gold))
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)

@@ -56,6 +56,7 @@ class DocumentInfo:
 ProgressCallback = Callable[[int, int, str], None]
 
 INDEXED_DOCUMENTS_FILE = "indexed_documents.json"
+SECTIONING_FORMAT_VERSION = 2
 # Manual page edits and review marks, kept across preprocessing runs.
 PAGE_EDITS_FILE = "page_edits.json"
 PAGE_RENDER_SCALE = 1.5
@@ -527,6 +528,7 @@ class DocumentService:
             "document_id": filename,
             "page": page_number,
             "block_id": block_id,
+            "sectioning_version": SECTIONING_FORMAT_VERSION,
         }
 
     def page_reviews(self, project_id: str, filename: str) -> list[PageReview]:

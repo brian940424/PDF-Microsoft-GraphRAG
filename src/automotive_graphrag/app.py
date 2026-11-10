@@ -40,6 +40,7 @@ from .connections import (
 from .dashboard3d import dashboard_iframe
 from .documents import DocumentInfo, DocumentService, PageReview
 from .downloads import stage_downloads
+from .evidence import evidence_page_label
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService, parse_indexing_progress
 from .evaluation.source_scoring import cited_sources, strip_citations
@@ -880,10 +881,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def active_project_label(project_id: str | None) -> str:
+        if not project_id:
+            return workspace_lock_reason(project_id)
+        try:
+            project = store.get(project_id)
+        except ProjectError:
+            return workspace_lock_reason(project_id)
+        if project.status == "INDEXED" and IndexingService.input_needs_rebuild(store.path_for(project_id)):
+            store.update_status(project_id, "STALE")
+            project = store.get(project_id)
         reason = workspace_lock_reason(project_id)
         if reason:
+            if project.status == "STALE":
+                if IndexingService.preprocessing_needs_refresh(store.path_for(project_id)):
+                    return f"{reason} 前處理格式已更新，請重新預處理 PDF，再重新建圖。"
+                return f"{reason} 目前專案索引需重新建圖。"
             return reason
-        project = store.get(project_id)
         return (
             f"目前開啟專案：**{project.display_name}** (`{project.project_id}`)｜"
             f"狀態：{project.status}（{PROJECT_STATUS_LABELS.get(project.status, project.status)}）"
@@ -980,7 +993,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return "", f"❌ {summary}｜{query_result.error}", [], gr.Dropdown(choices=[]), "", {}, [], hidden
         evidence_values = [asdict(item) for item in query_result.evidence]
         evidence_rows = [
-            [item.rank, item.evidence_id, item.document_id, item.page or "—", item.chunk_id or "—", item.score]
+            [item.rank, item.evidence_id, item.document_id, evidence_page_label(item) or "—", item.chunk_id or "—", item.score]
             for item in query_result.evidence
         ]
         if query_result.evidence:
@@ -1056,7 +1069,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         for item in evidence_values or []:
             if item.get("evidence_id") == evidence_id:
                 location = (
-                    f"第 {item['page']} 頁"
+                    f"第 {'、'.join(str(page) for page in (item.get('pages') or [item['page']]))} 頁"
                     if item.get("page") is not None
                     else "GraphRAG 社群報告（無單一 PDF 頁碼）"
                 )

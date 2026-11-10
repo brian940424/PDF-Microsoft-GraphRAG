@@ -20,7 +20,7 @@ from automotive_graphrag.automatic_evaluation import AutomaticEvaluationItem, Au
 from automotive_graphrag.automatic_qa import AutomaticQATestService
 from automotive_graphrag.cancellation import JobAlreadyRunning, JobRegistry, JobStopped
 from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult
-from automotive_graphrag.documents import DocumentService
+from automotive_graphrag.documents import DocumentService, SECTIONING_FORMAT_VERSION
 from automotive_graphrag.indexing import IndexingService
 from automotive_graphrag.projects import ProjectError, ProjectStore, indexing_lock_held, indexing_lock_path
 from automotive_graphrag.querying import QueryResult, QueryService
@@ -172,7 +172,10 @@ class IndexingStopTests(unittest.TestCase):
         self.store = ProjectStore(Path(self.temporary_directory.name) / "projects")
         self.store.create(project_id="P", display_name="P", vehicle_name="V", manual_version="1")
         self.project_path = self.store.path_for("P")
-        (self.project_path / "processed" / "input.jsonl").write_text('{"id":"p1","title":"Page","text":"content"}\n')
+        (self.project_path / "processed" / "input.jsonl").write_text(json.dumps({
+            "id": "p1", "title": "Page", "text": "content",
+            "sectioning_version": SECTIONING_FORMAT_VERSION,
+        }) + "\n")
         self.connections = ConnectionSettings(self.store.root, lambda base_url, key: ConnectionTestResult(True, "ok"))
         self.connections.save("https://api.openai.com/v1", "test-key")
         self.pid_file = Path(self.temporary_directory.name) / "index.pid"

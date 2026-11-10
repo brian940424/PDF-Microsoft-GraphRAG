@@ -27,6 +27,20 @@ class Evidence:
     score: float | None = None
     source_type: str = "text_unit"
     section_path: str = ""
+    pages: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pages", tuple(int(page) for page in self.pages))
+
+
+def evidence_page_label(evidence: Evidence) -> str | None:
+    """Format one or multiple original PDF pages for compact evidence tables."""
+    pages = sorted(set(evidence.pages or ((evidence.page,) if evidence.page is not None else ())))
+    if not pages:
+        return None
+    if pages == list(range(pages[0], pages[-1] + 1)) and len(pages) > 1:
+        return f"{pages[0]}–{pages[-1]}"
+    return ", ".join(str(page) for page in pages)
 
 
 class EvidenceService:
@@ -81,6 +95,7 @@ class EvidenceService:
                         block_id=source_metadata.block_id,
                         text=source_metadata.text,
                         section_path=source_metadata.section_path,
+                        pages=source_metadata.pages or (source_metadata.page,),
                     )
                 )
         if result:

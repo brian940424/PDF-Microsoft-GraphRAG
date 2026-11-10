@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult
+from automotive_graphrag.documents import SECTIONING_FORMAT_VERSION
 from automotive_graphrag.indexing import IndexingService, parse_indexing_progress
 from automotive_graphrag.projects import ProjectError, ProjectStore
 
@@ -52,7 +53,10 @@ class IndexingServiceTests(unittest.TestCase):
             manual_version="SM3E",
         )
         project_path = self.store.path_for("L33-SM3E")
-        (project_path / "processed" / "input.jsonl").write_text('{"id":"p1","title":"Page","text":"content"}\n')
+        (project_path / "processed" / "input.jsonl").write_text(json.dumps({
+            "id": "p1", "title": "Page", "text": "content",
+            "sectioning_version": SECTIONING_FORMAT_VERSION,
+        }) + "\n")
         self.store.update_status("L33-SM3E", "READY")
         self.connections = ConnectionSettings(
             self.store.root,
@@ -99,6 +103,86 @@ class IndexingServiceTests(unittest.TestCase):
         )
         graph_input = settings_path.parent / "input" / "input.jsonl"
         self.assertIn('"id":"p1"', graph_input.read_text())
+
+    def test_sync_input_merges_one_continuation_page_and_preserves_both_page_numbers(self) -> None:
+        project_path = self.store.path_for("L33-SM3E")
+        graph_root = project_path / "graphrag"
+        records = [
+            {"id": "p125", "title": "Manual - Page 125 - DeX", "text": "DeX 操控方式\n使用外接鍵盤與滑鼠。",
+             "document_id": "Manual.pdf", "page": 125, "block_id": "b01", "section_id": "dex",
+             "section_name": "DeX 操控方式", "section_path": "Manual > DeX 操控方式",
+             "sectioning_version": SECTIONING_FORMAT_VERSION},
+            {"id": "p126", "title": "Manual - Page 126 - DeX 操控方式", "text": "也可使用裝置作為觸控板，或使用螢幕鍵盤。",
+             "document_id": "Manual.pdf", "page": 126, "block_id": "b01", "section_id": "dex",
+             "section_name": "DeX 操控方式", "section_path": "Manual > DeX 操控方式",
+             "sectioning_version": SECTIONING_FORMAT_VERSION},
+            {"id": "p127", "title": "Manual - Page 127 - 連接裝置", "text": "連接裝置\n另節內容。",
+             "document_id": "Manual.pdf", "page": 127, "block_id": "b01", "section_id": "connect",
+             "section_name": "連接裝置", "section_path": "Manual > 連接裝置",
+             "sectioning_version": SECTIONING_FORMAT_VERSION},
+        ]
+        (project_path / "processed" / "input.jsonl").write_text(
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records), encoding="utf-8",
+        )
+        graph_input = graph_root / "input"
+        graph_input.mkdir(parents=True)
+        (graph_input / "input.jsonl").write_text(
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records), encoding="utf-8",
+        )
+
+        self.assertTrue(IndexingService.input_needs_rebuild(project_path))
+
+        IndexingService._sync_input(project_path, graph_root)
+
+        indexed = [json.loads(line) for line in (graph_root / "input" / "input.jsonl").read_text().splitlines()]
+        self.assertFalse(IndexingService.input_needs_rebuild(project_path))
+        self.assertEqual([item["id"] for item in indexed], ["p125", "p127"])
+        self.assertEqual(indexed[0]["pages"], [125, 126])
+        self.assertIn("觸控板", indexed[0]["text"])
+        self.assertIn("螢幕鍵盤", indexed[0]["text"])
+        self.assertEqual(indexed[0]["page"], 125)
+        self.assertEqual(indexed[1]["page"], 127)
+        self.assertNotIn("pages", indexed[1])
+
+    def test_sync_input_limits_continuation_merge_to_two_pages(self) -> None:
+        project_path = self.store.path_for("L33-SM3E")
+        graph_root = project_path / "graphrag"
+        rows = [
+            {"id": f"p{page}", "title": "T", "text": f"continued {page}", "document_id": "M.pdf",
+             "page": page, "block_id": "b01", "section_id": "s", "section_name": "Section",
+             "section_path": "M > Section", "sectioning_version": SECTIONING_FORMAT_VERSION}
+            for page in (1, 2, 3)
+        ]
+        (project_path / "processed" / "input.jsonl").write_text(
+            "".join(json.dumps(item) + "\n" for item in rows), encoding="utf-8",
+        )
+
+        IndexingService._sync_input(project_path, graph_root)
+
+        indexed = [json.loads(line) for line in (graph_root / "input" / "input.jsonl").read_text().splitlines()]
+        self.assertEqual([item["page"] for item in indexed], [1, 2, 3])
+        self.assertTrue(all("pages" not in item for item in indexed))
+
+    def test_preprocessing_refresh_is_required_for_old_sectioning_records(self) -> None:
+        project_path = self.store.path_for("L33-SM3E")
+        source = project_path / "processed" / "input.jsonl"
+        source.write_text('{"id":"old","text":"content"}\n', encoding="utf-8")
+
+        self.assertTrue(IndexingService.preprocessing_needs_refresh(project_path))
+        self.assertTrue(IndexingService.input_needs_rebuild(project_path))
+
+        source.write_text(json.dumps({"id": "new", "text": "content", "sectioning_version": SECTIONING_FORMAT_VERSION}) + "\n")
+        self.assertFalse(IndexingService.preprocessing_needs_refresh(project_path))
+
+    def test_build_requires_reprocessing_when_sectioning_format_is_old(self) -> None:
+        project_path = self.store.path_for("L33-SM3E")
+        (project_path / "processed" / "input.jsonl").write_text('{"id":"old","text":"content"}\n')
+        service = IndexingService(
+            self.store, FakeGraphRag(), connection_settings=self.connections, metadata_builder=self.build_metadata
+        )
+
+        with self.assertRaisesRegex(ProjectError, "重新預處理 PDF"):
+            service.build("L33-SM3E")
 
     def test_successful_build_sets_indexed_and_saves_result(self) -> None:
         runner = FakeGraphRag()
