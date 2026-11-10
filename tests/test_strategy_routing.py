@@ -207,6 +207,37 @@ class SearchWithFallbackTests(unittest.TestCase):
         self.assertEqual((result.method, result.found), ("basic", True))
         self.assertEqual(checked, [])
 
+    def test_generic_s_pen_title_does_not_stop_fallback_for_specific_questions(self) -> None:
+        questions = (
+            "使用 S Pen 的懸浮翻譯時，要如何切換逐字或整句翻譯？",
+            "螢幕錄影時，如何在畫面上顯示 S Pen 游標？",
+            "如何用 S Pen 按鈕遠端拍照？拍照時要如何變更拍攝模式？",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                tried: list[str] = []
+
+                def search(method: str) -> SearchOutcome:
+                    tried.append(method)
+                    if method == "local":
+                        return SearchOutcome(
+                            "提供的資料未說明這項操作。", source_count=8,
+                            section_titles=("使用 S Pen",),
+                        )
+                    return SearchOutcome(
+                        "找到具體操作步驟。", source_count=3,
+                        section_titles=("使用 S Pen 拍照",),
+                    )
+
+                result = search_with_fallback(
+                    StrategyDecision("local", "specific manual lookup"), search,
+                    lambda answer: AnswerCheck("未說明" not in answer, "answer check"),
+                    question,
+                )
+
+                self.assertEqual(tried[:2], ["local", "basic"])
+                self.assertEqual((result.method, result.found), ("basic", True))
+
     def test_unsupported_drift_reuses_basic_and_records_attempt(self) -> None:
         tried: list[str] = []
         def search(method: str) -> SearchOutcome:

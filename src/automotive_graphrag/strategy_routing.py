@@ -270,22 +270,36 @@ def context_source_count(context: object) -> int | None:
 
 
 def _section_title_matches(question: str, title: str) -> bool:
-    """Accept a title only when it shares a meaningful feature phrase with the question."""
-    normalize = lambda value: re.sub(r"[\W_]+", "", value.casefold())
-    q, t = normalize(question), normalize(title)
-    if not q or not t:
+    """Accept specific feature titles; generic headings must not stop strategy fallback."""
+    question_cjk, question_latin = _title_terms(question)
+    title_cjk, title_latin = _title_terms(title)
+    if not title_cjk and not title_latin:
         return False
-    # Exact title occurrence is strong evidence; otherwise require a meaningful title (>=4 chars)
-    # to occur in the question, or a substantial question phrase to occur in the title.
-    if t in q and len(t) >= 4:
+    normalized_question = re.sub(r"[\W_]+", "", question.casefold())
+    normalized_title = re.sub(r"[\W_]+", "", title.casefold())
+    specific_title_cjk = title_cjk - _GENERIC_TITLE_TERMS
+    exact_feature = normalized_title in normalized_question and (
+        bool(specific_title_cjk) or len(title_latin) >= 2
+    )
+    if exact_feature:
         return True
-    if len(t) >= 5:
-        shared = sum(1 for char in set(t) if char in q)
-        if shared / len(set(t)) >= 0.7:
-            return True
-    terms = [normalize(term) for term in re.findall(r"[\u3400-\u9fff]{2,}|[A-Za-z0-9]{3,}", question)]
-    meaningful = [term for term in terms if len(term) >= 3]
-    return bool(meaningful and sum(term in t for term in meaningful) >= min(2, len(meaningful)))
+    shared_cjk = specific_title_cjk & (question_cjk - _GENERIC_TITLE_TERMS)
+    shared_latin = title_latin & question_latin
+    return len(shared_cjk) >= 2 or bool(shared_cjk and shared_latin)
+
+
+_GENERIC_TITLE_TERMS = {
+    "如何", "可以", "使用", "設定", "功能", "裝置", "手機", "螢幕", "應用", "模式",
+    "開啟", "關閉", "操作", "方法", "步驟", "事項", "資訊", "其他", "管理",
+}
+
+
+def _title_terms(value: str) -> tuple[set[str], set[str]]:
+    cjk_terms: set[str] = set()
+    for run in re.findall(r"[\u3400-\u9fff]+", value):
+        cjk_terms.update(run[index:index + 2] for index in range(len(run) - 1))
+    latin_terms = {term.casefold() for term in re.findall(r"[A-Za-z0-9]{2,}", value)}
+    return cjk_terms, latin_terms
 
 
 def _drift_answer_is_unsupported(outcome: SearchOutcome) -> bool:

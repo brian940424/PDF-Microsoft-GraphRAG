@@ -525,6 +525,20 @@ class QueryServiceTests(unittest.TestCase):
         self.assertIn("翻譯助理", expanded)
         self.assertIn("即時翻譯", expanded)
 
+    def test_manual_query_expansion_adds_exact_terms_for_weak_retrieval_cases(self) -> None:
+        unlock = expand_manual_query("錯誤解鎖碼達到上限要如何自動重設？")
+        heat = expand_manual_query("裝置使用中過熱要怎麼辦？")
+        translation = expand_manual_query("S Pen 懸浮翻譯如何切換逐字？")
+        recording = expand_manual_query("螢幕錄影時如何顯示 S Pen 游標？")
+        dex = expand_manual_query("如何用 S Pen 遠端拍照？")
+
+        self.assertIn("自動原廠重設", unlock)
+        self.assertIn("安全鎖定設定", unlock)
+        self.assertIn("裝置使用時發生過熱情形", heat)
+        self.assertIn("切換逐字或整句翻譯", translation)
+        self.assertIn("顯示游標圖示", recording)
+        self.assertIn("使用 S Pen 拍照", dex)
+
     def test_manual_query_expansion_is_idempotent_and_leaves_other_queries_alone(self) -> None:
         question = "如何清潔螢幕？"
         self.assertEqual(expand_manual_query(question), question)
