@@ -128,6 +128,34 @@ class VisionPreprocessTests(unittest.TestCase):
             VisionSettings(model="gpt-6-luna", scope="everything")
 
 
+class SideMarginVisionTests(unittest.TestCase):
+    def test_image_inside_ignored_side_margin_does_not_send_page_to_vision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ProjectStore(root / "projects")
+            store.create(project_id="L33-SM3E", display_name="L33", vehicle_name="L33", manual_version="SM3E")
+            pdf = root / "tab.pdf"
+            document = pymupdf.open()
+            page = document.new_page(width=612, height=792)
+            page.insert_text((52, 300), "Remove the two pedal bolts.", fontname="helv")
+            pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 8, 8), False)
+            pixmap.clear_with(0)
+            page.insert_image(pymupdf.Rect(570, 100, 600, 130), stream=pixmap.tobytes("png"))
+            document.save(pdf)
+            document.close()
+            analyzer = RecordingAnalyzer()
+            service = DocumentService(store, page_analyzer=analyzer)
+            service.import_pdfs("L33-SM3E", [pdf])
+            vision = VisionSettings(model="gpt-6-luna", scope=SCOPE_FIGURES)
+
+            service.preprocess("L33-SM3E", vision=vision)
+            self.assertEqual([page for page, _ in analyzer.calls], [1])
+
+            analyzer.calls.clear()
+            service.preprocess("L33-SM3E", {"tab.pdf": {"right_ignore_percent": 8}}, vision=vision)
+            self.assertEqual(analyzer.calls, [])
+
+
 class PageNeedsVisionTests(unittest.TestCase):
     def test_textless_page_and_all_scope_always_need_vision(self) -> None:
         document = pymupdf.open()

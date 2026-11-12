@@ -58,7 +58,7 @@ Chat 模型預設為 `gpt-6-luna`，Embedding 模型預設為 `text-embedding-3-
 ```text
 PDF
   → PyMuPDF 逐頁擷取文字（含圖表或無文字層的頁面可改以 Vision 模型轉寫）
-  → 排除指定比例的頁首／頁尾
+  → 排除指定比例的頁首／頁尾與左右兩側
   → processed/input.jsonl
   → Microsoft GraphRAG index
   → GraphRAG local/global/drift/basic query

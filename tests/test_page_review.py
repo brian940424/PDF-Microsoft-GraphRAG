@@ -170,5 +170,45 @@ class PageReviewUiTests(unittest.TestCase):
         self.assertEqual(self.functions["review_previous_page"]("L33-SM3E", "A.pdf", "全部", 3)[0], 2)
 
 
+    def test_review_shades_margins_from_unsaved_table_and_keeps_editor_text(self) -> None:
+        rows = [["A.pdf", 3, 0, 0, 0, 10, 0, 2]]
+        _, page, image, text, info = self.functions["review_refresh"]("L33-SM3E", "A.pdf", "全部", None, rows)
+        self.assertEqual((page, text), (1, "甲頁"))
+        self.assertGreater(image.size[0], 0)
+        self.assertIn("右 59.5 pt", info)
+        self.assertIn("與上次前處理不同", info)
+        # Without table values the saved (zero) margins apply and nothing is shaded.
+        self.assertNotIn("紅色為忽略區域", self.functions["review_page_view"]("L33-SM3E", "A.pdf", 1)[2])
+
+        # Editing the table redraws the image but leaves the editor alone for preprocessed PDFs.
+        image, text, info = self.functions["review_margin_refresh"]("L33-SM3E", "A.pdf", 1, rows)
+        self.assertGreater(image.size[0], 0)
+        self.assertFalse(isinstance(text, str))
+        self.assertIn("右 59.5 pt", info)
+        rows[0][4], rows[0][5] = 60, 50
+        self.assertIn("❌ 忽略比例", self.functions["review_margin_refresh"]("L33-SM3E", "A.pdf", 1, rows)[2])
+
+    def test_pdf_not_yet_preprocessed_previews_clipped_text_layer(self) -> None:
+        store = ProjectStore(self.root)
+        source = store.path_for("L33-SM3E") / "source" / "B.pdf"
+        document = pymupdf.open()
+        for _ in range(3):
+            page = document.new_page(width=612, height=792)
+            page.insert_text((52, 300), "Body text", fontname="helv")
+            page.insert_text((575, 100), "TAB", fontname="helv")
+        document.save(source)
+        document.close()
+
+        dropdown = self.functions["review_document_choices"]("L33-SM3E", "B.pdf")
+        self.assertEqual((dropdown.value, [name for name, _ in dropdown.choices]), ("B.pdf", ["A.pdf", "B.pdf"]))
+        rows = [["B.pdf", 3, 0, 0, 0, 8, 1, 2]]
+        table, page, _, text, info = self.functions["review_refresh"]("L33-SM3E", "B.pdf", "全部", None, rows)
+        self.assertEqual([row[:2] for row in table], [[2, "尚未前處理"], [3, "尚未前處理"]])
+        self.assertEqual((page, text), (2, "Body text"))
+        self.assertIn("此頁會裁掉的文字：TAB", info)
+        _, text, _ = self.functions["review_margin_refresh"]("L33-SM3E", "B.pdf", 2, [["B.pdf", 3, 0, 0, 0, 0, 1, 2]])
+        self.assertEqual(text, "Body text\nTAB")
+        self.assertIn("尚未前處理", self.functions["review_save"]("L33-SM3E", "B.pdf", 2, "x"))
+
 if __name__ == "__main__":
     unittest.main()

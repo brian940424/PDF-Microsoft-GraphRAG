@@ -38,7 +38,13 @@ from .connections import (
     parse_judge_models,
 )
 from .dashboard3d import dashboard_iframe
-from .documents import DocumentInfo, DocumentService, PageReview
+from .documents import (
+    MARGIN_OPTION_NAMES as PROCESSING_MARGIN_OPTIONS,
+    DocumentInfo,
+    DocumentService,
+    IgnoredMargins,
+    PageReview,
+)
 from .downloads import stage_downloads
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService, parse_indexing_progress
@@ -71,7 +77,9 @@ UPLOAD_PDF_OPTION = "__upload_pdf__"
 UPLOAD_PDF_LABEL = "+ 上傳 PDF..."
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
-PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
+PROCESSING_COLUMNS = [
+    "PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "忽略左側 (%)", "忽略右側 (%)", "起始頁索引", "結束頁索引",
+]
 VISION_DISABLED = "__vision_disabled__"
 REVIEW_FILTERS = ["全部", "未檢查", "已修改", "Vision", "文字層", "Vision 失敗", "空白／錯誤"]
 REVIEW_COLUMNS = ["頁碼", "解析方式", "已檢查", "已修改", "字元數"]
@@ -81,6 +89,7 @@ PAGE_SOURCE_LABELS = {
     "fallback": "Vision 失敗→文字層",
     "empty": "空白",
     "error": "錯誤",
+    "pending": "尚未前處理",
 }
 VISION_SCOPE_CHOICES = [
     ("僅含圖表或表格的頁面（純文字頁用文字層，省 token）", SCOPE_FIGURES),
@@ -547,6 +556,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     documents = DocumentService(store)
     indexing = IndexingService(store, connection_settings=connections)
     indexing.recover_interrupted_builds()
+    documents.recover_interrupted_preprocessing()
     querying = QueryService(store, connection_settings=connections)
     question_sets = QuestionSetService(store, querying)
     reviews = ReviewService(store, question_sets)
@@ -3026,8 +3036,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 [
                     document.filename,
                     pages,
-                    float(options.get("header_ignore_percent", 0)),
-                    float(options.get("footer_ignore_percent", 0)),
+                    *(float(options.get(name, 0)) for name in PROCESSING_MARGIN_OPTIONS),
                     int(options.get("start_page", 0)),
                     int(options.get("end_page", max(pages - 1, 0))),
                 ]
@@ -3041,14 +3050,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         # Gradio's Dataframe(type="array") may submit a NumPy array; avoid
         # truth-value checks, which are ambiguous for arrays with multiple rows.
         for row in rows:
-            if len(row) < 6 or row[0] in (None, ""):
+            if len(row) < len(PROCESSING_COLUMNS) or row[0] in (None, ""):
                 continue
             filename = Path(str(row[0])).name
+            margins = row[2:2 + len(PROCESSING_MARGIN_OPTIONS)]
+            start_page, end_page = row[2 + len(PROCESSING_MARGIN_OPTIONS):len(PROCESSING_COLUMNS)]
             options[filename] = {
-                "header_ignore_percent": row[2] if row[2] not in (None, "") else 0,
-                "footer_ignore_percent": row[3] if row[3] not in (None, "") else 0,
-                "start_page": row[4] if row[4] not in (None, "") else 0,
-                "end_page": row[5],
+                **{name: value if value not in (None, "") else 0 for name, value in zip(PROCESSING_MARGIN_OPTIONS, margins)},
+                "start_page": start_page if start_page not in (None, "") else 0,
+                "end_page": end_page,
             }
         return options
 
@@ -3121,13 +3131,56 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def review_document_choices(project_id: str | None, current: str | None):
-        names = [item.filename for item in documents.list_documents_if_available(project_id) if item.preprocessed]
+        names = [item.filename for item in documents.list_documents_if_available(project_id)]
         return gr.Dropdown(choices=names, value=current if current in names else (names[0] if names else None))
 
-    def filtered_reviews(project_id: str | None, filename: str | None, review_filter: str | None) -> list[PageReview]:
+    def review_margin_options(
+        project_id: str, filename: str, option_rows: object | None,
+    ) -> tuple[dict[str, object], bool]:
+        """Margins to show: unsaved values in the options table win over the last preprocessing run.
+
+        The flag tells whether the table's margins differ from the ones the shown text was extracted with.
+        """
+        saved = documents.processing_options(project_id).get(filename, {})
+        table = parse_processing_options(option_rows).get(filename)
+        if table is None:
+            return saved, False
+        try:
+            changed = IgnoredMargins.from_options(table) != IgnoredMargins.from_options(saved)
+        except ProjectError:
+            changed = True
+        return table, changed
+
+    def is_preprocessed(project_id: str, filename: str) -> bool:
+        return any(
+            item.filename == filename and item.preprocessed for item in documents.list_documents_if_available(project_id)
+        )
+
+    def filtered_reviews(
+        project_id: str | None, filename: str | None, review_filter: str | None, option_rows: object | None = None,
+    ) -> list[PageReview]:
         if not project_id or not filename:
             return []
-        return [item for item in documents.page_reviews(project_id, filename) if review_matches(item, review_filter)]
+        document = next((item for item in documents.list_documents_if_available(project_id) if item.filename == filename), None)
+        if document is None:
+            return []
+        if document.preprocessed:
+            reviews = documents.page_reviews(project_id, filename)
+        else:
+            # Not preprocessed yet: list the pages in the range typed in the options table.
+            options, _ = review_margin_options(project_id, filename, option_rows)
+            pages = document.pages or 0
+            try:
+                start = int(float(options.get("start_page") or 0))
+                end_value = options.get("end_page")
+                end = pages - 1 if end_value in (None, "") else int(float(end_value))
+            except (TypeError, ValueError):
+                start, end = 0, pages - 1
+            reviews = [
+                PageReview(page=index + 1, source="pending", text="")
+                for index in range(max(start, 0), min(end, pages - 1) + 1)
+            ]
+        return [item for item in reviews if review_matches(item, review_filter)]
 
     def review_rows(reviews: list[PageReview]) -> list[list[object]]:
         return [
@@ -3141,19 +3194,41 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             for item in reviews
         ]
 
-    def review_page_view(project_id: str | None, filename: str | None, page: object):
+    def review_margin_view(project_id: str, filename: str, page: int, option_rows: object | None):
+        """The page image with ignored margins shaded, notes on what they remove, and the clipped text layer."""
+        options, changed = review_margin_options(project_id, filename, option_rows)
+        try:
+            preview = documents.margin_preview(project_id, filename, page, options)
+        except ProjectError as exc:
+            image = Image.open(io.BytesIO(documents.render_page_image(project_id, filename, page)))
+            return image, [f"❌ 忽略比例：{exc}"], ""
+        notes: list[str] = []
+        top, bottom, left, right = preview.margin_points
+        if any(preview.margin_points):
+            notes.append(f"紅色為忽略區域（不讀取、不送 Vision）：上 {top:g} pt、下 {bottom:g} pt、左 {left:g} pt、右 {right:g} pt")
+            removed = "、".join(preview.removed_lines) or "無"
+            notes.append(f"此頁會裁掉的文字：{removed[:300]}{'…' if len(removed) > 300 else ''}")
+        if changed:
+            notes.append("⚠️ 忽略比例依「前處理設定」表格目前的數值標示，與上次前處理不同；解析結果需重新前處理才會更新")
+        return Image.open(io.BytesIO(preview.image_png)), notes, preview.kept_text
+
+    def review_page_view(project_id: str | None, filename: str | None, page: object, option_rows: object | None = None):
         """Image, text and status line of one page."""
         try:
             page_number = int(page)
             review = next(
-                (item for item in documents.page_reviews(project_id, filename) if item.page == page_number), None
+                (item for item in filtered_reviews(project_id, filename, "全部", option_rows) if item.page == page_number),
+                None,
             ) if project_id and filename else None
         except (TypeError, ValueError, ProjectError):
             review = None
         if review is None:
             return None, "", ""
-        image = Image.open(io.BytesIO(documents.render_page_image(project_id, filename, review.page)))
+        image, notes, kept_text = review_margin_view(project_id, filename, review.page, option_rows)
         flags = [f"**第 {review.page} 頁**", f"解析方式：{PAGE_SOURCE_LABELS[review.source]}"]
+        if review.source == "pending":
+            flags.append("右側為套用目前忽略比例的文字層預覽，前處理後才會寫入")
+            return image, kept_text, "\n\n".join(["｜".join(flags), *notes])
         flags.append("✅ 已檢查" if review.reviewed else "⬜ 未檢查")
         if review.edited:
             flags.append("✏️ 已手動修改，重新前處理會保留")
@@ -3161,12 +3236,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             flags.append("⚠️ 修改後重新前處理過且解析結果已變，請確認修改是否仍正確")
         if review.error:
             flags.append(f"錯誤：{' '.join(review.error.split())[:200]}")
-        return image, review.text, "｜".join(flags)
+        return image, review.text, "\n\n".join(["｜".join(flags), *notes])
 
-    def review_refresh(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+    def review_margin_refresh(project_id: str | None, filename: str | None, page: object, option_rows: object | None):
+        """Redraw the margins after the options table changes, keeping unsaved edits in the editor."""
+        image, text, info = review_page_view(project_id, filename, page, option_rows)
+        pending = bool(project_id and filename) and not is_preprocessed(project_id, filename)
+        return image, (text if pending else gr.skip()), info
+
+    def review_refresh(
+        project_id: str | None, filename: str | None, review_filter: str | None, page: object,
+        option_rows: object | None = None,
+    ):
         """Reload the page list, keeping the current page when it still matches the filter."""
         try:
-            reviews = filtered_reviews(project_id, filename, review_filter)
+            reviews = filtered_reviews(project_id, filename, review_filter, option_rows)
         except ProjectError as exc:
             return [], None, None, "", f"❌ {exc}"
         pages = [item.page for item in reviews]
@@ -3175,15 +3259,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except (TypeError, ValueError):
             current = None
         selected = current if current in pages else (pages[0] if pages else None)
-        return review_rows(reviews), selected, *review_page_view(project_id, filename, selected)
+        return review_rows(reviews), selected, *review_page_view(project_id, filename, selected, option_rows)
 
-    def review_select(project_id: str | None, filename: str | None, evt: gr.SelectData):
+    def review_select(project_id: str | None, filename: str | None, option_rows: object | None, evt: gr.SelectData):
         page = (evt.row_value or [None])[0]
-        return page, *review_page_view(project_id, filename, page)
+        return page, *review_page_view(project_id, filename, page, option_rows)
 
-    def review_step(project_id: str | None, filename: str | None, review_filter: str | None, page: object, step: int):
+    def review_step(
+        project_id: str | None, filename: str | None, review_filter: str | None, page: object, step: int,
+        option_rows: object | None = None,
+    ):
         try:
-            pages = [item.page for item in filtered_reviews(project_id, filename, review_filter)]
+            pages = [item.page for item in filtered_reviews(project_id, filename, review_filter, option_rows)]
         except ProjectError:
             pages = []
         if not pages:
@@ -3194,17 +3281,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             current = pages[0]
         later = [number for number in pages if (number > current if step > 0 else number < current)]
         target = (min(later) if step > 0 else max(later)) if later else current
-        return target, *review_page_view(project_id, filename, target)
+        return target, *review_page_view(project_id, filename, target, option_rows)
 
-    def review_previous_page(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
-        return review_step(project_id, filename, review_filter, page, -1)
+    def review_previous_page(
+        project_id: str | None, filename: str | None, review_filter: str | None, page: object,
+        option_rows: object | None = None,
+    ):
+        return review_step(project_id, filename, review_filter, page, -1, option_rows)
 
-    def review_next_page(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
-        return review_step(project_id, filename, review_filter, page, 1)
+    def review_next_page(
+        project_id: str | None, filename: str | None, review_filter: str | None, page: object,
+        option_rows: object | None = None,
+    ):
+        return review_step(project_id, filename, review_filter, page, 1, option_rows)
 
     def review_save(project_id: str | None, filename: str | None, page: object, text: str | None, revert: bool = False):
         if not project_id or not filename or page in (None, ""):
             return "❌ 請先選擇 PDF 與頁面"
+        if not is_preprocessed(project_id, filename):
+            return "❌ 此 PDF 尚未前處理，請先執行前處理再儲存"
         try:
             if revert:
                 review = documents.revert_page_text(project_id, filename, int(page))
@@ -3223,6 +3318,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         """Extract the page again into the editor without saving it."""
         if not project_id or not filename or page in (None, ""):
             return gr.skip(), "❌ 請先選擇 PDF 與頁面"
+        if not is_preprocessed(project_id, filename):
+            return gr.skip(), "❌ 此 PDF 尚未前處理，請先執行前處理"
         try:
             vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort) if use_vision else None
             if use_vision and vision is None:
@@ -3749,10 +3846,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 processing_options_table = gr.Dataframe(
                     headers=PROCESSING_COLUMNS,
                     interactive=True,
-                    datatype=["str", "number", "number", "number", "number", "number"],
+                    datatype=["str", *["number"] * (len(PROCESSING_COLUMNS) - 1)],
                     type="array",
                     static_columns=[0, 1],
-                    label="頁面索引從 0 開始，結束頁包含在範圍內；設定在執行前處理後才會儲存",
+                    label=(
+                        "頁面索引從 0 開始，結束頁包含在範圍內；左右忽略比例可去除頁緣的章節索引籤；"
+                        "設定在執行前處理後才會儲存"
+                    ),
                 )
 
             with gr.Group():
@@ -3766,9 +3866,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     elem_id="indexing-log",
                 )
 
-            with gr.Accordion("逐頁檢查", open=False, elem_classes="bold-title"):
+            with gr.Accordion("逐頁檢查（含忽略範圍預覽）", open=False, elem_classes="bold-title"):
                 with gr.Row():
-                    review_document = gr.Dropdown(label="PDF（已前處理）", choices=[], scale=2)
+                    review_document = gr.Dropdown(
+                        label="PDF（原頁以紅色標示「前處理設定」表格中的忽略範圍）", choices=[], scale=2,
+                    )
                     review_filter = gr.Dropdown(REVIEW_FILTERS, value="全部", label="篩選頁面", scale=1)
                 review_table = gr.Dataframe(
                     headers=REVIEW_COLUMNS,
@@ -4695,13 +4797,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[document_project, target_documents],
             outputs=[document_table, document_empty_notice, processing_options_section],
         ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document)
-        review_inputs = [document_project, review_document, review_filter, review_page]
+        review_inputs = [document_project, review_document, review_filter, review_page, processing_options_table]
         review_outputs = [review_table, review_page, review_image, review_text, review_info]
         review_page_outputs = [review_image, review_text, review_info]
         review_document.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
         review_filter.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
-        review_page.submit(review_page_view, inputs=[document_project, review_document, review_page], outputs=review_page_outputs)
-        review_table.select(review_select, inputs=[document_project, review_document], outputs=[review_page, *review_page_outputs])
+        review_page.submit(
+            review_page_view, inputs=[document_project, review_document, review_page, processing_options_table],
+            outputs=review_page_outputs,
+        )
+        review_table.select(
+            review_select, inputs=[document_project, review_document, processing_options_table],
+            outputs=[review_page, *review_page_outputs],
+        )
+        processing_options_table.change(
+            review_margin_refresh,
+            inputs=[document_project, review_document, review_page, processing_options_table],
+            outputs=review_page_outputs,
+        )
         review_previous.click(review_previous_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
         review_next.click(review_next_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
         review_save_button.click(

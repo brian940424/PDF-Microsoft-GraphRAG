@@ -238,6 +238,93 @@ class DocumentServiceTests(unittest.TestCase):
         record = json.loads(processed.read_text(encoding="utf-8").strip())
         self.assertEqual(record["text"], "繁體中文維修內容")
 
+    def write_tabbed_pdf(self) -> Path:
+        """A service-manual page with chapter index tabs printed down the right page edge."""
+        pdf = self.root / "uploads" / "TAB.pdf"
+        pdf.parent.mkdir(exist_ok=True)
+        document = pymupdf.open()
+        page = document.new_page(width=612, height=792)
+        page.insert_text((52, 300), "Remove the two pedal bolts.", fontname="helv")
+        for index, label in enumerate(("Q", "ZZZ", "X")):
+            page.insert_text((570, 100 + index * 40), label, fontname="helv")
+        document.save(pdf)
+        document.close()
+        return pdf
+
+    def test_side_margins_drop_page_edge_index_tabs(self) -> None:
+        service = DocumentService(self.store)
+        service.import_pdfs("L33-SM3E", [self.write_tabbed_pdf()])
+
+        service.preprocess("L33-SM3E")
+        processed = self.store.path_for("L33-SM3E") / "processed"
+        self.assertIn("ZZZ", json.loads((processed / "input.jsonl").read_text().strip())["text"])
+
+        service.preprocess("L33-SM3E", {"TAB.pdf": {"right_ignore_percent": 8}})
+
+        record = json.loads((processed / "input.jsonl").read_text().strip())
+        self.assertEqual(record["text"], "Remove the two pedal bolts.")
+        options = service.processing_options("L33-SM3E")["TAB.pdf"]
+        self.assertEqual((options["left_ignore_percent"], options["right_ignore_percent"]), (0, 8))
+        # Re-extracting one page from the page review uses the saved side margins.
+        self.assertEqual(service.extract_page_text("L33-SM3E", "TAB.pdf", 1), "Remove the two pedal bolts.")
+
+    def test_margin_preview_shades_ignored_margins_and_lists_removed_text(self) -> None:
+        service = DocumentService(self.store)
+        service.import_pdfs("L33-SM3E", [self.write_tabbed_pdf()])
+        source = self.store.path_for("L33-SM3E") / "source" / "TAB.pdf"
+        before = source.read_bytes()
+
+        preview = service.margin_preview("L33-SM3E", "TAB.pdf", 1, {"right_ignore_percent": 8, "header_ignore_percent": 5})
+
+        self.assertEqual((preview.page, preview.pages), (1, 1))
+        self.assertEqual(preview.margin_points, (39.6, 0, 0, 49.0))
+        self.assertEqual(preview.removed_lines, ("Q", "ZZZ", "X"))
+        image = pymupdf.Pixmap(preview.image_png)
+        # The right margin is shaded red and the body stays white.
+        self.assertGreater(image.pixel(image.width - 5, image.height // 2)[0], image.pixel(image.width - 5, image.height // 2)[1])
+        self.assertEqual(image.pixel(image.width // 2, image.height - 5), (255, 255, 255))
+        self.assertEqual(source.read_bytes(), before)
+        unchanged = service.margin_preview("L33-SM3E", "TAB.pdf", 1, {})
+        self.assertEqual((unchanged.removed_lines, unchanged.margin_points), ((), (0, 0, 0, 0)))
+        with self.assertRaisesRegex(ProjectError, "左右忽略比例合計"):
+            service.margin_preview("L33-SM3E", "TAB.pdf", 1, {"left_ignore_percent": 50, "right_ignore_percent": 50})
+
+    def test_preprocess_rejects_side_margins_that_remove_the_whole_width(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
+
+        with self.assertRaisesRegex(ProjectError, "左右忽略比例合計必須小於 100"):
+            self.service.preprocess(
+                "L33-SM3E",
+                {"WW.pdf": {"left_ignore_percent": 60, "right_ignore_percent": 40}},
+            )
+
+        self.assertEqual(self.store.get("L33-SM3E").status, "UPLOADED")
+
+    def test_recover_interrupted_preprocessing_restores_status_from_files_on_disk(self) -> None:
+        self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf"), self.upload("PG.pdf")])
+        project_path = self.store.path_for("L33-SM3E")
+
+        def recover_from_processing() -> str:
+            self.store.update_status("L33-SM3E", "PROCESSING")
+            self.assertEqual(self.service.recover_interrupted_preprocessing(), ["L33-SM3E"])
+            return self.store.get("L33-SM3E").status
+
+        self.assertEqual(recover_from_processing(), "UPLOADED")
+        self.service.preprocess("L33-SM3E")
+        self.assertEqual(recover_from_processing(), "READY")
+        processed_at = {item.filename: item.processed_at for item in self.service.list_documents("L33-SM3E")}
+        indexed = project_path / "graphrag" / "indexed_documents.json"
+        indexed.write_text(json.dumps({"WW.pdf": processed_at["WW.pdf"]}))
+        self.assertEqual(recover_from_processing(), "STALE")
+        indexed.write_text(json.dumps(processed_at))
+        self.assertEqual(recover_from_processing(), "INDEXED")
+        for filename in ("WW.pdf", "PG.pdf"):
+            self.service.remove_pdf("L33-SM3E", filename)
+        self.assertEqual(recover_from_processing(), "EMPTY")
+        # Projects in other states are left alone.
+        self.assertEqual(self.service.recover_interrupted_preprocessing(), [])
+        self.assertEqual(self.store.get("T30-SM5E").status, "EMPTY")
+
     def test_preprocess_rejects_margins_that_remove_the_whole_page(self) -> None:
         self.service.import_pdfs("L33-SM3E", [self.upload("WW.pdf")])
 
