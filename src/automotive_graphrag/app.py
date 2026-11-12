@@ -3871,21 +3871,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     max_height=260,
                     label="點選列切換頁面",
                 )
-                with gr.Row(equal_height=True):
-                    review_previous = gr.Button("◀ 上一頁")
-                    review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
-                    review_next = gr.Button("下一頁 ▶")
+                
                 review_info = gr.Markdown(elem_classes="collapse-when-empty")
                 with gr.Row(equal_height=True):
                     review_image = gr.Image(type="pil", label="PDF 原頁", interactive=False, height=760)
-                    review_text = gr.Textbox(
-                        label="解析結果（可直接修改，此為送去建圖的文字）", lines=30, max_lines=40, interactive=True
-                    )
+                    
+                    with gr.Group():
+                        review_text = gr.Textbox(
+                            label="解析結果（可直接修改，此為送去建圖的文字）", lines=30, max_lines=40, interactive=True
+                        )
+                        review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
                 with gr.Row():
-                    review_save_button = gr.Button("儲存並標示已檢查", variant="primary")
+                    review_previous = gr.Button("◀ 上一頁")
                     review_vision_button = gr.Button("重跑 Vision（本頁）")
                     review_text_layer_button = gr.Button("改用文字層")
                     review_revert_button = gr.Button("還原為解析結果")
+                    review_save_button = gr.Button("儲存並標示已檢查", variant="primary")
+                    review_next = gr.Button("下一頁 ▶")
                 review_status = gr.Markdown(elem_classes="collapse-when-empty")
 
             with gr.Group():
