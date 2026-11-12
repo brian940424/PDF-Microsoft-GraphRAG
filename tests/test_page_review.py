@@ -210,5 +210,14 @@ class PageReviewUiTests(unittest.TestCase):
         self.assertEqual(text, "Body text\nTAB")
         self.assertIn("尚未前處理", self.functions["review_save"]("L33-SM3E", "B.pdf", 2, "x"))
 
+    def test_settings_and_review_section_opens_only_while_selected_pdfs_need_preprocessing(self) -> None:
+        update = self.functions["processing_section_update"]
+        self.assertEqual((update("L33-SM3E", ["A.pdf"]).visible, update("L33-SM3E", ["A.pdf"]).open), (True, False))
+        self.assertEqual(update("L33-SM3E", []).visible, False)
+        write_pdf(ProjectStore(self.root).path_for("L33-SM3E") / "source" / "B.pdf", ["乙頁"])
+        self.assertEqual(update("L33-SM3E", ["A.pdf", "B.pdf"]).open, True)
+        _, section = self.functions["processing_options_view"]("L33-SM3E", ["B.pdf"], None)
+        self.assertEqual((section.visible, section.open), (True, True))
+
 if __name__ == "__main__":
     unittest.main()

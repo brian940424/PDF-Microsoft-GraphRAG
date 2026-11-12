@@ -3110,9 +3110,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Accordion(visible=has_targets),
         )
 
+    def processing_section_update(project_id: str | None, targets: list[str] | None):
+        """Show the section for selected PDFs; open it while any of them still needs preprocessing."""
+        targets = [target for target in targets or [] if target != UPLOAD_PDF_OPTION]
+        preprocessed = {item.filename for item in documents.list_documents_if_available(project_id) if item.preprocessed}
+        return gr.Accordion(visible=bool(targets), open=any(target not in preprocessed for target in targets))
+
     def processing_options_view(project_id: str | None, targets: list[str] | None, edited_rows):
         targets = [target for target in targets or [] if target != UPLOAD_PDF_OPTION]
-        return processing_option_rows(project_id, targets, edited_rows), gr.Accordion(visible=bool(targets))
+        return processing_option_rows(project_id, targets, edited_rows), processing_section_update(project_id, targets)
 
     def preprocess_options(project_id: str, option_rows) -> dict[str, dict[str, object]]:
         """Saved options for every PDF, overridden by the rows shown for the selected PDFs."""
@@ -3819,7 +3825,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             remove_pdf_confirmation = gr.Checkbox(visible=False)
             
             with gr.Accordion(
-                "前處理設定（所選 PDF）", open=False, visible=False, elem_classes="bold-title"
+                "前處理設定與逐頁檢查（所選 PDF）", open=False, visible=False, elem_classes="bold-title"
             ) as processing_options_section:
                 with gr.Row():
                     vision_model = gr.Dropdown(
@@ -3854,23 +3860,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         "設定在執行前處理後才會儲存"
                     ),
                 )
-
-            with gr.Group():
-                document_result = gr.Markdown(elem_classes="collapse-when-empty")
-                document_progress = gr.HTML(elem_classes="collapse-when-empty")
-                indexing_log = gr.Textbox(
-                    label="建圖日誌",
-                    lines=12,
-                    interactive=False,
-                    autoscroll=True,
-                    elem_id="indexing-log",
-                )
-
-            with gr.Accordion("逐頁檢查（含忽略範圍預覽）", open=False, elem_classes="bold-title"):
+                gr.Markdown("**逐頁檢查**：原頁以紅色標示上表的忽略範圍，右側為解析結果；尚未前處理的 PDF 顯示套用比例後的文字層預覽")
                 with gr.Row():
-                    review_document = gr.Dropdown(
-                        label="PDF（原頁以紅色標示「前處理設定」表格中的忽略範圍）", choices=[], scale=2,
-                    )
+                    review_document = gr.Dropdown(label="PDF", choices=[], scale=2)
                     review_filter = gr.Dropdown(REVIEW_FILTERS, value="全部", label="篩選頁面", scale=1)
                 review_table = gr.Dataframe(
                     headers=REVIEW_COLUMNS,
@@ -3895,6 +3887,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     review_text_layer_button = gr.Button("改用文字層")
                     review_revert_button = gr.Button("還原為解析結果")
                 review_status = gr.Markdown(elem_classes="collapse-when-empty")
+
+            with gr.Group():
+                document_result = gr.Markdown(elem_classes="collapse-when-empty")
+                document_progress = gr.HTML(elem_classes="collapse-when-empty")
+                indexing_log = gr.Textbox(
+                    label="建圖日誌",
+                    lines=12,
+                    interactive=False,
+                    autoscroll=True,
+                    elem_id="indexing-log",
+                )
+
+            
 
         with gr.Tab("2 問答測試", interactive=False) as query_tab:
             with gr.Row(equal_height=True):
@@ -4864,12 +4869,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[document_result, document_progress, *document_view_outputs],
         ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document).then(
             review_refresh, inputs=review_inputs, outputs=review_outputs
-        )
+        ).then(processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section)
         bind_job(
             "index", index_button, index_stop_button, build_index,
             inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope, vision_reasoning_effort, indexing_reasoning_effort],
             outputs=[document_result, indexing_log, document_progress],
-        ).then(document_view, inputs=document_project, outputs=document_view_outputs)
+        ).then(document_view, inputs=document_project, outputs=document_view_outputs).then(
+            processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section
+        )
         document_refresh_button.click(
             document_view,
             inputs=document_project,
