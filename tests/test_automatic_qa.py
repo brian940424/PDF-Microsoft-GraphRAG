@@ -331,6 +331,7 @@ class QuestionSetSelectorUiTests(unittest.TestCase):
         self.store = ProjectStore(root)
         self.store.create(project_id="P", display_name="P", vehicle_name="V", manual_version="1")
         app = create_app(root)
+        self.app = app
         functions = {getattr(event.fn, "__name__", ""): event.fn for event in app.fns.values()}
         self.functions = functions
         self.delete = functions["delete_autoqa_question_set"]
@@ -403,12 +404,12 @@ class QuestionSetSelectorUiTests(unittest.TestCase):
         from automotive_graphrag.app import AUTOQA_GENERATE_OPTION, AUTOQA_IMPORT_OPTION
 
         views = self.functions["autoqa_question_set_section_views"]
-        visible = lambda selected: [update["visible"] for update in views("P", selected)]
-        # import, generate, export, delete
-        self.assertEqual(visible(None), [False, False, False, False])
-        self.assertEqual(visible(AUTOQA_IMPORT_OPTION), [True, False, False, False])
-        self.assertEqual(visible(AUTOQA_GENERATE_OPTION), [False, True, False, False])
-        self.assertEqual(visible(self.newer.question_set_id), [False, False, True, True])
+        visible = lambda selected: [update.get("visible") for update in views("P", selected)]
+        # import, generate, export, delete, questions table (None: left as the loaded set sets it)
+        self.assertEqual(visible(None), [False, False, False, False, None])
+        self.assertEqual(visible(AUTOQA_IMPORT_OPTION), [True, False, False, False, False])
+        self.assertEqual(visible(AUTOQA_GENERATE_OPTION), [False, True, False, False, False])
+        self.assertEqual(visible(self.newer.question_set_id), [False, False, True, True, None])
 
     def test_choosing_an_action_option_does_not_load_a_question_set(self) -> None:
         import gradio as gr
@@ -428,3 +429,78 @@ class QuestionSetSelectorUiTests(unittest.TestCase):
             job.release()
 
         self.assertTrue(updates[1]["visible"])
+
+
+class AutoQAAutosaveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import json
+
+        from automotive_graphrag.app import create_app
+
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        root = Path(self.temporary_directory.name) / "projects"
+        ProjectStore(root).create(project_id="P", display_name="P", vehicle_name="V", manual_version="1")
+        self.app = create_app(root)
+        functions = {getattr(event.fn, "__name__", ""): event.fn for event in self.app.fns.values()}
+        self.autosave = functions["autosave_automatic_questions"]
+        closure = dict(zip(
+            self.autosave.__code__.co_freevars, (cell.cell_contents for cell in self.autosave.__closure__)
+        ))
+        save = closure["save_autoqa_edits"]
+        save_closure = dict(zip(save.__code__.co_freevars, (cell.cell_contents for cell in save.__closure__)))
+        self.question_rows = save_closure["autoqa_question_rows"]
+        self.question_sets = save_closure["question_sets"]
+        source = Path(self.temporary_directory.name) / "set.json"
+        source.write_text(json.dumps({"questions": [
+            {"number": index, "question": f"問題{index}", "expected_answer": f"答案{index}", "question_sources": [],
+             "answer_sources": [{"document_name": "S25.pdf", "pages": [index]}]}
+            for index in (1, 2)
+        ]}, ensure_ascii=False), encoding="utf-8")
+        imported = self.question_sets.import_file("P", source)
+        # Compare against the stored form: on disk an empty question source is written as the answer source.
+        self.question_set = self.question_sets.get("P", imported.question_set_id)
+        self.path = root / "P" / "question_sets" / f"{self.question_set.question_set_id}.json"
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_autosave_is_bound_to_user_input_only(self) -> None:
+        triggers = [
+            event_name
+            for event in self.app.fns.values() if getattr(event.fn, "__name__", "") == "autosave_automatic_questions"
+            for _block, event_name in event.targets
+        ]
+        self.assertEqual(triggers, ["input"])
+
+    def test_unedited_table_does_not_rewrite_file(self) -> None:
+        before = self.path.read_bytes()
+
+        message = self.autosave("P", self.question_set.question_set_id, self.question_rows(self.question_set))
+
+        self.assertIn("已自動儲存", message)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_editing_question_text_keeps_untouched_sources_exactly(self) -> None:
+        rows = self.question_rows(self.question_set)
+        rows[0][1] = "修改後的問題"
+
+        self.autosave("P", self.question_set.question_set_id, rows)
+
+        saved = self.question_sets.get("P", self.question_set.question_set_id)
+        original = self.question_set.questions
+        self.assertEqual(saved.questions[0].question, "修改後的問題")
+        for field in ("question_source_evidence", "answer_source_evidence", "gold_evidence", "source_documents"):
+            self.assertEqual(getattr(saved.questions[0], field), getattr(original[0], field), field)
+        self.assertEqual(saved.questions[1], original[1])
+
+    def test_editing_source_cell_parses_only_that_cell(self) -> None:
+        rows = self.question_rows(self.question_set)
+        rows[0][4] = "S25.pdf: 1, 9"
+
+        self.autosave("P", self.question_set.question_set_id, rows)
+
+        saved = self.question_sets.get("P", self.question_set.question_set_id).questions[0]
+        self.assertEqual(saved.answer_source_evidence[0].pages, (1, 9))
+        self.assertEqual(saved.answer_source_evidence[0].document_name, "S25.pdf")
+        self.assertEqual(saved.gold_evidence, saved.answer_source_evidence)
+        self.assertEqual(saved.question_source_evidence, self.question_set.questions[0].question_source_evidence)

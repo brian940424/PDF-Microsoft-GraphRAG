@@ -1671,6 +1671,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.update(visible=generating),
             gr.update(visible=saved),
             gr.update(visible=saved),
+            # The previous set's questions are hidden while importing or generating; loading a set
+            # (including the new one) shows the table again with its rows.
+            gr.update(visible=False) if selected in AUTOQA_ACTION_OPTIONS else gr.skip(),
         )
 
     def autoqa_question_rows(question_set):
@@ -1752,7 +1755,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             raise ProjectError("請先生成或匯入題目集")
         current = question_sets.get(project_id, question_set_id)
         by_id = {item.question_id: item for item in current.questions}
+        shown_rows = {row[0]: row for row in autoqa_question_rows(current)}
         updated = []
+        changed = False
         if rows is None:
             editable_rows = []
         elif hasattr(rows, "itertuples"):
@@ -1766,33 +1771,43 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             if question_id not in by_id:
                 raise ProjectError(f"題目集找不到題號：{question_id}")
             old = by_id[question_id]
-            question_sources = parse_autoqa_sources(
-                row[3], old.question_source_evidence or old.gold_evidence
+            # Cells equal to what the table showed keep the stored values untouched, so an
+            # unedited row (or source cell) is never rewritten through the text round trip.
+            edited = [str(value or "").strip() for value in row[1:5]]
+            shown = [str(value or "").strip() for value in shown_rows[question_id][1:5]]
+            if edited == shown:
+                updated.append(old)
+                continue
+            changed = True
+            question_edited = edited[2] != shown[2]
+            answer_edited = edited[3] != shown[3]
+            question_sources = (
+                parse_autoqa_sources(row[3], old.question_source_evidence or old.gold_evidence)
+                if question_edited else old.question_source_evidence
             )
-            answer_sources = parse_autoqa_sources(
-                row[4], old.answer_source_evidence or old.gold_evidence
+            answer_sources = (
+                parse_autoqa_sources(row[4], old.answer_source_evidence or old.gold_evidence)
+                if answer_edited else old.answer_source_evidence
             )
-            source_documents = tuple(dict.fromkeys(
-                source.document_id for source in (*question_sources, *answer_sources)
-            ))
-            updated.append(BatchQuestion(
-                question_id=question_id,
-                question=str(row[1] or "").strip(),
-                reference_answer=str(row[2] or "").strip(),
-                status=old.status,
-                answer=old.answer,
-                error=old.error,
-                duration_seconds=old.duration_seconds,
-                completed_at=old.completed_at,
-                gold_evidence=answer_sources,
-                retrieved_evidence=old.retrieved_evidence,
+            source_documents = (
+                tuple(dict.fromkeys(
+                    source.document_id for source in (
+                        *(question_sources or old.gold_evidence), *(answer_sources or old.gold_evidence)
+                    )
+                ))
+                if question_edited or answer_edited else old.source_documents
+            )
+            updated.append(replace(
+                old,
+                question=edited[0],
+                reference_answer=edited[1],
+                gold_evidence=answer_sources if answer_edited else old.gold_evidence,
                 question_source_evidence=question_sources,
                 answer_source_evidence=answer_sources,
                 source_documents=source_documents,
-                routed_method=old.routed_method,
-                routing_reason=old.routing_reason,
-                answer_aliases=old.answer_aliases,
             ))
+        if not changed:
+            return current
         return question_sets.update_questions(project_id, question_set_id, updated)
 
     def automatic_qa_summary(report):
@@ -5223,7 +5238,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             fn=autoqa_question_set_section_views,
             inputs=[automatic_project, autoqa_question_set_selector],
             outputs=[autoqa_import_section, autoqa_generate_section, autoqa_export_section,
-                     autoqa_delete_question_set_button],
+                     autoqa_delete_question_set_button, autoqa_questions_table],
             show_progress="hidden",
         )
         autoqa_question_set_selector.change(**autoqa_section_views)
@@ -5264,7 +5279,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=autoqa_question_set_selector,
             show_progress="hidden",
         )
-        autoqa_questions_table.change(
+        # .input fires only for the user's own edits; .change also fired whenever a question set was
+        # loaded, imported, generated or deleted, writing the shown table back to the file.
+        autoqa_questions_table.input(
             autosave_automatic_questions,
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
             outputs=autoqa_result,
