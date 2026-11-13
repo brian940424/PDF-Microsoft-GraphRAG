@@ -75,6 +75,11 @@ NEW_PROJECT_OPTION = "__new_project__"
 NEW_PROJECT_LABEL = "+ 新增專案..."
 UPLOAD_PDF_OPTION = "__upload_pdf__"
 UPLOAD_PDF_LABEL = "+ 上傳 PDF..."
+AUTOQA_IMPORT_OPTION = "__import_question_set__"
+AUTOQA_IMPORT_LABEL = "+ 匯入題目集..."
+AUTOQA_GENERATE_OPTION = "__generate_questions__"
+AUTOQA_GENERATE_LABEL = "+ 自動生成題目..."
+AUTOQA_ACTION_OPTIONS = (AUTOQA_IMPORT_OPTION, AUTOQA_GENERATE_OPTION)
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = [
@@ -1647,7 +1652,26 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 item.question_set_id,
             ))
         ids = {value for _label, value in choices}
+        choices += [(AUTOQA_IMPORT_LABEL, AUTOQA_IMPORT_OPTION), (AUTOQA_GENERATE_LABEL, AUTOQA_GENERATE_OPTION)]
         return gr.update(choices=choices, value=selected_id if selected_id in ids else None)
+
+    def select_autoqa_question_set(project_id, selected):
+        """Load a saved question set; the import/generate options only reveal their section."""
+        if not selected or selected in AUTOQA_ACTION_OPTIONS:
+            return (gr.skip(),) * 8
+        return automatic_qa_saved_view(project_id, selected)
+
+    def autoqa_question_set_section_views(project_id, selected):
+        """Import and generate sections show only when their option is chosen; generation also
+        stays visible while it runs so its stop button can be reached after a reload."""
+        saved = bool(selected) and selected not in AUTOQA_ACTION_OPTIONS
+        generating = selected == AUTOQA_GENERATE_OPTION or jobs.is_running(project_id, "qa_generate")
+        return (
+            gr.update(visible=selected == AUTOQA_IMPORT_OPTION),
+            gr.update(visible=generating),
+            gr.update(visible=saved),
+            gr.update(visible=saved),
+        )
 
     def autoqa_question_rows(question_set):
         rows = []
@@ -1822,8 +1846,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def delete_autoqa_question_set(project_id, question_set_id, confirmed):
         """Delete the selected question set with its saved evaluation records, then show the latest one."""
         unchanged = (gr.skip(),) * 8
-        if not project_id or not question_set_id:
-            return "❌ 請先在「選擇已存在的題目集」選擇要刪除的題目集", *unchanged, False
+        if not project_id or not question_set_id or question_set_id in AUTOQA_ACTION_OPTIONS:
+            return "❌ 請先在「題目集」選擇要刪除的題目集", *unchanged, False
         if not confirmed:
             return gr.skip(), *unchanged, False
         busy = [
@@ -4137,53 +4161,57 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
                 with gr.Row(equal_height=True):
                     autoqa_question_set_selector = gr.Dropdown(
-                        label="選擇已存在的題目集",
-                        info="列出此專案所有已儲存的題目集（含「4 檢索實驗」匯入的題目集），選取後載入題目與已儲存的回答、評測",
+                        label="題目集",
+                        info="選取已儲存的題目集（含「4 檢索實驗」匯入的）載入題目與已儲存的回答、評測；"
+                        f"選「{AUTOQA_IMPORT_LABEL}」或「{AUTOQA_GENERATE_LABEL}」新增題目集",
                         choices=[],
                         interactive=True,
                         scale=5,
                     )
                     autoqa_delete_question_set_button = gr.Button(
-                        "刪除此題目集", variant="stop", scale=1, min_width=140,
+                        "刪除此題目集", variant="stop", scale=1, min_width=140, visible=False,
                     )
                 autoqa_delete_question_set_confirmation = gr.Checkbox(visible=False)
-                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
-                    with gr.Group(elem_classes=["file-action-group"]):
-                        autoqa_import_file = gr.File(
-                            label="匯入題目集 JSON",
-                            file_types=[".json"],
-                            type="filepath",
-                            height=70,
-                            elem_classes=["no-dashed-file"],
-                        )
-                        autoqa_import_button = gr.Button("匯入題目集")
+                with gr.Column(visible=False) as autoqa_import_section:
+                    with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                        with gr.Group(elem_classes=["file-action-group"]):
+                            autoqa_import_file = gr.File(
+                                label="匯入題目集 JSON",
+                                file_types=[".json"],
+                                type="filepath",
+                                height=70,
+                                elem_classes=["no-dashed-file"],
+                            )
+                            autoqa_import_button = gr.Button("匯入題目集")
 
-                    with gr.Group(elem_classes=["file-action-group"]):
-                        autoqa_json_export = gr.File(
-                            label="題目集 JSON（按匯出後顯示）",
-                            height=70,
-                            elem_classes=["no-dashed-file"],
+                with gr.Column(visible=False) as autoqa_generate_section:
+                    with gr.Row(equal_height=True):
+                        autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
+                        autoqa_generation_model = gr.Dropdown(
+                            choices=chat_model_choices(), value=connections.get_chat_model(), label="生題模型"
                         )
-                        autoqa_export_button = gr.Button("匯出目前題目集")
+                        autoqa_generation_effort = gr.Dropdown(
+                            choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                            label="推理深度", visible=model_supports_reasoning(connections.get_chat_model()),
+                        )
+                        autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                    autoqa_generation_model.change(
+                        lambda model: gr.update(visible=model_supports_reasoning(model)),
+                        inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
+                    )
+                    autoqa_generate_button = gr.Button("生成題目", variant="primary")
+                    autoqa_generate_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_generate"][1], variant="stop", visible=False)
+                    autoqa_generate_progress = gr.HTML(label="題目生成進度", visible=False)
 
-                gr.Markdown("**或自動生成題目**")
-                with gr.Row(equal_height=True):
-                    autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
-                    autoqa_generation_model = gr.Dropdown(
-                        choices=chat_model_choices(), value=connections.get_chat_model(), label="生題模型"
-                    )
-                    autoqa_generation_effort = gr.Dropdown(
-                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
-                        label="推理深度", visible=model_supports_reasoning(connections.get_chat_model()),
-                    )
-                    autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
-                autoqa_generation_model.change(
-                    lambda model: gr.update(visible=model_supports_reasoning(model)),
-                    inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
-                )
-                autoqa_generate_button = gr.Button("生成題目", variant="primary")
-                autoqa_generate_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_generate"][1], variant="stop", visible=False)
-                autoqa_generate_progress = gr.HTML(label="題目生成進度", visible=False)
+                with gr.Column(visible=False) as autoqa_export_section:
+                    with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                        with gr.Group(elem_classes=["file-action-group"]):
+                            autoqa_json_export = gr.File(
+                                label="題目集 JSON（按匯出後顯示）",
+                                height=70,
+                                elem_classes=["no-dashed-file"],
+                            )
+                            autoqa_export_button = gr.Button("匯出目前題目集")
                 autoqa_result = gr.Markdown()
                 autoqa_questions_table = gr.Dataframe(
                     headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
@@ -5191,14 +5219,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[autoqa_judge_model, autoqa_judge_selection_status],
             show_progress="hidden",
         )
+        autoqa_section_views = dict(
+            fn=autoqa_question_set_section_views,
+            inputs=[automatic_project, autoqa_question_set_selector],
+            outputs=[autoqa_import_section, autoqa_generate_section, autoqa_export_section,
+                     autoqa_delete_question_set_button],
+            show_progress="hidden",
+        )
+        autoqa_question_set_selector.change(**autoqa_section_views)
         autoqa_question_set_selector.input(
-            automatic_qa_saved_view,
+            select_autoqa_question_set,
             inputs=[automatic_project, autoqa_question_set_selector],
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
         ).then(**autoqa_table_refresh).then(
             automatic_qa_metric_flag_values,
-            inputs=[automatic_project, autoqa_question_set_selector],
+            inputs=[automatic_project, autoqa_question_set_state],
             outputs=[autoqa_enable_llm_judge, autoqa_enable_classic_metrics],
         ).then(
             lambda: (hidden_progress,) * 3,
@@ -5538,7 +5574,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
         demo.load(
             running_job_views, inputs=active_project_id, outputs=running_job_outputs, show_progress="hidden",
-        )
+        ).then(**autoqa_section_views)
+        # The selector may not change when the first question set is still being generated, so the
+        # generate section is also re-checked whenever running jobs are re-checked.
+        for trigger in (active_project_id.change, running_jobs_timer.tick):
+            trigger(**autoqa_section_views, concurrency_limit=None)
         dashboard_refresh_button.click(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
     return demo
 

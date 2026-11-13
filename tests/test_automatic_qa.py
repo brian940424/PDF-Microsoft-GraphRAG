@@ -322,7 +322,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class DeleteQuestionSetUiTests(unittest.TestCase):
+class QuestionSetSelectorUiTests(unittest.TestCase):
     def setUp(self) -> None:
         from automotive_graphrag.app import create_app
 
@@ -332,6 +332,7 @@ class DeleteQuestionSetUiTests(unittest.TestCase):
         self.store.create(project_id="P", display_name="P", vehicle_name="V", manual_version="1")
         app = create_app(root)
         functions = {getattr(event.fn, "__name__", ""): event.fn for event in app.fns.values()}
+        self.functions = functions
         self.delete = functions["delete_autoqa_question_set"]
         closure = dict(zip(
             self.delete.__code__.co_freevars, (cell.cell_contents for cell in self.delete.__closure__)
@@ -387,3 +388,43 @@ class DeleteQuestionSetUiTests(unittest.TestCase):
 
         self.assertIn("4 檢索實驗", message)
         self.assertIn(self.newer.question_set_id, self.ids())
+
+    def test_selector_lists_import_and_generate_options_after_saved_sets(self) -> None:
+        from automotive_graphrag.app import AUTOQA_GENERATE_OPTION, AUTOQA_IMPORT_OPTION
+
+        choices = self.functions["autoqa_question_set_choices"]("P", AUTOQA_IMPORT_OPTION)
+
+        values = [value for _label, value in choices["choices"]]
+        self.assertEqual(values[-2:], [AUTOQA_IMPORT_OPTION, AUTOQA_GENERATE_OPTION])
+        self.assertEqual(set(values[:-2]), {self.older.question_set_id, self.newer.question_set_id})
+        self.assertIsNone(choices["value"])
+
+    def test_action_options_only_reveal_their_section(self) -> None:
+        from automotive_graphrag.app import AUTOQA_GENERATE_OPTION, AUTOQA_IMPORT_OPTION
+
+        views = self.functions["autoqa_question_set_section_views"]
+        visible = lambda selected: [update["visible"] for update in views("P", selected)]
+        # import, generate, export, delete
+        self.assertEqual(visible(None), [False, False, False, False])
+        self.assertEqual(visible(AUTOQA_IMPORT_OPTION), [True, False, False, False])
+        self.assertEqual(visible(AUTOQA_GENERATE_OPTION), [False, True, False, False])
+        self.assertEqual(visible(self.newer.question_set_id), [False, False, True, True])
+
+    def test_choosing_an_action_option_does_not_load_a_question_set(self) -> None:
+        import gradio as gr
+        from automotive_graphrag.app import AUTOQA_IMPORT_OPTION
+
+        outputs = self.functions["select_autoqa_question_set"]("P", AUTOQA_IMPORT_OPTION)
+
+        self.assertEqual(list(outputs), [gr.skip()] * 8)
+        loaded = self.functions["select_autoqa_question_set"]("P", self.older.question_set_id)
+        self.assertEqual(loaded[2], self.older.question_set_id)
+
+    def test_running_generation_keeps_generate_section_visible(self) -> None:
+        job = self.jobs.begin("P", "qa_generate")
+        try:
+            updates = self.functions["autoqa_question_set_section_views"]("P", self.newer.question_set_id)
+        finally:
+            job.release()
+
+        self.assertTrue(updates[1]["visible"])
