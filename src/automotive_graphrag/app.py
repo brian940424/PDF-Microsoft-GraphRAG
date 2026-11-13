@@ -3173,10 +3173,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
 
     def processing_section_update(project_id: str | None, targets: list[str] | None):
-        """Show the section for selected PDFs; open it while any of them still needs preprocessing."""
+        """Show the section, opened, for selected PDFs; only indexing collapses it."""
         targets = [target for target in targets or [] if target != UPLOAD_PDF_OPTION]
-        preprocessed = {item.filename for item in documents.list_documents_if_available(project_id) if item.preprocessed}
-        return gr.Accordion(visible=bool(targets), open=any(target not in preprocessed for target in targets))
+        return gr.Accordion(visible=bool(targets), open=True)
 
     def processing_options_view(project_id: str | None, targets: list[str] | None, edited_rows):
         targets = [target for target in targets or [] if target != UPLOAD_PDF_OPTION]
@@ -3715,9 +3714,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     preprocess_hiding_review.__qualname__ = preprocess_documents.__qualname__
 
     def build_index_showing_log(*args, **kwargs):
-        """Show the indexing log only while it has content to stream."""
+        """Show the indexing log only while it has content to stream; collapse the settings section once."""
+        section = gr.Accordion(open=False)
         for message, log, progress in build_index(*args, **kwargs):
-            yield message, gr.update(value=log, visible=bool(log)), progress
+            yield message, gr.update(value=log, visible=bool(log)), progress, section
+            section = gr.skip()
 
     # 事件以函式名稱識別，沿用 build_index 的名稱
     build_index_showing_log.__name__ = build_index.__name__
@@ -3939,7 +3940,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             remove_pdf_confirmation = gr.Checkbox(visible=False)
             
             with gr.Accordion(
-                "前處理設定與逐頁檢查（所選 PDF）", open=False, visible=False, elem_classes="bold-title"
+                "前處理設定與逐頁檢查（所選 PDF）", open=True, visible=False, elem_classes="bold-title"
             ) as processing_options_section:
                 with gr.Row():
                     vision_model = gr.Dropdown(
@@ -5002,7 +5003,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         bind_job(
             "index", index_button, index_stop_button, build_index_showing_log,
             inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope, vision_reasoning_effort, indexing_reasoning_effort],
-            outputs=[document_result, indexing_log, document_progress],
+            outputs=[document_result, indexing_log, document_progress, processing_options_section],
         ).then(
             lambda message: gr.update(visible=str(message or "").startswith("❌")),
             inputs=document_result, outputs=indexing_log, show_progress="hidden",

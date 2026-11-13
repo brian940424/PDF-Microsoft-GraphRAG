@@ -241,9 +241,9 @@ class PageReviewUiTests(unittest.TestCase):
         self.assertIn("尚未前處理", message)
         self.assertFalse(isinstance(page, int))
 
-    def test_settings_and_review_section_opens_only_while_selected_pdfs_need_preprocessing(self) -> None:
+    def test_settings_and_review_section_is_open_whenever_pdfs_are_selected(self) -> None:
         update = self.functions["processing_section_update"]
-        self.assertEqual((update("L33-SM3E", ["A.pdf"]).visible, update("L33-SM3E", ["A.pdf"]).open), (True, False))
+        self.assertEqual((update("L33-SM3E", ["A.pdf"]).visible, update("L33-SM3E", ["A.pdf"]).open), (True, True))
         self.assertEqual(update("L33-SM3E", []).visible, False)
         write_pdf(ProjectStore(self.root).path_for("L33-SM3E") / "source" / "B.pdf", ["乙頁"])
         self.assertEqual(update("L33-SM3E", ["A.pdf", "B.pdf"]).open, True)
