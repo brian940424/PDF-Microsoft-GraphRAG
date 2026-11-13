@@ -509,6 +509,12 @@ class RetrievalExperimentService:
                     pass
         return imported, errors
 
+    def uses_question_set(self, project_id: str, question_set_id: str) -> bool:
+        state = self.load(project_id)
+        return question_set_id in self._normalize_question_set_ids(
+            state.get("question_set_ids", state.get("question_set_id", ""))
+        )
+
     def remove_question_set(self, project_id: str, question_set_id: str) -> dict[str, object]:
         current = self.load(project_id)
         ids = [item for item in self._normalize_question_set_ids(current.get("question_set_ids"))

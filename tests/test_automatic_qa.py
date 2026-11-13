@@ -320,3 +320,70 @@ class AutomaticQATests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeleteQuestionSetUiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from automotive_graphrag.app import create_app
+
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        root = Path(self.temporary_directory.name) / "projects"
+        self.store = ProjectStore(root)
+        self.store.create(project_id="P", display_name="P", vehicle_name="V", manual_version="1")
+        app = create_app(root)
+        functions = {getattr(event.fn, "__name__", ""): event.fn for event in app.fns.values()}
+        self.delete = functions["delete_autoqa_question_set"]
+        closure = dict(zip(
+            self.delete.__code__.co_freevars, (cell.cell_contents for cell in self.delete.__closure__)
+        ))
+        self.question_sets = closure["question_sets"]
+        self.jobs = closure["jobs"]
+        self.experiments = closure["retrieval_experiments"]
+        self.older = self.question_sets.create("P", "舊題目集")
+        time.sleep(0.01)
+        self.newer = self.question_sets.create("P", "新題目集")
+        self.runs = self.store.path_for("P") / "runs"
+        self.runs.mkdir(exist_ok=True)
+        for prefix in ("automatic-evaluation", "retrieval-evaluation"):
+            (self.runs / f"{prefix}-{self.newer.question_set_id}.json").write_text("{}", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def ids(self) -> list[str]:
+        return [item.question_set_id for item in self.question_sets.list("P")]
+
+    def test_confirmed_delete_removes_set_and_its_records_then_loads_remaining_set(self) -> None:
+        message, *view, confirmation = self.delete("P", self.newer.question_set_id, True)
+
+        self.assertIn("已刪除題目集「新題目集」", message)
+        self.assertEqual(self.ids(), [self.older.question_set_id])
+        self.assertEqual(list(self.runs.glob(f"*{self.newer.question_set_id}*")), [])
+        self.assertEqual(view[1], self.older.question_set_id)
+        self.assertFalse(confirmation)
+
+    def test_cancelled_confirmation_keeps_set(self) -> None:
+        self.delete("P", self.newer.question_set_id, False)
+
+        self.assertIn(self.newer.question_set_id, self.ids())
+        self.assertEqual(len(list(self.runs.glob(f"*{self.newer.question_set_id}*"))), 2)
+
+    def test_running_question_job_blocks_delete(self) -> None:
+        job = self.jobs.begin("P", "qa_answer")
+        try:
+            message, *_rest = self.delete("P", self.newer.question_set_id, True)
+        finally:
+            job.release()
+
+        self.assertIn("檢索並生成回答", message)
+        self.assertIn(self.newer.question_set_id, self.ids())
+
+    def test_set_used_by_retrieval_experiment_is_not_deleted(self) -> None:
+        state = self.experiments.load("P")
+        state["question_set_ids"] = [self.newer.question_set_id]
+        self.experiments._write("P", state)
+
+        message, *_rest = self.delete("P", self.newer.question_set_id, True)
+
+        self.assertIn("4 檢索實驗", message)
+        self.assertIn(self.newer.question_set_id, self.ids())

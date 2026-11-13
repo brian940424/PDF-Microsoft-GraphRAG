@@ -1819,6 +1819,36 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             question_set.response_type,
         )
 
+    def delete_autoqa_question_set(project_id, question_set_id, confirmed):
+        """Delete the selected question set with its saved evaluation records, then show the latest one."""
+        unchanged = (gr.skip(),) * 8
+        if not project_id or not question_set_id:
+            return "❌ 請先在「選擇已存在的題目集」選擇要刪除的題目集", *unchanged, False
+        if not confirmed:
+            return gr.skip(), *unchanged, False
+        busy = [
+            JOB_BUTTON_LABELS[kind][0]
+            for kind in ("qa_generate", "qa_answer", "qa_evaluate", "retrieval_answer", "retrieval_evaluate")
+            if jobs.is_running(project_id, kind)
+        ]
+        if busy:
+            return f"❌ 「{'、'.join(busy)}」執行中，請等待完成或停止後再刪除題目集", *unchanged, False
+        try:
+            question_set = question_sets.get(project_id, question_set_id)
+            if retrieval_experiments.uses_question_set(project_id, question_set_id):
+                return (
+                    f"❌ 題目集「{question_set.name}」正用於「4 檢索實驗」，請先在該分頁更換題目集再刪除",
+                    *unchanged, False,
+                )
+            question_sets.delete(project_id, question_set_id)
+            runs = store.path_for(project_id) / "runs"
+            for name in (f"automatic-evaluation-{question_set_id}.json", f"retrieval-evaluation-{question_set_id}.json"):
+                (runs / name).unlink(missing_ok=True)
+        except (ProjectError, OSError) as exc:
+            return f"❌ 刪除題目集失敗：{exc}", *unchanged, False
+        _message, *view = automatic_qa_saved_view(project_id)
+        return f"✅ 已刪除題目集「{question_set.name}」", *view, False
+
     def automatic_qa_metric_flag_values(project_id, question_set_id=None):
         if not project_id or not question_set_id:
             return True, False
@@ -4105,12 +4135,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             autoqa_question_set_state = gr.State("")
 
             with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
-                autoqa_question_set_selector = gr.Dropdown(
-                    label="選擇已存在的題目集",
-                    info="列出此專案所有已儲存的題目集（含「4 檢索實驗」匯入的題目集），選取後載入題目與已儲存的回答、評測",
-                    choices=[],
-                    interactive=True,
-                )
+                with gr.Row(equal_height=True):
+                    autoqa_question_set_selector = gr.Dropdown(
+                        label="選擇已存在的題目集",
+                        info="列出此專案所有已儲存的題目集（含「4 檢索實驗」匯入的題目集），選取後載入題目與已儲存的回答、評測",
+                        choices=[],
+                        interactive=True,
+                        scale=5,
+                    )
+                    autoqa_delete_question_set_button = gr.Button(
+                        "刪除此題目集", variant="stop", scale=1, min_width=140,
+                    )
+                autoqa_delete_question_set_confirmation = gr.Checkbox(visible=False)
                 with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
                     with gr.Group(elem_classes=["file-action-group"]):
                         autoqa_import_file = gr.File(
@@ -5167,6 +5203,30 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             lambda: (hidden_progress,) * 3,
             outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
+        )
+        autoqa_delete_question_set_button.click(
+            None,
+            inputs=autoqa_question_set_selector,
+            outputs=autoqa_delete_question_set_confirmation,
+            js=(
+                "(id) => !id || confirm("
+                "'確定要刪除目前選取的題目集，以及它的回答與評測紀錄嗎？此動作無法復原。')"
+            ),
+        ).then(
+            delete_autoqa_question_set,
+            inputs=[automatic_project, autoqa_question_set_selector, autoqa_delete_question_set_confirmation],
+            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
+                     autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type,
+                     autoqa_delete_question_set_confirmation],
+        ).then(**autoqa_table_refresh).then(
+            automatic_qa_metric_flag_values,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=[autoqa_enable_llm_judge, autoqa_enable_classic_metrics],
+        ).then(
+            autoqa_question_set_choices,
+            inputs=[automatic_project, autoqa_question_set_state],
+            outputs=autoqa_question_set_selector,
+            show_progress="hidden",
         )
         autoqa_questions_table.change(
             autosave_automatic_questions,
