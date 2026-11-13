@@ -219,6 +219,41 @@ APP_CSS = """
     min-height: 0;
     overflow-y: auto !important;
 }
+/* 逐頁檢查整塊佔一個螢幕高度：資訊列與按鈕列維持原高，剩餘高度給原頁與解析結果 */
+#review-screen {
+    height: calc(100vh - 2 * var(--size-4, 16px));
+    min-height: 560px;
+    flex-wrap: nowrap !important;
+}
+#review-screen > * {
+    flex: 0 0 auto;
+}
+#review-screen > #review-pane {
+    flex: 1 1 0 !important;
+    min-height: 0;
+}
+#review-image {
+    flex: 1 1 0 !important;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+#review-image > label,
+#review-image .image-container,
+#review-image .image-frame {
+    flex: 1 1 0;
+    min-height: 0;
+}
+#review-image .image-frame {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+#review-image img {
+    max-height: 100%;
+    max-width: 100%;
+    object-fit: contain;
+}
 /* 匯入／匯出題目集兩欄等高：檔案區撐滿，按鈕固定在底部 */
 .file-action-group,
 .file-action-group .gr-group,
@@ -3925,28 +3960,30 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
                 # The PDF under review: the row last clicked in the options table (first row by default).
                 review_document = gr.State(None)
-                with gr.Group():
-                    gr.Markdown(
-                    "### 逐頁檢查\n點選上表的列切換 PDF；左側原頁的紅色區域為忽略範圍，右側為送去建圖的文字"
-                    )
-                    review_info = gr.Markdown(elem_classes="collapse-when-empty")
-                
-                with gr.Row(equal_height=True):
-                    review_image = gr.Image(type="pil", label="PDF 原頁", interactive=False, height=760)
-                    
-                    with gr.Group(elem_classes="review-editor"):
-                        review_text = gr.Textbox(
-                            label="解析結果（可直接修改，此為送去建圖的文字）", lines=12, interactive=True,
-                            elem_id="review-text",
+                # The whole page review fits one screen: image and editor take the height left over.
+                with gr.Column(elem_id="review-screen"):
+                    with gr.Group():
+                        gr.Markdown(
+                        "### 逐頁檢查\n點選上表的列切換 PDF；左側原頁的紅色區域為忽略範圍，右側為送去建圖的文字"
                         )
-                        review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
-                with gr.Row():
-                    review_previous = gr.Button("◀ 上一頁")
-                    review_vision_button = gr.Button("重跑 Vision（本頁）")
-                    review_text_layer_button = gr.Button("改用文字層")
-                    review_revert_button = gr.Button("還原為解析結果")
-                    review_save_next_button = gr.Button("儲存並前往下一頁 ▶", variant="primary")
-                review_status = gr.Markdown(elem_classes="collapse-when-empty")
+                        review_info = gr.Markdown(elem_classes="collapse-when-empty")
+                
+                    with gr.Row(equal_height=True, elem_id="review-pane"):
+                        review_image = gr.Image(type="pil", label="PDF 原頁", interactive=False, elem_id="review-image")
+                    
+                        with gr.Group(elem_classes="review-editor"):
+                            review_text = gr.Textbox(
+                                label="解析結果（可直接修改，此為送去建圖的文字）", lines=12, interactive=True,
+                                elem_id="review-text",
+                            )
+                            review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
+                    with gr.Row():
+                        review_previous = gr.Button("◀ 上一頁")
+                        review_vision_button = gr.Button("重跑 Vision（本頁）")
+                        review_text_layer_button = gr.Button("改用文字層")
+                        review_revert_button = gr.Button("還原為解析結果")
+                        review_save_next_button = gr.Button("儲存並前往下一頁 ▶", variant="primary")
+                    review_status = gr.Markdown(elem_classes="collapse-when-empty")
 
             with gr.Group():
                 document_result = gr.Markdown(elem_classes="collapse-when-empty")
