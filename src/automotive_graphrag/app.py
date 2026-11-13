@@ -3706,6 +3706,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         yield summary, log, final_progress
 
+    def preprocess_hiding_review(*args, **kwargs):
+        """Hide the page review while preprocessing rewrites the pages it shows."""
+        for update in preprocess_documents(*args, **kwargs):
+            yield (*update, gr.update(visible=False))
+
+    preprocess_hiding_review.__name__ = preprocess_documents.__name__
+    preprocess_hiding_review.__qualname__ = preprocess_documents.__qualname__
+
+    def build_index_showing_log(*args, **kwargs):
+        """Show the indexing log only while it has content to stream."""
+        for message, log, progress in build_index(*args, **kwargs):
+            yield message, gr.update(value=log, visible=bool(log)), progress
+
+    # 事件以函式名稱識別，沿用 build_index 的名稱
+    build_index_showing_log.__name__ = build_index.__name__
+    build_index_showing_log.__qualname__ = build_index.__qualname__
+
     def create_project(
         project_id: str,
         display_name: str,
@@ -3960,8 +3977,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
                 # The PDF under review: the row last clicked in the options table (first row by default).
                 review_document = gr.State(None)
+                # 前處理進度顯示在逐頁檢查的位置；前處理期間逐頁檢查隱藏
+                preprocess_progress = gr.HTML(elem_classes="collapse-when-empty")
                 # The whole page review fits one screen: image and editor take the height left over.
-                with gr.Column(elem_id="review-screen"):
+                with gr.Column(elem_id="review-screen") as review_screen:
                     with gr.Group():
                         gr.Markdown(
                         "### 逐頁檢查\n點選上表的列切換 PDF；左側原頁的紅色區域為忽略範圍，右側為送去建圖的文字"
@@ -3988,12 +4007,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             with gr.Group():
                 document_result = gr.Markdown(elem_classes="collapse-when-empty")
                 document_progress = gr.HTML(elem_classes="collapse-when-empty")
+                # 只在建圖期間顯示；成功或停止後收起，失敗時保留以便查看錯誤
                 indexing_log = gr.Textbox(
                     label="建圖日誌",
                     lines=12,
                     interactive=False,
                     autoscroll=True,
                     elem_id="indexing-log",
+                    visible=False,
                 )
 
             
@@ -4967,9 +4988,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[upload_pdf_group, uploaded_files],
         )
         bind_job(
-            "preprocess", preprocess_button, preprocess_stop_button, preprocess_documents,
+            "preprocess", preprocess_button, preprocess_stop_button, preprocess_hiding_review,
             inputs=[document_project, processing_options_table, target_documents, vision_model, vision_scope, vision_reasoning_effort],
-            outputs=[document_result, document_progress, *document_view_outputs],
+            outputs=[document_result, preprocess_progress, *document_view_outputs, review_screen],
+        ).then(
+            lambda: gr.update(visible=True), outputs=review_screen, show_progress="hidden",
         ).then(
             lambda project_id, rows, filename, review_filter, page: review_sync(
                 project_id, rows, filename, review_filter, page, force=True,
@@ -4977,9 +5000,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=review_sync_event["inputs"], outputs=review_sync_event["outputs"],
         ).then(processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section)
         bind_job(
-            "index", index_button, index_stop_button, build_index,
+            "index", index_button, index_stop_button, build_index_showing_log,
             inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope, vision_reasoning_effort, indexing_reasoning_effort],
             outputs=[document_result, indexing_log, document_progress],
+        ).then(
+            lambda message: gr.update(visible=str(message or "").startswith("❌")),
+            inputs=document_result, outputs=indexing_log, show_progress="hidden",
         ).then(document_view, inputs=document_project, outputs=document_view_outputs).then(
             processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section
         )

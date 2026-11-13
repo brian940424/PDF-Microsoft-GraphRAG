@@ -43,7 +43,9 @@ class DocumentProgressTests(unittest.TestCase):
         start, stop = outputs[0][-2:]
         self.assertFalse(start["visible"])
         self.assertTrue(stop["visible"])
-        message, progress, table, _, targets, notice, _start, _stop = outputs[-1]
+        message, progress, table, _, targets, notice, review_screen, _start, _stop = outputs[-1]
+        # The page review stays hidden while preprocessing rewrites its pages.
+        self.assertTrue(all(output[-3]["visible"] is False for output in outputs))
         rows = table["value"]
         self.assertIn("✅ 前處理完成（1 份 PDF）", message)
         self.assertIn("100%", progress)
