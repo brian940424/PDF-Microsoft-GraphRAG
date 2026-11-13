@@ -284,6 +284,19 @@ class AnalyzePageTests(unittest.TestCase):
             with self.assertRaises(VisionAbort):
                 analyze_page("aW1n", 1, None, self.settings)
 
+    def test_cloudflare_tunnel_error_is_retried(self) -> None:
+        content = {"page_number": 1, "content": [{"type": "text", "data": "ok"}]}
+        success = mock.MagicMock()
+        success.__enter__.return_value.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": json.dumps(content)}}]}
+        ).encode()
+        tunnel_down = urllib.error.HTTPError("url", 530, "", {}, io.BytesIO(b"error code: 1033"))
+        with mock.patch("urllib.request.urlopen", side_effect=[tunnel_down, success]) as urlopen, \
+                mock.patch("automotive_graphrag.vision.time.sleep"):
+            text = analyze_page("aW1n", 1, None, self.settings)
+        self.assertEqual(text, "ok")
+        self.assertEqual(urlopen.call_count, 2)
+
     def test_rejects_malformed_content(self) -> None:
         response = {"choices": [{"message": {"content": '{"content": [{"type": "chart", "data": "x"}]}'}}]}
         with mock.patch("urllib.request.urlopen") as urlopen:

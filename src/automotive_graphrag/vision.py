@@ -21,15 +21,20 @@ from .connections import REASONING_EFFORT_OPTIONS, extract_json_object, llm_requ
 from .projects import ProjectError
 
 
-DEFAULT_VISION_CONCURRENCY = 8
+# Each request carries a full-page PNG of several MB; fewer parallel uploads
+# keep a Cloudflare Tunnel in front of the LLM gateway from dropping.
+DEFAULT_VISION_CONCURRENCY = 4
 RENDER_SCALE = 2.0
 REQUEST_TIMEOUT_SECONDS = 180
-MAX_RETRIES = 3
+# Backoff 2+4+8+16 s gives a reconnecting tunnel about 30 s to recover.
+MAX_RETRIES = 4
 RETRY_BASE_DELAY_SECONDS = 2.0
 # HTTP errors that fail identically on every page (bad key, no access, unknown
 # model); stop sending requests instead of retrying each page.
 ABORT_HTTP_CODES = {401, 403, 404}
-RETRY_HTTP_CODES = {429, 500, 502, 503, 504}
+# Transient gateway errors, including Cloudflare's 52x origin errors and 530
+# (e.g. error 1033: no healthy cloudflared connection for the tunnel).
+RETRY_HTTP_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 530}
 
 # Which pages are sent to the vision model: every page, or only pages with a
 # detected figure/table, only tables, or only diagrams (images and vector
