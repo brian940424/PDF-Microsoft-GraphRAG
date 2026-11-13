@@ -410,23 +410,6 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                         continue
                     metric_samples.append((result.retrieved_evidence, gold))
             metrics = compute_source_metrics(tuple(metric_samples)) if metric_samples else (None, None, None, 0)
-            coverages = [float(item["answer_point_coverage_percent"]) for item in selected
-                         if isinstance(item.get("answer_point_coverage_percent"), (int, float))]
-            unsupported_counts = [int(item["unsupported_claim_count"]) for item in selected
-                                  if isinstance(item.get("unsupported_claim_count"), int)]
-            refusal_labels = [item.get("refusal_correctness") for item in selected]
-            scored_refusals = [value for value in refusal_labels if value in {"correct", "incorrect"}]
-            quality_reviewed = sum(
-                item.get("answer_point_coverage_percent") is not None
-                or item.get("unsupported_claim_count") is not None
-                or item.get("refusal_correctness") is not None
-                for item in selected
-            )
-            metric_status = (
-                "已計算（文件 ID／頁碼比對；逐題 precision 平均，無頁碼 Gold 排除）" if metric_samples else
-                "不可計算：Global／Agentic 社群報告無法可靠映射" if method in {"global", EXPERIMENT_AGENTIC_METHOD} else
-                "不可計算：尚無可用來源證據"
-            )
             average_answer_em = RetrievalExperimentService._mean_present(item.get("answer_em") for item in selected)
             average_answer_f1 = RetrievalExperimentService._mean_present(item.get("answer_f1") for item in selected)
             average_term_hit = RetrievalExperimentService._mean_present(item.get("answer_term_hit") for item in selected)
@@ -443,12 +426,6 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 f"{metrics[0]:.1%}" if metrics[0] is not None else "不可計算",
                 f"{metrics[1]:.1%}" if metrics[1] is not None else "不可計算",
                 f"{metrics[2]:.1%}" if metrics[2] is not None else "不可計算",
-                metric_status,
-                f"{sum(coverages) / len(coverages):.1f}%" if coverages else "未標註",
-                f"{sum(count > 0 for count in unsupported_counts) / len(unsupported_counts):.1%}" if unsupported_counts else "未標註",
-                f"{sum(unsupported_counts) / len(unsupported_counts):.2f}" if unsupported_counts else "未標註",
-                f"{sum(value == 'correct' for value in scored_refusals) / len(scored_refusals):.1%}" if scored_refusals else "未標註",
-                quality_reviewed,
                 f"{average_answer_em:.1%}" if average_answer_em is not None else "—",
                 f"{average_answer_f1:.1%}" if average_answer_f1 is not None else "—",
                 f"{average_term_hit:.1%}" if average_term_hit is not None else "—",
@@ -1989,17 +1966,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     f"{item['evidence_precision']:.1%}" if item.get("evidence_precision") is not None else "不可計算",
                     f"{item['document_hit_rate']:.1%}" if item.get("document_hit_rate") is not None else "不可計算",
                     item.get("no_evidence_question_count", 0),
-                    item.get("retrieval_metrics_status", ""),
                     f"{item['average_latency_seconds']:.2f}" if item.get("average_latency_seconds") is not None else "—",
                     f"{item['p95_latency_seconds']:.2f}" if item.get("p95_latency_seconds") is not None else "—",
                     f"{item['average_search_steps']:.2f}" if item.get("average_search_steps") is not None else "—",
                     f"{item['average_agent_model_calls']:.2f}" if item.get("average_agent_model_calls") is not None else "—",
-                    "未知（無 Token 用量）",
-                    f"{item['answer_point_coverage_percent']:.1f}%" if item.get("answer_point_coverage_percent") is not None else "未標註",
-                    f"{item['unsupported_answer_rate']:.1%}" if item.get("unsupported_answer_rate") is not None else "未標註",
-                    f"{item['average_unsupported_claim_count']:.2f}" if item.get("average_unsupported_claim_count") is not None else "未標註",
-                    f"{item['refusal_accuracy']:.1%}" if item.get("refusal_accuracy") is not None else "未標註",
-                    item.get("quality_reviewed_count", 0),
                     f"{item['average_answer_em']:.1%}" if item.get("average_answer_em") is not None else "—",
                     f"{item['average_answer_f1']:.1%}" if item.get("average_answer_f1") is not None else "—",
                     f"{item['average_answer_term_hit']:.1%}" if item.get("average_answer_term_hit") is not None else "—",
@@ -2020,9 +1990,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     _experiment_judge_cell(item),
                     _experiment_strategy_cell(item, strategy_labels),
                     _experiment_trace_cell(item.get("execution_trace", {})),
-                    f"{item['answer_point_coverage_percent']:.1f}" if item.get("answer_point_coverage_percent") is not None else "",
-                    str(item["unsupported_claim_count"]) if item.get("unsupported_claim_count") is not None else "",
-                    _quality_annotation_label(item.get("refusal_correctness")),
                 ]
                 for item in ordered_raw_results
                 if str(item.get("actual_answer", "") or "").strip()
@@ -2038,12 +2005,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ]
             if panel_lines:
                 status += "\n\n**評審分數：** " + "；".join(panel_lines)
-            # 摘要與逐題結果等評測完才顯示
+            # 摘要與逐題結果等評測完才顯示；傳統指標與 Agentic 欄位只在有值時出現
             evaluated = bool(results)
+            show_classic = bool(run.get("enable_classic_metrics"))
+            show_agentic = any(item.get("method") == EXPERIMENT_AGENTIC_METHOD for item in run.get("groups", []))
             return (
                 status, question_set_ids, gr.update(value=question_rows, visible=bool(question_rows)),
-                gr.update(value=summaries, visible=evaluated),
-                gr.update(value=dataset_summaries, visible=evaluated),
+                experiment_summary_update(
+                    EXPERIMENT_SUMMARY_HEADERS, summaries, evaluated,
+                    drop=(() if show_agentic else EXPERIMENT_AGENTIC_HEADERS)
+                    + (() if show_classic else EXPERIMENT_CLASSIC_HEADERS),
+                ),
+                experiment_summary_update(
+                    EXPERIMENT_DATASET_SUMMARY_HEADERS, dataset_summaries, evaluated,
+                    drop=() if show_classic else EXPERIMENT_CLASSIC_HEADERS,
+                ),
                 gr.update(value=results, visible=evaluated), state.get("max_concurrency", 5),
                 judge_model_update(state.get("judge_model")),
                 generation_status, gr.update(interactive=answers_ready), state.get("evaluation_mode", "strict"),
@@ -2668,7 +2644,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         else:
             table_rows = table_data or []
         judgments = []
-        quality_annotations = []
         run = retrieval_experiments.load(project_id).get("run") or {}
         dataset_display_to_id = {
             f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})": item.get("dataset_id", "")
@@ -2688,15 +2663,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 dataset_id = ""
                 question_id = str(row[1])
                 judgments.append((str(row[0]), question_id, grade))
-            if len(row) >= 14:
-                quality_annotations.append((
-                    str(row[0]), dataset_id, question_id,
-                    str(row[11] if row[11] is not None else ""),
-                    str(row[12] if row[12] is not None else ""),
-                    str(row[13] if row[13] is not None else ""),
-                ))
         try:
-            retrieval_experiments.update_quality_annotations(project_id, quality_annotations)
             retrieval_experiments.update_manual_judgments(project_id, judgments)
         except ProjectError as exc:
             return f"❌ 儲存人工判斷失敗：{exc}", [], [], []
@@ -4460,17 +4427,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_question_set_state = gr.State([])
 
             with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
-                with gr.Row(equal_height=True):
-                    experiment_question_set_selector = gr.Dropdown(
-                        label="題目集（可多選）",
-                        info="從此專案已儲存的題目集（與「3 自動問答測試」共用）選擇要實驗的資料集，再按「使用所選題目集」；"
-                        f"選「{AUTOQA_IMPORT_LABEL}」上傳新的 JSON。取消選取只從實驗移除，不會刪除題目集",
-                        choices=[],
-                        multiselect=True,
-                        interactive=True,
-                        scale=5,
-                    )
-                    experiment_apply_question_sets_button = gr.Button("使用所選題目集", scale=1, min_width=140)
+                experiment_question_set_selector = gr.Dropdown(
+                    label="題目集（可多選）",
+                    info="從此專案已儲存的題目集（與「3 自動問答測試」共用）選擇要實驗的資料集，再按「使用所選題目集」；"
+                    f"選「{AUTOQA_IMPORT_LABEL}」上傳新的 JSON。取消選取只從實驗移除，不會刪除題目集",
+                    choices=[],
+                    multiselect=True,
+                    interactive=True,
+                    scale=5,
+                )
+                experiment_apply_question_sets_button = gr.Button("使用所選題目集", scale=1)
                 experiment_has_results_flag = gr.Checkbox(visible=False)
                 experiment_question_sets_confirmation = gr.Checkbox(visible=False)
                 with gr.Column(visible=False) as experiment_import_section:

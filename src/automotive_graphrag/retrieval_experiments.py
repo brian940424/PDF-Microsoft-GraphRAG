@@ -149,6 +149,9 @@ class ExperimentGroup:
     strategy_parameters: dict[str, dict[str, object]] = field(default_factory=default_strategy_parameters)
 
 
+LEGACY_QUALITY_KEYS = ("answer_point_coverage_percent", "unsupported_claim_count", "refusal_correctness")
+
+
 @dataclass(frozen=True, slots=True)
 class ExperimentQuestionResult:
     group_id: str
@@ -176,9 +179,6 @@ class ExperimentQuestionResult:
     routing_reason: str = ""
     execution_trace: dict[str, object] = field(default_factory=dict)
     duration_seconds: float | None = None
-    answer_point_coverage_percent: float | None = None
-    unsupported_claim_count: int | None = None
-    refusal_correctness: str | None = None
     answer_em: float | None = None
     answer_f1: float | None = None
     judge_scores: tuple[JudgeScore, ...] = ()
@@ -221,11 +221,6 @@ class ExperimentGroupSummary:
     average_agent_model_calls: float | None = None
     estimated_cost_usd: float | None = None
     cost_status: str = "此適配器未提供 Token 用量，成本未知"
-    answer_point_coverage_percent: float | None = None
-    unsupported_answer_rate: float | None = None
-    average_unsupported_claim_count: float | None = None
-    refusal_accuracy: float | None = None
-    quality_reviewed_count: int = 0
     average_answer_em: float | None = None
     average_answer_f1: float | None = None
     judge_average_scores: dict[str, float] = field(default_factory=dict)
@@ -1006,105 +1001,6 @@ class RetrievalExperimentService:
             self._write(project_id, state)
         return run
 
-    def update_quality_annotations(
-        self, project_id: str, annotations: Sequence[tuple[str, ...]]
-    ) -> dict[str, object]:
-        """Persist human review metrics without invoking any model."""
-        normalized = []
-        for annotation in annotations:
-            if len(annotation) != 6:
-                continue
-            group_name, dataset_id, question_id, raw_coverage, raw_unsupported, raw_refusal = annotation
-            coverage = self._optional_annotation_number(raw_coverage, "答案要點覆蓋率", 0, 100)
-            unsupported = self._optional_annotation_number(raw_unsupported, "無根據主張數", 0, None, integer=True)
-            refusal_text = str(raw_refusal or "").strip().casefold()
-            refusal_values = {
-                "正確": "correct", "correct": "correct",
-                "錯誤": "incorrect", "incorrect": "incorrect",
-                "不適用": "not_applicable", "not_applicable": "not_applicable",
-                "": None, "nan": None,
-            }
-            if refusal_text not in refusal_values:
-                raise ProjectError("拒答判定只接受：正確、錯誤、不適用或留白")
-            normalized.append((str(group_name), str(dataset_id), str(question_id), coverage, unsupported, refusal_values[refusal_text]))
-
-        state = self.load(project_id)
-        run = state.get("run")
-        if not isinstance(run, dict):
-            raise ProjectError("目前沒有可標註的檢索實驗結果")
-        results = run.get("results", [])
-        changed = False
-        for group_name, dataset_id, question_id, coverage, unsupported, refusal in normalized:
-            for item in results:
-                if (
-                    item.get("group_name") != group_name
-                    or item.get("question_id") != question_id
-                    or (dataset_id and item.get("dataset_id") != dataset_id)
-                ):
-                    continue
-                values = {
-                    "answer_point_coverage_percent": coverage,
-                    "unsupported_claim_count": unsupported,
-                    "refusal_correctness": refusal,
-                }
-                for key, value in values.items():
-                    if item.get(key) != value:
-                        item[key] = value
-                        changed = True
-        for summary in run.get("groups", []):
-            selected = [item for item in results if item.get("group_id") == summary.get("group_id")]
-            summary.update(self._quality_annotation_summary(selected))
-        if changed or run.get("groups"):
-            self._write(project_id, state)
-        return run
-
-    @staticmethod
-    def _optional_annotation_number(
-        value: object, label: str, minimum: int | float, maximum: int | float | None,
-        integer: bool = False,
-    ) -> int | float | None:
-        if value is None or str(value).strip().casefold() in {"", "nan", "none"}:
-            return None
-        try:
-            number = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ProjectError(f"{label}必須是數字或留白") from exc
-        if not math.isfinite(number) or number < minimum or (maximum is not None and number > maximum):
-            raise ProjectError(f"{label}超出允許範圍")
-        if integer and not number.is_integer():
-            raise ProjectError(f"{label}必須是整數")
-        return int(number) if integer else number
-
-    @staticmethod
-    def _quality_annotation_summary(items: Sequence[dict[str, object]]) -> dict[str, object]:
-        coverages = [float(item["answer_point_coverage_percent"]) for item in items
-                     if isinstance(item.get("answer_point_coverage_percent"), (int, float))]
-        unsupported_counts = [int(item["unsupported_claim_count"]) for item in items
-                              if isinstance(item.get("unsupported_claim_count"), int)]
-        refusal_labels = [item.get("refusal_correctness") for item in items]
-        refusal_scored = [item for item in refusal_labels if item in {"correct", "incorrect"}]
-        reviewed = sum(
-            item.get("answer_point_coverage_percent") is not None
-            or item.get("unsupported_claim_count") is not None
-            or item.get("refusal_correctness") is not None
-            for item in items
-        )
-        return {
-            "answer_point_coverage_percent": sum(coverages) / len(coverages) if coverages else None,
-            "unsupported_answer_rate": (
-                sum(count > 0 for count in unsupported_counts) / len(unsupported_counts)
-                if unsupported_counts else None
-            ),
-            "average_unsupported_claim_count": (
-                sum(unsupported_counts) / len(unsupported_counts) if unsupported_counts else None
-            ),
-            "refusal_accuracy": (
-                sum(label == "correct" for label in refusal_scored) / len(refusal_scored)
-                if refusal_scored else None
-            ),
-            "quality_reviewed_count": reviewed,
-        }
-
     def export(self, project_id: str) -> tuple[Path, Path]:
         state = self.load(project_id)
         if state.get("run") is None:
@@ -1166,17 +1062,10 @@ class RetrievalExperimentService:
                     "p95_latency_seconds": summary.get("p95_latency_seconds"),
                     "average_search_steps": summary.get("average_search_steps"),
                     "average_agent_model_calls": summary.get("average_agent_model_calls"),
-                    "estimated_cost_usd": summary.get("estimated_cost_usd"),
-                    "cost_status": summary.get("cost_status"),
-                    "answer_point_coverage_percent": summary.get("answer_point_coverage_percent"),
                     "average_answer_em": summary.get("average_answer_em"),
                     "average_answer_f1": summary.get("average_answer_f1"),
                     "average_answer_term_hit": summary.get("average_answer_term_hit"),
                     "average_answer_term_coverage": summary.get("average_answer_term_coverage"),
-                    "unsupported_answer_rate": summary.get("unsupported_answer_rate"),
-                    "average_unsupported_claim_count": summary.get("average_unsupported_claim_count"),
-                    "refusal_accuracy": summary.get("refusal_accuracy"),
-                    "quality_reviewed_count": summary.get("quality_reviewed_count", 0),
                 },
             })
         expected_count = sum(int(item.get("question_count", 0)) for item in run_groups)
@@ -1225,8 +1114,6 @@ class RetrievalExperimentService:
                 "evidence_precision": self._average_metric(run_groups, "evidence_precision"),
                 "document_hit_rate": self._average_metric(run_groups, "document_hit_rate"),
                 "average_latency_seconds": self._average_metric(run_groups, "average_latency_seconds"),
-                "estimated_cost_usd": None,
-                "cost_status": "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
             },
             "groups": group_rows,
             "datasets": [
@@ -1262,7 +1149,10 @@ class RetrievalExperimentService:
                 }
                 for group in group_rows
             ],
-            "question_results": run_results,
+            "question_results": [
+                {key: value for key, value in item.items() if key not in LEGACY_QUALITY_KEYS}
+                for item in run_results
+            ],
         }
         self._atomic_write(summary_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         self._atomic_write(details_path, json.dumps(details_payload, ensure_ascii=False, indent=2) + "\n")
@@ -1708,14 +1598,6 @@ class RetrievalExperimentService:
                 for item in agentic_results
                 if isinstance(item.execution_trace.get("agentic_metadata"), dict)
             ]
-            quality_summary = self._quality_annotation_summary([
-                {
-                    "answer_point_coverage_percent": item.answer_point_coverage_percent,
-                    "unsupported_claim_count": item.unsupported_claim_count,
-                    "refusal_correctness": item.refusal_correctness,
-                }
-                for item in group_items
-            ])
             answer_em = self._mean_present(item.answer_em for item in group_items)
             answer_f1 = self._mean_present(item.answer_f1 for item in group_items)
             answer_term_hit = self._mean_present(item.answer_term_hit for item in group_items)
@@ -1739,7 +1621,6 @@ class RetrievalExperimentService:
                 sum(model_calls) / len(model_calls) if model_calls else None,
                 None,
                 "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
-                **quality_summary,
                 average_answer_em=answer_em,
                 average_answer_f1=answer_f1,
                 judge_average_scores=judge_averages,
@@ -1797,6 +1678,9 @@ class RetrievalExperimentService:
     @staticmethod
     def _result_from_dict(value: dict[str, object]) -> ExperimentQuestionResult:
         data = dict(value)
+        # Manual quality annotations were removed (F-51); older saved runs may still carry them.
+        for key in LEGACY_QUALITY_KEYS:
+            data.pop(key, None)
         data.setdefault("retrieved_evidence", [])
         data["judge_scores"] = judge_scores_from_dicts(data.get("judge_scores"))
         data["retrieved_evidence"] = tuple(
