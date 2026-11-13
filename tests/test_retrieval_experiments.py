@@ -246,20 +246,25 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(self.service.load("project")["question_set_ids"], [existing.question_set_id])
         self.assertEqual(self.question_sets.get("project", existing.question_set_id), existing)
 
-    def test_importing_new_sets_replaces_and_deletes_old_sets(self):
+    def test_importing_new_sets_adds_them_and_keeps_old_sets(self):
         old_set = self.service.import_question_set("project", self.question_file)
+        state = self.service.load("project")
+        state["run"] = {"status": "stopped"}
+        self.service._write("project", state)
         second_file = self.root / "second-dataset.json"
         second_file.write_text(self.question_file.read_text(encoding="utf-8"), encoding="utf-8")
 
         imported = self.service.import_question_sets("project", [self.question_file, second_file])
 
         imported_ids = [item.question_set_id for item in imported]
-        self.assertEqual(self.service.load("project")["question_set_ids"], imported_ids)
-        self.assertFalse(
+        state = self.service.load("project")
+        self.assertEqual(state["question_set_ids"], [old_set.question_set_id, *imported_ids])
+        self.assertIsNone(state["run"])
+        self.assertTrue(
             (self.projects.path_for("project") / "question_sets" / f"{old_set.question_set_id}.json").exists()
         )
 
-    def test_removing_question_set_deletes_it_and_clears_saved_run(self):
+    def test_removing_question_set_keeps_file_and_clears_saved_run(self):
         question_set = self.service.import_question_set("project", self.question_file)
         state = self.service.load("project")
         state["run"] = {"status": "stopped"}
@@ -269,9 +274,23 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         self.assertEqual(updated["question_set_ids"], [])
         self.assertIsNone(updated["run"])
-        self.assertFalse(
-            (self.projects.path_for("project") / "question_sets" / f"{question_set.question_set_id}.json").exists()
-        )
+        self.assertEqual(self.question_sets.get("project", question_set.question_set_id), question_set)
+
+    def test_set_question_sets_clears_run_only_when_selection_changes(self):
+        first = self.service.import_question_set("project", self.question_file)
+        second = self.question_sets.import_file("project", self.question_file)
+        state = self.service.load("project")
+        state["run"] = {"status": "stopped"}
+        self.service._write("project", state)
+
+        unchanged = self.service.set_question_sets("project", [first.question_set_id])
+        self.assertEqual(unchanged["run"], {"status": "stopped"})
+
+        changed = self.service.set_question_sets("project", [second.question_set_id, first.question_set_id])
+        self.assertEqual(changed["question_set_ids"], [second.question_set_id, first.question_set_id])
+        self.assertIsNone(changed["run"])
+        with self.assertRaises(ProjectError):
+            self.service.set_question_sets("project", ["0" * 32])
 
     def test_run_multiple_question_sets_keeps_dataset_identity_on_every_result(self):
         second_file = self.root / "second-dataset.json"
@@ -1110,9 +1129,13 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(question_preview["headers"][0], "資料集")
         question_uploader = next(
             config for config in component_configs
-            if config.get("label") == "選擇要取代目前資料集的 JSON 題目集"
+            if config.get("label") == "選擇要加入實驗的 JSON 題目集"
         )
         self.assertEqual(question_uploader["file_count"], "multiple")
+        question_selector = next(
+            config for config in component_configs if config.get("label") == "題目集（可多選）"
+        )
+        self.assertTrue(question_selector["multiselect"])
         experiment_results = next(
             config for config in component_configs if str(config.get("label", "")).startswith("逐題實驗結果")
         )
@@ -1273,3 +1296,86 @@ class RetrievalExperimentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExperimentQuestionSetSelectorUiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from automotive_graphrag.app import create_app
+
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        root = Path(self.temporary_directory.name) / "projects"
+        ProjectStore(root).create(project_id="P", display_name="P", vehicle_name="V", manual_version="1")
+        app = create_app(root)
+        self.functions = {getattr(event.fn, "__name__", ""): event.fn for event in app.fns.values()}
+        apply = self.functions["apply_experiment_question_sets"]
+        closure = dict(zip(apply.__code__.co_freevars, (cell.cell_contents for cell in apply.__closure__)))
+        self.experiments = closure["retrieval_experiments"]
+        running = self.functions["running_job_views"]
+        self.jobs = dict(zip(
+            running.__code__.co_freevars, (cell.cell_contents for cell in running.__closure__)
+        ))["jobs"]
+        question_sets = self.experiments.question_sets
+        self.first = question_sets.create("P", "第一份")
+        self.second = question_sets.create("P", "第二份")
+        self.experiments.set_question_sets("P", [self.first.question_set_id])
+        state = self.experiments.load("P")
+        state["run"] = {"status": "stopped"}
+        self.experiments._write("P", state)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def applied(self) -> list[str]:
+        return self.experiments.load("P")["question_set_ids"]
+
+    def test_selector_lists_saved_sets_and_import_option_with_applied_value(self) -> None:
+        from automotive_graphrag.app import EXPERIMENT_IMPORT_OPTION
+
+        update = self.functions["experiment_question_set_choices"]("P", [self.first.question_set_id, "gone"])
+
+        values = [value for _label, value in update["choices"]]
+        self.assertEqual(values[-1], EXPERIMENT_IMPORT_OPTION)
+        self.assertEqual(set(values[:-1]), {self.first.question_set_id, self.second.question_set_id})
+        self.assertEqual(update["value"], [self.first.question_set_id])
+
+    def test_choosing_import_opens_upload_and_drops_the_option(self) -> None:
+        from automotive_graphrag.app import EXPERIMENT_IMPORT_OPTION
+
+        selector, section = self.functions["experiment_selector_input"](
+            [self.first.question_set_id, EXPERIMENT_IMPORT_OPTION]
+        )
+
+        self.assertEqual(selector["value"], [self.first.question_set_id])
+        self.assertTrue(section["visible"])
+
+    def test_has_results_reflects_saved_run(self) -> None:
+        self.assertTrue(self.functions["experiment_has_results"]("P"))
+
+    def test_confirmed_apply_switches_sets_clears_run_and_keeps_files(self) -> None:
+        view = self.functions["apply_experiment_question_sets"]("P", [self.second.question_set_id], True)
+
+        self.assertIn("實驗結果已清除", view[0])
+        self.assertEqual(self.applied(), [self.second.question_set_id])
+        self.assertIsNone(self.experiments.load("P")["run"])
+        self.assertEqual(
+            {item.question_set_id for item in self.experiments.question_sets.list("P")},
+            {self.first.question_set_id, self.second.question_set_id},
+        )
+
+    def test_cancelled_or_unchanged_apply_keeps_results(self) -> None:
+        self.functions["apply_experiment_question_sets"]("P", [self.second.question_set_id], False)
+        view = self.functions["apply_experiment_question_sets"]("P", [self.first.question_set_id], True)
+
+        self.assertIn("未變更", view[0])
+        self.assertEqual(self.applied(), [self.first.question_set_id])
+        self.assertEqual(self.experiments.load("P")["run"], {"status": "stopped"})
+
+    def test_running_experiment_blocks_apply(self) -> None:
+        job = self.jobs.begin("P", "retrieval_answer")
+        try:
+            view = self.functions["apply_experiment_question_sets"]("P", [self.second.question_set_id], True)
+        finally:
+            job.release()
+
+        self.assertIn("執行中", view[0])
+        self.assertEqual(self.applied(), [self.first.question_set_id])

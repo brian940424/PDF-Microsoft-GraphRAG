@@ -80,6 +80,7 @@ AUTOQA_IMPORT_LABEL = "+ 匯入題目集..."
 AUTOQA_GENERATE_OPTION = "__generate_questions__"
 AUTOQA_GENERATE_LABEL = "+ 自動生成題目..."
 AUTOQA_ACTION_OPTIONS = (AUTOQA_IMPORT_OPTION, AUTOQA_GENERATE_OPTION)
+EXPERIMENT_IMPORT_OPTION = AUTOQA_IMPORT_OPTION
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = [
@@ -1876,7 +1877,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             question_set = question_sets.get(project_id, question_set_id)
             if retrieval_experiments.uses_question_set(project_id, question_set_id):
                 return (
-                    f"❌ 題目集「{question_set.name}」正用於「4 檢索實驗」，請先在該分頁更換題目集再刪除",
+                    f"❌ 題目集「{question_set.name}」正用於「4 檢索實驗」，請先在該分頁取消選取並按「使用所選題目集」後再刪除",
                     *unchanged, False,
                 )
             question_sets.delete(project_id, question_set_id)
@@ -2211,10 +2212,75 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             details = "\n- ".join(import_errors) or "沒有可匯入的題目集"
             return experiment_view(project_id, f"❌ 題目集匯入失敗：\n- {details}")
         details = "、".join(f"{item.name}（{len(item.questions)} 題）" for item in imported)
-        message = f"✅ 已取代舊題目集；目前資料集：{details}"
+        message = f"✅ 已匯入並加入實驗：{details}"
         if import_errors:
             message += "\n⚠️ 以下檔案未匯入：\n- " + "\n- ".join(import_errors)
         return experiment_view(project_id, message)
+
+    def experiment_question_set_choices(project_id, applied_ids):
+        """All saved question sets plus the import option; the value is the applied selection."""
+        choices = autoqa_question_set_choices(project_id, None).get("choices", [])
+        saved = [(label, value) for label, value in choices if value not in AUTOQA_ACTION_OPTIONS]
+        ids = {value for _label, value in saved}
+        return gr.update(
+            choices=[*saved, (AUTOQA_IMPORT_LABEL, EXPERIMENT_IMPORT_OPTION)],
+            value=[item for item in (applied_ids or []) if item in ids],
+        )
+
+    def experiment_selector_input(selected):
+        """Choosing the import option opens the upload area and drops the option from the selection."""
+        selected = list(selected or [])
+        if EXPERIMENT_IMPORT_OPTION not in selected:
+            return gr.skip(), gr.skip()
+        return gr.update(value=[item for item in selected if item != EXPERIMENT_IMPORT_OPTION]), gr.update(visible=True)
+
+    def experiment_has_results(project_id):
+        if not project_id:
+            return False
+        try:
+            return bool(retrieval_experiments.load(project_id).get("run"))
+        except ProjectError:
+            return False
+
+    def experiment_jobs_running(project_id):
+        return [
+            JOB_BUTTON_LABELS[kind][0] for kind in ("retrieval_answer", "retrieval_evaluate")
+            if jobs.is_running(project_id, kind)
+        ]
+
+    def apply_experiment_question_sets(project_id, selected, confirmed):
+        if not confirmed:
+            return (gr.skip(),) * 11
+        if not project_id:
+            return experiment_view(project_id)
+        busy = experiment_jobs_running(project_id)
+        if busy:
+            return experiment_view(project_id, f"❌ 「{'、'.join(busy)}」執行中，請等待完成或停止後再變更題目集")
+        ids = [item for item in (selected or []) if item != EXPERIMENT_IMPORT_OPTION]
+        try:
+            before = retrieval_experiments.load(project_id)
+            after = retrieval_experiments.set_question_sets(project_id, ids)
+        except ProjectError as exc:
+            return experiment_view(project_id, f"❌ 題目集未變更：{exc}")
+        if after.get("question_set_ids") == before.get("question_set_ids"):
+            return experiment_view(project_id, "題目集未變更")
+        message = f"✅ 已改用 {len(ids)} 份題目集" if ids else "✅ 已清空實驗題目集"
+        if before.get("run"):
+            message += "；原本的實驗結果已清除"
+        return experiment_view(project_id, message)
+
+    def import_experiment_questions_checked(project_id, filepaths, confirmed):
+        """Outputs: the experiment view, then the import section and file input (closed after success)."""
+        if not confirmed:
+            return (gr.skip(),) * 13
+        busy = experiment_jobs_running(project_id) if project_id else []
+        if busy:
+            message = f"❌ 「{'、'.join(busy)}」執行中，請等待完成或停止後再匯入"
+            return (*experiment_view(project_id, message), gr.skip(), gr.skip())
+        view = import_experiment_questions(project_id, filepaths)
+        if str(view[0]).startswith("✅"):
+            return (*view, gr.update(visible=False), gr.update(value=None))
+        return (*view, gr.skip(), gr.skip())
 
     def save_experiment_globals(
         project_id: str | None, concurrency, judge_model: str | None, evaluation_mode: str | None,
@@ -4394,22 +4460,36 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_question_set_state = gr.State([])
 
             with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
-                gr.Markdown(
-                    "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
-                    "題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；"
-                    "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。"
-                )
-                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
-                    with gr.Group(elem_classes=["file-action-group"]):
-                        experiment_question_file = gr.File(
-                            label="選擇要取代目前資料集的 JSON 題目集",
-                            file_types=[".json"],
-                            type="filepath",
-                            file_count="multiple",
-                            height=50,
-                            elem_classes=["no-dashed-file"],
-                        )
-                        experiment_import_button = gr.Button("取代題目集")
+                with gr.Row(equal_height=True):
+                    experiment_question_set_selector = gr.Dropdown(
+                        label="題目集（可多選）",
+                        info="從此專案已儲存的題目集（與「3 自動問答測試」共用）選擇要實驗的資料集，再按「使用所選題目集」；"
+                        f"選「{AUTOQA_IMPORT_LABEL}」上傳新的 JSON。取消選取只從實驗移除，不會刪除題目集",
+                        choices=[],
+                        multiselect=True,
+                        interactive=True,
+                        scale=5,
+                    )
+                    experiment_apply_question_sets_button = gr.Button("使用所選題目集", scale=1, min_width=140)
+                experiment_has_results_flag = gr.Checkbox(visible=False)
+                experiment_question_sets_confirmation = gr.Checkbox(visible=False)
+                with gr.Column(visible=False) as experiment_import_section:
+                    gr.Markdown(
+                        "可一次選多份 JSON，匯入後加入實驗目前的題目集；若任一檔案格式錯誤，整批都不加入。"
+                        "題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；"
+                        "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。"
+                    )
+                    with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                        with gr.Group(elem_classes=["file-action-group"]):
+                            experiment_question_file = gr.File(
+                                label="選擇要加入實驗的 JSON 題目集",
+                                file_types=[".json"],
+                                type="filepath",
+                                file_count="multiple",
+                                height=50,
+                                elem_classes=["no-dashed-file"],
+                            )
+                            experiment_import_button = gr.Button("匯入並加入實驗")
                 experiment_question_preview = gr.Dataframe(
                     headers=["資料集", "題號", "題目", "正確答案", "題目來源", "答案來源"],
                     interactive=False,
@@ -5107,17 +5187,66 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[document_project, target_documents, remove_pdf_confirmation],
             outputs=[document_result, *document_view_outputs, remove_pdf_confirmation],
         )
+        experiment_view_outputs = [
+            experiment_status, experiment_question_set_state, experiment_question_preview,
+            experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
+            experiment_max_concurrency, experiment_judge_model,
+            experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode,
+        ]
+        # Changing the question sets clears saved results, so the browser asks first when there are any.
+        clears_results_js = (
+            "(_value, hasResults) => !hasResults || confirm("
+            "'{action}會清除目前的檢索實驗結果，確定嗎？')"
+        )
         experiment_import_button.click(
-            import_experiment_questions,
-            inputs=[active_project_id, experiment_question_file],
-            outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
-                     experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
-                     experiment_max_concurrency, experiment_judge_model,
-                     experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
+            experiment_has_results, inputs=active_project_id, outputs=experiment_has_results_flag,
+        ).then(
+            None,
+            inputs=[experiment_question_file, experiment_has_results_flag],
+            outputs=experiment_question_sets_confirmation,
+            js=clears_results_js.replace("{action}", "匯入並加入題目集"),
+        ).then(
+            import_experiment_questions_checked,
+            inputs=[active_project_id, experiment_question_file, experiment_question_sets_confirmation],
+            outputs=[*experiment_view_outputs, experiment_import_section, experiment_question_file],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
             experiment_progress_views, inputs=active_project_id,
             outputs=[experiment_progress_bar, experiment_evaluate_progress],
         ).then(**experiment_table_refresh)
+        experiment_apply_question_sets_button.click(
+            experiment_has_results, inputs=active_project_id, outputs=experiment_has_results_flag,
+        ).then(
+            None,
+            inputs=[experiment_question_set_selector, experiment_has_results_flag],
+            outputs=experiment_question_sets_confirmation,
+            js=clears_results_js.replace("{action}", "若題目集有變更，"),
+        ).then(
+            apply_experiment_question_sets,
+            inputs=[active_project_id, experiment_question_set_selector, experiment_question_sets_confirmation],
+            outputs=experiment_view_outputs,
+        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
+            experiment_progress_views, inputs=active_project_id,
+            outputs=[experiment_progress_bar, experiment_evaluate_progress],
+        ).then(**experiment_table_refresh)
+        experiment_question_set_selector.input(
+            experiment_selector_input,
+            inputs=experiment_question_set_selector,
+            outputs=[experiment_question_set_selector, experiment_import_section],
+        )
+        # The selector follows the applied question sets, and refreshes when the tab opens because
+        # question sets may have been imported or deleted on 「3 自動問答測試」.
+        experiment_question_set_state.change(
+            experiment_question_set_choices,
+            inputs=[active_project_id, experiment_question_set_state],
+            outputs=experiment_question_set_selector,
+            show_progress="hidden",
+        )
+        experiment_tab.select(
+            experiment_question_set_choices,
+            inputs=[active_project_id, experiment_question_set_state],
+            outputs=experiment_question_set_selector,
+            show_progress="hidden",
+        )
         experiment_add_group_button.click(
             add_experiment_group,
             inputs=[active_project_id, experiment_group_revision],

@@ -465,12 +465,13 @@ class RetrievalExperimentService:
     def import_question_sets(self, project_id: str, filepaths: Sequence[str | Path]) -> list[object]:
         imported, errors = self.import_question_sets_with_errors(project_id, filepaths)
         if errors:
-            raise ProjectError("題目集未取代，舊資料已保留：\n- " + "\n- ".join(errors))
+            raise ProjectError("題目集未匯入，實驗題目集維持原狀：\n- " + "\n- ".join(errors))
         return imported
 
     def import_question_sets_with_errors(
         self, project_id: str, filepaths: Sequence[str | Path]
     ) -> tuple[list[object], list[str]]:
+        """Import JSON files and add them to the experiment's question sets; nothing is deleted."""
         if not filepaths:
             raise ProjectError("請至少選擇一份 JSON 題目集")
         current = self.load(project_id)
@@ -485,29 +486,33 @@ class RetrievalExperimentService:
             except (ProjectError, OSError, ValueError) as exc:
                 errors.append(f"{Path(filepath).name}：{exc}")
         if errors or not imported:
-            # Treat multi-file replacement atomically: a malformed file must not
-            # replace or partially erase the currently loaded datasets.
+            # A multi-file import is all or nothing: the files saved before a malformed
+            # one are removed again, and the experiment keeps its question sets.
             for item in imported:
                 try:
                     self.question_sets.delete(project_id, item.question_set_id)
                 except (ProjectError, OSError):
                     pass
             return [], errors or ["沒有可匯入的題目集"]
+        self.set_question_sets(project_id, [*old_ids, *(item.question_set_id for item in imported)])
+        return imported, errors
 
-        ids = [item.question_set_id for item in imported]
+    def set_question_sets(self, project_id: str, question_set_ids: Sequence[str]) -> dict[str, object]:
+        """Use these saved question sets; a changed selection clears the saved run."""
+        ids = list(dict.fromkeys(str(item) for item in question_set_ids if item))
+        for question_set_id in ids:
+            self.question_sets.get(project_id, question_set_id)
+        current = self.load(project_id)
+        old_ids = self._normalize_question_set_ids(
+            current.get("question_set_ids", current.get("question_set_id", ""))
+        )
+        if ids == old_ids:
+            return current
         current["question_set_ids"] = ids
-        current["question_set_id"] = ids[0]
+        current["question_set_id"] = ids[0] if ids else ""
         current["run"] = None
         self._write(project_id, current)
-        for old_id in old_ids:
-            if old_id not in ids:
-                try:
-                    self.question_sets.delete(project_id, old_id)
-                except ProjectError:
-                    # A stale ID may already have been removed; the replacement
-                    # state is authoritative and remains usable.
-                    pass
-        return imported, errors
+        return current
 
     def uses_question_set(self, project_id: str, question_set_id: str) -> bool:
         state = self.load(project_id)
@@ -516,21 +521,14 @@ class RetrievalExperimentService:
         )
 
     def remove_question_set(self, project_id: str, question_set_id: str) -> dict[str, object]:
+        """Stop using a question set in the experiment; its file is kept."""
         current = self.load(project_id)
-        ids = [item for item in self._normalize_question_set_ids(current.get("question_set_ids"))
-               if item != question_set_id]
-        if len(ids) == len(self._normalize_question_set_ids(current.get("question_set_ids"))):
+        old_ids = self._normalize_question_set_ids(
+            current.get("question_set_ids", current.get("question_set_id", ""))
+        )
+        if question_set_id not in old_ids:
             raise ProjectError(f"題目集不在檢索實驗清單中：{question_set_id}")
-        current["question_set_ids"] = ids
-        current["question_set_id"] = ids[0] if ids else ""
-        current["run"] = None
-        self._write(project_id, current)
-        try:
-            self.question_sets.delete(project_id, question_set_id)
-        except ProjectError:
-            # The active list is already updated; tolerate a stale missing file.
-            pass
-        return current
+        return self.set_question_sets(project_id, [item for item in old_ids if item != question_set_id])
 
     @staticmethod
     def _normalize_question_set_ids(value: str | Sequence[str] | object) -> list[str]:
