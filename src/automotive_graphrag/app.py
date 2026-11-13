@@ -82,7 +82,8 @@ PROCESSING_COLUMNS = [
 ]
 VISION_DISABLED = "__vision_disabled__"
 REVIEW_FILTERS = ["全部", "未檢查", "已修改", "Vision", "文字層", "Vision 失敗", "空白／錯誤"]
-REVIEW_COLUMNS = ["頁碼", "解析方式", "已檢查", "已修改", "字元數"]
+# Lines of removed text listed under a page in the page review.
+REVIEW_REMOVED_LINES_SHOWN = 12
 PAGE_SOURCE_LABELS = {
     "vision": "Vision",
     "text": "文字層",
@@ -191,6 +192,32 @@ APP_CSS = """
 }
 #query-summary {
     flex: 0 0 auto !important;
+}
+/* 逐頁檢查兩欄等高：右欄的解析結果撐滿到與原頁同高，頁碼固定在底部；文字過長時在框內捲動 */
+.review-editor,
+.review-editor > .styler,
+.review-editor > .styler > .form {
+    flex: 1 1 0 !important;
+    display: flex !important;
+    flex-direction: column;
+    min-width: 0;
+}
+#review-text {
+    flex: 1 1 auto !important;
+    display: flex;
+    flex-direction: column;
+}
+#review-text > label,
+#review-text .input-container {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+}
+#review-text textarea {
+    flex: 1 1 0;
+    height: auto !important;
+    min-height: 0;
+    overflow-y: auto !important;
 }
 /* 匯入／匯出題目集兩欄等高：檔案區撐滿，按鈕固定在底部 */
 .file-action-group,
@@ -3136,10 +3163,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f'<span>{html.escape(detail)}</span><span>{percent}%｜{html.escape(status)}</span></div></div>'
         )
 
-    def review_document_choices(project_id: str | None, current: str | None):
-        names = [item.filename for item in documents.list_documents_if_available(project_id)]
-        return gr.Dropdown(choices=names, value=current if current in names else (names[0] if names else None))
-
     def review_margin_options(
         project_id: str, filename: str, option_rows: object | None,
     ) -> tuple[dict[str, object], bool]:
@@ -3188,38 +3211,36 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ]
         return [item for item in reviews if review_matches(item, review_filter)]
 
-    def review_rows(reviews: list[PageReview]) -> list[list[object]]:
-        return [
-            [
-                item.page,
-                PAGE_SOURCE_LABELS[item.source],
-                "✅" if item.reviewed else "",
-                ("⚠️ 解析結果已變" if item.source_changed else "✏️") if item.edited else "",
-                len(item.text),
-            ]
-            for item in reviews
-        ]
+    def markdown_code(text: str) -> str:
+        """Inline code span, so text such as ``< REMOVAL >`` is not read as HTML or Markdown."""
+        return f"`{text.replace('`', "'")}`"
 
     def review_margin_view(project_id: str, filename: str, page: int, option_rows: object | None):
-        """The page image with ignored margins shaded, notes on what they remove, and the clipped text layer."""
+        """The page image with ignored margins shaded, info lines on what they remove, and the clipped text layer."""
         options, changed = review_margin_options(project_id, filename, option_rows)
         try:
             preview = documents.margin_preview(project_id, filename, page, options)
         except ProjectError as exc:
             image = Image.open(io.BytesIO(documents.render_page_image(project_id, filename, page)))
-            return image, [f"❌ 忽略比例：{exc}"], ""
-        notes: list[str] = []
-        top, bottom, left, right = preview.margin_points
-        if any(preview.margin_points):
-            notes.append(f"紅色為忽略區域（不讀取、不送 Vision）：上 {top:g} pt、下 {bottom:g} pt、左 {left:g} pt、右 {right:g} pt")
-            removed = "、".join(preview.removed_lines) or "無"
-            notes.append(f"此頁會裁掉的文字：{removed[:300]}{'…' if len(removed) > 300 else ''}")
+            return image, [f"❌ 忽略比例無效：{exc}"], ""
+        lines: list[str] = []
+        sides = [
+            f"{side} {points:g} pt"
+            for side, points in zip(("上", "下", "左", "右"), preview.margin_points)
+            if points
+        ]
+        if sides:
+            lines.append(f"🟥 **忽略範圍**：{'、'.join(sides)}（紅色區域不讀取、不送 Vision）")
+            removed = preview.removed_lines[:REVIEW_REMOVED_LINES_SHOWN]
+            more = len(preview.removed_lines) - len(removed)
+            shown = " ".join(markdown_code(line[:60]) for line in removed) or "無"
+            lines.append(f"✂️ **裁掉文字**：{shown}{f' …另 {more} 行' if more > 0 else ''}")
         if changed:
-            notes.append("⚠️ 忽略比例依「前處理設定」表格目前的數值標示，與上次前處理不同；解析結果需重新前處理才會更新")
-        return Image.open(io.BytesIO(preview.image_png)), notes, preview.kept_text
+            lines.append("⚠️ 表格中的比例與上次前處理不同，右側解析結果要重新前處理才會更新")
+        return Image.open(io.BytesIO(preview.image_png)), lines, preview.kept_text
 
     def review_page_view(project_id: str | None, filename: str | None, page: object, option_rows: object | None = None):
-        """Image, text and status line of one page."""
+        """Image, text and info lines of one page."""
         try:
             page_number = int(page)
             review = next(
@@ -3230,19 +3251,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             review = None
         if review is None:
             return None, "", ""
-        image, notes, kept_text = review_margin_view(project_id, filename, review.page, option_rows)
-        flags = [f"**第 {review.page} 頁**", f"解析方式：{PAGE_SOURCE_LABELS[review.source]}"]
+        image, margin_lines, kept_text = review_margin_view(project_id, filename, review.page, option_rows)
+        status = [f"📄 **{filename}　第 {review.page} 頁**", PAGE_SOURCE_LABELS[review.source]]
+        notes: list[str] = []
         if review.source == "pending":
-            flags.append("右側為套用目前忽略比例的文字層預覽，前處理後才會寫入")
-            return image, kept_text, "\n\n".join(["｜".join(flags), *notes])
-        flags.append("✅ 已檢查" if review.reviewed else "⬜ 未檢查")
-        if review.edited:
-            flags.append("✏️ 已手動修改，重新前處理會保留")
-        if review.source_changed:
-            flags.append("⚠️ 修改後重新前處理過且解析結果已變，請確認修改是否仍正確")
-        if review.error:
-            flags.append(f"錯誤：{' '.join(review.error.split())[:200]}")
-        return image, review.text, "\n\n".join(["｜".join(flags), *notes])
+            notes.append("ℹ️ 右側為套用目前比例的文字層預覽，前處理後才會寫入")
+            text = kept_text
+        else:
+            status.append("✅ 已檢查" if review.reviewed else "⬜ 未檢查")
+            if review.edited:
+                status.append("✏️ 已手動修改")
+            if review.source_changed:
+                notes.append("⚠️ 修改後重新前處理過且解析結果已變，請確認修改是否仍正確")
+            if review.error:
+                notes.append(f"❌ 錯誤：{' '.join(review.error.split())[:200]}")
+            text = review.text
+        # Markdown line breaks keep the info compact instead of one paragraph per line.
+        return image, text, "  \n".join([" ｜ ".join(status), *margin_lines, *notes])
 
     def review_margin_refresh(project_id: str | None, filename: str | None, page: object, option_rows: object | None):
         """Redraw the margins after the options table changes, keeping unsaved edits in the editor."""
@@ -3254,22 +3279,52 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         project_id: str | None, filename: str | None, review_filter: str | None, page: object,
         option_rows: object | None = None,
     ):
-        """Reload the page list, keeping the current page when it still matches the filter."""
+        """Page, image, text and info, keeping the current page when it still matches the filter."""
         try:
             reviews = filtered_reviews(project_id, filename, review_filter, option_rows)
         except ProjectError as exc:
-            return [], None, None, "", f"❌ {exc}"
+            return None, None, "", f"❌ {exc}"
         pages = [item.page for item in reviews]
+        if not pages:
+            return None, None, "", (f"{filename} 沒有符合「{review_filter}」的頁面" if filename else "")
         try:
             current = int(page)
         except (TypeError, ValueError):
             current = None
-        selected = current if current in pages else (pages[0] if pages else None)
-        return review_rows(reviews), selected, *review_page_view(project_id, filename, selected, option_rows)
+        selected = current if current in pages else pages[0]
+        return selected, *review_page_view(project_id, filename, selected, option_rows)
 
-    def review_select(project_id: str | None, filename: str | None, option_rows: object | None, evt: gr.SelectData):
-        page = (evt.row_value or [None])[0]
-        return page, *review_page_view(project_id, filename, page, option_rows)
+    def review_sync(
+        project_id: str | None, option_rows: object | None, filename: str | None, review_filter: str | None,
+        page: object, force: bool = False,
+    ):
+        """Keep the reviewed PDF in step with the options table rows.
+
+        The PDF stays while it is still in the table; edits to the table then only redraw the
+        page (unsaved text in the editor is kept). Otherwise the first row is reviewed.
+        """
+        names = list(parse_processing_options(option_rows))
+        if filename in names and not force:
+            try:
+                pages = [item.page for item in filtered_reviews(project_id, filename, review_filter, option_rows)]
+                current = int(page)
+            except (TypeError, ValueError, ProjectError):
+                pages, current = [], None
+            if current in pages:
+                return gr.skip(), gr.skip(), *review_margin_refresh(project_id, filename, current, option_rows)
+        if filename not in names:
+            filename, page = (names[0] if names else None), None
+        return filename, *review_refresh(project_id, filename, review_filter, page, option_rows)
+
+    def review_pick(
+        project_id: str | None, option_rows: object | None, filename: str | None, review_filter: str | None,
+        evt: gr.SelectData,
+    ):
+        """Clicking a row of the options table reviews that PDF; clicks within the current PDF's row change nothing."""
+        picked = Path(str((evt.row_value or [None])[0])).name if evt.row_value else None
+        if not picked or picked == filename:
+            return (gr.skip(),) * 5
+        return picked, *review_refresh(project_id, picked, review_filter, None, option_rows)
 
     def review_step(
         project_id: str | None, filename: str | None, review_filter: str | None, page: object, step: int,
@@ -3295,12 +3350,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     ):
         return review_step(project_id, filename, review_filter, page, -1, option_rows)
 
-    def review_next_page(
-        project_id: str | None, filename: str | None, review_filter: str | None, page: object,
-        option_rows: object | None = None,
-    ):
-        return review_step(project_id, filename, review_filter, page, 1, option_rows)
-
     def review_save(project_id: str | None, filename: str | None, page: object, text: str | None, revert: bool = False):
         if not project_id or not filename or page in (None, ""):
             return "❌ 請先選擇 PDF 與頁面"
@@ -3315,6 +3364,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}"
         edited = "，內容與解析結果不同，已標示為手動修改" if review.edited else ""
         return f"✅ 第 {review.page} 頁已儲存並標示已檢查{edited}；需重新建立 Graph 才會套用"
+
+    def review_save_next(
+        project_id: str | None, filename: str | None, review_filter: str | None, page: object, text: str | None,
+        option_rows: object | None = None,
+    ):
+        """Save the page, then move to the next page matching the filter."""
+        message = review_save(project_id, filename, page, text)
+        if message.startswith("❌"):
+            return message, *(gr.skip(),) * 4
+        target, *view = review_step(project_id, filename, review_filter, page, 1, option_rows)
+        if target == int(page):
+            message += "；已是最後一頁"
+        return message, target, *view
 
     def review_extract(
         project_id: str | None, filename: str | None, page: object, use_vision: bool,
@@ -3832,7 +3894,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         choices=vision_model_choices(),
                         value=default_vision_model(),
                         label="Vision 模型",
-                        info="以 Vision 模型轉寫頁面影像：表格轉 Markdown、圖片與圖解改寫成文字描述，失敗的頁面改用文字層。會依頁數呼叫 API。",
+                        info="以 Vision 模型轉寫頁面影像：表格轉 Markdown、圖片與圖解改寫成文字描述。",
                     )
                     vision_reasoning_effort = gr.Dropdown(
                         choices=VISION_REASONING_EFFORT_CHOICES, value="low", label="推理深度",
@@ -3849,6 +3911,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         lambda model: gr.update(visible=model_supports_reasoning(model)),
                         inputs=vision_model, outputs=vision_reasoning_effort,
                     )
+                review_filter = gr.Dropdown(REVIEW_FILTERS, value="全部", label="篩選頁面", scale=0)
                 processing_options_table = gr.Dataframe(
                     headers=PROCESSING_COLUMNS,
                     interactive=True,
@@ -3856,29 +3919,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     type="array",
                     static_columns=[0, 1],
                     label=(
-                        "頁面索引從 0 開始，結束頁包含在範圍內；左右忽略比例可去除頁緣的章節索引籤；"
-                        "設定在執行前處理後才會儲存"
+                        "點選列即在下方逐頁檢查該 PDF；頁面索引從 0 開始，結束頁包含在範圍內；"
+                        "左右忽略比例可去除頁緣的章節索引籤；設定在執行前處理後才會儲存"
                     ),
                 )
-                gr.Markdown("**逐頁檢查**：原頁以紅色標示上表的忽略範圍，右側為解析結果；尚未前處理的 PDF 顯示套用比例後的文字層預覽")
-                with gr.Row():
-                    review_document = gr.Dropdown(label="PDF", choices=[], scale=2)
-                    review_filter = gr.Dropdown(REVIEW_FILTERS, value="全部", label="篩選頁面", scale=1)
-                review_table = gr.Dataframe(
-                    headers=REVIEW_COLUMNS,
-                    interactive=False,
-                    type="array",
-                    max_height=260,
-                    label="點選列切換頁面",
-                )
+                # The PDF under review: the row last clicked in the options table (first row by default).
+                review_document = gr.State(None)
+                with gr.Group():
+                    gr.Markdown(
+                    "### 逐頁檢查\n點選上表的列切換 PDF；左側原頁的紅色區域為忽略範圍，右側為送去建圖的文字"
+                    )
+                    review_info = gr.Markdown(elem_classes="collapse-when-empty")
                 
-                review_info = gr.Markdown(elem_classes="collapse-when-empty")
                 with gr.Row(equal_height=True):
                     review_image = gr.Image(type="pil", label="PDF 原頁", interactive=False, height=760)
                     
-                    with gr.Group():
+                    with gr.Group(elem_classes="review-editor"):
                         review_text = gr.Textbox(
-                            label="解析結果（可直接修改，此為送去建圖的文字）", lines=30, max_lines=40, interactive=True
+                            label="解析結果（可直接修改，此為送去建圖的文字）", lines=12, interactive=True,
+                            elem_id="review-text",
                         )
                         review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
                 with gr.Row():
@@ -3886,8 +3945,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     review_vision_button = gr.Button("重跑 Vision（本頁）")
                     review_text_layer_button = gr.Button("改用文字層")
                     review_revert_button = gr.Button("還原為解析結果")
-                    review_save_button = gr.Button("儲存並標示已檢查", variant="primary")
-                    review_next = gr.Button("下一頁 ▶")
+                    review_save_next_button = gr.Button("儲存並前往下一頁 ▶", variant="primary")
                 review_status = gr.Markdown(elem_classes="collapse-when-empty")
 
             with gr.Group():
@@ -4799,42 +4857,48 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(**experiment_table_refresh)
         document_view_outputs = [document_table, processing_options_table, target_documents, document_empty_notice]
+        review_sync_event = dict(
+            fn=review_sync,
+            inputs=[document_project, processing_options_table, review_document, review_filter, review_page],
+            outputs=[review_document, review_page, review_image, review_text, review_info],
+        )
         documents_tab.select(
             documents_tab_visibility,
             inputs=[document_project, target_documents],
             outputs=[document_table, document_empty_notice, processing_options_section],
-        ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document)
+        ).then(**review_sync_event)
         review_inputs = [document_project, review_document, review_filter, review_page, processing_options_table]
-        review_outputs = [review_table, review_page, review_image, review_text, review_info]
+        review_outputs = [review_page, review_image, review_text, review_info]
         review_page_outputs = [review_image, review_text, review_info]
-        review_document.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
+
+        def document_view_keeping_options(project_id: str | None):
+            # Re-rendering the options table here would drop margins typed but not yet saved.
+            table, _rows, targets, notice = document_view(project_id)
+            return table, gr.skip(), targets, notice
+
         review_filter.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
         review_page.submit(
             review_page_view, inputs=[document_project, review_document, review_page, processing_options_table],
             outputs=review_page_outputs,
         )
-        review_table.select(
-            review_select, inputs=[document_project, review_document, processing_options_table],
-            outputs=[review_page, *review_page_outputs],
+        processing_options_table.select(
+            review_pick,
+            inputs=[document_project, processing_options_table, review_document, review_filter],
+            outputs=[review_document, *review_outputs],
         )
-        processing_options_table.change(
-            review_margin_refresh,
-            inputs=[document_project, review_document, review_page, processing_options_table],
-            outputs=review_page_outputs,
-        )
+        processing_options_table.change(**review_sync_event)
         review_previous.click(review_previous_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
-        review_next.click(review_next_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
-        review_save_button.click(
-            review_save, inputs=[document_project, review_document, review_page, review_text], outputs=review_status,
-        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
-            document_view, inputs=document_project, outputs=document_view_outputs
-        )
+        review_save_next_button.click(
+            review_save_next,
+            inputs=[document_project, review_document, review_filter, review_page, review_text, processing_options_table],
+            outputs=[review_status, *review_outputs],
+        ).then(document_view_keeping_options, inputs=document_project, outputs=document_view_outputs)
         review_revert_button.click(
             lambda project_id, filename, page: review_save(project_id, filename, page, None, revert=True),
             inputs=[document_project, review_document, review_page],
             outputs=review_status,
         ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
-            document_view, inputs=document_project, outputs=document_view_outputs
+            document_view_keeping_options, inputs=document_project, outputs=document_view_outputs
         )
         review_vision_button.click(
             lambda project_id, filename, page, model, scope, effort: review_extract(project_id, filename, page, True, model, scope, effort),
@@ -4869,8 +4933,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             "preprocess", preprocess_button, preprocess_stop_button, preprocess_documents,
             inputs=[document_project, processing_options_table, target_documents, vision_model, vision_scope, vision_reasoning_effort],
             outputs=[document_result, document_progress, *document_view_outputs],
-        ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document).then(
-            review_refresh, inputs=review_inputs, outputs=review_outputs
+        ).then(
+            lambda project_id, rows, filename, review_filter, page: review_sync(
+                project_id, rows, filename, review_filter, page, force=True,
+            ),
+            inputs=review_sync_event["inputs"], outputs=review_sync_event["outputs"],
         ).then(processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section)
         bind_job(
             "index", index_button, index_stop_button, build_index,

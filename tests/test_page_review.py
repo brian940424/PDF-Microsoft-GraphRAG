@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import gradio as gr
 import pymupdf
 
 from automotive_graphrag.app import create_app
@@ -147,46 +148,74 @@ class PageReviewUiTests(unittest.TestCase):
 
     def test_filter_save_and_step_through_pages(self) -> None:
         refresh = self.functions["review_refresh"]
-        dropdown = self.functions["review_document_choices"]("L33-SM3E", None)
-        self.assertEqual(dropdown.value, "A.pdf")
-
-        rows, page, image, text, info = refresh("L33-SM3E", "A.pdf", "全部", None)
-        self.assertEqual([row[:2] for row in rows], [[1, "文字層"], [2, "空白"], [3, "文字層"]])
+        page, image, text, info = refresh("L33-SM3E", "A.pdf", "全部", None)
         self.assertEqual((page, text), (1, "甲頁"))
         self.assertEqual(image.size[0] > 0, True)
+        self.assertIn("**A.pdf　第 1 頁**", info)
         self.assertIn("⬜ 未檢查", info)
 
-        message = self.functions["review_save"]("L33-SM3E", "A.pdf", 1, "甲頁（修正）")
+        save_next = self.functions["review_save_next"]
+        message, page, _, text, _ = save_next("L33-SM3E", "A.pdf", "全部", 1, "甲頁（修正）")
         self.assertIn("已標示為手動修改", message)
-        rows, page, *_ = refresh("L33-SM3E", "A.pdf", "已修改", 1)
-        self.assertEqual((len(rows), page, rows[0][3]), (1, 1, "✏️"))
+        # Saving moves on to the next page matching the filter.
+        self.assertEqual((page, text), (2, ""))
+        page, *_ = refresh("L33-SM3E", "A.pdf", "已修改", 3)
+        self.assertEqual(page, 1)
+        self.assertEqual(refresh("L33-SM3E", "A.pdf", "未檢查", 1)[0], 2)
 
-        rows, page, *_ = refresh("L33-SM3E", "A.pdf", "未檢查", 1)
-        self.assertEqual([row[0] for row in rows], [2, 3])
-        self.assertEqual(page, 2)
-        # Stepping stays within the filtered pages and stops at either end.
-        self.assertEqual(self.functions["review_next_page"]("L33-SM3E", "A.pdf", "未檢查", 2)[0], 3)
-        self.assertEqual(self.functions["review_next_page"]("L33-SM3E", "A.pdf", "未檢查", 3)[0], 3)
+        # With the "unchecked" filter the saved page drops out and the next unchecked page follows.
+        message, page, *_ = save_next("L33-SM3E", "A.pdf", "未檢查", 2, "")
+        self.assertEqual(page, 3)
+        message, page, *_ = save_next("L33-SM3E", "A.pdf", "全部", 3, "丙頁")
+        self.assertEqual(page, 3)
+        self.assertIn("已是最後一頁", message)
+        self.assertIn("沒有符合「未檢查」的頁面", refresh("L33-SM3E", "A.pdf", "未檢查", 1)[3])
         self.assertEqual(self.functions["review_previous_page"]("L33-SM3E", "A.pdf", "全部", 3)[0], 2)
+        # A failed save stays on the page.
+        message, *rest = save_next("L33-SM3E", None, "全部", 1, "x")
+        self.assertTrue(message.startswith("❌"))
 
+    def test_options_table_rows_choose_the_reviewed_pdf(self) -> None:
+        write_pdf(ProjectStore(self.root).path_for("L33-SM3E") / "source" / "B.pdf", ["乙頁", "乙二"])
+        rows = [["A.pdf", 3, 0, 0, 0, 0, 0, 2], ["B.pdf", 2, 0, 0, 0, 0, 0, 1]]
+        sync = self.functions["review_sync"]
+
+        filename, page, _, text, info = sync("L33-SM3E", rows, None, "全部", None)
+        self.assertEqual((filename, page, text), ("A.pdf", 1, "甲頁"))
+        # Editing the table while A.pdf stays listed keeps the PDF, page and editor text.
+        result = sync("L33-SM3E", rows, "A.pdf", "全部", 3)
+        self.assertFalse(isinstance(result[0], str))
+        self.assertFalse(isinstance(result[3], str))
+        # A PDF no longer in the table falls back to the first row.
+        self.assertEqual(sync("L33-SM3E", rows[1:], "A.pdf", "全部", 3)[:2], ("B.pdf", 1))
+        self.assertEqual(sync("L33-SM3E", rows, "A.pdf", "全部", 3, force=True)[:2], ("A.pdf", 3))
+
+        pick = self.functions["review_pick"]
+        clicked = gr.SelectData(None, {"index": [1, 5], "value": 0, "row_value": rows[1]})
+        filename, page, _, text, info = pick("L33-SM3E", rows, "A.pdf", "全部", clicked)
+        self.assertEqual((filename, page, text), ("B.pdf", 1, "乙頁"))
+        self.assertIn("尚未前處理", info)
+        # Clicking a cell of the PDF already under review (e.g. to edit a margin) changes nothing.
+        same = gr.SelectData(None, {"index": [1, 5], "value": 0, "row_value": rows[1]})
+        self.assertTrue(all(not isinstance(value, str) for value in pick("L33-SM3E", rows, "B.pdf", "全部", same)))
 
     def test_review_shades_margins_from_unsaved_table_and_keeps_editor_text(self) -> None:
         rows = [["A.pdf", 3, 0, 0, 0, 10, 0, 2]]
-        _, page, image, text, info = self.functions["review_refresh"]("L33-SM3E", "A.pdf", "全部", None, rows)
+        page, image, text, info = self.functions["review_refresh"]("L33-SM3E", "A.pdf", "全部", None, rows)
         self.assertEqual((page, text), (1, "甲頁"))
         self.assertGreater(image.size[0], 0)
         self.assertIn("右 59.5 pt", info)
         self.assertIn("與上次前處理不同", info)
         # Without table values the saved (zero) margins apply and nothing is shaded.
-        self.assertNotIn("紅色為忽略區域", self.functions["review_page_view"]("L33-SM3E", "A.pdf", 1)[2])
+        self.assertNotIn("忽略範圍", self.functions["review_page_view"]("L33-SM3E", "A.pdf", 1)[2])
 
         # Editing the table redraws the image but leaves the editor alone for preprocessed PDFs.
-        image, text, info = self.functions["review_margin_refresh"]("L33-SM3E", "A.pdf", 1, rows)
+        *_, image, text, info = self.functions["review_sync"]("L33-SM3E", rows, "A.pdf", "全部", 1)
         self.assertGreater(image.size[0], 0)
         self.assertFalse(isinstance(text, str))
         self.assertIn("右 59.5 pt", info)
         rows[0][4], rows[0][5] = 60, 50
-        self.assertIn("❌ 忽略比例", self.functions["review_margin_refresh"]("L33-SM3E", "A.pdf", 1, rows)[2])
+        self.assertIn("❌ 忽略比例", self.functions["review_sync"]("L33-SM3E", rows, "A.pdf", "全部", 1)[4])
 
     def test_pdf_not_yet_preprocessed_previews_clipped_text_layer(self) -> None:
         store = ProjectStore(self.root)
@@ -199,16 +228,18 @@ class PageReviewUiTests(unittest.TestCase):
         document.save(source)
         document.close()
 
-        dropdown = self.functions["review_document_choices"]("L33-SM3E", "B.pdf")
-        self.assertEqual((dropdown.value, [name for name, _ in dropdown.choices]), ("B.pdf", ["A.pdf", "B.pdf"]))
         rows = [["B.pdf", 3, 0, 0, 0, 8, 1, 2]]
-        table, page, _, text, info = self.functions["review_refresh"]("L33-SM3E", "B.pdf", "全部", None, rows)
-        self.assertEqual([row[:2] for row in table], [[2, "尚未前處理"], [3, "尚未前處理"]])
+        page, _, text, info = self.functions["review_refresh"]("L33-SM3E", "B.pdf", "全部", None, rows)
+        # Only pages inside the table's range (indexes 1–2) are listed.
         self.assertEqual((page, text), (2, "Body text"))
-        self.assertIn("此頁會裁掉的文字：TAB", info)
-        _, text, _ = self.functions["review_margin_refresh"]("L33-SM3E", "B.pdf", 2, [["B.pdf", 3, 0, 0, 0, 0, 1, 2]])
+        self.assertEqual(self.functions["review_previous_page"]("L33-SM3E", "B.pdf", "全部", 2, rows)[0], 2)
+        self.assertIn("｜ 尚未前處理", info)
+        self.assertIn("**裁掉文字**：`TAB`", info)
+        *_, text, _ = self.functions["review_sync"]("L33-SM3E", [["B.pdf", 3, 0, 0, 0, 0, 1, 2]], "B.pdf", "全部", 2)
         self.assertEqual(text, "Body text\nTAB")
-        self.assertIn("尚未前處理", self.functions["review_save"]("L33-SM3E", "B.pdf", 2, "x"))
+        message, page, *_ = self.functions["review_save_next"]("L33-SM3E", "B.pdf", "全部", 2, "x", rows)
+        self.assertIn("尚未前處理", message)
+        self.assertFalse(isinstance(page, int))
 
     def test_settings_and_review_section_opens_only_while_selected_pdfs_need_preprocessing(self) -> None:
         update = self.functions["processing_section_update"]
