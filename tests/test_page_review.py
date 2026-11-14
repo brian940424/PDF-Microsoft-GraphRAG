@@ -180,19 +180,28 @@ class PageReviewUiTests(unittest.TestCase):
         rows = [["A.pdf", 3, 0, 0, 0, 0, 0, 2], ["B.pdf", 2, 0, 0, 0, 0, 0, 1]]
         sync = self.functions["review_sync"]
 
-        filename, page, _, text, info = sync("L33-SM3E", rows, None, "全部", None)
-        self.assertEqual((filename, page, text), ("A.pdf", 1, "甲頁"))
+        filename, page, _, text, info, filter_update = sync("L33-SM3E", rows, None, "全部", None)
+        # Filter choices carry page counts; A.pdf has a blank page 2 and no Vision failures,
+        # so a newly reviewed PDF opens on the blank/error filter.
+        self.assertEqual((filename, page, text), ("A.pdf", 2, ""))
+        self.assertEqual(filter_update["value"], "空白／錯誤")
+        self.assertIn(("全部（3）", "全部"), filter_update["choices"])
+        self.assertIn(("空白／錯誤（1）", "空白／錯誤"), filter_update["choices"])
+        self.assertIn(("Vision 失敗（0）", "Vision 失敗"), filter_update["choices"])
+        page, _, text, _ = self.functions["review_refresh"]("L33-SM3E", "A.pdf", "全部", None, rows)
+        self.assertEqual((page, text), (1, "甲頁"))
         # Editing the table while A.pdf stays listed keeps the PDF, page and editor text.
         result = sync("L33-SM3E", rows, "A.pdf", "全部", 3)
         self.assertFalse(isinstance(result[0], str))
         self.assertFalse(isinstance(result[3], str))
         # A PDF no longer in the table falls back to the first row.
         self.assertEqual(sync("L33-SM3E", rows[1:], "A.pdf", "全部", 3)[:2], ("B.pdf", 1))
-        self.assertEqual(sync("L33-SM3E", rows, "A.pdf", "全部", 3, force=True)[:2], ("A.pdf", 3))
+        # After preprocessing (force) the filter resets to the default, so the blank page comes up.
+        self.assertEqual(sync("L33-SM3E", rows, "A.pdf", "全部", 3, force=True)[:2], ("A.pdf", 2))
 
         pick = self.functions["review_pick"]
         clicked = gr.SelectData(None, {"index": [1, 5], "value": 0, "row_value": rows[1]})
-        filename, page, _, text, info = pick("L33-SM3E", rows, "A.pdf", "全部", clicked)
+        filename, page, _, text, info, _ = pick("L33-SM3E", rows, "A.pdf", "全部", clicked)
         self.assertEqual((filename, page, text), ("B.pdf", 1, "乙頁"))
         self.assertIn("尚未前處理", info)
         # Clicking a cell of the PDF already under review (e.g. to edit a margin) changes nothing.
@@ -210,7 +219,7 @@ class PageReviewUiTests(unittest.TestCase):
         self.assertNotIn("忽略範圍", self.functions["review_page_view"]("L33-SM3E", "A.pdf", 1)[2])
 
         # Editing the table redraws the image but leaves the editor alone for preprocessed PDFs.
-        *_, image, text, info = self.functions["review_sync"]("L33-SM3E", rows, "A.pdf", "全部", 1)
+        *_, image, text, info, _ = self.functions["review_sync"]("L33-SM3E", rows, "A.pdf", "全部", 1)
         self.assertGreater(image.size[0], 0)
         self.assertFalse(isinstance(text, str))
         self.assertIn("右 59.5 pt", info)
@@ -235,7 +244,7 @@ class PageReviewUiTests(unittest.TestCase):
         self.assertEqual(self.functions["review_previous_page"]("L33-SM3E", "B.pdf", "全部", 2, rows)[0], 2)
         self.assertIn("｜ 尚未前處理", info)
         self.assertIn("**裁掉文字**：`TAB`", info)
-        *_, text, _ = self.functions["review_sync"]("L33-SM3E", [["B.pdf", 3, 0, 0, 0, 0, 1, 2]], "B.pdf", "全部", 2)
+        *_, text, _, _ = self.functions["review_sync"]("L33-SM3E", [["B.pdf", 3, 0, 0, 0, 0, 1, 2]], "B.pdf", "全部", 2)
         self.assertEqual(text, "Body text\nTAB")
         message, page, *_ = self.functions["review_save_next"]("L33-SM3E", "B.pdf", "全部", 2, "x", rows)
         self.assertIn("尚未前處理", message)

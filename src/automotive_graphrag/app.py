@@ -457,8 +457,30 @@ def _experiment_trace_cell(trace):
     return f"{step_text}｜停止：{stop_reason}" if stop_reason else step_text
 
 
-def _quality_annotation_label(value):
-    return {"correct": "正確", "incorrect": "錯誤", "not_applicable": "不適用"}.get(value, "")
+EXPERIMENT_AGENTIC_HEADERS = ("平均搜尋步數", "平均 Agent 模型呼叫")
+EXPERIMENT_CLASSIC_HEADERS = ("Average EM", "Average F1", "Average Term Hit", "Average Term Coverage")
+EXPERIMENT_SUMMARY_HEADERS = (
+    "實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "得分正確率", "來源分數", "綜合得分率",
+    "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "平均延遲（秒）", "P95 延遲（秒）",
+    *EXPERIMENT_AGENTIC_HEADERS, *EXPERIMENT_CLASSIC_HEADERS,
+)
+EXPERIMENT_DATASET_SUMMARY_HEADERS = (
+    "實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "得分正確率",
+    "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", *EXPERIMENT_CLASSIC_HEADERS,
+)
+
+
+def experiment_summary_update(headers, rows, visible, drop=()):
+    """A summary table update without the `drop` columns (Agentic or classic metrics not in use)."""
+    keep = [index for index, header in enumerate(headers) if header not in set(drop)]
+    return gr.update(
+        value={
+            "headers": [headers[index] for index in keep],
+            "data": [[row[index] for index in keep] for row in rows],
+        },
+        datatype=["str"] * len(keep),
+        visible=visible,
+    )
 
 
 def _score_percent(value, scale: float = 1) -> str:
@@ -3347,6 +3369,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ]
         return [item for item in reviews if review_matches(item, review_filter)]
 
+    def review_filter_update(
+        project_id: str | None, filename: str | None, review_filter: str | None, option_rows: object | None = None,
+        reset: bool = False,
+    ):
+        """Filter choices labelled with page counts, and the filter to use.
+
+        ``reset`` picks the default for a newly reviewed PDF: Vision failures first, then
+        blank/error pages, otherwise all pages.
+        """
+        try:
+            reviews = filtered_reviews(project_id, filename, "全部", option_rows)
+        except ProjectError:
+            reviews = []
+        counts = {name: sum(review_matches(item, name) for item in reviews) for name in REVIEW_FILTERS}
+        if reset or review_filter not in REVIEW_FILTERS:
+            review_filter = next((name for name in ("Vision 失敗", "空白／錯誤") if counts[name]), "全部")
+        choices = [(f"{name}（{counts[name]}）", name) for name in REVIEW_FILTERS]
+        return gr.update(choices=choices, value=review_filter), review_filter
+
     def markdown_code(text: str) -> str:
         """Inline code span, so text such as ``< REMOVAL >`` is not read as HTML or Markdown."""
         return f"`{text.replace('`', "'")}`"
@@ -3447,10 +3488,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             except (TypeError, ValueError, ProjectError):
                 pages, current = [], None
             if current in pages:
-                return gr.skip(), gr.skip(), *review_margin_refresh(project_id, filename, current, option_rows)
+                filter_update, _ = review_filter_update(project_id, filename, review_filter, option_rows)
+                return (
+                    gr.skip(), gr.skip(), *review_margin_refresh(project_id, filename, current, option_rows),
+                    filter_update,
+                )
         if filename not in names:
             filename, page = (names[0] if names else None), None
-        return filename, *review_refresh(project_id, filename, review_filter, page, option_rows)
+        filter_update, review_filter = review_filter_update(project_id, filename, review_filter, option_rows, reset=True)
+        return filename, *review_refresh(project_id, filename, review_filter, page, option_rows), filter_update
 
     def review_pick(
         project_id: str | None, option_rows: object | None, filename: str | None, review_filter: str | None,
@@ -3459,8 +3505,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         """Clicking a row of the options table reviews that PDF; clicks within the current PDF's row change nothing."""
         picked = Path(str((evt.row_value or [None])[0])).name if evt.row_value else None
         if not picked or picked == filename:
-            return (gr.skip(),) * 5
-        return picked, *review_refresh(project_id, picked, review_filter, None, option_rows)
+            return (gr.skip(),) * 6
+        filter_update, review_filter = review_filter_update(project_id, picked, review_filter, option_rows, reset=True)
+        return picked, *review_refresh(project_id, picked, review_filter, None, option_rows), filter_update
 
     def review_step(
         project_id: str | None, filename: str | None, review_filter: str | None, page: object, step: int,
@@ -4678,27 +4725,27 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     "無根據主張數只計回答中沒有來源支持的事實主張；拒答欄僅對預期無答案題填「正確」或「錯誤」，其餘填「不適用」。"
                 )
                 experiment_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "得分正確率", "來源分數", "綜合得分率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+                    headers=list(EXPERIMENT_SUMMARY_HEADERS),
                     interactive=False,
-                    datatype=["str"] * 28,
+                    datatype=["str"] * len(EXPERIMENT_SUMMARY_HEADERS),
                     label="實驗組摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_dataset_summary_table = gr.Dataframe(
-                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
+                    headers=list(EXPERIMENT_DATASET_SUMMARY_HEADERS),
                     interactive=False,
-                    datatype=["str"] * 21,
+                    datatype=["str"] * len(EXPERIMENT_DATASET_SUMMARY_HEADERS),
                     label="實驗組 × 題目集摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
                     interactive=True,
-                    datatype=["str"] * 8 + ["markdown"] + ["str"] * 5,
-                    column_widths=["6%", "8%", "4%", "8%", "10%", "15%", "12%", "5%", "9%", "7%", "6%", "4%", "3%", "3%"],
-                    label="逐題實驗結果（不執行模型評測也可手動編輯得分與品質欄位；得分可填百分比或 0／1／2；拒答欄填正確／錯誤／不適用）",
+                    datatype=["str"] * 8 + ["markdown"] + ["str"] * 2,
+                    column_widths=["6%", "8%", "4%", "8%", "11%", "18%", "13%", "6%", "11%", "8%", "7%"],
+                    label="逐題實驗結果（不執行模型評測也可手動編輯得分；得分可填百分比或 0／1／2）",
                     wrap=True,
                     visible=False,
                 )
@@ -5044,7 +5091,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         review_sync_event = dict(
             fn=review_sync,
             inputs=[document_project, processing_options_table, review_document, review_filter, review_page],
-            outputs=[review_document, review_page, review_image, review_text, review_info],
+            outputs=[review_document, review_page, review_image, review_text, review_info, review_filter],
         )
         documents_tab.select(
             documents_tab_visibility,
@@ -5060,7 +5107,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             table, _rows, targets, notice = document_view(project_id)
             return table, gr.skip(), targets, notice
 
-        review_filter.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
+        # .input, not .change: review_sync/review_pick set the filter themselves and already refresh the page.
+        review_filter.input(review_refresh, inputs=review_inputs, outputs=review_outputs)
+        review_filter_counts = dict(
+            fn=lambda project_id, filename, review_filter, rows: review_filter_update(
+                project_id, filename, review_filter, rows,
+            )[0],
+            inputs=[document_project, review_document, review_filter, processing_options_table],
+            outputs=review_filter,
+            show_progress="hidden",
+        )
         review_page.submit(
             review_page_view, inputs=[document_project, review_document, review_page, processing_options_table],
             outputs=review_page_outputs,
@@ -5068,7 +5124,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         processing_options_table.select(
             review_pick,
             inputs=[document_project, processing_options_table, review_document, review_filter],
-            outputs=[review_document, *review_outputs],
+            outputs=[review_document, *review_outputs, review_filter],
         )
         processing_options_table.change(**review_sync_event)
         review_previous.click(review_previous_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
@@ -5076,12 +5132,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             review_save_next,
             inputs=[document_project, review_document, review_filter, review_page, review_text, processing_options_table],
             outputs=[review_status, *review_outputs],
-        ).then(document_view_keeping_options, inputs=document_project, outputs=document_view_outputs)
+        ).then(**review_filter_counts).then(document_view_keeping_options, inputs=document_project, outputs=document_view_outputs)
         review_revert_button.click(
             lambda project_id, filename, page: review_save(project_id, filename, page, None, revert=True),
             inputs=[document_project, review_document, review_page],
             outputs=review_status,
-        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
+        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(**review_filter_counts).then(
             document_view_keeping_options, inputs=document_project, outputs=document_view_outputs
         )
         review_vision_button.click(

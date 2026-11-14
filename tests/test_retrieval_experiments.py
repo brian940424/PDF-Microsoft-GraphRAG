@@ -228,6 +228,33 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(summary["summary"]["average_answer_em"], 1.0)
         self.assertEqual(details["question_results"][0]["answer_em"], 1.0)
 
+    def test_saved_run_with_removed_quality_fields_still_loads_and_exports_without_them(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        group = ExperimentGroup("G01", "實驗組1", "gpt-4o-mini", "local")
+        self.service.save_configuration("project", [group], question_set.question_set_id, 2, "gpt-4.1-mini")
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=2)
+        state = self.service.load("project")
+        for item in state["run"]["results"]:
+            item.update(answer_point_coverage_percent=80.0, unsupported_claim_count=1, refusal_correctness="correct")
+        for item in state["run"]["groups"]:
+            item.update(answer_point_coverage_percent=80.0, quality_reviewed_count=2)
+        self.service._write("project", state)
+
+        results = [
+            self.service._result_from_dict(item) for item in self.service.load("project")["run"]["results"]
+        ]
+        summary_path, details_path = self.service.export("project")
+
+        self.assertTrue(results)
+        removed = ("answer_point_coverage_percent", "unsupported_claim_count", "refusal_correctness",
+                   "quality_reviewed_count", "cost_status")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        details = json.loads(details_path.read_text(encoding="utf-8"))
+        for key in removed:
+            self.assertNotIn(key, summary["groups"][0]["summary"])
+            self.assertNotIn(key, summary["summary"])
+            self.assertNotIn(key, details["question_results"][0])
+
     def test_failed_replacement_keeps_existing_sets_when_source_pages_are_empty(self):
         existing = self.service.import_question_set("project", self.question_file)
         invalid_file = self.root / "invalid-pages.json"
@@ -1098,7 +1125,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertIn("實驗組摘要", labels)
         self.assertIn("實驗組 × 題目集摘要", labels)
         self.assertIn(
-            "逐題實驗結果（不執行模型評測也可手動編輯得分與品質欄位；得分可填百分比或 0／1／2；拒答欄填正確／錯誤／不適用）",
+            "逐題實驗結果（不執行模型評測也可手動編輯得分；得分可填百分比或 0／1／2）",
             labels,
         )
         button_values = [
@@ -1141,14 +1168,14 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertEqual(experiment_results["datatype"][8], "markdown")
         self.assertTrue(experiment_results["interactive"])
         self.assertEqual(
             experiment_results["column_widths"],
-            ["6%", "8%", "4%", "8%", "10%", "15%", "12%", "5%", "9%", "7%", "6%", "4%", "3%", "3%"],
+            ["6%", "8%", "4%", "8%", "11%", "18%", "13%", "6%", "11%", "8%", "7%"],
         )
         judge_detail = next(
             config for config in component_configs
@@ -1379,3 +1406,25 @@ class ExperimentQuestionSetSelectorUiTests(unittest.TestCase):
 
         self.assertIn("執行中", view[0])
         self.assertEqual(self.applied(), [self.first.question_set_id])
+
+
+class ExperimentSummaryColumnTests(unittest.TestCase):
+    def test_unused_agentic_and_classic_columns_are_dropped(self) -> None:
+        from automotive_graphrag.app import (
+            EXPERIMENT_AGENTIC_HEADERS, EXPERIMENT_CLASSIC_HEADERS, EXPERIMENT_SUMMARY_HEADERS,
+            experiment_summary_update,
+        )
+
+        row = list(range(len(EXPERIMENT_SUMMARY_HEADERS)))
+        update = experiment_summary_update(
+            EXPERIMENT_SUMMARY_HEADERS, [row], True, drop=EXPERIMENT_AGENTIC_HEADERS + EXPERIMENT_CLASSIC_HEADERS,
+        )
+
+        self.assertEqual(update["value"]["headers"], list(EXPERIMENT_SUMMARY_HEADERS[:15]))
+        self.assertEqual(update["value"]["data"], [row[:15]])
+        self.assertEqual(update["datatype"], ["str"] * 15)
+        for removed in ("成本", "檢索指標狀態", "人工複核題數", "拒答正確率（人工）"):
+            self.assertNotIn(removed, EXPERIMENT_SUMMARY_HEADERS)
+
+        full = experiment_summary_update(EXPERIMENT_SUMMARY_HEADERS, [row], True)
+        self.assertEqual(full["value"]["headers"], list(EXPERIMENT_SUMMARY_HEADERS))
