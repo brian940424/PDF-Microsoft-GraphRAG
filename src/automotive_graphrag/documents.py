@@ -8,7 +8,7 @@ import os
 import shutil
 import tempfile
 import threading
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -757,6 +757,141 @@ class DocumentService:
         finally:
             document.close()
         return self.page_analyzer(image, page_number, language, vision).strip()
+
+    def retry_vision_fallbacks(
+        self, project_id: str, filename: str, vision: VisionSettings,
+        stop_event: threading.Event | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[list[int], list[int]]:
+        """Transcribe a preprocessed PDF's Vision-failed pages again and save the ones that succeed.
+
+        Returns (recovered pages, pages still failing). A recovered page leaves
+        `vision_fallback_pages` for `vision_pages`; a manual edit on it is kept and flagged
+        like a re-preprocess would. Setting `stop_event` stops sending new requests and
+        saves the pages finished so far.
+        """
+        project = self.projects.get(project_id)
+        project_path = self.projects.path_for(project_id)
+        if project_indexing_locked(project_path):
+            raise ProjectError("建圖工作執行中，無法修改頁面內容")
+        document_report = self._processed_report(project_id, filename)
+        failed_pages = sorted(int(item["page"]) for item in document_report.get("vision_fallback_pages", []))
+        if not failed_pages:
+            raise ProjectError(f"{filename} 沒有 Vision 失敗的頁面")
+        margins = IgnoredMargins.from_options(document_report)
+        document = pymupdf.open(self._source_path(project_id, filename))
+        try:
+            language = document_report.get("language") or detect_document_language(
+                self._extract_page_text(document[index], margins) for index in self._report_indices(document_report)
+            )
+            images: dict[int, str] = {}
+            errors: dict[int, str] = {}
+            for page_number in failed_pages:
+                page = self._load_page(document, page_number)
+                try:
+                    images[page_number] = render_page(page, margins.clip(page))
+                except Exception as exc:
+                    errors[page_number] = f"頁面渲染失敗：{exc}"
+        finally:
+            document.close()
+
+        abort = threading.Event()
+
+        def analyze(page_number: int) -> str:
+            if (stop_event is not None and stop_event.is_set()) or abort.is_set():
+                raise JobStopped()
+            try:
+                return self.page_analyzer(images[page_number], page_number, language, vision)
+            except VisionAbort:
+                # The error would repeat on every page (bad key, unknown model).
+                abort.set()
+                raise
+
+        transcribed: dict[int, str] = {}
+        total = len(failed_pages)
+        done = total - len(images)
+        if progress_callback is not None:
+            progress_callback(done, total, filename)
+        with ThreadPoolExecutor(max_workers=vision.max_workers) as pool:
+            futures = {pool.submit(analyze, page_number): page_number for page_number in images}
+            for future in as_completed(futures):
+                page_number = futures[future]
+                try:
+                    transcribed[page_number] = future.result().strip()
+                except JobStopped:
+                    pass
+                except Exception as exc:
+                    errors[page_number] = str(exc) or type(exc).__name__
+                done += 1
+                if progress_callback is not None:
+                    progress_callback(done, total, filename)
+
+        processed_directory = project_path / "processed"
+        records = self._read_jsonl(processed_directory / "input.jsonl")
+        report = self._read_report(project_id)
+        stored_report = next(item for item in report.get("documents", []) if item.get("filename") == filename)
+        edits = self._read_edits(project_id)
+        document_edits = edits.setdefault(filename, {})
+        stem = Path(filename).stem
+        for page_number in sorted(transcribed):
+            previous = [
+                item for item in records
+                if item.get("document_id") == filename and item.get("page") == page_number - 1
+            ]
+            last = max(previous, key=lambda item: item.get("block_id", ""), default=None)
+            # Records carry their heading as the section name, except the PDF's default section.
+            incoming_heading = last["section_name"] if last and last.get("section_path") != stem else ""
+            extracted = remove_leading_printed_page_number(transcribed[page_number])
+            sections, _ = split_into_sections(extracted, incoming_heading)
+            extracted = "\n\n".join(section_text for _, section_text in sections)
+            page_records = [
+                item for item in records if item.get("document_id") == filename and item.get("page") == page_number
+            ]
+            was_empty = not page_records
+            entry = document_edits.get(str(page_number))
+            if entry is not None and entry.get("extracted_text", "") != extracted:
+                if "text" in entry:
+                    entry["source_changed"] = True
+                else:
+                    entry["reviewed"] = False
+                entry["extracted_text"] = extracted
+            if entry is not None and "text" not in entry and not entry.get("reviewed"):
+                del document_edits[str(page_number)]
+                entry = None
+            if entry is None or "text" not in entry:
+                records = [item for item in records if item not in page_records]
+                records.extend(
+                    self._page_record(project_id, filename, page_number, section_text, block_number, heading)
+                    for block_number, (heading, section_text) in enumerate(sections, start=1)
+                )
+                if was_empty and extracted:
+                    stored_report["empty_pages"] = max(int(stored_report.get("empty_pages", 0)) - 1, 0)
+                elif not was_empty and not extracted:
+                    stored_report["empty_pages"] = int(stored_report.get("empty_pages", 0)) + 1
+        stored_report["vision_pages"] = sorted({*stored_report.get("vision_pages", []), *transcribed})
+        stored_report["vision_fallback_pages"] = [
+            {"page": page_number, "error": errors.get(page_number, item.get("error", ""))}
+            for item in stored_report.get("vision_fallback_pages", [])
+            if (page_number := int(item["page"])) not in transcribed
+        ]
+        if not stored_report["vision_fallback_pages"]:
+            stored_report["vision_abort_reason"] = None
+        if stored_report.get("error_pages"):
+            stored_report["status"] = "PROCESSED_WITH_ERRORS"
+        elif stored_report.get("empty_pages") or stored_report["vision_fallback_pages"]:
+            stored_report["status"] = "PROCESSED_WITH_WARNINGS"
+        else:
+            stored_report["status"] = "PROCESSED"
+        if transcribed:
+            # A new processed_at marks the PDF as changed since the last graph.
+            stored_report["processed_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_jsonl(processed_directory / "input.jsonl", self._sorted_records(records))
+        self._write_edits(project_id, edits)
+        self._write_json(processed_directory / "report.json", report)
+        if transcribed and project.status == "INDEXED":
+            self.projects.update_status(project_id, "STALE")
+        still_failing = [item["page"] for item in stored_report["vision_fallback_pages"]]
+        return sorted(transcribed), still_failing
 
     def margin_preview(
         self, project_id: str, filename: str, page_number: int, options: Mapping[str, object],

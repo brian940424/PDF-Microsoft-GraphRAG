@@ -122,6 +122,21 @@ class PageReviewTests(unittest.TestCase):
         with self.assertRaises(ProjectError):
             self.service.page_reviews("L33-SM3E", "missing.pdf")
 
+    def test_retry_vision_fallbacks_stops_before_sending_pages(self) -> None:
+        import threading
+
+        vision = VisionSettings(model="gpt-6-luna", scope=SCOPE_ALL, max_workers=1)
+        self.service.page_analyzer = lambda image, page, language, settings: (_ for _ in ()).throw(RuntimeError("x"))
+        self.service.preprocess("L33-SM3E", vision=vision)
+        sent: list[int] = []
+        self.service.page_analyzer = lambda image, page, language, settings: sent.append(page) or f"Vision {page}"
+        stop = threading.Event()
+        stop.set()
+
+        recovered, failing = self.service.retry_vision_fallbacks("L33-SM3E", "manual.pdf", vision, stop_event=stop)
+
+        self.assertEqual((sent, recovered, failing), ([], [], [1, 2, 3]))
+
     def test_extract_page_again_and_render_image(self) -> None:
         vision = VisionSettings(model="gpt-6-luna")
 
@@ -130,6 +145,52 @@ class PageReviewTests(unittest.TestCase):
         self.assertTrue(self.service.render_page_image("L33-SM3E", "manual.pdf", 1).startswith(b"\x89PNG"))
         # Re-extracting does not save anything.
         self.assertEqual(self.records()[3], "第三頁原文")
+
+    def test_retry_vision_fallbacks_saves_recovered_pages(self) -> None:
+        failing = {1, 3}
+        attempts: list[int] = []
+
+        def analyzer(image, page, language, settings):
+            attempts.append(page)
+            if page in failing:
+                raise RuntimeError(f"timeout {page}")
+            return f"Vision {page}"
+
+        self.service.page_analyzer = analyzer
+        vision = VisionSettings(model="gpt-6-luna", scope=SCOPE_ALL, max_workers=1)
+        self.service.preprocess("L33-SM3E", vision=vision)
+        self.service.save_page_text("L33-SM3E", "manual.pdf", 1, "修正後的第一頁")
+        self.assertEqual([self.reviews()[page].source for page in (1, 3)], ["fallback", "fallback"])
+
+        failing = {1}
+        attempts.clear()
+        progress: list[tuple[int, int, str]] = []
+        recovered, still_failing = self.service.retry_vision_fallbacks(
+            "L33-SM3E", "manual.pdf", vision, progress_callback=lambda *update: progress.append(update),
+        )
+        self.assertEqual(progress, [(0, 2, "manual.pdf"), (1, 2, "manual.pdf"), (2, 2, "manual.pdf")])
+
+        # Only the failed pages are sent again.
+        self.assertEqual(sorted(attempts), [1, 3])
+        self.assertEqual((recovered, still_failing), ([3], [1]))
+        reviews = self.reviews()
+        self.assertEqual((reviews[1].source, reviews[1].error), ("fallback", "timeout 1"))
+        self.assertEqual((reviews[3].source, self.records()[3]), ("vision", "Vision 3"))
+        # The manual edit on a still-failing page is untouched.
+        self.assertEqual(self.records()[1], "修正後的第一頁")
+        self.assertEqual(self.service.list_documents("L33-SM3E")[0].status, "PROCESSED_WITH_WARNINGS")
+
+        failing = set()
+        self.assertEqual(self.service.retry_vision_fallbacks("L33-SM3E", "manual.pdf", vision), ([1], []))
+        reviews = self.reviews()
+        self.assertEqual(reviews[1].source, "vision")
+        # A recovered page with a manual edit keeps the edit and is flagged.
+        self.assertTrue(reviews[1].edited and reviews[1].source_changed)
+        self.assertEqual(self.records()[1], "修正後的第一頁")
+        # With no Vision failures left the warning status clears.
+        self.assertEqual(self.service.list_documents("L33-SM3E")[0].status, "PROCESSED")
+        with self.assertRaises(ProjectError):
+            self.service.retry_vision_fallbacks("L33-SM3E", "manual.pdf", vision)
 
 
 class PageReviewUiTests(unittest.TestCase):
@@ -173,6 +234,15 @@ class PageReviewUiTests(unittest.TestCase):
         self.assertEqual(self.functions["review_previous_page"]("L33-SM3E", "A.pdf", "全部", 3)[0], 2)
         # A failed save stays on the page.
         message, *rest = save_next("L33-SM3E", None, "全部", 1, "x")
+        self.assertTrue(message.startswith("❌"))
+
+    def test_retry_vision_button_requires_a_vision_model(self) -> None:
+        retry = self.functions["review_retry_vision"]
+        # Outputs: status, progress, review screen, page, image, text, info, filter, then the job buttons.
+        (message, *rest), = list(retry("L33-SM3E", "A.pdf", "全部", 1, None, "__vision_disabled__", None))
+        self.assertTrue(message.startswith("❌"))
+        self.assertEqual(len(rest), 9)
+        (message, *_), = list(retry("L33-SM3E", None, "全部", 1, None, None, None))
         self.assertTrue(message.startswith("❌"))
 
     def test_options_table_rows_choose_the_reviewed_pdf(self) -> None:

@@ -613,6 +613,7 @@ JOB_BUTTON_LABELS = {
     "qa_evaluate": ("評測回答", "停止評測回答"),
     "retrieval_answer": ("檢索並生成答案", "停止生成答案"),
     "retrieval_evaluate": ("評測答案", "停止評測答案"),
+    "vision_retry": ("重跑 Vision 失敗頁", "停止重跑 Vision"),
 }
 JOB_STOPPING_LABEL = "停止中…"
 
@@ -3581,6 +3582,90 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         source = "Vision" if use_vision else "文字層"
         return text, f"⏳ 已以{source}重新解析第 {int(page)} 頁，**尚未儲存**；確認後請按「儲存並標示已檢查」"
 
+    def review_retry_vision(
+        project_id: str | None, filename: str | None, review_filter: str | None, page: object,
+        option_rows: object | None, vision_model: str | None, vision_scope: str | None,
+        reasoning_effort: str = "none", job: Job | None = None,
+    ):
+        """Transcribe the PDF's Vision-failed pages again and save the recovered ones.
+
+        Yields (status, progress, review screen, page, image, text, info, filter): the page
+        review is replaced by a progress bar while it runs and comes back refreshed at the end.
+        """
+        skip_review = (gr.skip(),) * 5
+
+        def fail(message: str):
+            return message, gr.skip(), gr.skip(), *skip_review
+
+        if not project_id or not filename:
+            yield fail("❌ 請先選擇 PDF")
+            return
+        if not is_preprocessed(project_id, filename):
+            yield fail("❌ 此 PDF 尚未前處理，請先執行前處理")
+            return
+        if jobs.is_running(project_id, "preprocess"):
+            yield fail("❌ 前處理執行中，請待完成後再重跑")
+            return
+        try:
+            vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
+        except ProjectError as exc:
+            yield fail(f"❌ {exc}")
+            return
+        if vision is None:
+            yield fail("❌ 請先在「前處理設定」選擇 Vision 模型")
+            return
+
+        updates: queue.Queue[tuple[int, int, str]] = queue.Queue()
+        result_holder: list[tuple[list[int], list[int]]] = []
+        error_holder: list[BaseException] = []
+
+        def worker_task() -> None:
+            try:
+                result_holder.append(documents.retry_vision_fallbacks(
+                    project_id, filename, vision, stop_event=stop_event_of(job),
+                    progress_callback=lambda done, total, name: updates.put((done, total, name)),
+                ))
+            except BaseException as exc:
+                error_holder.append(exc)
+
+        worker = start_worker(job, worker_task)
+        progress = task_progress_markup(0, "重跑 Vision 中", f"{filename}｜準備頁面…")
+        yield "⏳ 重跑 Vision 失敗頁中…", progress, gr.update(visible=False), *skip_review
+        while worker.is_alive() or not updates.empty():
+            try:
+                done, total, name = updates.get(timeout=0.25)
+                while not updates.empty():
+                    done, total, name = updates.get_nowait()
+            except queue.Empty:
+                continue
+            progress = task_progress_markup(done / total if total else 0, "重跑 Vision 中", f"{name}｜已處理 {done} / {total} 頁")
+            yield gr.skip(), progress, gr.skip(), *skip_review
+        worker.join()
+        stopped = job is not None and job.stop_requested
+        if error_holder:
+            message = f"❌ {error_holder[0]}"
+            recovered, failing = [], []
+        else:
+            recovered, failing = result_holder[0]
+            message = f"{'🛑 已停止' if stopped else '✅ 已重跑 Vision'}：{len(recovered)} 頁成功"
+            if failing:
+                message += f"，{len(failing)} 頁仍失敗（第 {'、'.join(map(str, failing))} 頁）"
+            if recovered:
+                message += "；需重新建立 Graph 才會套用"
+        progress = task_progress_markup(
+            1 if not (stopped or error_holder) else 0,
+            "已停止" if stopped else ("重跑失敗" if error_holder else "重跑 Vision 完成"),
+            f"成功 {len(recovered)} 頁、仍失敗 {len(failing)} 頁" if not error_holder else "",
+        )
+        filter_update, review_filter = review_filter_update(
+            project_id, filename, review_filter, option_rows,
+            reset=review_filter == "Vision 失敗" and not failing,
+        )
+        yield (
+            message, progress, gr.update(visible=True),
+            *review_refresh(project_id, filename, review_filter, page, option_rows), filter_update,
+        )
+
     def vision_settings(project_id: str, model: str | None, scope: str | None, reasoning_effort: str = "none") -> VisionSettings | None:
         if not model or model == VISION_DISABLED:
             return None
@@ -3673,6 +3758,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     ):
         if not project_id:
             yield "❌ 請先到「專案與連線設定」開啟專案", "", *document_view(None)
+            return
+        if jobs.is_running(project_id, "vision_retry"):
+            yield "❌ 重跑 Vision 失敗頁執行中，請待完成或停止後再前處理", "", *document_view(project_id)
             return
         try:
             vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
@@ -4149,6 +4237,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     with gr.Row():
                         review_previous = gr.Button("◀ 上一頁")
                         review_vision_button = gr.Button("重跑 Vision（本頁）")
+                        review_retry_vision_button = gr.Button(JOB_BUTTON_LABELS["vision_retry"][0])
+                        review_retry_vision_stop_button = gr.Button(
+                            JOB_BUTTON_LABELS["vision_retry"][1], variant="stop", visible=False,
+                        )
                         review_text_layer_button = gr.Button("改用文字層")
                         review_revert_button = gr.Button("還原為解析結果")
                         review_save_next_button = gr.Button("儲存並前往下一頁 ▶", variant="primary")
@@ -5145,6 +5237,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[document_project, review_document, review_page, vision_model, vision_scope, vision_reasoning_effort],
             outputs=[review_text, review_status],
         )
+        bind_job(
+            "vision_retry", review_retry_vision_button, review_retry_vision_stop_button, review_retry_vision,
+            inputs=[*review_inputs, vision_model, vision_scope, vision_reasoning_effort],
+            outputs=[review_status, preprocess_progress, review_screen, *review_outputs, review_filter],
+        ).then(document_view_keeping_options, inputs=document_project, outputs=document_view_outputs)
         review_text_layer_button.click(
             lambda project_id, filename, page: review_extract(project_id, filename, page, False),
             inputs=[document_project, review_document, review_page],
@@ -5731,6 +5828,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             autoqa_judge_button, autoqa_judge_stop_button,
             experiment_run_button, experiment_run_stop_button,
             experiment_evaluate_button, experiment_evaluate_stop_button,
+            review_retry_vision_button, review_retry_vision_stop_button,
             running_jobs_notice, running_jobs_timer,
         ]
         # A reloaded page reopens the project; jobs started before the reload show their stop
