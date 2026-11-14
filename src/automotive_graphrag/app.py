@@ -23,6 +23,7 @@ from .automatic_evaluation import (
     JudgeScore,
     extra_error_share,
     judge_scores_from_dicts,
+    question_set_cost,
 )
 from .automatic_qa import AutomaticQATestService
 from .cancellation import Job, JobAlreadyRunning, JobRegistry, JobStopped
@@ -457,12 +458,12 @@ def _experiment_trace_cell(trace):
     return f"{step_text}｜停止：{stop_reason}" if stop_reason else step_text
 
 
-EXPERIMENT_AGENTIC_HEADERS = ("平均搜尋步數", "平均 Agent 模型呼叫")
+EXPERIMENT_COST_HEADERS = ("平均搜尋次數", "平均 LLM 呼叫", "平均 Token", "路由首選命中率")
 EXPERIMENT_CLASSIC_HEADERS = ("Average EM", "Average F1", "Average Term Hit", "Average Term Coverage")
 EXPERIMENT_SUMMARY_HEADERS = (
     "實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "得分正確率", "來源分數", "綜合得分率",
     "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "平均延遲（秒）", "P95 延遲（秒）",
-    *EXPERIMENT_AGENTIC_HEADERS, *EXPERIMENT_CLASSIC_HEADERS,
+    *EXPERIMENT_COST_HEADERS, *EXPERIMENT_CLASSIC_HEADERS,
 )
 EXPERIMENT_DATASET_SUMMARY_HEADERS = (
     "實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "得分正確率",
@@ -1609,12 +1610,35 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         models = [f"生題 {generation_model}"] if generation_model and generation_model != "—" else []
         if answer_model:
             models.append(f"回答 {answer_model}")
+        cost_line = autoqa_cost_line(question_set)
+        if cost_line:
+            items.append(cost_line)
         if models:
             items.append("- **模型：** " + "｜".join(models))
         if not judge:
             items.append("- 尚無已儲存的評判結果")
         items.extend(f"- **提醒：** {note}" for note in notes if note)
         return title + ("\n\n" + "\n".join(items) if items else "")
+
+    def autoqa_cost_line(question_set):
+        """Search cost of the saved answers; empty when the answers predate cost recording."""
+        cost = question_set_cost(question_set.questions)
+        parts = []
+        if cost["average_search_count"] is not None:
+            parts.append(f"平均搜尋 {cost['average_search_count']:.2f} 次")
+        if cost["average_llm_call_count"] is not None:
+            parts.append(f"平均 LLM 呼叫 {cost['average_llm_call_count']:.2f} 次")
+        if cost["average_total_tokens"] is not None:
+            parts.append(
+                f"平均 {cost['average_total_tokens']:,.0f} Token（{cost['measured_query_count']} 題有用量）"
+            )
+        if cost["first_choice_hit_rate"] is not None:
+            detail = "、".join(
+                f"{QUERY_METHOD_LABELS.get(method, method)} {bucket['found']}/{bucket['first']}"
+                for method, bucket in cost["first_choice_by_method"].items()
+            )
+            parts.append(f"路由首選命中 {cost['first_choice_hit_rate']:.0%}（{detail}）")
+        return "- **搜尋成本：** " + "｜".join(parts) if parts else ""
 
     def autoqa_strategy_cell(question_set, question):
         if not question.routed_method:
@@ -1992,7 +2016,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     f"{item['average_latency_seconds']:.2f}" if item.get("average_latency_seconds") is not None else "—",
                     f"{item['p95_latency_seconds']:.2f}" if item.get("p95_latency_seconds") is not None else "—",
                     f"{item['average_search_steps']:.2f}" if item.get("average_search_steps") is not None else "—",
-                    f"{item['average_agent_model_calls']:.2f}" if item.get("average_agent_model_calls") is not None else "—",
+                    (
+                        f"{item['average_llm_calls']:.2f}" if item.get("average_llm_calls") is not None
+                        else f"{item['average_agent_model_calls']:.2f}（僅 Agent）"
+                        if item.get("average_agent_model_calls") is not None else "—"
+                    ),
+                    f"{item['average_total_tokens']:,.0f}" if item.get("average_total_tokens") is not None else "—",
+                    f"{item['first_choice_hit_rate']:.1%}" if item.get("first_choice_hit_rate") is not None else "—",
                     f"{item['average_answer_em']:.1%}" if item.get("average_answer_em") is not None else "—",
                     f"{item['average_answer_f1']:.1%}" if item.get("average_answer_f1") is not None else "—",
                     f"{item['average_answer_term_hit']:.1%}" if item.get("average_answer_term_hit") is not None else "—",
@@ -2028,15 +2058,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ]
             if panel_lines:
                 status += "\n\n**評審分數：** " + "；".join(panel_lines)
-            # 摘要與逐題結果等評測完才顯示；傳統指標與 Agentic 欄位只在有值時出現
+            # 摘要與逐題結果等評測完才顯示；傳統指標與搜尋成本欄位只在有值時出現
             evaluated = bool(results)
             show_classic = bool(run.get("enable_classic_metrics"))
-            show_agentic = any(item.get("method") == EXPERIMENT_AGENTIC_METHOD for item in run.get("groups", []))
+            show_cost = any(
+                item.get(key) is not None
+                for item in run.get("groups", [])
+                for key in ("average_search_steps", "average_llm_calls", "average_agent_model_calls")
+            )
             return (
                 status, question_set_ids, gr.update(value=question_rows, visible=bool(question_rows)),
                 experiment_summary_update(
                     EXPERIMENT_SUMMARY_HEADERS, summaries, evaluated,
-                    drop=(() if show_agentic else EXPERIMENT_AGENTIC_HEADERS)
+                    drop=(() if show_cost else EXPERIMENT_COST_HEADERS)
                     + (() if show_classic else EXPERIMENT_CLASSIC_HEADERS),
                 ),
                 experiment_summary_update(

@@ -48,6 +48,7 @@ from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
 from .answer_prompts import install_answer_prompts
+from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, aggregate_cost, query_cost_summary, tag_calls, usage_metadata
 from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
 
 
@@ -128,6 +129,8 @@ EXPERIMENT_STRATEGY_CONFIG_KEYS = {
     },
     "basic": {"k", "max_context_tokens"},
 }
+# Context key that carries the query worker's LLM call records back to `_generate_case`.
+LLM_CALLS_CONTEXT_KEY = "_llm_calls"
 UNSUPPORTED_RETRIEVAL_METRICS = "暫不可計算：Global 社群報告尚未可靠映射至原始文件"
 
 
@@ -229,6 +232,9 @@ class ExperimentGroupSummary:
     average_answer_term_coverage: float | None = None
     average_source_score: float | None = None
     combined_score_accuracy: float | None = None
+    average_llm_calls: float | None = None
+    average_total_tokens: float | None = None
+    first_choice_hit_rate: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1062,6 +1068,9 @@ class RetrievalExperimentService:
                     "p95_latency_seconds": summary.get("p95_latency_seconds"),
                     "average_search_steps": summary.get("average_search_steps"),
                     "average_agent_model_calls": summary.get("average_agent_model_calls"),
+                    "average_llm_calls": summary.get("average_llm_calls"),
+                    "average_total_tokens": summary.get("average_total_tokens"),
+                    "first_choice_hit_rate": summary.get("first_choice_hit_rate"),
                     "average_answer_em": summary.get("average_answer_em"),
                     "average_answer_f1": summary.get("average_answer_f1"),
                     "average_answer_term_hit": summary.get("average_answer_term_hit"),
@@ -1232,6 +1241,16 @@ class RetrievalExperimentService:
         routed_method = routing_reason = ""
         method = group.method
         execution_trace: dict[str, object] = {}
+        llm_calls: list[dict[str, object]] = []
+
+        def take_search_calls(strategy: str, context_value: object) -> object:
+            """Move the worker's LLM call records out of the context into this case's call list."""
+            if isinstance(context_value, dict) and LLM_CALLS_CONTEXT_KEY in context_value:
+                context_value = dict(context_value)
+                calls = context_value.pop(LLM_CALLS_CONTEXT_KEY)
+                llm_calls.extend(tag_calls(calls if isinstance(calls, list) else [], SEARCH_STAGE, strategy))
+            return context_value
+
         try:
             def run_strategy(strategy: str) -> tuple[str, dict[str, object]]:
                 query_arguments = (
@@ -1243,8 +1262,12 @@ class RetrievalExperimentService:
                     item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
                 ) or len(inspect.signature(self.query_function).parameters) >= 7
                 if accepts_strategy_parameters:
-                    return self.query_function(*query_arguments, group.strategy_parameters.get(strategy, {}))
-                return self.query_function(*query_arguments)
+                    answer_value, context_value = self.query_function(
+                        *query_arguments, group.strategy_parameters.get(strategy, {})
+                    )
+                else:
+                    answer_value, context_value = self.query_function(*query_arguments)
+                return answer_value, take_search_calls(strategy, context_value)
 
             if group.method == EXPERIMENT_AUTO_METHOD:
                 api_base = self.connections.get_api_base_url()
@@ -1260,13 +1283,24 @@ class RetrievalExperimentService:
                         str(answer_value), None, context_value, context_source_count(context_value),
                     )
 
-                fallback = search_with_fallback(
-                    self.router.route(question.question, group.answer_model, api_base, api_key, effort),
-                    search,
-                    lambda candidate: self.router.check_answer(
+                searched: list[str] = []
+
+                def search_and_track(strategy: str) -> SearchOutcome:
+                    searched.append(strategy)
+                    return search(strategy)
+
+                def check(candidate: str):
+                    verdict = self.router.check_answer(
                         question.question, candidate, group.answer_model, api_base, api_key, effort,
-                    ),
-                )
+                    )
+                    llm_calls.extend(tag_calls(
+                        getattr(verdict, "llm_calls", ()), ANSWER_CHECK_STAGE, searched[-1] if searched else None,
+                    ))
+                    return verdict
+
+                decision = self.router.route(question.question, group.answer_model, api_base, api_key, effort)
+                llm_calls.extend(getattr(decision, "llm_calls", ()))
+                fallback = search_with_fallback(decision, search_and_track, check)
                 method = routed_method = fallback.method
                 routing_reason = fallback.reason
                 execution_trace = {"strategy_attempts": list(fallback.attempts)}
@@ -1296,7 +1330,7 @@ class RetrievalExperimentService:
                         )
                     else:
                         answer_value, context_value = self.query_function(*arguments, **kwargs)
-                    return QueryExecution(0, str(answer_value), "", context_value)
+                    return QueryExecution(0, str(answer_value), "", take_search_calls(search_method, context_value))
 
                 decision = self.agentic_search.run(
                     question.question, group.answer_model, api_base, api_key,
@@ -1306,6 +1340,11 @@ class RetrievalExperimentService:
                 method = EXPERIMENT_AGENTIC_METHOD
                 answer = decision.answer
                 context = dict(decision.context)
+                agentic_metadata = context.get("agentic_metadata")
+                if isinstance(agentic_metadata, dict):
+                    llm_calls[:0] = agentic_metadata.get("planner_llm_calls", [])
+                    context["search_step_count"] = agentic_metadata.get("search_step_count")
+                context.update(usage_metadata(llm_calls))
                 execution_trace = context
                 if decision.returncode != 0 and not answer.strip():
                     failed = self._failed_result(
@@ -1334,6 +1373,9 @@ class RetrievalExperimentService:
                 execution_trace = context
             else:
                 answer, context = run_strategy(method)
+                execution_trace = {"requested_method": method}
+            if group.method != EXPERIMENT_AGENTIC_METHOD:
+                execution_trace.update(usage_metadata(llm_calls))
         except Exception as exc:
             return replace(
                 self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name),
@@ -1603,6 +1645,9 @@ class RetrievalExperimentService:
             answer_term_hit = self._mean_present(item.answer_term_hit for item in group_items)
             answer_term_coverage = self._mean_present(item.answer_term_coverage for item in group_items)
             average_source, combined_accuracy = self._source_stats(group_items, total)
+            cost = aggregate_cost(
+                query_cost_summary(item.execution_trace) for item in group_items if item.execution_trace
+            )
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 total, answered, correct, partial, incorrect,
@@ -1617,7 +1662,10 @@ class RetrievalExperimentService:
                 ),
                 sum(durations) / len(durations) if durations else None,
                 p95_latency,
-                sum(step_counts) / len(step_counts) if step_counts else None,
+                (
+                    cost["average_search_count"] if cost["average_search_count"] is not None
+                    else sum(step_counts) / len(step_counts) if step_counts else None
+                ),
                 sum(model_calls) / len(model_calls) if model_calls else None,
                 None,
                 "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
@@ -1629,6 +1677,9 @@ class RetrievalExperimentService:
                 average_answer_term_coverage=answer_term_coverage,
                 average_source_score=average_source,
                 combined_score_accuracy=combined_accuracy if enable_llm_judge else None,
+                average_llm_calls=cost["average_llm_call_count"],
+                average_total_tokens=cost["average_total_tokens"],
+                first_choice_hit_rate=cost["first_choice_hit_rate"],
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
@@ -1777,7 +1828,12 @@ class RetrievalExperimentService:
         if result.returncode or "error" in response:
             raise ProjectError(str(response.get("error") or result.stderr or "GraphRAG 查詢失敗"))
         context = response.get("context", {})
-        return str(response.get("answer", "")), context if isinstance(context, dict) else {}
+        context = dict(context) if isinstance(context, dict) else {}
+        llm_calls = response.get("llm_calls")
+        if isinstance(llm_calls, list):
+            # Carried out of the worker inside the context; `_generate_case` removes it again.
+            context[LLM_CALLS_CONTEXT_KEY] = llm_calls
+        return str(response.get("answer", "")), context
 
     def _validate_groups(self, groups: Sequence[ExperimentGroup]) -> None:
         seen: set[str] = set()

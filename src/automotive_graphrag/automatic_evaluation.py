@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .llm_usage import aggregate_cost
 from .cancellation import JobStopped, raise_if_stopped
 from .evaluation.classic_metrics import (
     answer_term_scores,
@@ -87,6 +88,15 @@ Output only a JSON object in this format:
 """
 logger = logging.getLogger(__name__)
 JudgeClient = Callable[..., object]
+
+# Per-question search cost saved on BatchQuestion (P-02).
+COST_FIELDS = ("search_count", "llm_call_count", "total_tokens", "first_method", "first_choice_found")
+
+
+def question_set_cost(questions: Sequence[object]) -> dict[str, object]:
+    """Average search count, LLM calls and tokens of answered questions, and the first-choice hit rate."""
+    answered = [item for item in questions if getattr(item, "answer", "")]
+    return aggregate_cost({key: getattr(item, key, None) for key in COST_FIELDS} for item in answered)
 
 
 @dataclass(frozen=True, slots=True)
@@ -775,6 +785,10 @@ class AutomaticEvaluationService:
                 "routed_method": question_by_id[question_id].routed_method if question_id in question_by_id else "",
                 "routing_reason": question_by_id[question_id].routing_reason if question_id in question_by_id else "",
                 "duration_seconds": question_by_id[question_id].duration_seconds if question_id in question_by_id else None,
+                **{
+                    key: getattr(question_by_id[question_id], key, None) if question_id in question_by_id else None
+                    for key in COST_FIELDS
+                },
                 "is_correct": judge_by_id[question_id].is_correct if question_id in judge_by_id else None,
                 "average_score": judge_by_id[question_id].score if question_id in judge_by_id else None,
                 "source_score": judge_by_id[question_id].source_score if question_id in judge_by_id else None,
@@ -807,6 +821,7 @@ class AutomaticEvaluationService:
             "average_answer_term_coverage": result.average_answer_term_coverage,
             "enable_llm_judge": result.enable_llm_judge,
             "enable_classic_metrics": result.enable_classic_metrics,
+            "search_cost": question_set_cost(question_set.questions),
         }
         self._atomic_text(json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         buffer = io.StringIO(newline="")
@@ -817,7 +832,7 @@ class AutomaticEvaluationService:
         fieldnames = [
             "question_id", "question", "expected_answer", "system_answer", "raw_system_answer",
             "system_answer_sources", "answer_sources",
-            "retrieved_evidence", "routed_method", "routing_reason", "duration_seconds",
+            "retrieved_evidence", "routed_method", "routing_reason", "duration_seconds", *COST_FIELDS,
             "is_correct", "average_score", "source_score", "combined_score", "source_bonus_share", "manual", "judge_reason",
             *judge_columns,
             "answer_em",

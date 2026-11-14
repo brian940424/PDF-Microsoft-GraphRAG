@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .llm_usage import install_litellm_recorder
 from .querying import QueryService
 
 
@@ -25,6 +26,8 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
 
     from graphrag.cli import query as cli_query
 
+    llm_calls: list[dict[str, Any]] = []
+    install_litellm_recorder(llm_calls)
     common = {
         "data_dir": None,
         "root_dir": root_dir,
@@ -62,6 +65,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "answer": str(answer),
         "context": QueryService._serialize_context(context),
+        "llm_calls": llm_calls,
     }
 
 

@@ -34,20 +34,20 @@ class StrategyRouterTests(unittest.TestCase):
         self.assertIn("這批手冊涵蓋哪些系統？", prompt)
         self.assertTrue(prompt.startswith("You choose the Microsoft GraphRAG search method"))
 
-    def test_invalid_method_falls_back_to_local(self) -> None:
+    def test_invalid_method_falls_back_to_basic(self) -> None:
         decision = StrategyRouter(lambda *_: {"method": "hybrid", "reason": "x"}).route("q", "m", "u", "k")
 
-        self.assertEqual(decision.method, "local")
+        self.assertEqual(decision.method, "basic")
         self.assertIn("自動判斷失敗", decision.reason)
         self.assertIn("hybrid", decision.reason)
 
-    def test_api_error_falls_back_to_local(self) -> None:
+    def test_api_error_falls_back_to_basic(self) -> None:
         def chat(*_: object) -> object:
             raise ProjectError("策略判斷 API 回應 HTTP 500")
 
         decision = StrategyRouter(chat).route("q", "m", "u", "k")
 
-        self.assertEqual(decision.method, "local")
+        self.assertEqual(decision.method, "basic")
         self.assertIn("HTTP 500", decision.reason)
 
     def test_missing_api_key_falls_back_without_calling_model(self) -> None:
@@ -56,7 +56,7 @@ class StrategyRouterTests(unittest.TestCase):
 
         decision = StrategyRouter(chat).route("q", "m", "u", None)
 
-        self.assertEqual(decision.method, "local")
+        self.assertEqual(decision.method, "basic")
         self.assertIn("API Key", decision.reason)
 
     def test_missing_reason_is_marked(self) -> None:
@@ -92,7 +92,7 @@ class StrategyRankingTests(unittest.TestCase):
         decision = StrategyRouter(lambda *_: response).route("q", "m", "u", "k")
 
         self.assertIn("hybrid", decision.reason)
-        self.assertEqual(decision.attempt_order, ("local", "basic", "global", "drift"))
+        self.assertEqual(decision.attempt_order, ("basic", "local", "global", "drift"))
 
 
 class AnswerCheckTests(unittest.TestCase):

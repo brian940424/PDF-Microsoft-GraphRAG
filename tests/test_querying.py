@@ -195,6 +195,43 @@ class QueryServiceTests(unittest.TestCase):
         )
         self.assertEqual(service.history("L33-SM3E"), [result])
 
+    def test_auto_query_records_every_llm_call_with_stage_and_method(self) -> None:
+        def usage(stage: str, tokens: int) -> dict:
+            return {"stage": stage, "method": None, "model": "m", "prompt_tokens": tokens,
+                    "completion_tokens": 1, "duration_seconds": 0.1, "error": None}
+
+        class UsageRunner:
+            def __call__(self, command: list[str]) -> QueryExecution:
+                method = command[command.index("--method") + 1]
+                answer = "找到了" if method == "local" else "資料中沒有"
+                return QueryExecution(0, answer, "", {"sources": [{"id": str(i)} for i in range(8)]},
+                                      (usage("search", 1000),))
+
+        class UsageRouter(FakeRouter):
+            def route(self, *args: object, **kwargs: object) -> StrategyDecision:
+                return StrategyDecision("basic", "查找", ("basic", "local", "global", "drift"),
+                                        (usage("routing", 10),))
+
+            def check_answer(self, question: str, answer: str, *_: object) -> AnswerCheck:
+                return AnswerCheck(answer != "資料中沒有", "檢查", (usage("answer_check", 20),))
+
+        service = QueryService(
+            self.store, UsageRunner(), self.connections, evidence_service=FakeEvidenceService(),
+            router=UsageRouter(StrategyDecision("basic", "x")),
+        )
+
+        result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
+
+        metadata = result.execution_metadata
+        self.assertEqual(
+            [(item["stage"], item["method"]) for item in metadata["llm_calls"]],
+            [("routing", None), ("search", "basic"), ("answer_check", "basic"),
+             ("search", "local"), ("answer_check", "local")],
+        )
+        self.assertEqual(metadata["model_call_count"], 5)
+        self.assertEqual(metadata["prompt_tokens"], 2050)
+        self.assertEqual(metadata["cost_status"], "measured")
+
     def test_auto_query_skips_local_answer_built_on_too_few_sources(self) -> None:
         runner = ScriptedRunner({"local": "相簿群組的步驟", "basic": "聯絡人群組的步驟", "global": "不該執行", "drift": "不該執行"})
         router = FakeRouter(StrategyDecision("local", "具體事實"))

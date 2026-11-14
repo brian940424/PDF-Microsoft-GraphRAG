@@ -1411,13 +1411,13 @@ class ExperimentQuestionSetSelectorUiTests(unittest.TestCase):
 class ExperimentSummaryColumnTests(unittest.TestCase):
     def test_unused_agentic_and_classic_columns_are_dropped(self) -> None:
         from automotive_graphrag.app import (
-            EXPERIMENT_AGENTIC_HEADERS, EXPERIMENT_CLASSIC_HEADERS, EXPERIMENT_SUMMARY_HEADERS,
+            EXPERIMENT_COST_HEADERS, EXPERIMENT_CLASSIC_HEADERS, EXPERIMENT_SUMMARY_HEADERS,
             experiment_summary_update,
         )
 
         row = list(range(len(EXPERIMENT_SUMMARY_HEADERS)))
         update = experiment_summary_update(
-            EXPERIMENT_SUMMARY_HEADERS, [row], True, drop=EXPERIMENT_AGENTIC_HEADERS + EXPERIMENT_CLASSIC_HEADERS,
+            EXPERIMENT_SUMMARY_HEADERS, [row], True, drop=EXPERIMENT_COST_HEADERS + EXPERIMENT_CLASSIC_HEADERS,
         )
 
         self.assertEqual(update["value"]["headers"], list(EXPERIMENT_SUMMARY_HEADERS[:15]))

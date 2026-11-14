@@ -7,33 +7,35 @@ import json
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from .connections import chat_completion_api_params, extract_json_object, llm_request_headers
 from .evidence import EvidenceService
+from .llm_usage import ANSWER_CHECK_STAGE, ROUTING_STAGE, call_record
 from .projects import ProjectError
 
 
 ROUTABLE_METHODS = ("local", "global", "drift", "basic")
-FALLBACK_METHOD = "local"
+# Basic answers manual lookups far more often than Local when routing fails (P-02).
+FALLBACK_METHOD = "basic"
 # Cheapest first; completes a partial ranking and replaces a failed one.
-DEFAULT_METHOD_ORDER = ("local", "basic", "global", "drift")
+DEFAULT_METHOD_ORDER = ("basic", "local", "global", "drift")
 METHOD_LABELS = {"local": "Local", "global": "Global", "drift": "DRIFT", "basic": "Basic"}
 NOT_FOUND_ANSWER = "已依序嘗試所有檢索策略，仍未在文件中找到答案。"
 # Local fills about 10 text units with default settings; far fewer means the matched entities
 # barely link to the question's passage, so its answer is not trusted and the next method runs.
 LOCAL_MIN_SOURCES = 7
 
-ROUTING_PROMPT = """You choose the Microsoft GraphRAG search method for a question about automotive service manuals.
+ROUTING_PROMPT = """You choose the Microsoft GraphRAG search method for a question about a set of technical manuals (for example vehicle service manuals or product user manuals). Most questions look up something the manual states in one place: a procedure, its steps, a condition, a specification value, a warning, a diagnostic code or a definition.
 
 Available methods:
-- local: Starts from the entities most similar to the question and expands to their relationships, community reports and source text. Best for specific facts about particular parts, systems, specifications, symptoms or repair procedures.
+- basic: Vector search over the manual's text chunks, answering from the passages most similar to the question. Best for looking up a procedure, steps, conditions, values, warnings, diagnostic codes, settings or definitions that are written in one section of the manual. Fast, and it cites exact pages.
+- local: Starts from the entities most similar to the question and expands to their relationships, community reports and a limited amount of source text. Best for questions about how several named components, signals or systems relate to or affect each other. It often misses the exact passage for a single procedure or value.
 - global: Map-reduce over community reports of the whole corpus. Best for corpus-wide questions that ask for overviews, themes, summaries, comparisons across many systems, or "what kinds of ..." questions. It does not cite exact source pages.
 - drift: Starts from community reports, generates follow-up sub-questions and answers them with local search over several rounds. Best for complex multi-hop questions that need both broad context and specific details, such as causal chains across systems or diagnosis spanning several components. Slowest and most expensive.
-- basic: Plain vector search over text chunks without the graph. Best for simple lookups of a single value, term, warning or sentence that likely appears verbatim in one passage.
 
-Rank all four methods from most to least suitable. The methods are tried in that order until one finds an answer. Put local first when unsure. Put drift first only when the question clearly needs multi-step reasoning.
+Rank all four methods from most to least suitable. The methods are tried in that order until one finds an answer, so a wrong first choice costs a full extra search. Put basic first for lookups of what the manual states, and when unsure. Put local first only when the question is mainly about relationships between several named components or systems. Put global first only for corpus-wide overview questions. Put drift first only when the question clearly needs multi-step reasoning.
 
 Return a JSON object with exactly these keys:
 - "methods": an array containing "local", "global", "drift" and "basic" exactly once each, most suitable first
@@ -70,6 +72,7 @@ class StrategyDecision:
     method: str
     reason: str
     ranking: tuple[str, ...] = ()
+    llm_calls: tuple[dict[str, Any], ...] = field(default=(), compare=False)
 
     @property
     def attempt_order(self) -> tuple[str, ...]:
@@ -81,6 +84,7 @@ class StrategyDecision:
 class AnswerCheck:
     found: bool
     reason: str
+    llm_calls: tuple[dict[str, Any], ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,11 +119,15 @@ class StrategyRouter:
         """Return the selected method, falling back to Local instead of failing the query."""
         if not api_key:
             return self._fallback("尚未設定 API Key")
+        calls: list[dict[str, Any]] = []
         try:
             prompt = ROUTING_PROMPT.format(question=question)
-            return self._parse_response(self._ask(prompt, model, api_base_url, api_key, reasoning_effort))
+            decision = self._parse_response(
+                self._ask(prompt, model, api_base_url, api_key, reasoning_effort, ROUTING_STAGE, calls)
+            )
         except ProjectError as exc:
-            return self._fallback(str(exc))
+            decision = self._fallback(str(exc))
+        return replace(decision, llm_calls=tuple(calls))
 
     def check_answer(
         self, question: str, answer: str, model: str, api_base_url: str, api_key: str | None,
@@ -128,22 +136,24 @@ class StrategyRouter:
         """Judge whether an answer was found; an unusable check accepts the answer."""
         if not api_key:
             return AnswerCheck(True, "尚未設定 API Key，無法檢查，採用目前回答")
+        calls: list[dict[str, Any]] = []
         try:
             prompt = ANSWER_CHECK_PROMPT.format(question=question, answer=answer)
-            response = self._ask(prompt, model, api_base_url, api_key, reasoning_effort)
+            response = self._ask(prompt, model, api_base_url, api_key, reasoning_effort, ANSWER_CHECK_STAGE, calls)
             if not isinstance(response, dict) or not isinstance(response.get("found"), bool):
                 raise ProjectError("答案檢查回應缺少 found 布林值")
-            return AnswerCheck(response["found"], str(response.get("reason", "")).strip())
+            return AnswerCheck(response["found"], str(response.get("reason", "")).strip(), tuple(calls))
         except ProjectError as exc:
-            return AnswerCheck(True, f"答案檢查失敗（{exc}），採用目前回答")
+            return AnswerCheck(True, f"答案檢查失敗（{exc}），採用目前回答", tuple(calls))
 
     def _ask(
         self, prompt: str, model: str, api_base_url: str, api_key: str, reasoning_effort: str | None,
+        stage: str, calls: list[dict[str, Any]],
     ) -> object:
-        args = (api_base_url, api_key, model, prompt)
-        if "reasoning_effort" in inspect.signature(self.chat).parameters:
-            return self.chat(*args, reasoning_effort=reasoning_effort)
-        return self.chat(*args)
+        """Call the chat function and append one call record (with usage when it reports it)."""
+        return chat_with_usage(
+            self.chat, (api_base_url, api_key, model, prompt), reasoning_effort, stage, model, calls,
+        )
 
     @staticmethod
     def _parse_response(response: object) -> StrategyDecision:
@@ -161,12 +171,13 @@ class StrategyRouter:
 
     @staticmethod
     def _fallback(detail: str) -> StrategyDecision:
-        return StrategyDecision(FALLBACK_METHOD, f"自動判斷失敗（{detail}），改用預設 Local")
+        return StrategyDecision(FALLBACK_METHOD, f"自動判斷失敗（{detail}），改用預設 {METHOD_LABELS[FALLBACK_METHOD]}")
 
     @staticmethod
     def _openai_chat(
         api_base_url: str, api_key: str, model: str, prompt: str,
         reasoning_effort: str | None = None, timeout_seconds: float = 60,
+        usage_sink: dict[str, Any] | None = None,
     ) -> object:
         payload = {
             "model": model,
@@ -187,6 +198,8 @@ class StrategyRouter:
             raise ProjectError(f"策略判斷 API 回應 HTTP {exc.code}") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ProjectError("策略判斷 API 無法連線或回應格式錯誤") from exc
+        if usage_sink is not None and isinstance(value, dict) and isinstance(value.get("usage"), dict):
+            usage_sink.update(value["usage"])
         try:
             parsed = extract_json_object(value["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError, AttributeError) as exc:
@@ -194,6 +207,28 @@ class StrategyRouter:
         if parsed is None:
             raise ProjectError("策略判斷 API 回應缺少有效 JSON 內容")
         return parsed
+
+
+def chat_with_usage(
+    chat: ChatFunction, args: tuple[Any, ...], reasoning_effort: str | None,
+    stage: str, model: str, calls: list[dict[str, Any]],
+) -> object:
+    """Call a chat function, passing only the keyword arguments it accepts, and record the call."""
+    parameters = inspect.signature(chat).parameters
+    kwargs: dict[str, Any] = {}
+    if "reasoning_effort" in parameters:
+        kwargs["reasoning_effort"] = reasoning_effort
+    usage: dict[str, Any] = {}
+    if "usage_sink" in parameters:
+        kwargs["usage_sink"] = usage
+    started = time.monotonic()
+    try:
+        response = chat(*args, **kwargs)
+    except ProjectError as exc:
+        calls.append(call_record(stage, None, model, None, time.monotonic() - started, str(exc)))
+        raise
+    calls.append(call_record(stage, None, model, usage or None, time.monotonic() - started))
+    return response
 
 
 def search_with_fallback(

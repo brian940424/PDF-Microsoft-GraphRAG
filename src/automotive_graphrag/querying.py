@@ -24,6 +24,7 @@ from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
+from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
 from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
@@ -58,6 +59,8 @@ class QueryExecution:
     stdout: str
     stderr: str
     context: dict[str, Any] = field(default_factory=dict)
+    # LLM calls the GraphRAG search made, as recorded by the query worker.
+    llm_calls: tuple[dict[str, Any], ...] = ()
 
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str] | QueryExecution]
@@ -161,14 +164,22 @@ class QueryService:
             "cost_status": "unknown_usage_not_returned_by_query_adapter",
             "settings_sha256": hashlib.sha256((graph_root / "settings.yaml").read_bytes()).hexdigest(),
         }
+        llm_calls: list[dict[str, Any]] = []
         retrieval_query = expand_manual_query(prompt)
         if retrieval_query != prompt:
             execution_metadata["expanded_retrieval_query"] = retrieval_query
         def run_query(command: list[str]) -> subprocess.CompletedProcess[str] | QueryExecution:
             if self._custom_runner:
                 raise_if_stopped(stop_event)
-                return self.runner(command)
-            return self._run(command, stop_event=stop_event)
+                execution = self.runner(command)
+            else:
+                execution = self._run(command, stop_event=stop_event)
+            record_search_calls(command, execution)
+            return execution
+
+        def record_search_calls(command: list[str], execution: object) -> None:
+            method_name = command[command.index("--method") + 1] if "--method" in command else None
+            llm_calls.extend(tag_calls(getattr(execution, "llm_calls", ()) or (), SEARCH_STAGE, method_name))
 
         def query_command(search_method: str, search_question: str) -> list[str]:
             return [
@@ -192,13 +203,22 @@ class QueryService:
                     context_source_count(getattr(execution, "context", None)),
                 )
 
-            fallback = search_with_fallback(
-                self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort),
-                search,
-                lambda answer: self.router.check_answer(
+            searched: list[str] = []
+
+            def search_and_track(search_method: str) -> SearchOutcome:
+                searched.append(search_method)
+                return search(search_method)
+
+            def check(answer: str):
+                verdict = self.router.check_answer(
                     prompt, answer, selected_model, api_base_url, api_key, applied_effort,
-                ),
-            )
+                )
+                llm_calls.extend(tag_calls(verdict.llm_calls, ANSWER_CHECK_STAGE, searched[-1] if searched else None))
+                return verdict
+
+            decision = self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort)
+            llm_calls.extend(decision.llm_calls)
+            fallback = search_with_fallback(decision, search_and_track, check)
             normalized_method, routing_reason = fallback.method, fallback.reason
             execution_metadata["strategy_attempts"] = list(fallback.attempts)
             result = fallback.outcome.payload or QueryExecution(0, fallback.outcome.answer, "")
@@ -206,9 +226,12 @@ class QueryService:
             def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
                 search_command = query_command(search_method, search_question)
                 if not self._custom_runner:
-                    return self._run(search_command, timeout_seconds=timeout_seconds, stop_event=stop_event)
-                raise_if_stopped(stop_event)
-                return self.runner(search_command)
+                    execution = self._run(search_command, timeout_seconds=timeout_seconds, stop_event=stop_event)
+                else:
+                    raise_if_stopped(stop_event)
+                    execution = self.runner(search_command)
+                record_search_calls(search_command, execution)
+                return execution
 
             decision = self.agentic_search.run(
                 prompt,
@@ -222,8 +245,10 @@ class QueryService:
             routing_reason = decision.stop_reason
             execution_metadata.update(decision.execution_metadata)
             execution_metadata["requested_method"] = requested_method
+            llm_calls[:0] = execution_metadata.pop("planner_llm_calls", [])
         else:
             result = run_query(query_command(normalized_method, retrieval_query))
+        execution_metadata.update(usage_metadata(llm_calls))
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -365,11 +390,13 @@ class QueryService:
                 error = str(response.get("error") or completed.stderr or "GraphRAG 查詢失敗")
                 return QueryExecution(completed.returncode or 1, "", error)
             context = response.get("context", {})
+            llm_calls = response.get("llm_calls", [])
             return QueryExecution(
                 0,
                 str(response.get("answer", "")),
                 completed.stderr or "",
                 context if isinstance(context, dict) else {},
+                tuple(item for item in llm_calls if isinstance(item, dict)) if isinstance(llm_calls, list) else (),
             )
         except subprocess.TimeoutExpired:
             return QueryExecution(124, "", "Agentic GraphRAG 搜尋超過單題時間上限")
