@@ -47,6 +47,7 @@ from .connections import (
     parse_judge_models,
 )
 from .documents import DocumentService
+from .duplicate_passages import PageEquivalence
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .reviews import ReviewService
@@ -362,6 +363,7 @@ class AutomaticEvaluationService:
         )
         judged_by_id: dict[str, AutomaticEvaluationItem] = {}
         document_only_score = project_document_only_score(self.projects, project_id)
+        equivalent_pages = PageEquivalence(self.projects.path_for(project_id))
         failures: list[str] = []
         partial_failures: list[str] = []
         total_calls = len(eligible) * len(models)
@@ -427,7 +429,7 @@ class AutomaticEvaluationService:
                         f"{question.question_id}（{'、'.join(judge_model_label(item.model) for item in failed)}）"
                     )
                 average = average_judge_score(judges)
-                source = self._question_source_score(question, document_only_score)
+                source = self._question_source_score(question, document_only_score, equivalent_pages)
                 judged_by_id[question.question_id] = AutomaticEvaluationItem(
                     question_id=question.question_id,
                     is_correct=average >= CORRECT_SCORE,
@@ -511,9 +513,11 @@ class AutomaticEvaluationService:
         return result
 
     @staticmethod
-    def _question_source_score(question: BatchQuestion, document_only_score: float) -> float | None:
+    def _question_source_score(
+        question: BatchQuestion, document_only_score: float, equivalent_pages: PageEquivalence | None = None,
+    ) -> float | None:
         gold = question.answer_source_evidence or question.gold_evidence
-        return source_score(question.answer, question.retrieved_evidence, gold, document_only_score)
+        return source_score(question.answer, question.retrieved_evidence, gold, document_only_score, equivalent_pages)
 
     @staticmethod
     def _with_combined(item: AutomaticEvaluationItem, weight: float) -> AutomaticEvaluationItem:

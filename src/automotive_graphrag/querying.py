@@ -25,6 +25,7 @@ import yaml
 from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .agentic_search import AgenticSearch
+from .duplicate_passages import with_duplicate_citations
 from .evidence import Evidence, EvidenceService
 from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
 from .projects import ProjectError, ProjectStore
@@ -280,6 +281,14 @@ class QueryService:
                 context["_evidence_warning"] = str(exc)
         if requested_method == AGENTIC_METHOD and answer:
             answer = self._align_agentic_citations(answer, context, evidence)
+        if answer and evidence:
+            try:
+                evidence, added = with_duplicate_citations(self.projects, project_id, answer, evidence, context)
+            except (ProjectError, OSError, ValueError) as exc:
+                execution_metadata["duplicate_citations_error"] = str(exc)
+            else:
+                if added:
+                    execution_metadata["duplicate_citations"] = added
         if result.returncode == 0 and not answer:
             error = "GraphRAG 未回傳回答"
         query_result = QueryResult(

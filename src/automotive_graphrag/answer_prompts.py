@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v6"
+ANSWER_PROMPT_VERSION = "answer-requirements-v7"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -53,6 +53,8 @@ Wording and citations.
 - Keep the certainty of the source wording: if the data says something will happen, do not soften it to "may"; if it says "may", do not make it definite.
 - When the data gives different information for different device models, state which model each piece applies to.
 - Use citation identifiers exactly as supplied in the source context. Printed page numbers inside source text are content, not citation identifiers.
+- Cite sentence by sentence: end each sentence or step with the identifiers of every source that supports it. When one sentence combines several sources, list all of them, not only the main one.
+- Also cite the source that establishes the situation in the question. When the question describes a setting (for example "while removing part A, connector B was disconnected"), cite the source that describes that setting, such as the removal procedure that says to remove part A, together with the source that gives the answer, even if the answer itself comes from another page.
 
 """
 

@@ -50,6 +50,8 @@ class AnswerPromptTests(unittest.TestCase):
             "Keep the qualifiers inside each sentence or step you use", "keeping only the main action and the numbers is not enough",
             "state that instruction and its conditions together with the fact", "Final check before you answer",
             "qualifiers inside the same sentence or step as the asked content are kept",
+            # v7 (F-60): sentence-level citations and the source of the question's situation
+            "Cite sentence by sentence", "cite the source that establishes the situation in the question",
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 

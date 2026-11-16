@@ -29,6 +29,8 @@ class Evidence:
     source_type: str = "text_unit"
     section_path: str = ""
     variant: str = ""
+    # Set when code, not retrieval, added the item: "duplicate_passage" (F-59) counts as cited.
+    added_by: str = ""
 
 
 def section_path_with_variant(section_path: str, variant: str) -> str:

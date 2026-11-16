@@ -42,6 +42,7 @@ from .connections import (
 )
 from .evidence import Evidence, EvidenceService
 from .evaluation.classic_metrics import answer_term_scores, exact_match_score, f1_score, metric_max_over_ground_truths
+from .duplicate_passages import PageEquivalence, with_duplicate_citations
 from .evaluation.source_scoring import DEFAULT_SOURCE_WEIGHT, combined_score, source_score
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
@@ -1387,6 +1388,10 @@ class RetrievalExperimentService:
             if method in EVIDENCE_METHODS or method == EXPERIMENT_AGENTIC_METHOD:
                 try:
                     retrieved_evidence = self._resolved_evidence(project_id, context)
+                    if answer and retrieved_evidence:
+                        retrieved_evidence, _ = with_duplicate_citations(
+                            self.projects, project_id, answer, retrieved_evidence, context,
+                        )
                     raw_sources = EvidenceService.source_records(context)
                     if raw_sources and not retrieved_evidence:
                         mapping_error = "GraphRAG 回傳了來源，但無法映射至原始文件"
@@ -1453,6 +1458,7 @@ class RetrievalExperimentService:
                 generated.actual_answer, generated.retrieved_evidence,
                 question.answer_source_evidence or question.gold_evidence,
                 project_document_only_score(self.projects, project_id),
+                PageEquivalence(self.projects.path_for(project_id)),
             ),
         )
         if enable_llm_judge:

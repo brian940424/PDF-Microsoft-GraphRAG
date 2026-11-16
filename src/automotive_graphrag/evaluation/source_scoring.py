@@ -12,7 +12,7 @@ judges and answer metrics see) and ``cited_sources`` (the sources in question-se
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 DEFAULT_SOURCE_WEIGHT = 0.1
 """Largest bonus (on the 0–1 scale) a fully matching source can add to an eligible answer."""
@@ -52,13 +52,15 @@ def cited_evidence(answer: str, retrieved: Sequence[object]) -> list[object]:
 
     Models sometimes cite the page number printed in the source text instead of its record id,
     so a ``Sources`` number that matches no retrieved record falls back to the retrieved page.
+    Evidence that code added for a cited repeated passage (``added_by``) always counts.
     """
     source_ids, evidence_ids = cited_source_ids(answer)
     text_units = [item for item in retrieved if getattr(item, "source_type", "text_unit") == "text_unit"]
     page_citations = source_ids - {str(getattr(item, "context_id", "")) for item in text_units}
     return [
         item for item in text_units
-        if str(getattr(item, "context_id", "")) in source_ids
+        if getattr(item, "added_by", "")  # added by code for a cited repeated passage (F-59)
+        or str(getattr(item, "context_id", "")) in source_ids
         or str(getattr(item, "evidence_id", "")) in evidence_ids
         or str(getattr(item, "page", None)) in page_citations
     ]
@@ -83,6 +85,7 @@ def source_score(
     retrieved: Sequence[object],
     gold: Sequence[object],
     document_only_score: float = DOCUMENT_ONLY_SCORE,
+    equivalent_pages: Callable[[str, int, int], bool] | None = None,
 ) -> float | None:
     """0–1 score of the cited sources against the gold answer sources; None when not applicable.
 
@@ -91,6 +94,8 @@ def source_score(
       document; when no page is hit but a cited source is in a gold document, ``document_only_score``.
     * Gold documents without pages: 1.0 when any cited source is in that document.
     * An answer that cites nothing resolvable scores 0.
+    * ``equivalent_pages(document, gold_page, cited_page)``: a cited page with the same text as a
+      gold page of the same document (a repeated variant chapter, F-58/F-59) also hits it.
     """
     if not gold:
         return None
@@ -113,7 +118,11 @@ def source_score(
     if not gold_pages:
         return 1.0 if document_hit else 0.0
     hits = sum(
-        any(abs(page - cited) <= PAGE_TOLERANCE for cited in cited_pages.get(document, ()))
+        any(
+            abs(page - cited) <= PAGE_TOLERANCE
+            or (equivalent_pages is not None and equivalent_pages(document, page, cited))
+            for cited in cited_pages.get(document, ())
+        )
         for document, page in gold_pages
     )
     recall = hits / len(gold_pages)
