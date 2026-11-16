@@ -11,6 +11,7 @@ from typing import Any
 
 from .answer_extraction import install_two_stage_basic
 from .llm_usage import install_litellm_recorder
+from .variants import select_basic_context
 from .querying import QueryService
 
 
@@ -44,6 +45,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     from graphrag.cli import query as cli_query
 
     llm_calls: list[dict[str, Any]] = []
+    variant_report: dict[str, Any] = {}
     install_litellm_recorder(llm_calls)
     common = {
         "data_dir": None,
@@ -74,7 +76,18 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
         retrieval_query = str(payload.get("retrieval_query") or "").strip()
         if retrieval_query:
             use_retrieval_query_for_basic(retrieval_query)
-        install_two_stage_basic()
+
+        def select_variants(query: str, result: Any) -> Any:
+            try:
+                # A rewritten retrieval query carries variant names of a question in another language.
+                selected, report = select_basic_context(result, f"{query}\n{retrieval_query}", root_dir)
+            except Exception as exc:  # variant selection must never block an answer
+                variant_report["error"] = str(exc)
+                return result
+            variant_report.update(report)
+            return selected
+
+        install_two_stage_basic(select_variants)
         answer, context = cli_query.run_basic_search(
             data_dir=None,
             root_dir=root_dir,
@@ -83,9 +96,12 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
             query=question,
             verbose=False,
         )
+    serialized = QueryService._serialize_context(context)
+    if variant_report and isinstance(serialized, dict):
+        serialized["variant_selection"] = variant_report
     return {
         "answer": str(answer),
-        "context": QueryService._serialize_context(context),
+        "context": serialized,
         "llm_calls": llm_calls,
     }
 

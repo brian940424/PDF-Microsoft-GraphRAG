@@ -10,7 +10,7 @@ full sources and their citation identifiers.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 EXTRACTION_HEADING = "-----Extracted source sentences-----"
@@ -70,19 +70,28 @@ async def extract_source_sentences(model: Any, question: str, context_chunks: st
     return str(getattr(response, "content", "") or "")
 
 
-def install_two_stage_basic() -> None:
-    """Patch GraphRAG BasicSearch.stream_search (used by the query API) to answer in two stages."""
+ContextTransform = Callable[[str, Any], Any]
+
+
+def install_two_stage_basic(context_transform: ContextTransform | None = None) -> None:
+    """Patch GraphRAG BasicSearch.stream_search (used by the query API) to answer in two stages.
+
+    `context_transform(query, context_result)` may replace the retrieved context first, for
+    example to drop sources of another manual variant; it applies to both stages.
+    """
     from graphrag.query.structured_search.basic_search.search import BasicSearch
 
     original = BasicSearch.stream_search
     if getattr(original, "_two_stage_patch", False):
-        return
+        original = original.__wrapped__
 
     async def stream_search(self: Any, query: str, conversation_history: Any = None) -> AsyncGenerator[str, None]:
         builder = self.context_builder
         result = builder.build_context(
             query=query, conversation_history=conversation_history, **self.context_builder_params,
         )
+        if context_transform is not None:
+            result = context_transform(query, result)
         extraction = await extract_source_sentences(self.model, query, result.context_chunks, self.model_params)
         augmented = dataclasses.replace(result, context_chunks=context_with_extraction(result.context_chunks, extraction))
         builder.build_context = lambda *args, **kwargs: augmented

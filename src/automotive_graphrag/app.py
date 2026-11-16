@@ -1161,7 +1161,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 return (
                     f"### [{item['evidence_id']}] {item['document_id']} — {location}\n\n"
                     f"章節：{item['section_name']} (`{item['section_id']}`)  \n"
-                    f"{identifier_text}{item['text']}"
+                    + (f"版本：{item['variant']}  \n" if item.get("variant") else "")
+                    + f"{identifier_text}{item['text']}"
                 )
         return ""
 
