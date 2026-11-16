@@ -12,21 +12,30 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v2"
+ANSWER_PROMPT_VERSION = "answer-requirements-v3"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
 ANSWER_REQUIREMENTS = """---Answer requirements---
 
-- Answer about the exact feature, app, setting or procedure in the question. When the data describes similarly named functions (for example the same feature name in another app, or another way to do a similar task), use only the passages about the one asked and do not mix in the others.
-- When a relevant passage contains a list of steps, precautions, warnings, conditions or items, include every item of that list, not just the first few.
-- Keep each answer within the single section that directly answers the question. Include that section's relevant notes, limitations, alternatives and follow-up branches, but do not combine adjacent sections just because they share a page.
-- Preserve the source order of procedure steps. Do not move a later registration or setup step before the instruction that introduces it.
-- Use citation identifiers exactly as supplied in the source context. Printed page numbers inside source text are content, not citation identifiers.
+Scope: answer only what the question asks.
+- Answer about the exact feature, app, setting, component or procedure in the question. When the data describes similarly named functions (for example the same feature name in another app, or another way to do a similar task), use only the passages about the one asked and do not mix in the others.
+- Match the conditions in the question. When the data gives several examples, cases or patterns (for example different switch positions, lamps, modes or models), answer with the one whose conditions match the question, and do not substitute a case with different conditions.
+- Keep each answer within the single section that directly answers the question. Do not combine adjacent sections just because they share a page.
+- A passage often contains CAUTION, NOTE or WARNING items and background explanations next to the asked content. Leave out every such item that is not part of the answer: warnings about other components or situations, checks or inspections before or after the asked step, reasons why something happens, when or when not to do the task, and alternative part or bolt styles. Include a caution or warning only when the question asks for precautions or warnings, or when the asked task cannot be done correctly without it.
+- For a specification question (torque, dimension, clearance, pressure, capacity, voltage and similar), give only the requested values with their units for the items asked, and no extra sentences.
+- Do not add anything the data does not state, such as extra steps, conditions, costs, side effects or general knowledge.
+
+Completeness: do not drop what the asked task needs.
+- Include every step, condition and note that is required to complete the asked task, even when it appears later in the passage, in a separate note, or on another page. Examples: a condition that triggers an extra step (such as re-registering parts when a new unit does not come with them), or how a repair must be finished (such as soldering and taping).
+- When the question asks for a list of steps, precautions, warnings, conditions or items, include every item of that list, not just the first few.
 - Include the follow-up branches that the passage gives for the asked task, such as "To ...", "If ..." or "After ..." instructions (for example how to restore, undo, continue or set up next), unless the question clearly asks for only one part.
-- Do not add anything the data does not state, such as extra steps, conditions, costs, side effects or general knowledge, and do not add neighbouring content that the question did not ask about.
+- Preserve the source order of procedure steps. Do not move a later registration or setup step before the instruction that introduces it.
+
+Wording and citations.
 - Keep the certainty of the source wording: if the data says something will happen, do not soften it to "may"; if it says "may", do not make it definite.
 - When the data gives different information for different device models, state which model each piece applies to.
+- Use citation identifiers exactly as supplied in the source context. Printed page numbers inside source text are content, not citation identifiers.
 
 """
 
