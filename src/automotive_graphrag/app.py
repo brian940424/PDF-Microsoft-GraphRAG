@@ -1109,6 +1109,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ]
         return rows, [item.query_id for item in records]
 
+    def clear_query_history(project_id: str | None, confirmed: bool):
+        """Remove manual Q&A records only; AutoQA and portal records feed other reports."""
+        if not confirmed:
+            return load_query_history(project_id)
+        if not project_id:
+            raise gr.Error("請先開啟專案")
+        try:
+            removed = querying.clear_history(project_id, (None, "manual"))
+        except ProjectError as exc:
+            raise gr.Error(str(exc)) from exc
+        gr.Info(f"已清除 {removed} 筆手動問答紀錄")
+        return load_query_history(project_id)
+
     def format_history_time(value: str) -> str:
         try:
             return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -4364,6 +4377,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 with gr.Row():
                     gr.Markdown(f"最近 {QUERY_HISTORY_LIMIT} 筆手動問答，點選一列可載回問題與回答")
                     query_history_refresh = gr.Button("重新整理", size="sm", scale=0)
+                    query_history_clear = gr.Button("清除歷史紀錄", size="sm", scale=0, variant="stop")
+                # A js-only event cannot write a gr.State (server-side), so the confirm() result rides a hidden Checkbox.
+                query_history_clear_confirmation = gr.Checkbox(visible=False)
                 query_history_table = gr.Dataframe(
                     headers=["時間", "問題", "方法", "狀態", "耗時（秒）"],
                     datatype=["str", "str", "str", "str", "number"],
@@ -5631,6 +5647,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 outputs=[query_history_table, query_history_ids],
                 show_progress="hidden",
             )
+        query_history_clear.click(
+            None,
+            outputs=query_history_clear_confirmation,
+            js="() => confirm('確定要清除此專案所有手動問答歷史紀錄嗎？此動作無法復原（自動問答紀錄不受影響）。')",
+        ).then(
+            clear_query_history,
+            inputs=[query_project, query_history_clear_confirmation],
+            outputs=[query_history_table, query_history_ids],
+            show_progress="hidden",
+        )
         query_history_table.select(
             select_query_history,
             inputs=[query_project, query_history_ids],
@@ -5839,10 +5865,39 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
         )
+        def initial_model_menus():
+            """Page-load menus: current saved list and defaults, not the values baked in at startup."""
+            return (
+                chat_model_update(), chat_model_update(), chat_model_update(), chat_model_update(),
+                vision_model_update(), judge_model_update(autoqa_judge_model_state()[0]), judge_model_update(),
+            )
+
+        def connection_form_views():
+            """Connection form as saved now; the build-time choices go stale once settings are saved."""
+            models = chat_model_choices()
+            embedding_models = list(connections.available_embedding_models())
+            return (
+                connections.get_api_key() or "",
+                gr.update(choices=models, value=models),
+                gr.update(choices=models, value=connections.get_chat_model()),
+                gr.update(choices=embedding_models, value=connections.get_embedding_model()),
+            )
+
+        demo.load(initial_model_menus, outputs=model_menu_inputs, show_progress="hidden")
         demo.load(
-            refresh_model_menus, inputs=model_menu_inputs, outputs=model_menu_inputs, show_progress="hidden",
+            connection_form_views,
+            outputs=[api_key, connection_models, chat_model, embedding_model],
+            show_progress="hidden",
         )
         demo.load(workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs)
+        # Dropdown choices are baked in when the UI is built; re-read projects on every page load
+        # so projects deleted (or created) since the server started are reflected after a reload.
+        demo.load(
+            refresh_project_views,
+            inputs=[selected_project, active_project_id],
+            outputs=[project_table, selected_project, selected_project_details, active_project_id, active_project_banner],
+            show_progress="hidden",
+        )
         demo.load(
             refresh_autoqa_judge_model_selection,
             outputs=[autoqa_judge_model, autoqa_judge_selection_status],
