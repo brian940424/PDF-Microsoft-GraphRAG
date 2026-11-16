@@ -8,6 +8,7 @@ from unittest.mock import patch
 from automotive_graphrag.drift_compat import (
     SamplingParameterFilter,
     _filter_engine_model,
+    merge_local_contexts,
     run_drift_search,
 )
 
@@ -116,6 +117,73 @@ class DriftCompatibilityTests(unittest.TestCase):
             [{"messages": "prompt", "max_completion_tokens": 50}],
         )
         self.assertIs(query_api.get_drift_search_engine, original_factory)
+
+    def test_merge_local_contexts_keeps_sources_from_every_action(self):
+        import pandas as pd
+
+        first = {
+            "sources": pd.DataFrame([
+                {"id": "10", "text": "a", "in_context": False},
+                {"id": "11", "text": "b", "in_context": True},
+            ]),
+            "entities": pd.DataFrame([{"id": "e1"}]),
+        }
+        second = {
+            "sources": pd.DataFrame([
+                {"id": "12", "text": "c", "in_context": True},
+                {"id": "10", "text": "a", "in_context": True},
+                {"id": "11", "text": "b", "in_context": True},
+            ]),
+            "entities": pd.DataFrame([{"id": "e1"}, {"id": "e2"}]),
+        }
+
+        merged = merge_local_contexts([first, second])
+
+        self.assertEqual(
+            merged["sources"].to_dict(orient="records"),
+            [
+                {"id": "10", "text": "a", "in_context": True},
+                {"id": "11", "text": "b", "in_context": True},
+                {"id": "12", "text": "c", "in_context": True},
+            ],
+        )
+        self.assertEqual(list(merged["entities"]["id"]), ["e1", "e2"])
+
+    def test_drift_entrypoint_returns_context_of_all_followups(self):
+        import pandas as pd
+        from graphrag.api import query as query_api
+        from graphrag.cli import query as cli_query
+
+        config = SimpleNamespace(
+            drift_search=SimpleNamespace(completion_model_id="drift"),
+            get_completion_model_config=lambda _model_id: SimpleNamespace(model="gpt-4o-mini", call_args={}),
+        )
+        callbacks = []
+        engine = SimpleNamespace(model=FakeCompletion(), callbacks=callbacks)
+
+        def fake_factory(*, config):
+            return engine
+
+        def fake_cli_run(**_kwargs):
+            created = query_api.get_drift_search_engine(config=config)
+            # Mimic GraphRAG: the API keeps only the latest context, while every
+            # Local Search action reports its own records to all callbacks.
+            latest = {}
+            for source_id in ("1", "2"):
+                latest = {"sources": pd.DataFrame([{"id": source_id, "text": source_id}])}
+                for callback in created.callbacks:
+                    callback.on_context(latest)
+                    callback.on_reduce_response_start("ignored")
+            return "answer", latest
+
+        with (
+            patch.object(query_api, "get_drift_search_engine", fake_factory),
+            patch.object(cli_query, "run_drift_search", fake_cli_run),
+        ):
+            answer, context = run_drift_search(root_dir="unused", query="question")
+
+        self.assertEqual(answer, "answer")
+        self.assertEqual(list(context["sources"]["id"]), ["1", "2"])
 
     def test_drift_entrypoint_restores_process_working_directory(self):
         from graphrag.api import query as query_api

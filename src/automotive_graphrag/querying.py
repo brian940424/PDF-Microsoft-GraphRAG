@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import hashlib
 import os
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -543,9 +545,51 @@ class QueryService:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
 
+    @contextmanager
+    def _locked_history(self, path: Path):
+        """Serialize history writers across threads and processes (the portal appends too)."""
+        with self._history_lock, (path.parent / ".queries.lock").open("a") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
     def _append_record(self, path: Path, result: QueryResult) -> None:
         line = json.dumps(asdict(result), ensure_ascii=False) + "\n"
-        with self._history_lock, path.open("a", encoding="utf-8") as output:
+        with self._locked_history(path), path.open("a", encoding="utf-8") as output:
             output.write(line)
             output.flush()
             os.fsync(output.fileno())
+
+    def clear_history(self, project_id: str, sources: tuple[str | None, ...]) -> int:
+        """Drop records whose source is in ``sources``; other records stay. Returns the number removed."""
+        path = self.projects.path_for(project_id) / "runs" / "queries.jsonl"
+        if not path.exists():
+            return 0
+        with self._locked_history(path):
+            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+            kept: list[str] = []
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    source = json.loads(line).get("source")
+                except (json.JSONDecodeError, AttributeError) as exc:
+                    raise ProjectError("問答紀錄格式錯誤") from exc
+                if source not in sources:
+                    kept.append(line if line.endswith("\n") else line + "\n")
+            removed = sum(1 for line in lines if line.strip()) - len(kept)
+            if removed == 0:
+                return 0
+            handle, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".queries-", suffix=".jsonl")
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8") as temporary:
+                    temporary.writelines(kept)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                os.replace(temporary_name, path)
+            finally:
+                if os.path.exists(temporary_name):
+                    os.unlink(temporary_name)
+        return removed
