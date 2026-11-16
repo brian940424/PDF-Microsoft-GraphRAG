@@ -2499,7 +2499,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         answer_model = answer_model or connections.get_chat_model()
         return (
             gr.update(choices=chat_model_choices(), value=answer_model),
-            gr.update(choices=AUTOQA_QUERY_METHOD_CHOICES, value=method or "local"),
+            gr.update(choices=AUTOQA_QUERY_METHOD_CHOICES, value=method or "auto"),
         )
 
     def update_query_method_compatibility(answer_model: str | None, method: str | None):
@@ -4473,7 +4473,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     )
                     autoqa_method = gr.Dropdown(
                         choices=AUTOQA_QUERY_METHOD_CHOICES,
-                        value="local", label="檢索模式",
+                        value="auto", label="檢索模式",
                     )
                     autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
                     autoqa_response_type = gr.Dropdown(

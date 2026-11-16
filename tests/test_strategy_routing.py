@@ -274,6 +274,14 @@ class QueryTabAutoStrategyTests(unittest.TestCase):
         _model, other_update = handlers["update_autoqa_model_method_compatibility"]("gpt-4o-mini", "local")
         self.assertEqual(other_update["value"], "local")
         self.assertIn("agentic", [value for _label, value in other_update["choices"]])
+        # Automatic QA defaults to auto: the dropdown starts on the "auto" value, not its label.
+        _model, default_update = handlers["update_autoqa_model_method_compatibility"]("gpt-4o-mini", None)
+        self.assertEqual(default_update["value"], "auto")
+        autoqa_method = next(
+            component.get_config() for component in app.blocks.values()
+            if hasattr(component, "get_config") and component.get_config().get("label") == "檢索模式"
+        )
+        self.assertEqual(autoqa_method["value"], "auto")
 
 
 if __name__ == "__main__":
