@@ -24,9 +24,10 @@ from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .agentic_search import AgenticSearch
 from .evidence import Evidence, EvidenceService
-from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
+from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
+from .query_translation import document_language_sample, needs_rewrite
 from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
 
 
@@ -181,11 +182,26 @@ class QueryService:
             method_name = command[command.index("--method") + 1] if "--method" in command else None
             llm_calls.extend(tag_calls(getattr(execution, "llm_calls", ()) or (), SEARCH_STAGE, method_name))
 
-        def query_command(search_method: str, search_question: str) -> list[str]:
-            return [
+        rewritten: list[str | None] = []
+
+        def basic_retrieval_query() -> str | None:
+            """Rewrite the question into the manual's language once, on the first Basic search (F-53)."""
+            if not rewritten:
+                rewritten.append(self._rewrite_for_manual(
+                    project_id, graph_root, prompt, selected_model, applied_effort, llm_calls, execution_metadata,
+                ))
+            return rewritten[0]
+
+        def query_command(search_method: str, search_question: str, rewrite: bool = False) -> list[str]:
+            command = [
                 sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
-                "--method", search_method, "--response-type", response_type, search_question,
+                "--method", search_method, "--response-type", response_type,
             ]
+            if rewrite and search_method == "basic":
+                retrieval = basic_retrieval_query()
+                if retrieval:
+                    command += ["--retrieval-query", retrieval]
+            return command + [search_question]
 
         if normalized_method == AUTO_METHOD:
             api_base_url = self.connection_settings.get_api_base_url()
@@ -193,7 +209,7 @@ class QueryService:
 
             def search(search_method: str) -> SearchOutcome:
                 try:
-                    execution = run_query(query_command(search_method, retrieval_query))
+                    execution = run_query(query_command(search_method, retrieval_query, rewrite=True))
                 except ProjectError as exc:
                     return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
                 if execution.returncode != 0:
@@ -247,7 +263,7 @@ class QueryService:
             execution_metadata["requested_method"] = requested_method
             llm_calls[:0] = execution_metadata.pop("planner_llm_calls", [])
         else:
-            result = run_query(query_command(normalized_method, retrieval_query))
+            result = run_query(query_command(normalized_method, retrieval_query, rewrite=True))
         execution_metadata.update(usage_metadata(llm_calls))
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
@@ -289,6 +305,32 @@ class QueryService:
             # A separate admin process may remove the project while a long query is running.
             pass
         return query_result
+
+    def _rewrite_for_manual(
+        self,
+        project_id: str,
+        graph_root: Path,
+        question: str,
+        model: str,
+        reasoning_effort: str | None,
+        llm_calls: list[dict[str, Any]],
+        execution_metadata: dict[str, Any],
+    ) -> str | None:
+        """Return a retrieval query in the manual's language when the question is in another one."""
+        script, excerpt = document_language_sample(graph_root)
+        rewrite = getattr(self.router, "rewrite_query", None)
+        if rewrite is None or not needs_rewrite(question, script):
+            return None
+        query, calls = rewrite(
+            question, excerpt, model, self.connection_settings.get_api_base_url(),
+            self.connection_settings.get_api_key(project_id), reasoning_effort,
+        )
+        llm_calls.extend(tag_calls(calls, QUERY_REWRITE_STAGE, "basic"))
+        if query:
+            execution_metadata["retrieval_query"] = query
+        else:
+            execution_metadata["retrieval_query_error"] = "改寫為手冊語言失敗，改用原題檢索"
+        return query
 
     def history(self, project_id: str) -> list[QueryResult]:
         path = self.projects.path_for(project_id) / "runs" / "queries.jsonl"
@@ -352,6 +394,9 @@ class QueryService:
         method = command[command.index("--method") + 1]
         root = Path(command[command.index("--root") + 1])
         question = command[-1]
+        retrieval_query = (
+            command[command.index("--retrieval-query") + 1] if "--retrieval-query" in command else None
+        )
         model = ""
         settings_path = root / "settings.yaml"
         try:
@@ -378,6 +423,7 @@ class QueryService:
                 "method": method,
                 "model": model,
                 "response_type": response_type,
+                "retrieval_query": retrieval_query,
             },
             ensure_ascii=False,
         )

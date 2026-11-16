@@ -65,6 +65,27 @@ class StrategyRouterTests(unittest.TestCase):
         self.assertEqual(decision.method, "basic")
         self.assertEqual(decision.reason, "模型未提供原因")
 
+    def test_rewrite_query_returns_manual_language_query_and_records_call(self):
+        prompts = []
+
+        def chat(api_base_url, api_key, model, prompt, reasoning_effort=None):
+            prompts.append(prompt)
+            return {"query": "  Brake bleeding procedure:\n first caliper  "}
+
+        query, calls = StrategyRouter(chat).rewrite_query(
+            "煞車系統排氣時先接哪個卡鉗？", "Connect a vinyl tube", "m", "u", "k",
+        )
+
+        self.assertEqual(query, "Brake bleeding procedure: first caliper")
+        self.assertIn("煞車系統排氣時先接哪個卡鉗？", prompts[0])
+        self.assertIn("Connect a vinyl tube", prompts[0])
+        self.assertEqual([call["stage"] for call in calls], ["query_rewrite"])
+
+    def test_rewrite_query_returns_none_without_key_or_usable_reply(self):
+        self.assertEqual(StrategyRouter(lambda *args: {"query": "x"}).rewrite_query("q", "e", "m", "u", None), (None, ()))
+        query, _ = StrategyRouter(lambda *args: {"text": "x"}).rewrite_query("q", "e", "m", "u", "k")
+        self.assertIsNone(query)
+
 
 class StrategyRankingTests(unittest.TestCase):
     def test_ranking_is_kept_and_prompt_asks_for_it(self) -> None:

@@ -12,8 +12,9 @@ from typing import Any, Callable
 
 from .connections import chat_completion_api_params, extract_json_object, llm_request_headers
 from .evidence import EvidenceService
-from .llm_usage import ANSWER_CHECK_STAGE, ROUTING_STAGE, call_record
+from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, ROUTING_STAGE, call_record
 from .projects import ProjectError
+from .query_translation import REWRITE_PROMPT
 
 
 ROUTABLE_METHODS = ("local", "global", "drift", "basic")
@@ -145,6 +146,24 @@ class StrategyRouter:
             return AnswerCheck(response["found"], str(response.get("reason", "")).strip(), tuple(calls))
         except ProjectError as exc:
             return AnswerCheck(True, f"答案檢查失敗（{exc}），採用目前回答", tuple(calls))
+
+    def rewrite_query(
+        self, question: str, excerpt: str, model: str, api_base_url: str, api_key: str | None,
+        reasoning_effort: str | None = None,
+    ) -> tuple[str | None, tuple[dict[str, Any], ...]]:
+        """Return a retrieval query in the manual's language, or None when the rewrite fails."""
+        if not api_key:
+            return None, ()
+        calls: list[dict[str, Any]] = []
+        try:
+            prompt = REWRITE_PROMPT.format(question=question, excerpt=excerpt)
+            response = self._ask(prompt, model, api_base_url, api_key, reasoning_effort, QUERY_REWRITE_STAGE, calls)
+        except ProjectError:
+            return None, tuple(calls)
+        query = response.get("query") if isinstance(response, dict) else None
+        if not isinstance(query, str) or not query.strip():
+            return None, tuple(calls)
+        return " ".join(query.split()), tuple(calls)
 
     def _ask(
         self, prompt: str, model: str, api_base_url: str, api_key: str, reasoning_effort: str | None,

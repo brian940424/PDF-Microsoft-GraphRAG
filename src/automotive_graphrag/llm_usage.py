@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 ROUTING_STAGE = "routing"
 SEARCH_STAGE = "search"
 ANSWER_CHECK_STAGE = "answer_check"
+QUERY_REWRITE_STAGE = "query_rewrite"
 AGENTIC_STAGE = "agentic"
 
 

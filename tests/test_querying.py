@@ -69,6 +69,18 @@ class FakeRouter:
         return AnswerCheck(answer not in self.refusals, "檢查結果")
 
 
+class RewritingRouter(FakeRouter):
+    def __init__(self, decision: StrategyDecision, query: str | None = "Brake bleeding order") -> None:
+        super().__init__(decision)
+        self.query = query
+        self.rewrites: list[tuple[str, str]] = []
+
+    def rewrite_query(self, question: str, excerpt: str, *_: object):
+        self.rewrites.append((question, excerpt))
+        call = {"stage": "query_rewrite", "method": None, "model": "m", "prompt_tokens": 10, "completion_tokens": 5}
+        return self.query, (call,)
+
+
 class ScriptedRunner:
     """Answer per --method; a None answer simulates a failed GraphRAG process."""
 
@@ -154,6 +166,65 @@ class QueryServiceTests(unittest.TestCase):
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
         self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v3")
+
+    def write_text_units(self, *texts: str) -> None:
+        pd.DataFrame({"text": list(texts)}).to_parquet(self.graph_root / "output" / "text_units.parquet")
+
+    def test_basic_retrieval_uses_manual_language_query_when_question_language_differs(self) -> None:
+        self.write_text_units("Connect a vinyl tube to rear right brake caliper bleeder valve. " * 5)
+        runner = ScriptedRunner({"basic": "資料中沒有", "local": "右後卡鉗", "global": "x", "drift": "x"})
+        router = RewritingRouter(StrategyDecision("basic", "查找", ("basic", "local")))
+        router.refusals = ("資料中沒有",)
+        commands: list[list[str]] = []
+
+        def record(command: list[str]) -> QueryExecution:
+            commands.append(command)
+            return runner(command)
+
+        service = QueryService(self.store, record, self.connections, router=router)
+        result = service.ask("L33-SM3E", "煞車排氣順序為何？", method="auto")
+
+        basic, local = commands[:2]
+        self.assertEqual(basic[basic.index("--retrieval-query") + 1], "Brake bleeding order")
+        self.assertEqual(basic[-1], "煞車排氣順序為何？")
+        self.assertNotIn("--retrieval-query", local)
+        self.assertEqual(len(router.rewrites), 1)
+        self.assertEqual(result.execution_metadata["retrieval_query"], "Brake bleeding order")
+        stages = [call["stage"] for call in result.execution_metadata["llm_calls"]]
+        self.assertIn("query_rewrite", stages)
+
+    def test_basic_retrieval_keeps_question_when_languages_match_or_rewrite_fails(self) -> None:
+        runner = FakeQueryRunner()
+        self.write_text_units("指紋辨識可用來解鎖手機與登入帳號。" * 10)
+        router = RewritingRouter(StrategyDecision("basic", "查找"))
+        QueryService(self.store, runner, self.connections, router=router).ask("L33-SM3E", "如何註冊指紋？", method="basic")
+        self.assertNotIn("--retrieval-query", runner.commands[-1])
+        self.assertEqual(router.rewrites, [])
+
+        self.write_text_units("Connect a vinyl tube to rear right brake caliper bleeder valve. " * 5)
+        failing = RewritingRouter(StrategyDecision("basic", "查找"), query=None)
+        result = QueryService(self.store, runner, self.connections, router=failing).ask(
+            "L33-SM3E", "煞車排氣順序為何？", method="basic",
+        )
+        self.assertNotIn("--retrieval-query", runner.commands[-1])
+        self.assertIn("retrieval_query_error", result.execution_metadata)
+
+    def test_worker_payload_carries_retrieval_query(self) -> None:
+        payloads: list[dict[str, object]] = []
+
+        def fake_worker(environment, package_root, payload, timeout_seconds, stop_event):
+            payloads.append(json.loads(payload))
+            return subprocess.CompletedProcess([], 0, json.dumps({"answer": "a", "context": {}}), "")
+
+        command = ["python", "-m", "graphrag", "query", "--root", str(self.graph_root), "--method", "basic",
+                   "--response-type", "Single Paragraph", "--retrieval-query", "Brake bleeding order", "煞車排氣？"]
+        with patch.object(QueryService, "_run_worker", side_effect=fake_worker):
+            QueryService._run(command)
+            QueryService._run(command[:-3] + ["煞車排氣？"])
+
+        self.assertEqual(payloads[0]["question"], "煞車排氣？")
+        self.assertEqual(payloads[0]["retrieval_query"], "Brake bleeding order")
+        self.assertIsNone(payloads[1]["retrieval_query"])
 
     def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
         runner = FakeQueryRunner()

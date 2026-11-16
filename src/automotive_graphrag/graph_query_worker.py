@@ -13,6 +13,22 @@ from .llm_usage import install_litellm_recorder
 from .querying import QueryService
 
 
+def use_retrieval_query_for_basic(retrieval_query: str) -> None:
+    """Make Basic pick text units with `retrieval_query` while the answer prompt keeps the question."""
+    from graphrag.query.structured_search.basic_search.basic_context import BasicSearchContext
+
+    original = BasicSearchContext.build_context
+    if getattr(original, "_retrieval_query_patch", False):
+        original = original.__wrapped__
+
+    def build_context(self, query: str, *args: Any, **kwargs: Any):
+        return original(self, retrieval_query if query else query, *args, **kwargs)
+
+    build_context._retrieval_query_patch = True  # type: ignore[attr-defined]
+    build_context.__wrapped__ = original  # type: ignore[attr-defined]
+    BasicSearchContext.build_context = build_context  # type: ignore[method-assign]
+
+
 def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     """Execute one CLI query and return JSON-safe answer and context data."""
     method = str(payload.get("method", ""))
@@ -54,6 +70,9 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
             response_type=response_type,
         )
     else:
+        retrieval_query = str(payload.get("retrieval_query") or "").strip()
+        if retrieval_query:
+            use_retrieval_query_for_basic(retrieval_query)
         answer, context = cli_query.run_basic_search(
             data_dir=None,
             root_dir=root_dir,
