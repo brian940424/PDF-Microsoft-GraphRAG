@@ -427,6 +427,22 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual([item.source for item in service.history("L33-SM3E")], ["manual", None])
         self.assertEqual(service.history("L33-SM3E"), [manual, untagged])
 
+    def test_clear_history_removes_only_selected_sources(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+        service.ask("L33-SM3E", "手動", source="manual")
+        service.ask("L33-SM3E", "舊紀錄")
+        autoqa = service.ask("L33-SM3E", "題目集", source="question_set")
+        portal = service.ask("L33-SM3E", "入口", source="portal")
+
+        removed = service.clear_history("L33-SM3E", (None, "manual"))
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(service.history("L33-SM3E"), [autoqa, portal])
+        self.assertEqual(service.clear_history("L33-SM3E", (None, "manual")), 0)
+        # Appending still works after the file was rewritten.
+        again = service.ask("L33-SM3E", "再問", source="manual")
+        self.assertEqual(service.history("L33-SM3E"), [autoqa, portal, again])
+
     def test_failed_query_is_saved_with_error(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(return_code=2), self.connections)
 
