@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v3"
+ANSWER_PROMPT_VERSION = "answer-requirements-v6"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -31,6 +31,23 @@ Completeness: do not drop what the asked task needs.
 - When the question asks for a list of steps, precautions, warnings, conditions or items, include every item of that list, not just the first few.
 - Include the follow-up branches that the passage gives for the asked task, such as "To ...", "If ..." or "After ..." instructions (for example how to restore, undo, continue or set up next), unless the question clearly asks for only one part.
 - Preserve the source order of procedure steps. Do not move a later registration or setup step before the instruction that introduces it.
+
+Use every relevant source, not only the first one.
+- Before writing, go through the sources in the data one by one. For each source that is about the asked object or task, take every step, condition, caution and note in it that the asked task needs. Do this silently; output only the answer.
+- Several sources about the same object often split the information, for example an overview or description page and a later removal-and-installation page. Combine them. Never answer from only the first-ranked source or the lowest page number: a requirement that appears only in a later source, such as in a CAUTION at the end of an installation page, belongs in the answer.
+- For a comparison question (the question asks to compare, or asks about differences, similarities, what is common or what is specific), or a question about two or more objects: first sort, silently, the points from every relevant source into what all objects share and what is specific to each object, then write the answer in that structure. Each object's part must cover the points from all sources about that object, not just one of them.
+- Cite every source whose content you use, including each additional page that contributed a point.
+
+Keep the qualifiers inside each sentence or step you use.
+- A sentence or step you take from the data must keep its conditions ("while ...", "when ...", "if ...", "with X filled to / kept at ..."), the other actions joined to it in the same sentence or step ("..., and wrap ...", "then ..."), its end point ("until ...") and its result or how the result is shown ("indicated on the screen as ...", "shown as ..."). You may reword it, but keeping only the main action and the numbers is not enough.
+- When the asked fact (a limit, value, order or reason) is attached to an instruction, for example a bracketed limit after a repair step or an order given inside a "Repeat ... with ..." step, state that instruction and its conditions together with the fact.
+- Boundary with the scope rule above: qualifiers inside the same sentence or step as the asked content are kept. A separate CAUTION, NOTE or WARNING item, or text that describes an illustration, is a different item; include it only under the scope rule.
+- Example to keep: the data says "Seal the joint and wrap it with heat-shrink tube. [Exposed conductor must be within 5 mm.]" For a question about the exposed-conductor limit, answer "Seal the joint and wrap it with heat-shrink tube, keeping exposed conductor within 5 mm", not only "within 5 mm".
+- Example to leave out: the same passage also has a separate NOTE, "Inspect the connector housing for cracks." The question does not ask about the housing, so do not add that note.
+- Final check before you answer: compare each of your sentences with the source sentence it came from. Put back any condition, joined action, end point or result you dropped, and restore "will" if you weakened it to "can" or "may".
+
+Extracted source sentences.
+- The data may end with a section "-----Extracted source sentences-----": sentences copied word for word from the sources above, each starting with its source identifier. Build the answer from these lines: cover every copied line that the question asks about, from every source listed, and keep each line's conditions, joined actions, end points and results. Leave a copied line out only when it is clearly outside what the question asks. Check the full sources above for anything the copy missed, and cite the source identifiers of the lines you use.
 
 Wording and citations.
 - Keep the certainty of the source wording: if the data says something will happen, do not soften it to "may"; if it says "may", do not make it definite.

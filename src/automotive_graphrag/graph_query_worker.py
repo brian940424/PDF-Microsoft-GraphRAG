@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .answer_extraction import install_two_stage_basic
 from .llm_usage import install_litellm_recorder
 from .querying import QueryService
 
@@ -73,6 +74,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
         retrieval_query = str(payload.get("retrieval_query") or "").strip()
         if retrieval_query:
             use_retrieval_query_for_basic(retrieval_query)
+        install_two_stage_basic()
         answer, context = cli_query.run_basic_search(
             data_dir=None,
             root_dir=root_dir,

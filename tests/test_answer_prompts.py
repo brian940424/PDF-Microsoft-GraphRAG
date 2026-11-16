@@ -43,6 +43,13 @@ class AnswerPromptTests(unittest.TestCase):
             # v3 (F-43): matching conditions, required notes kept, unrelated notes dropped, bare specs
             "Match the conditions in the question", "Include every step, condition and note that is required",
             "Leave out every such item that is not part of the answer", "give only the requested values with their units",
+            # v4 (F-55): every retrieved source is checked, multi-page evidence combined, comparisons sorted
+            "go through the sources in the data one by one", "Never answer from only the first-ranked source",
+            "what all objects share and what is specific to each object", "Cite every source whose content you use",
+            # v5 (F-56): qualifiers inside a used sentence kept, separate unrelated notes still dropped
+            "Keep the qualifiers inside each sentence or step you use", "keeping only the main action and the numbers is not enough",
+            "state that instruction and its conditions together with the fact", "Final check before you answer",
+            "qualifiers inside the same sentence or step as the asked content are kept",
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 
