@@ -9,7 +9,7 @@ import pymupdf
 from automotive_graphrag.app import create_app
 from automotive_graphrag.documents import DocumentService
 from automotive_graphrag.projects import ProjectError, ProjectStore
-from automotive_graphrag.vision import SCOPE_ALL, VisionSettings
+from automotive_graphrag.vision import SCOPE_ALL, PageTranscription, VisionSettings
 
 
 def write_pdf(path: Path, texts: list[str]) -> None:
@@ -154,7 +154,7 @@ class PageReviewTests(unittest.TestCase):
             attempts.append(page)
             if page in failing:
                 raise RuntimeError(f"timeout {page}")
-            return f"Vision {page}"
+            return PageTranscription(f"Vision {page}", {"prompt_tokens": 100, "completion_tokens": 10})
 
         self.service.page_analyzer = analyzer
         vision = VisionSettings(model="gpt-6-luna", scope=SCOPE_ALL, max_workers=1)
@@ -179,6 +179,12 @@ class PageReviewTests(unittest.TestCase):
         # The manual edit on a still-failing page is untouched.
         self.assertEqual(self.records()[1], "修正後的第一頁")
         self.assertEqual(self.service.list_documents("L33-SM3E")[0].status, "PROCESSED_WITH_WARNINGS")
+        # The retry's usage is added to the usage of the first preprocess.
+        stored = json.loads((self.store.path_for("L33-SM3E") / "processed" / "report.json").read_text())["documents"][0]
+        self.assertEqual(
+            (stored["vision_prompt_tokens"], stored["vision_completion_tokens"], stored["vision_usage_pages"]),
+            (200, 20, 2),
+        )
 
         failing = set()
         self.assertEqual(self.service.retry_vision_fallbacks("L33-SM3E", "manual.pdf", vision), ([1], []))

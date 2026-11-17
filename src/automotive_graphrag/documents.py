@@ -19,7 +19,10 @@ import pymupdf
 from .cancellation import JobStopped, raise_if_stopped
 from .projects import ProjectError, ProjectStore, project_indexing_locked
 from .sectioning import remove_leading_printed_page_number, section_identifier, split_into_sections
-from .vision import PageAnalyzer, VisionAbort, VisionSettings, analyze_page, detect_document_language, page_needs_vision, render_page
+from .vision import (
+    PageAnalyzer, VisionAbort, VisionSettings, analyze_page, detect_document_language, page_needs_vision, render_page,
+    transcription_tokens,
+)
 
 
 class PdfPage(Protocol):
@@ -171,10 +174,30 @@ class ProcessingReport:
     vision_pages: int = 0
     vision_fallback_pages: int = 0
     vision_abort_reason: str | None = None
+    # Tokens reported by the vision API for successfully transcribed pages;
+    # `vision_usage_pages` counts the pages whose response included usage.
+    vision_prompt_tokens: int = 0
+    vision_completion_tokens: int = 0
+    vision_usage_pages: int = 0
     edited_pages: int = 0
     stopped: bool = False
     completed_documents: tuple[str, ...] = ()
     unprocessed_documents: tuple[str, ...] = ()
+
+
+VISION_USAGE_FIELDS = ("vision_prompt_tokens", "vision_completion_tokens", "vision_usage_pages")
+
+
+def add_vision_usage(target: dict[str, Any], text: str) -> None:
+    """Add one transcribed page's reported token usage to a report's vision usage fields."""
+    prompt_tokens, completion_tokens = transcription_tokens(text)
+    if prompt_tokens is None and completion_tokens is None:
+        return
+    for field in VISION_USAGE_FIELDS:
+        target.setdefault(field, 0)
+    target["vision_prompt_tokens"] += prompt_tokens or 0
+    target["vision_completion_tokens"] += completion_tokens or 0
+    target["vision_usage_pages"] += 1
 
 
 class DocumentService:
@@ -379,6 +402,7 @@ class DocumentService:
         totals = {
             "pages": 0, "successful_pages": 0, "empty_pages": 0, "error_pages": 0,
             "vision_pages": 0, "vision_fallback_pages": 0, "edited_pages": 0,
+            "vision_prompt_tokens": 0, "vision_completion_tokens": 0, "vision_usage_pages": 0,
         }
         all_edits = self._read_edits(project_id)
         progress = _PageProgress(
@@ -808,6 +832,7 @@ class DocumentService:
                 raise
 
         transcribed: dict[int, str] = {}
+        usage: dict[str, Any] = {}
         total = len(failed_pages)
         done = total - len(images)
         if progress_callback is not None:
@@ -817,7 +842,9 @@ class DocumentService:
             for future in as_completed(futures):
                 page_number = futures[future]
                 try:
-                    transcribed[page_number] = future.result().strip()
+                    result = future.result()
+                    transcribed[page_number] = result.strip()
+                    add_vision_usage(usage, result)
                 except JobStopped:
                     pass
                 except Exception as exc:
@@ -869,6 +896,8 @@ class DocumentService:
                 elif not was_empty and not extracted:
                     stored_report["empty_pages"] = int(stored_report.get("empty_pages", 0)) + 1
         stored_report["vision_pages"] = sorted({*stored_report.get("vision_pages", []), *transcribed})
+        for field, value in usage.items():
+            stored_report[field] = int(stored_report.get(field, 0)) + value
         stored_report["vision_fallback_pages"] = [
             {"page": page_number, "error": errors.get(page_number, item.get("error", ""))}
             for item in stored_report.get("vision_fallback_pages", [])
@@ -1031,7 +1060,9 @@ class DocumentService:
         for page_number, page in selected:
             self._read_page_text(page, page_number, texts, report, totals, margins)
         language = detect_document_language(texts.values())
-        report.update(language=language, vision_pages=[], vision_fallback_pages=[])
+        report.update(
+            language=language, vision_pages=[], vision_fallback_pages=[], **dict.fromkeys(VISION_USAGE_FIELDS, 0),
+        )
         vision_texts: dict[int, str] = {}
         stop = threading.Event()
         abort_reasons: list[str] = []
@@ -1063,7 +1094,10 @@ class DocumentService:
             for future in done:
                 page_number = pending.pop(future)
                 try:
-                    vision_texts[page_number] = future.result().strip()
+                    result = future.result()
+                    vision_texts[page_number] = result.strip()
+                    add_vision_usage(report, result)
+                    add_vision_usage(totals, result)
                 except JobStopped:
                     advance()
                 except VisionAbort:

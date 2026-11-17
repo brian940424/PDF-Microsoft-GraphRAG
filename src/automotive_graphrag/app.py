@@ -3788,12 +3788,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def vision_summary(report) -> str:
         summary = f"Vision（{report.vision_model}）解析 {report.vision_pages} 頁"
+        usage = vision_usage_summary(report)
         if report.vision_abort_reason:
             reason = " ".join(report.vision_abort_reason.split())[:160]
-            return f"⚠️ {summary}，已中止：{reason}；{report.vision_fallback_pages} 頁改用文字層"
+            return f"⚠️ {summary}，已中止：{reason}；{report.vision_fallback_pages} 頁改用文字層{usage}"
         if report.vision_fallback_pages:
-            return f"⚠️ {summary}；{report.vision_fallback_pages} 頁解析失敗，改用文字層（詳見 processed/report.json）"
-        return f"{summary}，其餘頁面使用文字層"
+            return (
+                f"⚠️ {summary}；{report.vision_fallback_pages} 頁解析失敗，改用文字層"
+                f"（詳見 processed/report.json）{usage}"
+            )
+        return f"{summary}，其餘頁面使用文字層{usage}"
+
+    def vision_usage_summary(report) -> str:
+        if not report.vision_usage_pages:
+            return ""
+        return (
+            f"；用量 input {report.vision_prompt_tokens:,} / output {report.vision_completion_tokens:,} tokens"
+            f"（{report.vision_usage_pages} 頁有回報）"
+        )
 
     def preprocess_documents(
         project_id: str | None,
