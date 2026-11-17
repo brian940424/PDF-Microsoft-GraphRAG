@@ -5,16 +5,33 @@ sentences it uses, dropping conditions, joined actions and results (F-55, F-56).
 GraphRAG's Basic answer call, one extra call copies verbatim, per source, every sentence
 the question needs. The copy is appended to the context so the answer call still sees the
 full sources and their citation identifiers.
+
+The extra call only runs for comparison questions (`needs_two_stage`). On single-object
+questions the copied CAUTION, NOTE and check sentences made the answer call add items the
+question did not ask for, and the exclusion rules dropped closing steps such as how to exit
+a mode (SM3E Q1 rerun, 2026-11-17: Q2, Q6, Q13 over-answered, Q27 lost its exit step).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import re
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 EXTRACTION_HEADING = "-----Extracted source sentences-----"
 NO_EXTRACTION = "NONE"
+
+COMPARISON_PATTERN = re.compile(
+    r"\b(?:compare[sd]?|comparing|comparison|differen(?:ce|ces|t)|differ|versus|vs\.?|both|in common)\b"
+    r"|what is common|比較|差異|差別|區別|異同|不同|相同|共同|兩者",
+    re.IGNORECASE,
+)
+
+
+def needs_two_stage(question: str) -> bool:
+    """Run the extraction call only for comparison questions, where facts for each object are split across sources."""
+    return bool(COMPARISON_PATTERN.search(question))
 
 EXTRACTION_PROMPT = """---Role---
 
@@ -73,11 +90,16 @@ async def extract_source_sentences(model: Any, question: str, context_chunks: st
 ContextTransform = Callable[[str, Any], Any]
 
 
-def install_two_stage_basic(context_transform: ContextTransform | None = None) -> None:
+def install_two_stage_basic(
+    context_transform: ContextTransform | None = None,
+    report: dict[str, Any] | None = None,
+) -> None:
     """Patch GraphRAG BasicSearch.stream_search (used by the query API) to answer in two stages.
 
     `context_transform(query, context_result)` may replace the retrieved context first, for
-    example to drop sources of another manual variant; it applies to both stages.
+    example to drop sources of another manual variant; it applies to both stages. Questions
+    that are not comparisons skip the extraction call and answer in one stage. `report`, when
+    given, receives `two_stage` (whether the extraction call ran).
     """
     from graphrag.query.structured_search.basic_search.search import BasicSearch
 
@@ -92,8 +114,14 @@ def install_two_stage_basic(context_transform: ContextTransform | None = None) -
         )
         if context_transform is not None:
             result = context_transform(query, result)
-        extraction = await extract_source_sentences(self.model, query, result.context_chunks, self.model_params)
-        augmented = dataclasses.replace(result, context_chunks=context_with_extraction(result.context_chunks, extraction))
+        two_stage = needs_two_stage(query)
+        if report is not None:
+            report["two_stage"] = two_stage
+        if two_stage:
+            extraction = await extract_source_sentences(self.model, query, result.context_chunks, self.model_params)
+            augmented = dataclasses.replace(result, context_chunks=context_with_extraction(result.context_chunks, extraction))
+        else:
+            augmented = result
         builder.build_context = lambda *args, **kwargs: augmented
         try:
             async for token in original(self, query, conversation_history):

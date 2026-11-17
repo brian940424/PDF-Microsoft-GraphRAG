@@ -46,6 +46,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
 
     llm_calls: list[dict[str, Any]] = []
     variant_report: dict[str, Any] = {}
+    extraction_report: dict[str, Any] = {}
     install_litellm_recorder(llm_calls)
     common = {
         "data_dir": None,
@@ -87,7 +88,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
             variant_report.update(report)
             return selected
 
-        install_two_stage_basic(select_variants)
+        install_two_stage_basic(select_variants, extraction_report)
         answer, context = cli_query.run_basic_search(
             data_dir=None,
             root_dir=root_dir,
@@ -99,6 +100,8 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     serialized = QueryService._serialize_context(context)
     if variant_report and isinstance(serialized, dict):
         serialized["variant_selection"] = variant_report
+    if extraction_report and isinstance(serialized, dict):
+        serialized["answer_extraction"] = extraction_report
     return {
         "answer": str(answer),
         "context": serialized,

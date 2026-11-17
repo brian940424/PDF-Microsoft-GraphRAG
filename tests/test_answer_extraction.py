@@ -11,6 +11,7 @@ from automotive_graphrag.answer_extraction import (
     context_with_extraction,
     extract_source_sentences,
     install_two_stage_basic,
+    needs_two_stage,
 )
 from automotive_graphrag.answer_prompts import ANSWER_REQUIREMENTS
 
@@ -63,6 +64,28 @@ class ContextWithExtractionTests(unittest.TestCase):
         self.assertEqual(context_with_extraction("ctx", " none "), "ctx")
 
 
+class NeedsTwoStageTests(unittest.TestCase):
+    def test_comparison_questions_use_two_stages(self) -> None:
+        for question in (
+            "Compare the additional service required when replacing the BCM with the AV control unit.",
+            "How does the rear rotor runout limit differ from the front rotor's?",
+            "How is the hose aligned on the front caliper versus the rear caliper?",
+            "和 B2190 的解除方式有什麼不同？",
+            "兩者的可能原因有何差別？",
+        ):
+            self.assertTrue(needs_two_stage(question), question)
+
+    def test_single_object_questions_skip_extraction(self) -> None:
+        for question in (
+            "What cautions must be observed when removing the accelerator pedal assembly?",
+            "安裝真空軟管到煞車助力器時有哪些注意事項？軟管至少要插入多深？",
+            "前碟煞來令片的新品標準厚度與磨耗極限厚度分別是多少？",
+            "前碟盤的最大偏擺量與厚度差限制值各是多少？",
+            "基本音響要進入「硬體/軟體版本與喇叭聲道檢查」模式，操作步驟為何？",
+        ):
+            self.assertFalse(needs_two_stage(question), question)
+
+
 class ExtractionCallTests(unittest.TestCase):
     def test_extraction_sends_context_and_question_without_streaming(self) -> None:
         model = FakeModel(extraction="[502] line")
@@ -89,20 +112,21 @@ class ExtractionCallTests(unittest.TestCase):
 class TwoStageBasicSearchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original = BasicSearch.stream_search
+        self.report: dict = {}
         install_two_stage_basic()
-        install_two_stage_basic()  # idempotent
+        install_two_stage_basic(report=self.report)  # idempotent
 
     def tearDown(self) -> None:
         BasicSearch.stream_search = self.original
 
-    def _search(self, model: FakeModel) -> tuple[str, FakeContextBuilder]:
+    def _search(self, model: FakeModel, question: str = "Compare BCM and AV") -> tuple[str, FakeContextBuilder]:
         builder = FakeContextBuilder()
         search = BasicSearch(
             model=model, context_builder=builder, tokenizer=FakeTokenizer(),
             system_prompt="DATA:\n{context_data}\nFORMAT:{response_type}", model_params={"reasoning_effort": "low"},
         )
         async def collect() -> str:
-            return "".join([token async for token in search.stream_search("Compare BCM and AV")])
+            return "".join([token async for token in search.stream_search(question)])
 
         result = asyncio.run(collect())
         self.assertNotIn("build_context", builder.__dict__)
@@ -119,6 +143,19 @@ class TwoStageBasicSearchTests(unittest.TestCase):
         answer_prompt = model.calls[1]["messages"][0]["content"]
         self.assertIn("486|BCM page", answer_prompt)
         self.assertIn(f"{EXTRACTION_HEADING}\n[502] If new BCM", answer_prompt)
+        self.assertEqual(self.report, {"two_stage": True})
+
+    def test_non_comparison_question_answers_in_one_stage(self) -> None:
+        model = FakeModel(extraction="[502] should not be used", answer="single")
+
+        result, builder = self._search(model, "What cautions apply when removing the BCM?")
+
+        self.assertEqual(result, "single")
+        self.assertEqual(builder.queries, ["What cautions apply when removing the BCM?"])
+        self.assertEqual([call["stream"] for call in model.calls], [True])
+        self.assertIn("486|BCM page", model.calls[0]["messages"][0]["content"])
+        self.assertNotIn(EXTRACTION_HEADING, model.calls[0]["messages"][0]["content"])
+        self.assertEqual(self.report, {"two_stage": False})
 
     def test_failed_extraction_falls_back_to_single_stage_context(self) -> None:
         model = FakeModel(fail_extraction=True, answer="still answered")
