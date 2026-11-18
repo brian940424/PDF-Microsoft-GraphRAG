@@ -42,12 +42,14 @@ from .connections import (
 )
 from .evidence import Evidence, EvidenceService
 from .evaluation.classic_metrics import answer_term_scores, exact_match_score, f1_score, metric_max_over_ground_truths
+from .duplicate_passages import PageEquivalence, with_duplicate_citations
 from .evaluation.source_scoring import DEFAULT_SOURCE_WEIGHT, combined_score, source_score
 from .projects import ProjectError, ProjectStore
 from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
 from .answer_prompts import install_answer_prompts
+from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, aggregate_cost, query_cost_summary, tag_calls, usage_metadata
 from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
 
 
@@ -128,6 +130,8 @@ EXPERIMENT_STRATEGY_CONFIG_KEYS = {
     },
     "basic": {"k", "max_context_tokens"},
 }
+# Context key that carries the query worker's LLM call records back to `_generate_case`.
+LLM_CALLS_CONTEXT_KEY = "_llm_calls"
 UNSUPPORTED_RETRIEVAL_METRICS = "暫不可計算：Global 社群報告尚未可靠映射至原始文件"
 
 
@@ -147,6 +151,9 @@ class ExperimentGroup:
     response_type: str = DEFAULT_EXPERIMENT_RESPONSE_TYPE
     answer_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     strategy_parameters: dict[str, dict[str, object]] = field(default_factory=default_strategy_parameters)
+
+
+LEGACY_QUALITY_KEYS = ("answer_point_coverage_percent", "unsupported_claim_count", "refusal_correctness")
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,9 +183,6 @@ class ExperimentQuestionResult:
     routing_reason: str = ""
     execution_trace: dict[str, object] = field(default_factory=dict)
     duration_seconds: float | None = None
-    answer_point_coverage_percent: float | None = None
-    unsupported_claim_count: int | None = None
-    refusal_correctness: str | None = None
     answer_em: float | None = None
     answer_f1: float | None = None
     judge_scores: tuple[JudgeScore, ...] = ()
@@ -221,11 +225,6 @@ class ExperimentGroupSummary:
     average_agent_model_calls: float | None = None
     estimated_cost_usd: float | None = None
     cost_status: str = "此適配器未提供 Token 用量，成本未知"
-    answer_point_coverage_percent: float | None = None
-    unsupported_answer_rate: float | None = None
-    average_unsupported_claim_count: float | None = None
-    refusal_accuracy: float | None = None
-    quality_reviewed_count: int = 0
     average_answer_em: float | None = None
     average_answer_f1: float | None = None
     judge_average_scores: dict[str, float] = field(default_factory=dict)
@@ -234,6 +233,9 @@ class ExperimentGroupSummary:
     average_answer_term_coverage: float | None = None
     average_source_score: float | None = None
     combined_score_accuracy: float | None = None
+    average_llm_calls: float | None = None
+    average_total_tokens: float | None = None
+    first_choice_hit_rate: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,12 +467,13 @@ class RetrievalExperimentService:
     def import_question_sets(self, project_id: str, filepaths: Sequence[str | Path]) -> list[object]:
         imported, errors = self.import_question_sets_with_errors(project_id, filepaths)
         if errors:
-            raise ProjectError("題目集未取代，舊資料已保留：\n- " + "\n- ".join(errors))
+            raise ProjectError("題目集未匯入，實驗題目集維持原狀：\n- " + "\n- ".join(errors))
         return imported
 
     def import_question_sets_with_errors(
         self, project_id: str, filepaths: Sequence[str | Path]
     ) -> tuple[list[object], list[str]]:
+        """Import JSON files and add them to the experiment's question sets; nothing is deleted."""
         if not filepaths:
             raise ProjectError("請至少選擇一份 JSON 題目集")
         current = self.load(project_id)
@@ -485,46 +488,49 @@ class RetrievalExperimentService:
             except (ProjectError, OSError, ValueError) as exc:
                 errors.append(f"{Path(filepath).name}：{exc}")
         if errors or not imported:
-            # Treat multi-file replacement atomically: a malformed file must not
-            # replace or partially erase the currently loaded datasets.
+            # A multi-file import is all or nothing: the files saved before a malformed
+            # one are removed again, and the experiment keeps its question sets.
             for item in imported:
                 try:
                     self.question_sets.delete(project_id, item.question_set_id)
                 except (ProjectError, OSError):
                     pass
             return [], errors or ["沒有可匯入的題目集"]
-
-        ids = [item.question_set_id for item in imported]
-        current["question_set_ids"] = ids
-        current["question_set_id"] = ids[0]
-        current["run"] = None
-        self._write(project_id, current)
-        for old_id in old_ids:
-            if old_id not in ids:
-                try:
-                    self.question_sets.delete(project_id, old_id)
-                except ProjectError:
-                    # A stale ID may already have been removed; the replacement
-                    # state is authoritative and remains usable.
-                    pass
+        self.set_question_sets(project_id, [*old_ids, *(item.question_set_id for item in imported)])
         return imported, errors
 
-    def remove_question_set(self, project_id: str, question_set_id: str) -> dict[str, object]:
+    def set_question_sets(self, project_id: str, question_set_ids: Sequence[str]) -> dict[str, object]:
+        """Use these saved question sets; a changed selection clears the saved run."""
+        ids = list(dict.fromkeys(str(item) for item in question_set_ids if item))
+        for question_set_id in ids:
+            self.question_sets.get(project_id, question_set_id)
         current = self.load(project_id)
-        ids = [item for item in self._normalize_question_set_ids(current.get("question_set_ids"))
-               if item != question_set_id]
-        if len(ids) == len(self._normalize_question_set_ids(current.get("question_set_ids"))):
-            raise ProjectError(f"題目集不在檢索實驗清單中：{question_set_id}")
+        old_ids = self._normalize_question_set_ids(
+            current.get("question_set_ids", current.get("question_set_id", ""))
+        )
+        if ids == old_ids:
+            return current
         current["question_set_ids"] = ids
         current["question_set_id"] = ids[0] if ids else ""
         current["run"] = None
         self._write(project_id, current)
-        try:
-            self.question_sets.delete(project_id, question_set_id)
-        except ProjectError:
-            # The active list is already updated; tolerate a stale missing file.
-            pass
         return current
+
+    def uses_question_set(self, project_id: str, question_set_id: str) -> bool:
+        state = self.load(project_id)
+        return question_set_id in self._normalize_question_set_ids(
+            state.get("question_set_ids", state.get("question_set_id", ""))
+        )
+
+    def remove_question_set(self, project_id: str, question_set_id: str) -> dict[str, object]:
+        """Stop using a question set in the experiment; its file is kept."""
+        current = self.load(project_id)
+        old_ids = self._normalize_question_set_ids(
+            current.get("question_set_ids", current.get("question_set_id", ""))
+        )
+        if question_set_id not in old_ids:
+            raise ProjectError(f"題目集不在檢索實驗清單中：{question_set_id}")
+        return self.set_question_sets(project_id, [item for item in old_ids if item != question_set_id])
 
     @staticmethod
     def _normalize_question_set_ids(value: str | Sequence[str] | object) -> list[str]:
@@ -1002,105 +1008,6 @@ class RetrievalExperimentService:
             self._write(project_id, state)
         return run
 
-    def update_quality_annotations(
-        self, project_id: str, annotations: Sequence[tuple[str, ...]]
-    ) -> dict[str, object]:
-        """Persist human review metrics without invoking any model."""
-        normalized = []
-        for annotation in annotations:
-            if len(annotation) != 6:
-                continue
-            group_name, dataset_id, question_id, raw_coverage, raw_unsupported, raw_refusal = annotation
-            coverage = self._optional_annotation_number(raw_coverage, "答案要點覆蓋率", 0, 100)
-            unsupported = self._optional_annotation_number(raw_unsupported, "無根據主張數", 0, None, integer=True)
-            refusal_text = str(raw_refusal or "").strip().casefold()
-            refusal_values = {
-                "正確": "correct", "correct": "correct",
-                "錯誤": "incorrect", "incorrect": "incorrect",
-                "不適用": "not_applicable", "not_applicable": "not_applicable",
-                "": None, "nan": None,
-            }
-            if refusal_text not in refusal_values:
-                raise ProjectError("拒答判定只接受：正確、錯誤、不適用或留白")
-            normalized.append((str(group_name), str(dataset_id), str(question_id), coverage, unsupported, refusal_values[refusal_text]))
-
-        state = self.load(project_id)
-        run = state.get("run")
-        if not isinstance(run, dict):
-            raise ProjectError("目前沒有可標註的檢索實驗結果")
-        results = run.get("results", [])
-        changed = False
-        for group_name, dataset_id, question_id, coverage, unsupported, refusal in normalized:
-            for item in results:
-                if (
-                    item.get("group_name") != group_name
-                    or item.get("question_id") != question_id
-                    or (dataset_id and item.get("dataset_id") != dataset_id)
-                ):
-                    continue
-                values = {
-                    "answer_point_coverage_percent": coverage,
-                    "unsupported_claim_count": unsupported,
-                    "refusal_correctness": refusal,
-                }
-                for key, value in values.items():
-                    if item.get(key) != value:
-                        item[key] = value
-                        changed = True
-        for summary in run.get("groups", []):
-            selected = [item for item in results if item.get("group_id") == summary.get("group_id")]
-            summary.update(self._quality_annotation_summary(selected))
-        if changed or run.get("groups"):
-            self._write(project_id, state)
-        return run
-
-    @staticmethod
-    def _optional_annotation_number(
-        value: object, label: str, minimum: int | float, maximum: int | float | None,
-        integer: bool = False,
-    ) -> int | float | None:
-        if value is None or str(value).strip().casefold() in {"", "nan", "none"}:
-            return None
-        try:
-            number = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ProjectError(f"{label}必須是數字或留白") from exc
-        if not math.isfinite(number) or number < minimum or (maximum is not None and number > maximum):
-            raise ProjectError(f"{label}超出允許範圍")
-        if integer and not number.is_integer():
-            raise ProjectError(f"{label}必須是整數")
-        return int(number) if integer else number
-
-    @staticmethod
-    def _quality_annotation_summary(items: Sequence[dict[str, object]]) -> dict[str, object]:
-        coverages = [float(item["answer_point_coverage_percent"]) for item in items
-                     if isinstance(item.get("answer_point_coverage_percent"), (int, float))]
-        unsupported_counts = [int(item["unsupported_claim_count"]) for item in items
-                              if isinstance(item.get("unsupported_claim_count"), int)]
-        refusal_labels = [item.get("refusal_correctness") for item in items]
-        refusal_scored = [item for item in refusal_labels if item in {"correct", "incorrect"}]
-        reviewed = sum(
-            item.get("answer_point_coverage_percent") is not None
-            or item.get("unsupported_claim_count") is not None
-            or item.get("refusal_correctness") is not None
-            for item in items
-        )
-        return {
-            "answer_point_coverage_percent": sum(coverages) / len(coverages) if coverages else None,
-            "unsupported_answer_rate": (
-                sum(count > 0 for count in unsupported_counts) / len(unsupported_counts)
-                if unsupported_counts else None
-            ),
-            "average_unsupported_claim_count": (
-                sum(unsupported_counts) / len(unsupported_counts) if unsupported_counts else None
-            ),
-            "refusal_accuracy": (
-                sum(label == "correct" for label in refusal_scored) / len(refusal_scored)
-                if refusal_scored else None
-            ),
-            "quality_reviewed_count": reviewed,
-        }
-
     def export(self, project_id: str) -> tuple[Path, Path]:
         state = self.load(project_id)
         if state.get("run") is None:
@@ -1162,17 +1069,13 @@ class RetrievalExperimentService:
                     "p95_latency_seconds": summary.get("p95_latency_seconds"),
                     "average_search_steps": summary.get("average_search_steps"),
                     "average_agent_model_calls": summary.get("average_agent_model_calls"),
-                    "estimated_cost_usd": summary.get("estimated_cost_usd"),
-                    "cost_status": summary.get("cost_status"),
-                    "answer_point_coverage_percent": summary.get("answer_point_coverage_percent"),
+                    "average_llm_calls": summary.get("average_llm_calls"),
+                    "average_total_tokens": summary.get("average_total_tokens"),
+                    "first_choice_hit_rate": summary.get("first_choice_hit_rate"),
                     "average_answer_em": summary.get("average_answer_em"),
                     "average_answer_f1": summary.get("average_answer_f1"),
                     "average_answer_term_hit": summary.get("average_answer_term_hit"),
                     "average_answer_term_coverage": summary.get("average_answer_term_coverage"),
-                    "unsupported_answer_rate": summary.get("unsupported_answer_rate"),
-                    "average_unsupported_claim_count": summary.get("average_unsupported_claim_count"),
-                    "refusal_accuracy": summary.get("refusal_accuracy"),
-                    "quality_reviewed_count": summary.get("quality_reviewed_count", 0),
                 },
             })
         expected_count = sum(int(item.get("question_count", 0)) for item in run_groups)
@@ -1221,8 +1124,6 @@ class RetrievalExperimentService:
                 "evidence_precision": self._average_metric(run_groups, "evidence_precision"),
                 "document_hit_rate": self._average_metric(run_groups, "document_hit_rate"),
                 "average_latency_seconds": self._average_metric(run_groups, "average_latency_seconds"),
-                "estimated_cost_usd": None,
-                "cost_status": "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
             },
             "groups": group_rows,
             "datasets": [
@@ -1258,7 +1159,10 @@ class RetrievalExperimentService:
                 }
                 for group in group_rows
             ],
-            "question_results": run_results,
+            "question_results": [
+                {key: value for key, value in item.items() if key not in LEGACY_QUALITY_KEYS}
+                for item in run_results
+            ],
         }
         self._atomic_write(summary_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         self._atomic_write(details_path, json.dumps(details_payload, ensure_ascii=False, indent=2) + "\n")
@@ -1338,6 +1242,16 @@ class RetrievalExperimentService:
         routed_method = routing_reason = ""
         method = group.method
         execution_trace: dict[str, object] = {}
+        llm_calls: list[dict[str, object]] = []
+
+        def take_search_calls(strategy: str, context_value: object) -> object:
+            """Move the worker's LLM call records out of the context into this case's call list."""
+            if isinstance(context_value, dict) and LLM_CALLS_CONTEXT_KEY in context_value:
+                context_value = dict(context_value)
+                calls = context_value.pop(LLM_CALLS_CONTEXT_KEY)
+                llm_calls.extend(tag_calls(calls if isinstance(calls, list) else [], SEARCH_STAGE, strategy))
+            return context_value
+
         try:
             def run_strategy(strategy: str) -> tuple[str, dict[str, object]]:
                 query_arguments = (
@@ -1349,8 +1263,12 @@ class RetrievalExperimentService:
                     item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
                 ) or len(inspect.signature(self.query_function).parameters) >= 7
                 if accepts_strategy_parameters:
-                    return self.query_function(*query_arguments, group.strategy_parameters.get(strategy, {}))
-                return self.query_function(*query_arguments)
+                    answer_value, context_value = self.query_function(
+                        *query_arguments, group.strategy_parameters.get(strategy, {})
+                    )
+                else:
+                    answer_value, context_value = self.query_function(*query_arguments)
+                return answer_value, take_search_calls(strategy, context_value)
 
             if group.method == EXPERIMENT_AUTO_METHOD:
                 api_base = self.connections.get_api_base_url()
@@ -1366,14 +1284,24 @@ class RetrievalExperimentService:
                         str(answer_value), None, context_value, context_source_count(context_value),
                     )
 
-                fallback = search_with_fallback(
-                    self.router.route(question.question, group.answer_model, api_base, api_key, effort),
-                    search,
-                    lambda candidate: self.router.check_answer(
+                searched: list[str] = []
+
+                def search_and_track(strategy: str) -> SearchOutcome:
+                    searched.append(strategy)
+                    return search(strategy)
+
+                def check(candidate: str):
+                    verdict = self.router.check_answer(
                         question.question, candidate, group.answer_model, api_base, api_key, effort,
-                    ),
-                    question.question,
-                )
+                    )
+                    llm_calls.extend(tag_calls(
+                        getattr(verdict, "llm_calls", ()), ANSWER_CHECK_STAGE, searched[-1] if searched else None,
+                    ))
+                    return verdict
+
+                decision = self.router.route(question.question, group.answer_model, api_base, api_key, effort)
+                llm_calls.extend(getattr(decision, "llm_calls", ()))
+                fallback = search_with_fallback(decision, search_and_track, check)
                 method = routed_method = fallback.method
                 routing_reason = fallback.reason
                 execution_trace = {"strategy_attempts": list(fallback.attempts)}
@@ -1403,7 +1331,7 @@ class RetrievalExperimentService:
                         )
                     else:
                         answer_value, context_value = self.query_function(*arguments, **kwargs)
-                    return QueryExecution(0, str(answer_value), "", context_value)
+                    return QueryExecution(0, str(answer_value), "", take_search_calls(search_method, context_value))
 
                 decision = self.agentic_search.run(
                     question.question, group.answer_model, api_base, api_key,
@@ -1413,6 +1341,11 @@ class RetrievalExperimentService:
                 method = EXPERIMENT_AGENTIC_METHOD
                 answer = decision.answer
                 context = dict(decision.context)
+                agentic_metadata = context.get("agentic_metadata")
+                if isinstance(agentic_metadata, dict):
+                    llm_calls[:0] = agentic_metadata.get("planner_llm_calls", [])
+                    context["search_step_count"] = agentic_metadata.get("search_step_count")
+                context.update(usage_metadata(llm_calls))
                 execution_trace = context
                 if decision.returncode != 0 and not answer.strip():
                     failed = self._failed_result(
@@ -1441,6 +1374,9 @@ class RetrievalExperimentService:
                 execution_trace = context
             else:
                 answer, context = run_strategy(method)
+                execution_trace = {"requested_method": method}
+            if group.method != EXPERIMENT_AGENTIC_METHOD:
+                execution_trace.update(usage_metadata(llm_calls))
         except Exception as exc:
             return replace(
                 self._failed_result(group, question, judge_model, str(exc), dataset_id, dataset_name),
@@ -1452,6 +1388,10 @@ class RetrievalExperimentService:
             if method in EVIDENCE_METHODS or method == EXPERIMENT_AGENTIC_METHOD:
                 try:
                     retrieved_evidence = self._resolved_evidence(project_id, context)
+                    if answer and retrieved_evidence:
+                        retrieved_evidence, _ = with_duplicate_citations(
+                            self.projects, project_id, answer, retrieved_evidence, context,
+                        )
                     raw_sources = EvidenceService.source_records(context)
                     if raw_sources and not retrieved_evidence:
                         mapping_error = "GraphRAG 回傳了來源，但無法映射至原始文件"
@@ -1518,6 +1458,7 @@ class RetrievalExperimentService:
                 generated.actual_answer, generated.retrieved_evidence,
                 question.answer_source_evidence or question.gold_evidence,
                 project_document_only_score(self.projects, project_id),
+                PageEquivalence(self.projects.path_for(project_id)),
             ),
         )
         if enable_llm_judge:
@@ -1705,19 +1646,14 @@ class RetrievalExperimentService:
                 for item in agentic_results
                 if isinstance(item.execution_trace.get("agentic_metadata"), dict)
             ]
-            quality_summary = self._quality_annotation_summary([
-                {
-                    "answer_point_coverage_percent": item.answer_point_coverage_percent,
-                    "unsupported_claim_count": item.unsupported_claim_count,
-                    "refusal_correctness": item.refusal_correctness,
-                }
-                for item in group_items
-            ])
             answer_em = self._mean_present(item.answer_em for item in group_items)
             answer_f1 = self._mean_present(item.answer_f1 for item in group_items)
             answer_term_hit = self._mean_present(item.answer_term_hit for item in group_items)
             answer_term_coverage = self._mean_present(item.answer_term_coverage for item in group_items)
             average_source, combined_accuracy = self._source_stats(group_items, total)
+            cost = aggregate_cost(
+                query_cost_summary(item.execution_trace) for item in group_items if item.execution_trace
+            )
             summaries.append(ExperimentGroupSummary(
                 group.group_id, group.name, group.answer_model, judge_model, group.method,
                 total, answered, correct, partial, incorrect,
@@ -1732,11 +1668,13 @@ class RetrievalExperimentService:
                 ),
                 sum(durations) / len(durations) if durations else None,
                 p95_latency,
-                sum(step_counts) / len(step_counts) if step_counts else None,
+                (
+                    cost["average_search_count"] if cost["average_search_count"] is not None
+                    else sum(step_counts) / len(step_counts) if step_counts else None
+                ),
                 sum(model_calls) / len(model_calls) if model_calls else None,
                 None,
                 "GraphRAG／Chat adapter 未提供 Token 用量；成本未知",
-                **quality_summary,
                 average_answer_em=answer_em,
                 average_answer_f1=answer_f1,
                 judge_average_scores=judge_averages,
@@ -1745,6 +1683,9 @@ class RetrievalExperimentService:
                 average_answer_term_coverage=answer_term_coverage,
                 average_source_score=average_source,
                 combined_score_accuracy=combined_accuracy if enable_llm_judge else None,
+                average_llm_calls=cost["average_llm_call_count"],
+                average_total_tokens=cost["average_total_tokens"],
+                first_choice_hit_rate=cost["first_choice_hit_rate"],
             ))
         question_set_name = "、".join(item.name for item in question_sets)
         run = RetrievalExperimentRun(
@@ -1794,6 +1735,9 @@ class RetrievalExperimentService:
     @staticmethod
     def _result_from_dict(value: dict[str, object]) -> ExperimentQuestionResult:
         data = dict(value)
+        # Manual quality annotations were removed (F-51); older saved runs may still carry them.
+        for key in LEGACY_QUALITY_KEYS:
+            data.pop(key, None)
         data.setdefault("retrieved_evidence", [])
         data["judge_scores"] = judge_scores_from_dicts(data.get("judge_scores"))
         data["retrieved_evidence"] = tuple(
@@ -1890,7 +1834,12 @@ class RetrievalExperimentService:
         if result.returncode or "error" in response:
             raise ProjectError(str(response.get("error") or result.stderr or "GraphRAG 查詢失敗"))
         context = response.get("context", {})
-        return str(response.get("answer", "")), context if isinstance(context, dict) else {}
+        context = dict(context) if isinstance(context, dict) else {}
+        llm_calls = response.get("llm_calls")
+        if isinstance(llm_calls, list):
+            # Carried out of the worker inside the context; `_generate_case` removes it again.
+            context[LLM_CALLS_CONTEXT_KEY] = llm_calls
+        return str(response.get("answer", "")), context
 
     def _validate_groups(self, groups: Sequence[ExperimentGroup]) -> None:
         seen: set[str] = set()

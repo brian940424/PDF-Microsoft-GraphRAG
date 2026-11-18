@@ -40,13 +40,18 @@ class AnswerPromptTests(unittest.TestCase):
             "Do not add anything the data does not state", "do not soften it", "different device models",
             "single section that directly answers the question", "Preserve the source order",
             "Printed page numbers inside source text are content",
-            "Answer only the requested parts", "immediate first action",
-            "Do not add relevant but unrequested details",
-            "Treat each clause of the question as the scope boundary",
-            "Ground every claim in the supplied context",
-            "only when they answer a requested part",
-            "For reset questions, give the requested reset path",
-            "include its stated activation steps and conditions",
+            # v3 (F-43): matching conditions, required notes kept, unrelated notes dropped, bare specs
+            "Match the conditions in the question", "Include every step, condition and note that is required",
+            "Leave out every such item that is not part of the answer", "give only the requested values with their units",
+            # v4 (F-55): every retrieved source is checked, multi-page evidence combined, comparisons sorted
+            "go through the sources in the data one by one", "Never answer from only the first-ranked source",
+            "what all objects share and what is specific to each object", "Cite every source whose content you use",
+            # v5 (F-56): qualifiers inside a used sentence kept, separate unrelated notes still dropped
+            "Keep the qualifiers inside each sentence or step you use", "keeping only the main action and the numbers is not enough",
+            "state that instruction and its conditions together with the fact", "Final check before you answer",
+            "qualifiers inside the same sentence or step as the asked content are kept",
+            # v7 (F-60): sentence-level citations and the source of the question's situation
+            "Cite sentence by sentence", "cite the source that establishes the situation in the question",
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 
