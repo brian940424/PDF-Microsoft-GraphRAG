@@ -69,6 +69,18 @@ class FakeRouter:
         return AnswerCheck(answer not in self.refusals, "檢查結果")
 
 
+class RewritingRouter(FakeRouter):
+    def __init__(self, decision: StrategyDecision, query: str | None = "Brake bleeding order") -> None:
+        super().__init__(decision)
+        self.query = query
+        self.rewrites: list[tuple[str, str]] = []
+
+    def rewrite_query(self, question: str, excerpt: str, *_: object):
+        self.rewrites.append((question, excerpt))
+        call = {"stage": "query_rewrite", "method": None, "model": "m", "prompt_tokens": 10, "completion_tokens": 5}
+        return self.query, (call,)
+
+
 class ScriptedRunner:
     """Answer per --method; a None answer simulates a failed GraphRAG process."""
 
@@ -153,7 +165,66 @@ class QueryServiceTests(unittest.TestCase):
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v6")
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v7")
+
+    def write_text_units(self, *texts: str) -> None:
+        pd.DataFrame({"text": list(texts)}).to_parquet(self.graph_root / "output" / "text_units.parquet")
+
+    def test_basic_retrieval_uses_manual_language_query_when_question_language_differs(self) -> None:
+        self.write_text_units("Connect a vinyl tube to rear right brake caliper bleeder valve. " * 5)
+        runner = ScriptedRunner({"basic": "資料中沒有", "local": "右後卡鉗", "global": "x", "drift": "x"})
+        router = RewritingRouter(StrategyDecision("basic", "查找", ("basic", "local")))
+        router.refusals = ("資料中沒有",)
+        commands: list[list[str]] = []
+
+        def record(command: list[str]) -> QueryExecution:
+            commands.append(command)
+            return runner(command)
+
+        service = QueryService(self.store, record, self.connections, router=router)
+        result = service.ask("L33-SM3E", "煞車排氣順序為何？", method="auto")
+
+        basic, local = commands[:2]
+        self.assertEqual(basic[basic.index("--retrieval-query") + 1], "Brake bleeding order")
+        self.assertEqual(basic[-1], "煞車排氣順序為何？")
+        self.assertNotIn("--retrieval-query", local)
+        self.assertEqual(len(router.rewrites), 1)
+        self.assertEqual(result.execution_metadata["retrieval_query"], "Brake bleeding order")
+        stages = [call["stage"] for call in result.execution_metadata["llm_calls"]]
+        self.assertIn("query_rewrite", stages)
+
+    def test_basic_retrieval_keeps_question_when_languages_match_or_rewrite_fails(self) -> None:
+        runner = FakeQueryRunner()
+        self.write_text_units("指紋辨識可用來解鎖手機與登入帳號。" * 10)
+        router = RewritingRouter(StrategyDecision("basic", "查找"))
+        QueryService(self.store, runner, self.connections, router=router).ask("L33-SM3E", "如何註冊指紋？", method="basic")
+        self.assertNotIn("--retrieval-query", runner.commands[-1])
+        self.assertEqual(router.rewrites, [])
+
+        self.write_text_units("Connect a vinyl tube to rear right brake caliper bleeder valve. " * 5)
+        failing = RewritingRouter(StrategyDecision("basic", "查找"), query=None)
+        result = QueryService(self.store, runner, self.connections, router=failing).ask(
+            "L33-SM3E", "煞車排氣順序為何？", method="basic",
+        )
+        self.assertNotIn("--retrieval-query", runner.commands[-1])
+        self.assertIn("retrieval_query_error", result.execution_metadata)
+
+    def test_worker_payload_carries_retrieval_query(self) -> None:
+        payloads: list[dict[str, object]] = []
+
+        def fake_worker(environment, package_root, payload, timeout_seconds, stop_event):
+            payloads.append(json.loads(payload))
+            return subprocess.CompletedProcess([], 0, json.dumps({"answer": "a", "context": {}}), "")
+
+        command = ["python", "-m", "graphrag", "query", "--root", str(self.graph_root), "--method", "basic",
+                   "--response-type", "Single Paragraph", "--retrieval-query", "Brake bleeding order", "煞車排氣？"]
+        with patch.object(QueryService, "_run_worker", side_effect=fake_worker):
+            QueryService._run(command)
+            QueryService._run(command[:-3] + ["煞車排氣？"])
+
+        self.assertEqual(payloads[0]["question"], "煞車排氣？")
+        self.assertEqual(payloads[0]["retrieval_query"], "Brake bleeding order")
+        self.assertIsNone(payloads[1]["retrieval_query"])
 
     def test_auto_query_runs_routed_method_and_saves_reason(self) -> None:
         runner = FakeQueryRunner()
@@ -194,6 +265,43 @@ class QueryServiceTests(unittest.TestCase):
             [("basic", "not_found"), ("local", "failed"), ("global", "found")],
         )
         self.assertEqual(service.history("L33-SM3E"), [result])
+
+    def test_auto_query_records_every_llm_call_with_stage_and_method(self) -> None:
+        def usage(stage: str, tokens: int) -> dict:
+            return {"stage": stage, "method": None, "model": "m", "prompt_tokens": tokens,
+                    "completion_tokens": 1, "duration_seconds": 0.1, "error": None}
+
+        class UsageRunner:
+            def __call__(self, command: list[str]) -> QueryExecution:
+                method = command[command.index("--method") + 1]
+                answer = "找到了" if method == "local" else "資料中沒有"
+                return QueryExecution(0, answer, "", {"sources": [{"id": str(i)} for i in range(8)]},
+                                      (usage("search", 1000),))
+
+        class UsageRouter(FakeRouter):
+            def route(self, *args: object, **kwargs: object) -> StrategyDecision:
+                return StrategyDecision("basic", "查找", ("basic", "local", "global", "drift"),
+                                        (usage("routing", 10),))
+
+            def check_answer(self, question: str, answer: str, *_: object) -> AnswerCheck:
+                return AnswerCheck(answer != "資料中沒有", "檢查", (usage("answer_check", 20),))
+
+        service = QueryService(
+            self.store, UsageRunner(), self.connections, evidence_service=FakeEvidenceService(),
+            router=UsageRouter(StrategyDecision("basic", "x")),
+        )
+
+        result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
+
+        metadata = result.execution_metadata
+        self.assertEqual(
+            [(item["stage"], item["method"]) for item in metadata["llm_calls"]],
+            [("routing", None), ("search", "basic"), ("answer_check", "basic"),
+             ("search", "local"), ("answer_check", "local")],
+        )
+        self.assertEqual(metadata["model_call_count"], 5)
+        self.assertEqual(metadata["prompt_tokens"], 2050)
+        self.assertEqual(metadata["cost_status"], "measured")
 
     def test_auto_query_skips_local_answer_built_on_too_few_sources(self) -> None:
         runner = ScriptedRunner({"local": "相簿群組的步驟", "basic": "聯絡人群組的步驟", "global": "不該執行", "drift": "不該執行"})
@@ -318,6 +426,22 @@ class QueryServiceTests(unittest.TestCase):
 
         self.assertEqual([item.source for item in service.history("L33-SM3E")], ["manual", None])
         self.assertEqual(service.history("L33-SM3E"), [manual, untagged])
+
+    def test_clear_history_removes_only_selected_sources(self) -> None:
+        service = QueryService(self.store, FakeQueryRunner(), self.connections)
+        service.ask("L33-SM3E", "手動", source="manual")
+        service.ask("L33-SM3E", "舊紀錄")
+        autoqa = service.ask("L33-SM3E", "題目集", source="question_set")
+        portal = service.ask("L33-SM3E", "入口", source="portal")
+
+        removed = service.clear_history("L33-SM3E", (None, "manual"))
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(service.history("L33-SM3E"), [autoqa, portal])
+        self.assertEqual(service.clear_history("L33-SM3E", (None, "manual")), 0)
+        # Appending still works after the file was rewritten.
+        again = service.ask("L33-SM3E", "再問", source="manual")
+        self.assertEqual(service.history("L33-SM3E"), [autoqa, portal, again])
 
     def test_failed_query_is_saved_with_error(self) -> None:
         service = QueryService(self.store, FakeQueryRunner(return_code=2), self.connections)
