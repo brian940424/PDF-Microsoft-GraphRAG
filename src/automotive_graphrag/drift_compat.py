@@ -31,54 +31,6 @@ class SamplingParameterFilter:
         return {key: value for key, value in kwargs.items() if key not in {"temperature", "top_p"}}
 
 
-class LocalContextCollector:
-    """Keep the context of every Local Search action that one DRIFT query runs.
-
-    GraphRAG's DRIFT API stores only the latest ``on_context`` payload, so the
-    sources of earlier follow-up questions are lost although the reduced answer
-    still cites them. This collector records all payloads for merging.
-    """
-
-    def __init__(self) -> None:
-        self.contexts: list[dict[str, Any]] = []
-
-    def __getattr__(self, name: str) -> Any:
-        # Other query callbacks (map/reduce/token events) are irrelevant here.
-        if name.startswith("on_"):
-            return lambda *args, **kwargs: None
-        raise AttributeError(name)
-
-    def on_context(self, context: Any) -> None:
-        if isinstance(context, dict):
-            self.contexts.append(dict(context))
-
-    def merged(self) -> dict[str, Any]:
-        return merge_local_contexts(self.contexts)
-
-
-def merge_local_contexts(contexts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Union per-action context tables, de-duplicated by record id in first-seen order."""
-    import pandas as pd
-
-    merged: dict[str, Any] = {}
-    for context in contexts:
-        for key, value in context.items():
-            if key not in merged:
-                merged[key] = value
-            elif isinstance(merged[key], pd.DataFrame) and isinstance(value, pd.DataFrame):
-                merged[key] = pd.concat([merged[key], value], ignore_index=True)
-    for key, value in merged.items():
-        if not isinstance(value, pd.DataFrame) or "id" not in value.columns or value.empty:
-            continue
-        frame = value.drop_duplicates(subset="id", keep="first").reset_index(drop=True)
-        if "in_context" in value.columns:
-            # A record used by any action counts as in context.
-            used_ids = set(value.loc[value["in_context"].map(lambda item: item is not False), "id"])
-            frame["in_context"] = frame["id"].isin(used_ids)
-        merged[key] = frame
-    return merged
-
-
 def _filter_engine_model(engine: Any, config: Any) -> Any:
     """Wrap every model reference used by one DRIFT engine when it selects a reasoning model."""
     model_settings = config.get_completion_model_config(config.drift_search.completion_model_id)
@@ -111,16 +63,10 @@ def run_drift_search(
 
     def execute() -> tuple[str, dict[str, Any]]:
         original_factory = query_api.get_drift_search_engine
-        collector = LocalContextCollector()
 
         def compatible_factory(*args: Any, **kwargs: Any) -> Any:
             engine = original_factory(*args, **kwargs)
             config = kwargs.get("config", args[0] if args else None)
-            # DRIFT shares this list with its inner LocalSearch, so the collector
-            # sees every follow-up action's context records.
-            callbacks = getattr(engine, "callbacks", None)
-            if isinstance(callbacks, list):
-                callbacks.append(collector)
             return _filter_engine_model(engine, config)
 
         query_api.get_drift_search_engine = compatible_factory
@@ -135,8 +81,6 @@ def run_drift_search(
                 verbose=False,
             )
             answer, context = result
-            if collector.contexts:
-                return str(answer), collector.merged()
             return str(answer), context if isinstance(context, dict) else {}
         finally:
             query_api.get_drift_search_engine = original_factory

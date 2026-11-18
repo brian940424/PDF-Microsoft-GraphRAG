@@ -13,29 +13,23 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable
 
 import pymupdf
 
 from .connections import REASONING_EFFORT_OPTIONS, extract_json_object, llm_request_headers
-from .llm_usage import usage_tokens
 from .projects import ProjectError
 
 
-# Each request carries a full-page PNG of several MB; fewer parallel uploads
-# keep a Cloudflare Tunnel in front of the LLM gateway from dropping.
-DEFAULT_VISION_CONCURRENCY = 4
+DEFAULT_VISION_CONCURRENCY = 8
 RENDER_SCALE = 2.0
 REQUEST_TIMEOUT_SECONDS = 180
-# Backoff 2+4+8+16 s gives a reconnecting tunnel about 30 s to recover.
-MAX_RETRIES = 4
+MAX_RETRIES = 3
 RETRY_BASE_DELAY_SECONDS = 2.0
 # HTTP errors that fail identically on every page (bad key, no access, unknown
 # model); stop sending requests instead of retrying each page.
 ABORT_HTTP_CODES = {401, 403, 404}
-# Transient gateway errors, including Cloudflare's 52x origin errors and 530
-# (e.g. error 1033: no healthy cloudflared connection for the tunnel).
-RETRY_HTTP_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 530}
+RETRY_HTTP_CODES = {429, 500, 502, 503, 504}
 
 # Which pages are sent to the vision model: every page, or only pages with a
 # detected figure/table, only tables, or only diagrams (images and vector
@@ -107,22 +101,6 @@ class VisionSettings:
             raise ProjectError("Vision 並行數必須大於 0")
         if self.reasoning_effort is not None and self.reasoning_effort not in VISION_REASONING_EFFORT_OPTIONS:
             raise ProjectError("不支援的 Vision 推理深度")
-
-
-class PageTranscription(str):
-    """A transcribed page's text that also carries the API's token usage, if it reported one."""
-
-    usage: Mapping[str, Any] | None
-
-    def __new__(cls, text: str, usage: Mapping[str, Any] | None = None) -> "PageTranscription":
-        value = super().__new__(cls, text)
-        value.usage = usage
-        return value
-
-
-def transcription_tokens(text: str) -> tuple[int | None, int | None]:
-    """Prompt and completion tokens of one page analysis; None when no usage was reported."""
-    return usage_tokens(getattr(text, "usage", None))
 
 
 class VisionAbort(Exception):
@@ -214,10 +192,7 @@ def analyze_page(image_base64: str, page_number: int, language: str | None, sett
     result = extract_json_object(content) if isinstance(content, str) else None
     if result is None:
         raise ValueError("Vision 模型回傳的不是有效 JSON")
-    usage = response.get("usage")
-    return PageTranscription(
-        serialize_result(validate_result(result, page_number)), usage if isinstance(usage, Mapping) else None,
-    )
+    return serialize_result(validate_result(result, page_number))
 
 
 def _post_json(url: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:

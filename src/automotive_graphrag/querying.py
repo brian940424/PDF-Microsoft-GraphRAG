@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import hashlib
 import os
@@ -13,7 +12,6 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,12 +23,9 @@ import yaml
 from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .agentic_search import AgenticSearch
-from .duplicate_passages import with_duplicate_citations
 from .evidence import Evidence, EvidenceService
-from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
-from .query_translation import document_language_sample, needs_rewrite
 from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
 
 
@@ -82,8 +77,6 @@ class QueryExecution:
     stdout: str
     stderr: str
     context: dict[str, Any] = field(default_factory=dict)
-    # LLM calls the GraphRAG search made, as recorded by the query worker.
-    llm_calls: tuple[dict[str, Any], ...] = ()
 
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str] | QueryExecution]
@@ -187,43 +180,20 @@ class QueryService:
             "cost_status": "unknown_usage_not_returned_by_query_adapter",
             "settings_sha256": hashlib.sha256((graph_root / "settings.yaml").read_bytes()).hexdigest(),
         }
-        llm_calls: list[dict[str, Any]] = []
         retrieval_query = expand_manual_query(prompt)
         if retrieval_query != prompt:
             execution_metadata["expanded_retrieval_query"] = retrieval_query
         def run_query(command: list[str]) -> subprocess.CompletedProcess[str] | QueryExecution:
             if self._custom_runner:
                 raise_if_stopped(stop_event)
-                execution = self.runner(command)
-            else:
-                execution = self._run(command, stop_event=stop_event)
-            record_search_calls(command, execution)
-            return execution
+                return self.runner(command)
+            return self._run(command, stop_event=stop_event)
 
-        def record_search_calls(command: list[str], execution: object) -> None:
-            method_name = command[command.index("--method") + 1] if "--method" in command else None
-            llm_calls.extend(tag_calls(getattr(execution, "llm_calls", ()) or (), SEARCH_STAGE, method_name))
-
-        rewritten: list[str | None] = []
-
-        def basic_retrieval_query() -> str | None:
-            """Rewrite the question into the manual's language once, on the first Basic search (F-53)."""
-            if not rewritten:
-                rewritten.append(self._rewrite_for_manual(
-                    project_id, graph_root, prompt, selected_model, applied_effort, llm_calls, execution_metadata,
-                ))
-            return rewritten[0]
-
-        def query_command(search_method: str, search_question: str, rewrite: bool = False) -> list[str]:
-            command = [
+        def query_command(search_method: str, search_question: str) -> list[str]:
+            return [
                 sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
-                "--method", search_method, "--response-type", response_type,
+                "--method", search_method, "--response-type", response_type, search_question,
             ]
-            if rewrite and search_method == "basic":
-                retrieval = basic_retrieval_query()
-                if retrieval:
-                    command += ["--retrieval-query", retrieval]
-            return command + [search_question]
 
         if normalized_method == AUTO_METHOD:
             api_base_url = self.connection_settings.get_api_base_url()
@@ -231,7 +201,7 @@ class QueryService:
 
             def search(search_method: str) -> SearchOutcome:
                 try:
-                    execution = run_query(query_command(search_method, retrieval_query, rewrite=True))
+                    execution = run_query(query_command(search_method, retrieval_query))
                 except ProjectError as exc:
                     return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
                 if execution.returncode != 0:
@@ -248,22 +218,14 @@ class QueryService:
                     section_titles,
                 )
 
-            searched: list[str] = []
-
-            def search_and_track(search_method: str) -> SearchOutcome:
-                searched.append(search_method)
-                return search(search_method)
-
-            def check(answer: str):
-                verdict = self.router.check_answer(
+            fallback = search_with_fallback(
+                self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort),
+                search,
+                lambda answer: self.router.check_answer(
                     prompt, answer, selected_model, api_base_url, api_key, applied_effort,
-                )
-                llm_calls.extend(tag_calls(verdict.llm_calls, ANSWER_CHECK_STAGE, searched[-1] if searched else None))
-                return verdict
-
-            decision = self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort)
-            llm_calls.extend(decision.llm_calls)
-            fallback = search_with_fallback(decision, search_and_track, check)
+                ),
+                prompt,
+            )
             normalized_method, routing_reason = fallback.method, fallback.reason
             execution_metadata["strategy_attempts"] = list(fallback.attempts)
             result = fallback.outcome.payload or QueryExecution(0, fallback.outcome.answer, "")
@@ -271,12 +233,9 @@ class QueryService:
             def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
                 search_command = query_command(search_method, search_question)
                 if not self._custom_runner:
-                    execution = self._run(search_command, timeout_seconds=timeout_seconds, stop_event=stop_event)
-                else:
-                    raise_if_stopped(stop_event)
-                    execution = self.runner(search_command)
-                record_search_calls(search_command, execution)
-                return execution
+                    return self._run(search_command, timeout_seconds=timeout_seconds, stop_event=stop_event)
+                raise_if_stopped(stop_event)
+                return self.runner(search_command)
 
             decision = self.agentic_search.run(
                 prompt,
@@ -290,10 +249,8 @@ class QueryService:
             routing_reason = decision.stop_reason
             execution_metadata.update(decision.execution_metadata)
             execution_metadata["requested_method"] = requested_method
-            llm_calls[:0] = execution_metadata.pop("planner_llm_calls", [])
         else:
-            result = run_query(query_command(normalized_method, retrieval_query, rewrite=True))
-        execution_metadata.update(usage_metadata(llm_calls))
+            result = run_query(query_command(normalized_method, retrieval_query))
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -307,14 +264,6 @@ class QueryService:
                 context["_evidence_warning"] = str(exc)
         if requested_method == AGENTIC_METHOD and answer:
             answer = self._align_agentic_citations(answer, context, evidence)
-        if answer and evidence:
-            try:
-                evidence, added = with_duplicate_citations(self.projects, project_id, answer, evidence, context)
-            except (ProjectError, OSError, ValueError) as exc:
-                execution_metadata["duplicate_citations_error"] = str(exc)
-            else:
-                if added:
-                    execution_metadata["duplicate_citations"] = added
         if result.returncode == 0 and not answer:
             error = "GraphRAG 未回傳回答"
         query_result = QueryResult(
@@ -342,32 +291,6 @@ class QueryService:
             # A separate admin process may remove the project while a long query is running.
             pass
         return query_result
-
-    def _rewrite_for_manual(
-        self,
-        project_id: str,
-        graph_root: Path,
-        question: str,
-        model: str,
-        reasoning_effort: str | None,
-        llm_calls: list[dict[str, Any]],
-        execution_metadata: dict[str, Any],
-    ) -> str | None:
-        """Return a retrieval query in the manual's language when the question is in another one."""
-        script, excerpt = document_language_sample(graph_root)
-        rewrite = getattr(self.router, "rewrite_query", None)
-        if rewrite is None or not needs_rewrite(question, script):
-            return None
-        query, calls = rewrite(
-            question, excerpt, model, self.connection_settings.get_api_base_url(),
-            self.connection_settings.get_api_key(project_id), reasoning_effort,
-        )
-        llm_calls.extend(tag_calls(calls, QUERY_REWRITE_STAGE, "basic"))
-        if query:
-            execution_metadata["retrieval_query"] = query
-        else:
-            execution_metadata["retrieval_query_error"] = "改寫為手冊語言失敗，改用原題檢索"
-        return query
 
     def history(self, project_id: str) -> list[QueryResult]:
         path = self.projects.path_for(project_id) / "runs" / "queries.jsonl"
@@ -431,9 +354,6 @@ class QueryService:
         method = command[command.index("--method") + 1]
         root = Path(command[command.index("--root") + 1])
         question = command[-1]
-        retrieval_query = (
-            command[command.index("--retrieval-query") + 1] if "--retrieval-query" in command else None
-        )
         model = ""
         settings_path = root / "settings.yaml"
         try:
@@ -460,7 +380,6 @@ class QueryService:
                 "method": method,
                 "model": model,
                 "response_type": response_type,
-                "retrieval_query": retrieval_query,
             },
             ensure_ascii=False,
         )
@@ -473,13 +392,11 @@ class QueryService:
                 error = str(response.get("error") or completed.stderr or "GraphRAG 查詢失敗")
                 return QueryExecution(completed.returncode or 1, "", error)
             context = response.get("context", {})
-            llm_calls = response.get("llm_calls", [])
             return QueryExecution(
                 0,
                 str(response.get("answer", "")),
                 completed.stderr or "",
                 context if isinstance(context, dict) else {},
-                tuple(item for item in llm_calls if isinstance(item, dict)) if isinstance(llm_calls, list) else (),
             )
         except subprocess.TimeoutExpired:
             return QueryExecution(124, "", "Agentic GraphRAG 搜尋超過單題時間上限")
@@ -580,51 +497,9 @@ class QueryService:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
 
-    @contextmanager
-    def _locked_history(self, path: Path):
-        """Serialize history writers across threads and processes (the portal appends too)."""
-        with self._history_lock, (path.parent / ".queries.lock").open("a") as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-
     def _append_record(self, path: Path, result: QueryResult) -> None:
         line = json.dumps(asdict(result), ensure_ascii=False) + "\n"
-        with self._locked_history(path), path.open("a", encoding="utf-8") as output:
+        with self._history_lock, path.open("a", encoding="utf-8") as output:
             output.write(line)
             output.flush()
             os.fsync(output.fileno())
-
-    def clear_history(self, project_id: str, sources: tuple[str | None, ...]) -> int:
-        """Drop records whose source is in ``sources``; other records stay. Returns the number removed."""
-        path = self.projects.path_for(project_id) / "runs" / "queries.jsonl"
-        if not path.exists():
-            return 0
-        with self._locked_history(path):
-            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-            kept: list[str] = []
-            for line in lines:
-                if not line.strip():
-                    continue
-                try:
-                    source = json.loads(line).get("source")
-                except (json.JSONDecodeError, AttributeError) as exc:
-                    raise ProjectError("問答紀錄格式錯誤") from exc
-                if source not in sources:
-                    kept.append(line if line.endswith("\n") else line + "\n")
-            removed = sum(1 for line in lines if line.strip()) - len(kept)
-            if removed == 0:
-                return 0
-            handle, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".queries-", suffix=".jsonl")
-            try:
-                with os.fdopen(handle, "w", encoding="utf-8") as temporary:
-                    temporary.writelines(kept)
-                    temporary.flush()
-                    os.fsync(temporary.fileno())
-                os.replace(temporary_name, path)
-            finally:
-                if os.path.exists(temporary_name):
-                    os.unlink(temporary_name)
-        return removed

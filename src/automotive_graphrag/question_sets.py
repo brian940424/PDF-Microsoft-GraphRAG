@@ -13,7 +13,6 @@ from typing import Iterable, Mapping, Protocol, Sequence
 
 from .evidence import Evidence
 from .projects import ProjectError, ProjectStore
-from .llm_usage import query_cost_summary
 from .querying import QueryResult, QueryService
 
 
@@ -50,12 +49,6 @@ class BatchQuestion:
     routed_method: str = ""
     routing_reason: str = ""
     answer_aliases: tuple[str, ...] = ()
-    # Search cost of the answer (see llm_usage.query_cost_summary); None when not recorded.
-    search_count: int | None = None
-    llm_call_count: int | None = None
-    total_tokens: int | None = None
-    first_method: str | None = None
-    first_choice_found: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,7 +208,6 @@ class QuestionSetService:
                     # Auto queries report the strategy the router picked in ``method``.
                     routed_method=result.method if result.requested_method == "auto" else "",
                     routing_reason=(result.routing_reason or "") if result.requested_method == "auto" else "",
-                    **_cost_fields(result.execution_metadata),
                 )
             )
         updated = self._replace(question_set, questions, method, response_type=response_type)
@@ -783,14 +775,3 @@ class QuestionSetService:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
-
-
-def _cost_fields(execution_metadata: dict | None) -> dict:
-    summary = query_cost_summary(execution_metadata)
-    return {
-        "search_count": summary["search_count"],
-        "llm_call_count": summary["llm_call_count"],
-        "total_tokens": summary["total_tokens"],
-        "first_method": summary["first_method"],
-        "first_choice_found": summary["first_choice_found"],
-    }

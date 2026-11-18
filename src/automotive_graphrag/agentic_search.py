@@ -8,7 +8,6 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
-from .llm_usage import AGENTIC_STAGE, call_record
 from .projects import ProjectError
 from .strategy_routing import ROUTABLE_METHODS, StrategyRouter
 
@@ -106,30 +105,30 @@ class AgenticSearch:
         reasoning_effort: str | None = None,
     ) -> AgenticDecision:
         deadline = time.monotonic() + MAX_TOTAL_SECONDS
-        model_calls: list[dict[str, Any]] = []
+        call_counter = [0]
         if not api_key:
             return self._fallback(question, search, "尚未設定 API Key", deadline, model, reasoning_effort)
 
         try:
-            plan = self._chat_json(api_base_url, api_key, model, PLAN_PROMPT.format(question=question), reasoning_effort, deadline, model_calls)
+            plan = self._chat_json(api_base_url, api_key, model, PLAN_PROMPT.format(question=question), reasoning_effort, deadline, call_counter)
             method, query = self._validated_plan(plan)
         except ProjectError as exc:
-            return self._fallback(question, search, str(exc), deadline, model, reasoning_effort, model_calls)
+            return self._fallback(question, search, str(exc), deadline, model, reasoning_effort, call_counter[0])
 
         steps: list[SearchStepResult] = []
         try:
             first, first_duration = self._run_search(search, method, query, deadline)
         except ProjectError as exc:
-            return self._decision(method, "", [], f"Agentic 搜尋未能開始：{exc}", 1, str(exc), model, reasoning_effort, model_calls)
+            return self._decision(method, "", [], f"Agentic 搜尋未能開始：{exc}", 1, str(exc), model, reasoning_effort, call_counter[0])
         steps.append(self._step_record(method, query, str(getattr(first, "stdout", "")), getattr(first, "context", {}), getattr(first, "returncode", 1), str(plan.get("purpose", "")), first_duration, getattr(first, "stderr", None)))
         if getattr(first, "returncode", 1) != 0:
-            return self._decision(method, "", steps, "初次 GraphRAG 搜尋失敗", int(getattr(first, "returncode", 1)), str(getattr(first, "stderr", "GraphRAG 查詢失敗")), model, reasoning_effort, model_calls)
+            return self._decision(method, "", steps, "初次 GraphRAG 搜尋失敗", int(getattr(first, "returncode", 1)), str(getattr(first, "stderr", "GraphRAG 查詢失敗")), model, reasoning_effort, call_counter[0])
 
         try:
             assessment = self._chat_json(
                 api_base_url, api_key, model,
                 ASSESS_PROMPT.format(question=question, results=self._serialize_steps(steps)),
-                reasoning_effort, deadline, model_calls,
+                reasoning_effort, deadline, call_counter,
             )
             self._validate_assessment(assessment)
             if assessment["sufficient"] is not True and len(steps) < MAX_SEARCH_STEPS:
@@ -149,22 +148,22 @@ class AgenticSearch:
         except ProjectError as exc:
             stop_reason = f"證據檢查失敗，停止補搜：{exc}"
 
-        return self._decision_from_results(question, model, api_base_url, api_key, steps, reasoning_effort, stop_reason, deadline, model_calls)
+        return self._decision_from_results(question, model, api_base_url, api_key, steps, reasoning_effort, stop_reason, deadline, call_counter)
 
     def _decision_from_results(
         self, question: str, model: str, api_base_url: str, api_key: str,
         steps: list[SearchStepResult], reasoning_effort: str | None, stop_reason: str, deadline: float,
-        model_calls: list[dict[str, Any]],
+        call_counter: list[int],
     ) -> AgenticDecision:
         if not any(step.evidence for step in steps):
             answer = "目前沒有取得可引用的來源證據，無法可靠回答此問題。"
             stop_reason += "；沒有可解析的 Evidence，已停止作答"
-            return self._decision("agentic", answer, steps, stop_reason, 0, None, model, reasoning_effort, model_calls)
+            return self._decision("agentic", answer, steps, stop_reason, 0, None, model, reasoning_effort, call_counter[0])
         results = self._serialize_steps(steps)
         try:
             final = self._chat_json(
                 api_base_url, api_key, model,
-                ANSWER_PROMPT.format(question=question, results=results), reasoning_effort, deadline, model_calls,
+                ANSWER_PROMPT.format(question=question, results=results), reasoning_effort, deadline, call_counter,
             )
             answer = str(final.get("answer", "")).strip()
             if not answer:
@@ -177,11 +176,11 @@ class AgenticSearch:
         used_method = methods[0] if len(set(methods)) == 1 else "agentic"
         # A failed optional follow-up does not discard a successful first search.
         first_step_succeeded = bool(steps) and steps[0].returncode == 0
-        return self._decision(used_method, answer, steps, stop_reason, 0 if first_step_succeeded else 1, None if first_step_succeeded else "GraphRAG 搜尋失敗", model, reasoning_effort, model_calls)
+        return self._decision(used_method, answer, steps, stop_reason, 0 if first_step_succeeded else 1, None if first_step_succeeded else "GraphRAG 搜尋失敗", model, reasoning_effort, call_counter[0])
 
     def _fallback(self, question: str, search: SearchFunction, detail: str, deadline: float,
                   model: str | None = None, reasoning_effort: str | None = None,
-                  model_calls: list[dict[str, Any]] | None = None) -> AgenticDecision:
+                  model_call_count: int = 0) -> AgenticDecision:
         try:
             result, duration = self._run_search(search, "local", question, deadline)
         except ProjectError as exc:
@@ -192,7 +191,7 @@ class AgenticSearch:
         if not step.evidence:
             answer = "目前沒有取得可引用的來源證據，無法可靠回答此問題。"
             stop_reason += "；沒有可解析的 Evidence，已停止作答"
-        return self._decision("local", answer, [step], stop_reason, int(getattr(result, "returncode", 1)), None if getattr(result, "returncode", 1) == 0 else str(getattr(result, "stderr", "Local 查詢失敗")), model, reasoning_effort, model_calls)
+        return self._decision("local", answer, [step], stop_reason, int(getattr(result, "returncode", 1)), None if getattr(result, "returncode", 1) == 0 else str(getattr(result, "stderr", "Local 查詢失敗")), model, reasoning_effort, model_call_count)
 
     @staticmethod
     def _run_search(search: SearchFunction, method: str, query: str, deadline: float) -> tuple[object, float]:
@@ -209,7 +208,7 @@ class AgenticSearch:
             raise ProjectError(f"GraphRAG {method} 搜尋執行失敗：{exc}") from exc
         return result, round(time.monotonic() - started, 3)
 
-    def _chat_json(self, base: str, key: str, model: str, prompt: str, effort: str, deadline: float, model_calls: list[dict[str, Any]]) -> dict[str, Any]:
+    def _chat_json(self, base: str, key: str, model: str, prompt: str, effort: str, deadline: float, call_counter: list[int]) -> dict[str, Any]:
         try:
             parameters = inspect.signature(self.chat).parameters
             kwargs = {}
@@ -220,16 +219,8 @@ class AgenticSearch:
                 if remaining <= 0:
                     raise ProjectError("Agentic 搜尋已達單題 300 秒上限")
                 kwargs["timeout_seconds"] = min(60, remaining)
-            usage: dict[str, Any] = {}
-            if "usage_sink" in parameters:
-                kwargs["usage_sink"] = usage
-            started = time.monotonic()
-            try:
-                response = self.chat(base, key, model, prompt, **kwargs)
-            except Exception as exc:
-                model_calls.append(call_record(AGENTIC_STAGE, None, model, None, time.monotonic() - started, str(exc)))
-                raise
-            model_calls.append(call_record(AGENTIC_STAGE, None, model, usage or None, time.monotonic() - started))
+            call_counter[0] += 1
+            response = self.chat(base, key, model, prompt, **kwargs)
         except Exception as exc:
             raise ProjectError(f"Agentic 模型呼叫失敗：{exc}") from exc
         if not isinstance(response, dict):
@@ -325,15 +316,13 @@ class AgenticSearch:
     @staticmethod
     def _decision(method: str, answer: str, steps: list[SearchStepResult], stop_reason: str,
                   returncode: int, error: str | None, model: str | None, reasoning_effort: str | None,
-                  model_calls: list[dict[str, Any]] | None) -> AgenticDecision:
-        model_call_count = len(model_calls or ())
+                  model_call_count: int) -> AgenticDecision:
         metadata = {
             "trace_schema_version": AGENTIC_TRACE_VERSION,
             "prompt_version": AGENTIC_PROMPT_VERSION,
             "model": model,
             "reasoning_effort": reasoning_effort,
             "model_call_count": model_call_count,
-            "planner_llm_calls": list(model_calls or ()),
             "search_step_count": len(steps),
             "max_search_steps": MAX_SEARCH_STEPS,
             "total_search_seconds": round(sum(step.duration_seconds for step in steps), 3),

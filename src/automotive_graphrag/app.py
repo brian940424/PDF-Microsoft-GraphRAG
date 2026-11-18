@@ -23,7 +23,6 @@ from .automatic_evaluation import (
     JudgeScore,
     extra_error_share,
     judge_scores_from_dicts,
-    question_set_cost,
 )
 from .automatic_qa import AutomaticQATestService
 from .cancellation import Job, JobAlreadyRunning, JobRegistry, JobStopped
@@ -39,13 +38,7 @@ from .connections import (
     parse_judge_models,
 )
 from .dashboard3d import dashboard_iframe
-from .documents import (
-    MARGIN_OPTION_NAMES as PROCESSING_MARGIN_OPTIONS,
-    DocumentInfo,
-    DocumentService,
-    IgnoredMargins,
-    PageReview,
-)
+from .documents import DocumentInfo, DocumentService, PageReview
 from .downloads import stage_downloads
 from .evidence import evidence_page_label
 from .ground_truth import GroundTruthService
@@ -77,28 +70,18 @@ NEW_PROJECT_OPTION = "__new_project__"
 NEW_PROJECT_LABEL = "+ 新增專案..."
 UPLOAD_PDF_OPTION = "__upload_pdf__"
 UPLOAD_PDF_LABEL = "+ 上傳 PDF..."
-AUTOQA_IMPORT_OPTION = "__import_question_set__"
-AUTOQA_IMPORT_LABEL = "+ 匯入題目集..."
-AUTOQA_GENERATE_OPTION = "__generate_questions__"
-AUTOQA_GENERATE_LABEL = "+ 自動生成題目..."
-AUTOQA_ACTION_OPTIONS = (AUTOQA_IMPORT_OPTION, AUTOQA_GENERATE_OPTION)
-EXPERIMENT_IMPORT_OPTION = AUTOQA_IMPORT_OPTION
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
-PROCESSING_COLUMNS = [
-    "PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "忽略左側 (%)", "忽略右側 (%)", "起始頁索引", "結束頁索引",
-]
+PROCESSING_COLUMNS = ["PDF", "總頁數", "忽略 Header (%)", "忽略 Footer (%)", "起始頁索引", "結束頁索引"]
 VISION_DISABLED = "__vision_disabled__"
 REVIEW_FILTERS = ["全部", "未檢查", "已修改", "Vision", "文字層", "Vision 失敗", "空白／錯誤"]
-# Lines of removed text listed under a page in the page review.
-REVIEW_REMOVED_LINES_SHOWN = 12
+REVIEW_COLUMNS = ["頁碼", "解析方式", "已檢查", "已修改", "字元數"]
 PAGE_SOURCE_LABELS = {
     "vision": "Vision",
     "text": "文字層",
     "fallback": "Vision 失敗→文字層",
     "empty": "空白",
     "error": "錯誤",
-    "pending": "尚未前處理",
 }
 VISION_SCOPE_CHOICES = [
     ("僅含圖表或表格的頁面（純文字頁用文字層，省 token）", SCOPE_FIGURES),
@@ -200,67 +183,6 @@ APP_CSS = """
 }
 #query-summary {
     flex: 0 0 auto !important;
-}
-/* 逐頁檢查兩欄等高：右欄的解析結果撐滿到與原頁同高，頁碼固定在底部；文字過長時在框內捲動 */
-.review-editor,
-.review-editor > .styler,
-.review-editor > .styler > .form {
-    flex: 1 1 0 !important;
-    display: flex !important;
-    flex-direction: column;
-    min-width: 0;
-}
-#review-text {
-    flex: 1 1 auto !important;
-    display: flex;
-    flex-direction: column;
-}
-#review-text > label,
-#review-text .input-container {
-    flex: 1 1 auto;
-    display: flex;
-    flex-direction: column;
-}
-#review-text textarea {
-    flex: 1 1 0;
-    height: auto !important;
-    min-height: 0;
-    overflow-y: auto !important;
-}
-/* 逐頁檢查整塊佔一個螢幕高度：資訊列與按鈕列維持原高，剩餘高度給原頁與解析結果 */
-#review-screen {
-    height: calc(100vh - 2 * var(--size-4, 16px));
-    min-height: 560px;
-    flex-wrap: nowrap !important;
-}
-#review-screen > * {
-    flex: 0 0 auto;
-}
-#review-screen > #review-pane {
-    flex: 1 1 0 !important;
-    min-height: 0;
-}
-#review-image {
-    flex: 1 1 0 !important;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-}
-#review-image > label,
-#review-image .image-container,
-#review-image .image-frame {
-    flex: 1 1 0;
-    min-height: 0;
-}
-#review-image .image-frame {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-#review-image img {
-    max-height: 100%;
-    max-width: 100%;
-    object-fit: contain;
 }
 /* 匯入／匯出題目集兩欄等高：檔案區撐滿，按鈕固定在底部 */
 .file-action-group,
@@ -412,6 +334,23 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                         continue
                     metric_samples.append((result.retrieved_evidence, gold))
             metrics = compute_source_metrics(tuple(metric_samples)) if metric_samples else (None, None, None, 0)
+            coverages = [float(item["answer_point_coverage_percent"]) for item in selected
+                         if isinstance(item.get("answer_point_coverage_percent"), (int, float))]
+            unsupported_counts = [int(item["unsupported_claim_count"]) for item in selected
+                                  if isinstance(item.get("unsupported_claim_count"), int)]
+            refusal_labels = [item.get("refusal_correctness") for item in selected]
+            scored_refusals = [value for value in refusal_labels if value in {"correct", "incorrect"}]
+            quality_reviewed = sum(
+                item.get("answer_point_coverage_percent") is not None
+                or item.get("unsupported_claim_count") is not None
+                or item.get("refusal_correctness") is not None
+                for item in selected
+            )
+            metric_status = (
+                "已計算（文件 ID／頁碼比對；逐題 precision 平均，無頁碼 Gold 排除）" if metric_samples else
+                "不可計算：Global／Agentic 社群報告無法可靠映射" if method in {"global", EXPERIMENT_AGENTIC_METHOD} else
+                "不可計算：尚無可用來源證據"
+            )
             average_answer_em = RetrievalExperimentService._mean_present(item.get("answer_em") for item in selected)
             average_answer_f1 = RetrievalExperimentService._mean_present(item.get("answer_f1") for item in selected)
             average_term_hit = RetrievalExperimentService._mean_present(item.get("answer_term_hit") for item in selected)
@@ -428,6 +367,12 @@ def _experiment_dataset_summary_rows(run, groups, question_sets):
                 f"{metrics[0]:.1%}" if metrics[0] is not None else "不可計算",
                 f"{metrics[1]:.1%}" if metrics[1] is not None else "不可計算",
                 f"{metrics[2]:.1%}" if metrics[2] is not None else "不可計算",
+                metric_status,
+                f"{sum(coverages) / len(coverages):.1f}%" if coverages else "未標註",
+                f"{sum(count > 0 for count in unsupported_counts) / len(unsupported_counts):.1%}" if unsupported_counts else "未標註",
+                f"{sum(unsupported_counts) / len(unsupported_counts):.2f}" if unsupported_counts else "未標註",
+                f"{sum(value == 'correct' for value in scored_refusals) / len(scored_refusals):.1%}" if scored_refusals else "未標註",
+                quality_reviewed,
                 f"{average_answer_em:.1%}" if average_answer_em is not None else "—",
                 f"{average_answer_f1:.1%}" if average_answer_f1 is not None else "—",
                 f"{average_term_hit:.1%}" if average_term_hit is not None else "—",
@@ -459,30 +404,8 @@ def _experiment_trace_cell(trace):
     return f"{step_text}｜停止：{stop_reason}" if stop_reason else step_text
 
 
-EXPERIMENT_COST_HEADERS = ("平均搜尋次數", "平均 LLM 呼叫", "平均 Token", "路由首選命中率")
-EXPERIMENT_CLASSIC_HEADERS = ("Average EM", "Average F1", "Average Term Hit", "Average Term Coverage")
-EXPERIMENT_SUMMARY_HEADERS = (
-    "實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "得分正確率", "來源分數", "綜合得分率",
-    "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "平均延遲（秒）", "P95 延遲（秒）",
-    *EXPERIMENT_COST_HEADERS, *EXPERIMENT_CLASSIC_HEADERS,
-)
-EXPERIMENT_DATASET_SUMMARY_HEADERS = (
-    "實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "得分正確率",
-    "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", *EXPERIMENT_CLASSIC_HEADERS,
-)
-
-
-def experiment_summary_update(headers, rows, visible, drop=()):
-    """A summary table update without the `drop` columns (Agentic or classic metrics not in use)."""
-    keep = [index for index, header in enumerate(headers) if header not in set(drop)]
-    return gr.update(
-        value={
-            "headers": [headers[index] for index in keep],
-            "data": [[row[index] for index in keep] for row in rows],
-        },
-        datatype=["str"] * len(keep),
-        visible=visible,
-    )
+def _quality_annotation_label(value):
+    return {"correct": "正確", "incorrect": "錯誤", "not_applicable": "不適用"}.get(value, "")
 
 
 def _score_percent(value, scale: float = 1) -> str:
@@ -615,7 +538,6 @@ JOB_BUTTON_LABELS = {
     "qa_evaluate": ("評測回答", "停止評測回答"),
     "retrieval_answer": ("檢索並生成答案", "停止生成答案"),
     "retrieval_evaluate": ("評測答案", "停止評測答案"),
-    "vision_retry": ("重跑 Vision 失敗頁", "停止重跑 Vision"),
 }
 JOB_STOPPING_LABEL = "停止中…"
 
@@ -626,7 +548,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     documents = DocumentService(store)
     indexing = IndexingService(store, connection_settings=connections)
     indexing.recover_interrupted_builds()
-    documents.recover_interrupted_preprocessing()
     querying = QueryService(store, connection_settings=connections)
     question_sets = QuestionSetService(store, querying)
     reviews = ReviewService(store, question_sets)
@@ -1122,19 +1043,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ]
         return rows, [item.query_id for item in records]
 
-    def clear_query_history(project_id: str | None, confirmed: bool):
-        """Remove manual Q&A records only; AutoQA and portal records feed other reports."""
-        if not confirmed:
-            return load_query_history(project_id)
-        if not project_id:
-            raise gr.Error("請先開啟專案")
-        try:
-            removed = querying.clear_history(project_id, (None, "manual"))
-        except ProjectError as exc:
-            raise gr.Error(str(exc)) from exc
-        gr.Info(f"已清除 {removed} 筆手動問答紀錄")
-        return load_query_history(project_id)
-
     def format_history_time(value: str) -> str:
         try:
             return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -1174,8 +1082,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 return (
                     f"### [{item['evidence_id']}] {item['document_id']} — {location}\n\n"
                     f"章節：{item['section_name']} (`{item['section_id']}`)  \n"
-                    + (f"版本：{item['variant']}  \n" if item.get("variant") else "")
-                    + f"{identifier_text}{item['text']}"
+                    f"{identifier_text}{item['text']}"
                 )
         return ""
 
@@ -1637,35 +1544,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         models = [f"生題 {generation_model}"] if generation_model and generation_model != "—" else []
         if answer_model:
             models.append(f"回答 {answer_model}")
-        cost_line = autoqa_cost_line(question_set)
-        if cost_line:
-            items.append(cost_line)
         if models:
             items.append("- **模型：** " + "｜".join(models))
         if not judge:
             items.append("- 尚無已儲存的評判結果")
         items.extend(f"- **提醒：** {note}" for note in notes if note)
         return title + ("\n\n" + "\n".join(items) if items else "")
-
-    def autoqa_cost_line(question_set):
-        """Search cost of the saved answers; empty when the answers predate cost recording."""
-        cost = question_set_cost(question_set.questions)
-        parts = []
-        if cost["average_search_count"] is not None:
-            parts.append(f"平均搜尋 {cost['average_search_count']:.2f} 次")
-        if cost["average_llm_call_count"] is not None:
-            parts.append(f"平均 LLM 呼叫 {cost['average_llm_call_count']:.2f} 次")
-        if cost["average_total_tokens"] is not None:
-            parts.append(
-                f"平均 {cost['average_total_tokens']:,.0f} Token（{cost['measured_query_count']} 題有用量）"
-            )
-        if cost["first_choice_hit_rate"] is not None:
-            detail = "、".join(
-                f"{QUERY_METHOD_LABELS.get(method, method)} {bucket['found']}/{bucket['first']}"
-                for method, bucket in cost["first_choice_by_method"].items()
-            )
-            parts.append(f"路由首選命中 {cost['first_choice_hit_rate']:.0%}（{detail}）")
-        return "- **搜尋成本：** " + "｜".join(parts) if parts else ""
 
     def autoqa_strategy_cell(question_set, question):
         if not question.routed_method:
@@ -1704,29 +1588,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 item.question_set_id,
             ))
         ids = {value for _label, value in choices}
-        choices += [(AUTOQA_IMPORT_LABEL, AUTOQA_IMPORT_OPTION), (AUTOQA_GENERATE_LABEL, AUTOQA_GENERATE_OPTION)]
         return gr.update(choices=choices, value=selected_id if selected_id in ids else None)
-
-    def select_autoqa_question_set(project_id, selected):
-        """Load a saved question set; the import/generate options only reveal their section."""
-        if not selected or selected in AUTOQA_ACTION_OPTIONS:
-            return (gr.skip(),) * 8
-        return automatic_qa_saved_view(project_id, selected)
-
-    def autoqa_question_set_section_views(project_id, selected):
-        """Import and generate sections show only when their option is chosen; generation also
-        stays visible while it runs so its stop button can be reached after a reload."""
-        saved = bool(selected) and selected not in AUTOQA_ACTION_OPTIONS
-        generating = selected == AUTOQA_GENERATE_OPTION or jobs.is_running(project_id, "qa_generate")
-        return (
-            gr.update(visible=selected == AUTOQA_IMPORT_OPTION),
-            gr.update(visible=generating),
-            gr.update(visible=saved),
-            gr.update(visible=saved),
-            # The previous set's questions are hidden while importing or generating; loading a set
-            # (including the new one) shows the table again with its rows.
-            gr.update(visible=False) if selected in AUTOQA_ACTION_OPTIONS else gr.skip(),
-        )
 
     def autoqa_question_rows(question_set):
         rows = []
@@ -1807,9 +1669,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             raise ProjectError("請先生成或匯入題目集")
         current = question_sets.get(project_id, question_set_id)
         by_id = {item.question_id: item for item in current.questions}
-        shown_rows = {row[0]: row for row in autoqa_question_rows(current)}
         updated = []
-        changed = False
         if rows is None:
             editable_rows = []
         elif hasattr(rows, "itertuples"):
@@ -1823,43 +1683,33 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             if question_id not in by_id:
                 raise ProjectError(f"題目集找不到題號：{question_id}")
             old = by_id[question_id]
-            # Cells equal to what the table showed keep the stored values untouched, so an
-            # unedited row (or source cell) is never rewritten through the text round trip.
-            edited = [str(value or "").strip() for value in row[1:5]]
-            shown = [str(value or "").strip() for value in shown_rows[question_id][1:5]]
-            if edited == shown:
-                updated.append(old)
-                continue
-            changed = True
-            question_edited = edited[2] != shown[2]
-            answer_edited = edited[3] != shown[3]
-            question_sources = (
-                parse_autoqa_sources(row[3], old.question_source_evidence or old.gold_evidence)
-                if question_edited else old.question_source_evidence
+            question_sources = parse_autoqa_sources(
+                row[3], old.question_source_evidence or old.gold_evidence
             )
-            answer_sources = (
-                parse_autoqa_sources(row[4], old.answer_source_evidence or old.gold_evidence)
-                if answer_edited else old.answer_source_evidence
+            answer_sources = parse_autoqa_sources(
+                row[4], old.answer_source_evidence or old.gold_evidence
             )
-            source_documents = (
-                tuple(dict.fromkeys(
-                    source.document_id for source in (
-                        *(question_sources or old.gold_evidence), *(answer_sources or old.gold_evidence)
-                    )
-                ))
-                if question_edited or answer_edited else old.source_documents
-            )
-            updated.append(replace(
-                old,
-                question=edited[0],
-                reference_answer=edited[1],
-                gold_evidence=answer_sources if answer_edited else old.gold_evidence,
+            source_documents = tuple(dict.fromkeys(
+                source.document_id for source in (*question_sources, *answer_sources)
+            ))
+            updated.append(BatchQuestion(
+                question_id=question_id,
+                question=str(row[1] or "").strip(),
+                reference_answer=str(row[2] or "").strip(),
+                status=old.status,
+                answer=old.answer,
+                error=old.error,
+                duration_seconds=old.duration_seconds,
+                completed_at=old.completed_at,
+                gold_evidence=answer_sources,
+                retrieved_evidence=old.retrieved_evidence,
                 question_source_evidence=question_sources,
                 answer_source_evidence=answer_sources,
                 source_documents=source_documents,
+                routed_method=old.routed_method,
+                routing_reason=old.routing_reason,
+                answer_aliases=old.answer_aliases,
             ))
-        if not changed:
-            return current
         return question_sets.update_questions(project_id, question_set_id, updated)
 
     def automatic_qa_summary(report):
@@ -1909,36 +1759,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.update(interactive=answers_ready),
             question_set.response_type,
         )
-
-    def delete_autoqa_question_set(project_id, question_set_id, confirmed):
-        """Delete the selected question set with its saved evaluation records, then show the latest one."""
-        unchanged = (gr.skip(),) * 8
-        if not project_id or not question_set_id or question_set_id in AUTOQA_ACTION_OPTIONS:
-            return "❌ 請先在「題目集」選擇要刪除的題目集", *unchanged, False
-        if not confirmed:
-            return gr.skip(), *unchanged, False
-        busy = [
-            JOB_BUTTON_LABELS[kind][0]
-            for kind in ("qa_generate", "qa_answer", "qa_evaluate", "retrieval_answer", "retrieval_evaluate")
-            if jobs.is_running(project_id, kind)
-        ]
-        if busy:
-            return f"❌ 「{'、'.join(busy)}」執行中，請等待完成或停止後再刪除題目集", *unchanged, False
-        try:
-            question_set = question_sets.get(project_id, question_set_id)
-            if retrieval_experiments.uses_question_set(project_id, question_set_id):
-                return (
-                    f"❌ 題目集「{question_set.name}」正用於「4 檢索實驗」，請先在該分頁取消選取並按「使用所選題目集」後再刪除",
-                    *unchanged, False,
-                )
-            question_sets.delete(project_id, question_set_id)
-            runs = store.path_for(project_id) / "runs"
-            for name in (f"automatic-evaluation-{question_set_id}.json", f"retrieval-evaluation-{question_set_id}.json"):
-                (runs / name).unlink(missing_ok=True)
-        except (ProjectError, OSError) as exc:
-            return f"❌ 刪除題目集失敗：{exc}", *unchanged, False
-        _message, *view = automatic_qa_saved_view(project_id)
-        return f"✅ 已刪除題目集「{question_set.name}」", *view, False
 
     def automatic_qa_metric_flag_values(project_id, question_set_id=None):
         if not project_id or not question_set_id:
@@ -2040,16 +1860,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     f"{item['evidence_precision']:.1%}" if item.get("evidence_precision") is not None else "不可計算",
                     f"{item['document_hit_rate']:.1%}" if item.get("document_hit_rate") is not None else "不可計算",
                     item.get("no_evidence_question_count", 0),
+                    item.get("retrieval_metrics_status", ""),
                     f"{item['average_latency_seconds']:.2f}" if item.get("average_latency_seconds") is not None else "—",
                     f"{item['p95_latency_seconds']:.2f}" if item.get("p95_latency_seconds") is not None else "—",
                     f"{item['average_search_steps']:.2f}" if item.get("average_search_steps") is not None else "—",
-                    (
-                        f"{item['average_llm_calls']:.2f}" if item.get("average_llm_calls") is not None
-                        else f"{item['average_agent_model_calls']:.2f}（僅 Agent）"
-                        if item.get("average_agent_model_calls") is not None else "—"
-                    ),
-                    f"{item['average_total_tokens']:,.0f}" if item.get("average_total_tokens") is not None else "—",
-                    f"{item['first_choice_hit_rate']:.1%}" if item.get("first_choice_hit_rate") is not None else "—",
+                    f"{item['average_agent_model_calls']:.2f}" if item.get("average_agent_model_calls") is not None else "—",
+                    "未知（無 Token 用量）",
+                    f"{item['answer_point_coverage_percent']:.1f}%" if item.get("answer_point_coverage_percent") is not None else "未標註",
+                    f"{item['unsupported_answer_rate']:.1%}" if item.get("unsupported_answer_rate") is not None else "未標註",
+                    f"{item['average_unsupported_claim_count']:.2f}" if item.get("average_unsupported_claim_count") is not None else "未標註",
+                    f"{item['refusal_accuracy']:.1%}" if item.get("refusal_accuracy") is not None else "未標註",
+                    item.get("quality_reviewed_count", 0),
                     f"{item['average_answer_em']:.1%}" if item.get("average_answer_em") is not None else "—",
                     f"{item['average_answer_f1']:.1%}" if item.get("average_answer_f1") is not None else "—",
                     f"{item['average_answer_term_hit']:.1%}" if item.get("average_answer_term_hit") is not None else "—",
@@ -2070,6 +1891,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     _experiment_judge_cell(item),
                     _experiment_strategy_cell(item, strategy_labels),
                     _experiment_trace_cell(item.get("execution_trace", {})),
+                    f"{item['answer_point_coverage_percent']:.1f}" if item.get("answer_point_coverage_percent") is not None else "",
+                    str(item["unsupported_claim_count"]) if item.get("unsupported_claim_count") is not None else "",
+                    _quality_annotation_label(item.get("refusal_correctness")),
                 ]
                 for item in ordered_raw_results
                 if str(item.get("actual_answer", "") or "").strip()
@@ -2085,25 +1909,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             ]
             if panel_lines:
                 status += "\n\n**評審分數：** " + "；".join(panel_lines)
-            # 摘要與逐題結果等評測完才顯示；傳統指標與搜尋成本欄位只在有值時出現
+            # 摘要與逐題結果等評測完才顯示
             evaluated = bool(results)
-            show_classic = bool(run.get("enable_classic_metrics"))
-            show_cost = any(
-                item.get(key) is not None
-                for item in run.get("groups", [])
-                for key in ("average_search_steps", "average_llm_calls", "average_agent_model_calls")
-            )
             return (
                 status, question_set_ids, gr.update(value=question_rows, visible=bool(question_rows)),
-                experiment_summary_update(
-                    EXPERIMENT_SUMMARY_HEADERS, summaries, evaluated,
-                    drop=(() if show_cost else EXPERIMENT_COST_HEADERS)
-                    + (() if show_classic else EXPERIMENT_CLASSIC_HEADERS),
-                ),
-                experiment_summary_update(
-                    EXPERIMENT_DATASET_SUMMARY_HEADERS, dataset_summaries, evaluated,
-                    drop=() if show_classic else EXPERIMENT_CLASSIC_HEADERS,
-                ),
+                gr.update(value=summaries, visible=evaluated),
+                gr.update(value=dataset_summaries, visible=evaluated),
                 gr.update(value=results, visible=evaluated), state.get("max_concurrency", 5),
                 judge_model_update(state.get("judge_model")),
                 generation_status, gr.update(interactive=answers_ready), state.get("evaluation_mode", "strict"),
@@ -2272,75 +2083,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             details = "\n- ".join(import_errors) or "沒有可匯入的題目集"
             return experiment_view(project_id, f"❌ 題目集匯入失敗：\n- {details}")
         details = "、".join(f"{item.name}（{len(item.questions)} 題）" for item in imported)
-        message = f"✅ 已匯入並加入實驗：{details}"
+        message = f"✅ 已取代舊題目集；目前資料集：{details}"
         if import_errors:
             message += "\n⚠️ 以下檔案未匯入：\n- " + "\n- ".join(import_errors)
         return experiment_view(project_id, message)
-
-    def experiment_question_set_choices(project_id, applied_ids):
-        """All saved question sets plus the import option; the value is the applied selection."""
-        choices = autoqa_question_set_choices(project_id, None).get("choices", [])
-        saved = [(label, value) for label, value in choices if value not in AUTOQA_ACTION_OPTIONS]
-        ids = {value for _label, value in saved}
-        return gr.update(
-            choices=[*saved, (AUTOQA_IMPORT_LABEL, EXPERIMENT_IMPORT_OPTION)],
-            value=[item for item in (applied_ids or []) if item in ids],
-        )
-
-    def experiment_selector_input(selected):
-        """Choosing the import option opens the upload area and drops the option from the selection."""
-        selected = list(selected or [])
-        if EXPERIMENT_IMPORT_OPTION not in selected:
-            return gr.skip(), gr.skip()
-        return gr.update(value=[item for item in selected if item != EXPERIMENT_IMPORT_OPTION]), gr.update(visible=True)
-
-    def experiment_has_results(project_id):
-        if not project_id:
-            return False
-        try:
-            return bool(retrieval_experiments.load(project_id).get("run"))
-        except ProjectError:
-            return False
-
-    def experiment_jobs_running(project_id):
-        return [
-            JOB_BUTTON_LABELS[kind][0] for kind in ("retrieval_answer", "retrieval_evaluate")
-            if jobs.is_running(project_id, kind)
-        ]
-
-    def apply_experiment_question_sets(project_id, selected, confirmed):
-        if not confirmed:
-            return (gr.skip(),) * 11
-        if not project_id:
-            return experiment_view(project_id)
-        busy = experiment_jobs_running(project_id)
-        if busy:
-            return experiment_view(project_id, f"❌ 「{'、'.join(busy)}」執行中，請等待完成或停止後再變更題目集")
-        ids = [item for item in (selected or []) if item != EXPERIMENT_IMPORT_OPTION]
-        try:
-            before = retrieval_experiments.load(project_id)
-            after = retrieval_experiments.set_question_sets(project_id, ids)
-        except ProjectError as exc:
-            return experiment_view(project_id, f"❌ 題目集未變更：{exc}")
-        if after.get("question_set_ids") == before.get("question_set_ids"):
-            return experiment_view(project_id, "題目集未變更")
-        message = f"✅ 已改用 {len(ids)} 份題目集" if ids else "✅ 已清空實驗題目集"
-        if before.get("run"):
-            message += "；原本的實驗結果已清除"
-        return experiment_view(project_id, message)
-
-    def import_experiment_questions_checked(project_id, filepaths, confirmed):
-        """Outputs: the experiment view, then the import section and file input (closed after success)."""
-        if not confirmed:
-            return (gr.skip(),) * 13
-        busy = experiment_jobs_running(project_id) if project_id else []
-        if busy:
-            message = f"❌ 「{'、'.join(busy)}」執行中，請等待完成或停止後再匯入"
-            return (*experiment_view(project_id, message), gr.skip(), gr.skip())
-        view = import_experiment_questions(project_id, filepaths)
-        if str(view[0]).startswith("✅"):
-            return (*view, gr.update(visible=False), gr.update(value=None))
-        return (*view, gr.skip(), gr.skip())
 
     def save_experiment_globals(
         project_id: str | None, concurrency, judge_model: str | None, evaluation_mode: str | None,
@@ -2512,7 +2258,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         answer_model = answer_model or connections.get_chat_model()
         return (
             gr.update(choices=chat_model_choices(), value=answer_model),
-            gr.update(choices=AUTOQA_QUERY_METHOD_CHOICES, value=method or "auto"),
+            gr.update(choices=AUTOQA_QUERY_METHOD_CHOICES, value=method or "local"),
         )
 
     def update_query_method_compatibility(answer_model: str | None, method: str | None):
@@ -2728,6 +2474,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         else:
             table_rows = table_data or []
         judgments = []
+        quality_annotations = []
         run = retrieval_experiments.load(project_id).get("run") or {}
         dataset_display_to_id = {
             f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})": item.get("dataset_id", "")
@@ -2747,7 +2494,15 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 dataset_id = ""
                 question_id = str(row[1])
                 judgments.append((str(row[0]), question_id, grade))
+            if len(row) >= 14:
+                quality_annotations.append((
+                    str(row[0]), dataset_id, question_id,
+                    str(row[11] if row[11] is not None else ""),
+                    str(row[12] if row[12] is not None else ""),
+                    str(row[13] if row[13] is not None else ""),
+                ))
         try:
+            retrieval_experiments.update_quality_annotations(project_id, quality_annotations)
             retrieval_experiments.update_manual_judgments(project_id, judgments)
         except ProjectError as exc:
             return f"❌ 儲存人工判斷失敗：{exc}", [], [], []
@@ -3284,7 +3039,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 [
                     document.filename,
                     pages,
-                    *(float(options.get(name, 0)) for name in PROCESSING_MARGIN_OPTIONS),
+                    float(options.get("header_ignore_percent", 0)),
+                    float(options.get("footer_ignore_percent", 0)),
                     int(options.get("start_page", 0)),
                     int(options.get("end_page", max(pages - 1, 0))),
                 ]
@@ -3298,15 +3054,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         # Gradio's Dataframe(type="array") may submit a NumPy array; avoid
         # truth-value checks, which are ambiguous for arrays with multiple rows.
         for row in rows:
-            if len(row) < len(PROCESSING_COLUMNS) or row[0] in (None, ""):
+            if len(row) < 6 or row[0] in (None, ""):
                 continue
             filename = Path(str(row[0])).name
-            margins = row[2:2 + len(PROCESSING_MARGIN_OPTIONS)]
-            start_page, end_page = row[2 + len(PROCESSING_MARGIN_OPTIONS):len(PROCESSING_COLUMNS)]
             options[filename] = {
-                **{name: value if value not in (None, "") else 0 for name, value in zip(PROCESSING_MARGIN_OPTIONS, margins)},
-                "start_page": start_page if start_page not in (None, "") else 0,
-                "end_page": end_page,
+                "header_ignore_percent": row[2] if row[2] not in (None, "") else 0,
+                "footer_ignore_percent": row[3] if row[3] not in (None, "") else 0,
+                "start_page": row[4] if row[4] not in (None, "") else 0,
+                "end_page": row[5],
             }
         return options
 
@@ -3358,14 +3113,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Accordion(visible=has_targets),
         )
 
-    def processing_section_update(project_id: str | None, targets: list[str] | None):
-        """Show the section, opened, for selected PDFs; only indexing collapses it."""
-        targets = [target for target in targets or [] if target != UPLOAD_PDF_OPTION]
-        return gr.Accordion(visible=bool(targets), open=True)
-
     def processing_options_view(project_id: str | None, targets: list[str] | None, edited_rows):
         targets = [target for target in targets or [] if target != UPLOAD_PDF_OPTION]
-        return processing_option_rows(project_id, targets, edited_rows), processing_section_update(project_id, targets)
+        return processing_option_rows(project_id, targets, edited_rows), gr.Accordion(visible=bool(targets))
 
     def preprocess_options(project_id: str, option_rows) -> dict[str, dict[str, object]]:
         """Saved options for every PDF, overridden by the rows shown for the selected PDFs."""
@@ -3383,200 +3133,70 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f'<span>{html.escape(detail)}</span><span>{percent}%｜{html.escape(status)}</span></div></div>'
         )
 
-    def review_margin_options(
-        project_id: str, filename: str, option_rows: object | None,
-    ) -> tuple[dict[str, object], bool]:
-        """Margins to show: unsaved values in the options table win over the last preprocessing run.
+    def review_document_choices(project_id: str | None, current: str | None):
+        names = [item.filename for item in documents.list_documents_if_available(project_id) if item.preprocessed]
+        return gr.Dropdown(choices=names, value=current if current in names else (names[0] if names else None))
 
-        The flag tells whether the table's margins differ from the ones the shown text was extracted with.
-        """
-        saved = documents.processing_options(project_id).get(filename, {})
-        table = parse_processing_options(option_rows).get(filename)
-        if table is None:
-            return saved, False
-        try:
-            changed = IgnoredMargins.from_options(table) != IgnoredMargins.from_options(saved)
-        except ProjectError:
-            changed = True
-        return table, changed
-
-    def is_preprocessed(project_id: str, filename: str) -> bool:
-        return any(
-            item.filename == filename and item.preprocessed for item in documents.list_documents_if_available(project_id)
-        )
-
-    def filtered_reviews(
-        project_id: str | None, filename: str | None, review_filter: str | None, option_rows: object | None = None,
-    ) -> list[PageReview]:
+    def filtered_reviews(project_id: str | None, filename: str | None, review_filter: str | None) -> list[PageReview]:
         if not project_id or not filename:
             return []
-        document = next((item for item in documents.list_documents_if_available(project_id) if item.filename == filename), None)
-        if document is None:
-            return []
-        if document.preprocessed:
-            reviews = documents.page_reviews(project_id, filename)
-        else:
-            # Not preprocessed yet: list the pages in the range typed in the options table.
-            options, _ = review_margin_options(project_id, filename, option_rows)
-            pages = document.pages or 0
-            try:
-                start = int(float(options.get("start_page") or 0))
-                end_value = options.get("end_page")
-                end = pages - 1 if end_value in (None, "") else int(float(end_value))
-            except (TypeError, ValueError):
-                start, end = 0, pages - 1
-            reviews = [
-                PageReview(page=index + 1, source="pending", text="")
-                for index in range(max(start, 0), min(end, pages - 1) + 1)
+        return [item for item in documents.page_reviews(project_id, filename) if review_matches(item, review_filter)]
+
+    def review_rows(reviews: list[PageReview]) -> list[list[object]]:
+        return [
+            [
+                item.page,
+                PAGE_SOURCE_LABELS[item.source],
+                "✅" if item.reviewed else "",
+                ("⚠️ 解析結果已變" if item.source_changed else "✏️") if item.edited else "",
+                len(item.text),
             ]
-        return [item for item in reviews if review_matches(item, review_filter)]
-
-    def review_filter_update(
-        project_id: str | None, filename: str | None, review_filter: str | None, option_rows: object | None = None,
-        reset: bool = False,
-    ):
-        """Filter choices labelled with page counts, and the filter to use.
-
-        ``reset`` picks the default for a newly reviewed PDF: Vision failures first, then
-        blank/error pages, otherwise all pages.
-        """
-        try:
-            reviews = filtered_reviews(project_id, filename, "全部", option_rows)
-        except ProjectError:
-            reviews = []
-        counts = {name: sum(review_matches(item, name) for item in reviews) for name in REVIEW_FILTERS}
-        if reset or review_filter not in REVIEW_FILTERS:
-            review_filter = next((name for name in ("Vision 失敗", "空白／錯誤") if counts[name]), "全部")
-        choices = [(f"{name}（{counts[name]}）", name) for name in REVIEW_FILTERS]
-        return gr.update(choices=choices, value=review_filter), review_filter
-
-    def markdown_code(text: str) -> str:
-        """Inline code span, so text such as ``< REMOVAL >`` is not read as HTML or Markdown."""
-        return f"`{text.replace('`', "'")}`"
-
-    def review_margin_view(project_id: str, filename: str, page: int, option_rows: object | None):
-        """The page image with ignored margins shaded, info lines on what they remove, and the clipped text layer."""
-        options, changed = review_margin_options(project_id, filename, option_rows)
-        try:
-            preview = documents.margin_preview(project_id, filename, page, options)
-        except ProjectError as exc:
-            image = Image.open(io.BytesIO(documents.render_page_image(project_id, filename, page)))
-            return image, [f"❌ 忽略比例無效：{exc}"], ""
-        lines: list[str] = []
-        sides = [
-            f"{side} {points:g} pt"
-            for side, points in zip(("上", "下", "左", "右"), preview.margin_points)
-            if points
+            for item in reviews
         ]
-        if sides:
-            lines.append(f"🟥 **忽略範圍**：{'、'.join(sides)}（紅色區域不讀取、不送 Vision）")
-            removed = preview.removed_lines[:REVIEW_REMOVED_LINES_SHOWN]
-            more = len(preview.removed_lines) - len(removed)
-            shown = " ".join(markdown_code(line[:60]) for line in removed) or "無"
-            lines.append(f"✂️ **裁掉文字**：{shown}{f' …另 {more} 行' if more > 0 else ''}")
-        if changed:
-            lines.append("⚠️ 表格中的比例與上次前處理不同，右側解析結果要重新前處理才會更新")
-        return Image.open(io.BytesIO(preview.image_png)), lines, preview.kept_text
 
-    def review_page_view(project_id: str | None, filename: str | None, page: object, option_rows: object | None = None):
-        """Image, text and info lines of one page."""
+    def review_page_view(project_id: str | None, filename: str | None, page: object):
+        """Image, text and status line of one page."""
         try:
             page_number = int(page)
             review = next(
-                (item for item in filtered_reviews(project_id, filename, "全部", option_rows) if item.page == page_number),
-                None,
+                (item for item in documents.page_reviews(project_id, filename) if item.page == page_number), None
             ) if project_id and filename else None
         except (TypeError, ValueError, ProjectError):
             review = None
         if review is None:
             return None, "", ""
-        image, margin_lines, kept_text = review_margin_view(project_id, filename, review.page, option_rows)
-        status = [f"📄 **{filename}　第 {review.page} 頁**", PAGE_SOURCE_LABELS[review.source]]
-        notes: list[str] = []
-        if review.source == "pending":
-            notes.append("ℹ️ 右側為套用目前比例的文字層預覽，前處理後才會寫入")
-            text = kept_text
-        else:
-            status.append("✅ 已檢查" if review.reviewed else "⬜ 未檢查")
-            if review.edited:
-                status.append("✏️ 已手動修改")
-            if review.source_changed:
-                notes.append("⚠️ 修改後重新前處理過且解析結果已變，請確認修改是否仍正確")
-            if review.error:
-                notes.append(f"❌ 錯誤：{' '.join(review.error.split())[:200]}")
-            text = review.text
-        # Markdown line breaks keep the info compact instead of one paragraph per line.
-        return image, text, "  \n".join([" ｜ ".join(status), *margin_lines, *notes])
+        image = Image.open(io.BytesIO(documents.render_page_image(project_id, filename, review.page)))
+        flags = [f"**第 {review.page} 頁**", f"解析方式：{PAGE_SOURCE_LABELS[review.source]}"]
+        flags.append("✅ 已檢查" if review.reviewed else "⬜ 未檢查")
+        if review.edited:
+            flags.append("✏️ 已手動修改，重新前處理會保留")
+        if review.source_changed:
+            flags.append("⚠️ 修改後重新前處理過且解析結果已變，請確認修改是否仍正確")
+        if review.error:
+            flags.append(f"錯誤：{' '.join(review.error.split())[:200]}")
+        return image, review.text, "｜".join(flags)
 
-    def review_margin_refresh(project_id: str | None, filename: str | None, page: object, option_rows: object | None):
-        """Redraw the margins after the options table changes, keeping unsaved edits in the editor."""
-        image, text, info = review_page_view(project_id, filename, page, option_rows)
-        pending = bool(project_id and filename) and not is_preprocessed(project_id, filename)
-        return image, (text if pending else gr.skip()), info
-
-    def review_refresh(
-        project_id: str | None, filename: str | None, review_filter: str | None, page: object,
-        option_rows: object | None = None,
-    ):
-        """Page, image, text and info, keeping the current page when it still matches the filter."""
+    def review_refresh(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        """Reload the page list, keeping the current page when it still matches the filter."""
         try:
-            reviews = filtered_reviews(project_id, filename, review_filter, option_rows)
+            reviews = filtered_reviews(project_id, filename, review_filter)
         except ProjectError as exc:
-            return None, None, "", f"❌ {exc}"
+            return [], None, None, "", f"❌ {exc}"
         pages = [item.page for item in reviews]
-        if not pages:
-            return None, None, "", (f"{filename} 沒有符合「{review_filter}」的頁面" if filename else "")
         try:
             current = int(page)
         except (TypeError, ValueError):
             current = None
-        selected = current if current in pages else pages[0]
-        return selected, *review_page_view(project_id, filename, selected, option_rows)
+        selected = current if current in pages else (pages[0] if pages else None)
+        return review_rows(reviews), selected, *review_page_view(project_id, filename, selected)
 
-    def review_sync(
-        project_id: str | None, option_rows: object | None, filename: str | None, review_filter: str | None,
-        page: object, force: bool = False,
-    ):
-        """Keep the reviewed PDF in step with the options table rows.
+    def review_select(project_id: str | None, filename: str | None, evt: gr.SelectData):
+        page = (evt.row_value or [None])[0]
+        return page, *review_page_view(project_id, filename, page)
 
-        The PDF stays while it is still in the table; edits to the table then only redraw the
-        page (unsaved text in the editor is kept). Otherwise the first row is reviewed.
-        """
-        names = list(parse_processing_options(option_rows))
-        if filename in names and not force:
-            try:
-                pages = [item.page for item in filtered_reviews(project_id, filename, review_filter, option_rows)]
-                current = int(page)
-            except (TypeError, ValueError, ProjectError):
-                pages, current = [], None
-            if current in pages:
-                filter_update, _ = review_filter_update(project_id, filename, review_filter, option_rows)
-                return (
-                    gr.skip(), gr.skip(), *review_margin_refresh(project_id, filename, current, option_rows),
-                    filter_update,
-                )
-        if filename not in names:
-            filename, page = (names[0] if names else None), None
-        filter_update, review_filter = review_filter_update(project_id, filename, review_filter, option_rows, reset=True)
-        return filename, *review_refresh(project_id, filename, review_filter, page, option_rows), filter_update
-
-    def review_pick(
-        project_id: str | None, option_rows: object | None, filename: str | None, review_filter: str | None,
-        evt: gr.SelectData,
-    ):
-        """Clicking a row of the options table reviews that PDF; clicks within the current PDF's row change nothing."""
-        picked = Path(str((evt.row_value or [None])[0])).name if evt.row_value else None
-        if not picked or picked == filename:
-            return (gr.skip(),) * 6
-        filter_update, review_filter = review_filter_update(project_id, picked, review_filter, option_rows, reset=True)
-        return picked, *review_refresh(project_id, picked, review_filter, None, option_rows), filter_update
-
-    def review_step(
-        project_id: str | None, filename: str | None, review_filter: str | None, page: object, step: int,
-        option_rows: object | None = None,
-    ):
+    def review_step(project_id: str | None, filename: str | None, review_filter: str | None, page: object, step: int):
         try:
-            pages = [item.page for item in filtered_reviews(project_id, filename, review_filter, option_rows)]
+            pages = [item.page for item in filtered_reviews(project_id, filename, review_filter)]
         except ProjectError:
             pages = []
         if not pages:
@@ -3587,19 +3207,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             current = pages[0]
         later = [number for number in pages if (number > current if step > 0 else number < current)]
         target = (min(later) if step > 0 else max(later)) if later else current
-        return target, *review_page_view(project_id, filename, target, option_rows)
+        return target, *review_page_view(project_id, filename, target)
 
-    def review_previous_page(
-        project_id: str | None, filename: str | None, review_filter: str | None, page: object,
-        option_rows: object | None = None,
-    ):
-        return review_step(project_id, filename, review_filter, page, -1, option_rows)
+    def review_previous_page(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        return review_step(project_id, filename, review_filter, page, -1)
+
+    def review_next_page(project_id: str | None, filename: str | None, review_filter: str | None, page: object):
+        return review_step(project_id, filename, review_filter, page, 1)
 
     def review_save(project_id: str | None, filename: str | None, page: object, text: str | None, revert: bool = False):
         if not project_id or not filename or page in (None, ""):
             return "❌ 請先選擇 PDF 與頁面"
-        if not is_preprocessed(project_id, filename):
-            return "❌ 此 PDF 尚未前處理，請先執行前處理再儲存"
         try:
             if revert:
                 review = documents.revert_page_text(project_id, filename, int(page))
@@ -3610,19 +3228,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         edited = "，內容與解析結果不同，已標示為手動修改" if review.edited else ""
         return f"✅ 第 {review.page} 頁已儲存並標示已檢查{edited}；需重新建立 Graph 才會套用"
 
-    def review_save_next(
-        project_id: str | None, filename: str | None, review_filter: str | None, page: object, text: str | None,
-        option_rows: object | None = None,
-    ):
-        """Save the page, then move to the next page matching the filter."""
-        message = review_save(project_id, filename, page, text)
-        if message.startswith("❌"):
-            return message, *(gr.skip(),) * 4
-        target, *view = review_step(project_id, filename, review_filter, page, 1, option_rows)
-        if target == int(page):
-            message += "；已是最後一頁"
-        return message, target, *view
-
     def review_extract(
         project_id: str | None, filename: str | None, page: object, use_vision: bool,
         vision_model: str | None = None, vision_scope: str | None = None,
@@ -3631,8 +3236,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         """Extract the page again into the editor without saving it."""
         if not project_id or not filename or page in (None, ""):
             return gr.skip(), "❌ 請先選擇 PDF 與頁面"
-        if not is_preprocessed(project_id, filename):
-            return gr.skip(), "❌ 此 PDF 尚未前處理，請先執行前處理"
         try:
             vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort) if use_vision else None
             if use_vision and vision is None:
@@ -3642,90 +3245,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return gr.skip(), f"❌ {exc}"
         source = "Vision" if use_vision else "文字層"
         return text, f"⏳ 已以{source}重新解析第 {int(page)} 頁，**尚未儲存**；確認後請按「儲存並標示已檢查」"
-
-    def review_retry_vision(
-        project_id: str | None, filename: str | None, review_filter: str | None, page: object,
-        option_rows: object | None, vision_model: str | None, vision_scope: str | None,
-        reasoning_effort: str = "none", job: Job | None = None,
-    ):
-        """Transcribe the PDF's Vision-failed pages again and save the recovered ones.
-
-        Yields (status, progress, review screen, page, image, text, info, filter): the page
-        review is replaced by a progress bar while it runs and comes back refreshed at the end.
-        """
-        skip_review = (gr.skip(),) * 5
-
-        def fail(message: str):
-            return message, gr.skip(), gr.skip(), *skip_review
-
-        if not project_id or not filename:
-            yield fail("❌ 請先選擇 PDF")
-            return
-        if not is_preprocessed(project_id, filename):
-            yield fail("❌ 此 PDF 尚未前處理，請先執行前處理")
-            return
-        if jobs.is_running(project_id, "preprocess"):
-            yield fail("❌ 前處理執行中，請待完成後再重跑")
-            return
-        try:
-            vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
-        except ProjectError as exc:
-            yield fail(f"❌ {exc}")
-            return
-        if vision is None:
-            yield fail("❌ 請先在「前處理設定」選擇 Vision 模型")
-            return
-
-        updates: queue.Queue[tuple[int, int, str]] = queue.Queue()
-        result_holder: list[tuple[list[int], list[int]]] = []
-        error_holder: list[BaseException] = []
-
-        def worker_task() -> None:
-            try:
-                result_holder.append(documents.retry_vision_fallbacks(
-                    project_id, filename, vision, stop_event=stop_event_of(job),
-                    progress_callback=lambda done, total, name: updates.put((done, total, name)),
-                ))
-            except BaseException as exc:
-                error_holder.append(exc)
-
-        worker = start_worker(job, worker_task)
-        progress = task_progress_markup(0, "重跑 Vision 中", f"{filename}｜準備頁面…")
-        yield "⏳ 重跑 Vision 失敗頁中…", progress, gr.update(visible=False), *skip_review
-        while worker.is_alive() or not updates.empty():
-            try:
-                done, total, name = updates.get(timeout=0.25)
-                while not updates.empty():
-                    done, total, name = updates.get_nowait()
-            except queue.Empty:
-                continue
-            progress = task_progress_markup(done / total if total else 0, "重跑 Vision 中", f"{name}｜已處理 {done} / {total} 頁")
-            yield gr.skip(), progress, gr.skip(), *skip_review
-        worker.join()
-        stopped = job is not None and job.stop_requested
-        if error_holder:
-            message = f"❌ {error_holder[0]}"
-            recovered, failing = [], []
-        else:
-            recovered, failing = result_holder[0]
-            message = f"{'🛑 已停止' if stopped else '✅ 已重跑 Vision'}：{len(recovered)} 頁成功"
-            if failing:
-                message += f"，{len(failing)} 頁仍失敗（第 {'、'.join(map(str, failing))} 頁）"
-            if recovered:
-                message += "；需重新建立 Graph 才會套用"
-        progress = task_progress_markup(
-            1 if not (stopped or error_holder) else 0,
-            "已停止" if stopped else ("重跑失敗" if error_holder else "重跑 Vision 完成"),
-            f"成功 {len(recovered)} 頁、仍失敗 {len(failing)} 頁" if not error_holder else "",
-        )
-        filter_update, review_filter = review_filter_update(
-            project_id, filename, review_filter, option_rows,
-            reset=review_filter == "Vision 失敗" and not failing,
-        )
-        yield (
-            message, progress, gr.update(visible=True),
-            *review_refresh(project_id, filename, review_filter, page, option_rows), filter_update,
-        )
 
     def vision_settings(project_id: str, model: str | None, scope: str | None, reasoning_effort: str = "none") -> VisionSettings | None:
         if not model or model == VISION_DISABLED:
@@ -3801,24 +3320,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def vision_summary(report) -> str:
         summary = f"Vision（{report.vision_model}）解析 {report.vision_pages} 頁"
-        usage = vision_usage_summary(report)
         if report.vision_abort_reason:
             reason = " ".join(report.vision_abort_reason.split())[:160]
-            return f"⚠️ {summary}，已中止：{reason}；{report.vision_fallback_pages} 頁改用文字層{usage}"
+            return f"⚠️ {summary}，已中止：{reason}；{report.vision_fallback_pages} 頁改用文字層"
         if report.vision_fallback_pages:
-            return (
-                f"⚠️ {summary}；{report.vision_fallback_pages} 頁解析失敗，改用文字層"
-                f"（詳見 processed/report.json）{usage}"
-            )
-        return f"{summary}，其餘頁面使用文字層{usage}"
-
-    def vision_usage_summary(report) -> str:
-        if not report.vision_usage_pages:
-            return ""
-        return (
-            f"；用量 input {report.vision_prompt_tokens:,} / output {report.vision_completion_tokens:,} tokens"
-            f"（{report.vision_usage_pages} 頁有回報）"
-        )
+            return f"⚠️ {summary}；{report.vision_fallback_pages} 頁解析失敗，改用文字層（詳見 processed/report.json）"
+        return f"{summary}，其餘頁面使用文字層"
 
     def preprocess_documents(
         project_id: str | None,
@@ -3831,9 +3338,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     ):
         if not project_id:
             yield "❌ 請先到「專案與連線設定」開啟專案", "", *document_view(None)
-            return
-        if jobs.is_running(project_id, "vision_retry"):
-            yield "❌ 重跑 Vision 失敗頁執行中，請待完成或停止後再前處理", "", *document_view(project_id)
             return
         try:
             vision = vision_settings(project_id, vision_model, vision_scope, reasoning_effort)
@@ -4014,25 +3518,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             else index_progress(log, "建圖失敗")
         )
         yield summary, log, final_progress
-
-    def preprocess_hiding_review(*args, **kwargs):
-        """Hide the page review while preprocessing rewrites the pages it shows."""
-        for update in preprocess_documents(*args, **kwargs):
-            yield (*update, gr.update(visible=False))
-
-    preprocess_hiding_review.__name__ = preprocess_documents.__name__
-    preprocess_hiding_review.__qualname__ = preprocess_documents.__qualname__
-
-    def build_index_showing_log(*args, **kwargs):
-        """Show the indexing log only while it has content to stream; collapse the settings section once."""
-        section = gr.Accordion(open=False)
-        for message, log, progress in build_index(*args, **kwargs):
-            yield message, gr.update(value=log, visible=bool(log)), progress, section
-            section = gr.skip()
-
-    # 事件以函式名稱識別，沿用 build_index 的名稱
-    build_index_showing_log.__name__ = build_index.__name__
-    build_index_showing_log.__qualname__ = build_index.__qualname__
 
     def create_project(
         project_id: str,
@@ -4250,14 +3735,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             remove_pdf_confirmation = gr.Checkbox(visible=False)
             
             with gr.Accordion(
-                "前處理設定與逐頁檢查（所選 PDF）", open=True, visible=False, elem_classes="bold-title"
+                "前處理設定（所選 PDF）", open=False, visible=False, elem_classes="bold-title"
             ) as processing_options_section:
                 with gr.Row():
                     vision_model = gr.Dropdown(
                         choices=vision_model_choices(),
                         value=default_vision_model(),
                         label="Vision 模型",
-                        info="以 Vision 模型轉寫頁面影像：表格轉 Markdown、圖片與圖解改寫成文字描述。",
+                        info="以 Vision 模型轉寫頁面影像：表格轉 Markdown、圖片與圖解改寫成文字描述，失敗的頁面改用文字層。會依頁數呼叫 API。",
                     )
                     vision_reasoning_effort = gr.Dropdown(
                         choices=VISION_REASONING_EFFORT_CHOICES, value="low", label="推理深度",
@@ -4274,65 +3759,53 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         lambda model: gr.update(visible=model_supports_reasoning(model)),
                         inputs=vision_model, outputs=vision_reasoning_effort,
                     )
-                review_filter = gr.Dropdown(REVIEW_FILTERS, value="全部", label="篩選頁面", scale=0)
                 processing_options_table = gr.Dataframe(
                     headers=PROCESSING_COLUMNS,
                     interactive=True,
-                    datatype=["str", *["number"] * (len(PROCESSING_COLUMNS) - 1)],
+                    datatype=["str", "number", "number", "number", "number", "number"],
                     type="array",
                     static_columns=[0, 1],
-                    label=(
-                        "點選列即在下方逐頁檢查該 PDF；頁面索引從 0 開始，結束頁包含在範圍內；"
-                        "左右忽略比例可去除頁緣的章節索引籤；設定在執行前處理後才會儲存"
-                    ),
+                    label="頁面索引從 0 開始，結束頁包含在範圍內；設定在執行前處理後才會儲存",
                 )
-                # The PDF under review: the row last clicked in the options table (first row by default).
-                review_document = gr.State(None)
-                # 前處理進度顯示在逐頁檢查的位置；前處理期間逐頁檢查隱藏
-                preprocess_progress = gr.HTML(elem_classes="collapse-when-empty")
-                # The whole page review fits one screen: image and editor take the height left over.
-                with gr.Column(elem_id="review-screen") as review_screen:
-                    with gr.Group():
-                        gr.Markdown(
-                        "### 逐頁檢查\n點選上表的列切換 PDF；左側原頁的紅色區域為忽略範圍，右側為送去建圖的文字"
-                        )
-                        review_info = gr.Markdown(elem_classes="collapse-when-empty")
-                
-                    with gr.Row(equal_height=True, elem_id="review-pane"):
-                        review_image = gr.Image(type="pil", label="PDF 原頁", interactive=False, elem_id="review-image")
-                    
-                        with gr.Group(elem_classes="review-editor"):
-                            review_text = gr.Textbox(
-                                label="解析結果（可直接修改，此為送去建圖的文字）", lines=12, interactive=True,
-                                elem_id="review-text",
-                            )
-                            review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
-                    with gr.Row():
-                        review_previous = gr.Button("◀ 上一頁")
-                        review_vision_button = gr.Button("重跑 Vision（本頁）")
-                        review_retry_vision_button = gr.Button(JOB_BUTTON_LABELS["vision_retry"][0])
-                        review_retry_vision_stop_button = gr.Button(
-                            JOB_BUTTON_LABELS["vision_retry"][1], variant="stop", visible=False,
-                        )
-                        review_text_layer_button = gr.Button("改用文字層")
-                        review_revert_button = gr.Button("還原為解析結果")
-                        review_save_next_button = gr.Button("儲存並前往下一頁 ▶", variant="primary")
-                    review_status = gr.Markdown(elem_classes="collapse-when-empty")
 
             with gr.Group():
                 document_result = gr.Markdown(elem_classes="collapse-when-empty")
                 document_progress = gr.HTML(elem_classes="collapse-when-empty")
-                # 只在建圖期間顯示；成功或停止後收起，失敗時保留以便查看錯誤
                 indexing_log = gr.Textbox(
                     label="建圖日誌",
                     lines=12,
                     interactive=False,
                     autoscroll=True,
                     elem_id="indexing-log",
-                    visible=False,
                 )
 
-            
+            with gr.Accordion("逐頁檢查", open=False, elem_classes="bold-title"):
+                with gr.Row():
+                    review_document = gr.Dropdown(label="PDF（已前處理）", choices=[], scale=2)
+                    review_filter = gr.Dropdown(REVIEW_FILTERS, value="全部", label="篩選頁面", scale=1)
+                review_table = gr.Dataframe(
+                    headers=REVIEW_COLUMNS,
+                    interactive=False,
+                    type="array",
+                    max_height=260,
+                    label="點選列切換頁面",
+                )
+                with gr.Row(equal_height=True):
+                    review_previous = gr.Button("◀ 上一頁")
+                    review_page = gr.Number(label="頁碼（從 1 起算，按 Enter 跳頁）", precision=0, minimum=1)
+                    review_next = gr.Button("下一頁 ▶")
+                review_info = gr.Markdown(elem_classes="collapse-when-empty")
+                with gr.Row(equal_height=True):
+                    review_image = gr.Image(type="pil", label="PDF 原頁", interactive=False, height=760)
+                    review_text = gr.Textbox(
+                        label="解析結果（可直接修改，此為送去建圖的文字）", lines=30, max_lines=40, interactive=True
+                    )
+                with gr.Row():
+                    review_save_button = gr.Button("儲存並標示已檢查", variant="primary")
+                    review_vision_button = gr.Button("重跑 Vision（本頁）")
+                    review_text_layer_button = gr.Button("改用文字層")
+                    review_revert_button = gr.Button("還原為解析結果")
+                review_status = gr.Markdown(elem_classes="collapse-when-empty")
 
         with gr.Tab("2 問答測試", interactive=False) as query_tab:
             with gr.Row(equal_height=True):
@@ -4403,9 +3876,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 with gr.Row():
                     gr.Markdown(f"最近 {QUERY_HISTORY_LIMIT} 筆手動問答，點選一列可載回問題與回答")
                     query_history_refresh = gr.Button("重新整理", size="sm", scale=0)
-                    query_history_clear = gr.Button("清除歷史紀錄", size="sm", scale=0, variant="stop")
-                # A js-only event cannot write a gr.State (server-side), so the confirm() result rides a hidden Checkbox.
-                query_history_clear_confirmation = gr.Checkbox(visible=False)
                 query_history_table = gr.Dataframe(
                     headers=["時間", "問題", "方法", "狀態", "耗時（秒）"],
                     datatype=["str", "str", "str", "str", "number"],
@@ -4422,59 +3892,49 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             autoqa_question_set_state = gr.State("")
 
             with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
+                autoqa_question_set_selector = gr.Dropdown(
+                    label="選擇已存在的題目集",
+                    info="列出此專案所有已儲存的題目集（含「4 檢索實驗」匯入的題目集），選取後載入題目與已儲存的回答、評測",
+                    choices=[],
+                    interactive=True,
+                )
+                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        autoqa_import_file = gr.File(
+                            label="匯入題目集 JSON",
+                            file_types=[".json"],
+                            type="filepath",
+                            height=70,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        autoqa_import_button = gr.Button("匯入題目集")
+
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        autoqa_json_export = gr.File(
+                            label="題目集 JSON（按匯出後顯示）",
+                            height=70,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        autoqa_export_button = gr.Button("匯出目前題目集")
+
+                gr.Markdown("**或自動生成題目**")
                 with gr.Row(equal_height=True):
-                    autoqa_question_set_selector = gr.Dropdown(
-                        label="題目集",
-                        info="選取已儲存的題目集（含「4 檢索實驗」匯入的）載入題目與已儲存的回答、評測；"
-                        f"選「{AUTOQA_IMPORT_LABEL}」或「{AUTOQA_GENERATE_LABEL}」新增題目集",
-                        choices=[],
-                        interactive=True,
-                        scale=5,
+                    autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
+                    autoqa_generation_model = gr.Dropdown(
+                        choices=chat_model_choices(), value=connections.get_chat_model(), label="生題模型"
                     )
-                    autoqa_delete_question_set_button = gr.Button(
-                        "刪除此題目集", variant="stop", scale=1, min_width=140, visible=False,
+                    autoqa_generation_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=model_supports_reasoning(connections.get_chat_model()),
                     )
-                autoqa_delete_question_set_confirmation = gr.Checkbox(visible=False)
-                with gr.Column(visible=False) as autoqa_import_section:
-                    with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
-                        with gr.Group(elem_classes=["file-action-group"]):
-                            autoqa_import_file = gr.File(
-                                label="匯入題目集 JSON",
-                                file_types=[".json"],
-                                type="filepath",
-                                height=70,
-                                elem_classes=["no-dashed-file"],
-                            )
-                            autoqa_import_button = gr.Button("匯入題目集")
-
-                with gr.Column(visible=False) as autoqa_generate_section:
-                    with gr.Row(equal_height=True):
-                        autoqa_questions_per_pdf = gr.Number(label="每份 PDF 題數", value=10, minimum=1, maximum=30, precision=0)
-                        autoqa_generation_model = gr.Dropdown(
-                            choices=chat_model_choices(), value=connections.get_chat_model(), label="生題模型"
-                        )
-                        autoqa_generation_effort = gr.Dropdown(
-                            choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
-                            label="推理深度", visible=model_supports_reasoning(connections.get_chat_model()),
-                        )
-                        autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
-                    autoqa_generation_model.change(
-                        lambda model: gr.update(visible=model_supports_reasoning(model)),
-                        inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
-                    )
-                    autoqa_generate_button = gr.Button("生成題目", variant="primary")
-                    autoqa_generate_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_generate"][1], variant="stop", visible=False)
-                    autoqa_generate_progress = gr.HTML(label="題目生成進度", visible=False)
-
-                with gr.Column(visible=False) as autoqa_export_section:
-                    with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
-                        with gr.Group(elem_classes=["file-action-group"]):
-                            autoqa_json_export = gr.File(
-                                label="題目集 JSON（按匯出後顯示）",
-                                height=70,
-                                elem_classes=["no-dashed-file"],
-                            )
-                            autoqa_export_button = gr.Button("匯出目前題目集")
+                    autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                autoqa_generation_model.change(
+                    lambda model: gr.update(visible=model_supports_reasoning(model)),
+                    inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
+                )
+                autoqa_generate_button = gr.Button("生成題目", variant="primary")
+                autoqa_generate_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_generate"][1], variant="stop", visible=False)
+                autoqa_generate_progress = gr.HTML(label="題目生成進度", visible=False)
                 autoqa_result = gr.Markdown()
                 autoqa_questions_table = gr.Dataframe(
                     headers=["題號", "題目", "正確答案", "題目來源（文件: 頁碼, 頁碼）", "答案來源（文件: 頁碼, 頁碼）"],
@@ -4498,7 +3958,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     )
                     autoqa_method = gr.Dropdown(
                         choices=AUTOQA_QUERY_METHOD_CHOICES,
-                        value="auto", label="檢索模式",
+                        value="local", label="檢索模式",
                     )
                     autoqa_answer_concurrency = gr.Number(label="回答請求並行數", value=3, minimum=1, maximum=32, precision=0)
                     autoqa_response_type = gr.Dropdown(
@@ -4642,35 +4102,22 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             experiment_question_set_state = gr.State([])
 
             with gr.Accordion("① 題目集", open=True, elem_classes=["static-section", "bold-title"]):
-                experiment_question_set_selector = gr.Dropdown(
-                    label="題目集（可多選）",
-                    info="從此專案已儲存的題目集（與「3 自動問答測試」共用）選擇要實驗的資料集，再按「使用所選題目集」；"
-                    f"選「{AUTOQA_IMPORT_LABEL}」上傳新的 JSON。取消選取只從實驗移除，不會刪除題目集",
-                    choices=[],
-                    multiselect=True,
-                    interactive=True,
-                    scale=5,
+                gr.Markdown(
+                    "每次匯入的多份 JSON 題目集會取代專案目前的題目集，並刪除舊題目集；若任一檔案格式錯誤，整批不會取代，舊資料會保留。"
+                    "題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；"
+                    "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。"
                 )
-                experiment_apply_question_sets_button = gr.Button("使用所選題目集", scale=1)
-                experiment_has_results_flag = gr.Checkbox(visible=False)
-                experiment_question_sets_confirmation = gr.Checkbox(visible=False)
-                with gr.Column(visible=False) as experiment_import_section:
-                    gr.Markdown(
-                        "可一次選多份 JSON，匯入後加入實驗目前的題目集；若任一檔案格式錯誤，整批都不加入。"
-                        "題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；"
-                        "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。"
-                    )
-                    with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
-                        with gr.Group(elem_classes=["file-action-group"]):
-                            experiment_question_file = gr.File(
-                                label="選擇要加入實驗的 JSON 題目集",
-                                file_types=[".json"],
-                                type="filepath",
-                                file_count="multiple",
-                                height=50,
-                                elem_classes=["no-dashed-file"],
-                            )
-                            experiment_import_button = gr.Button("匯入並加入實驗")
+                with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
+                    with gr.Group(elem_classes=["file-action-group"]):
+                        experiment_question_file = gr.File(
+                            label="選擇要取代目前資料集的 JSON 題目集",
+                            file_types=[".json"],
+                            type="filepath",
+                            file_count="multiple",
+                            height=50,
+                            elem_classes=["no-dashed-file"],
+                        )
+                        experiment_import_button = gr.Button("取代題目集")
                 experiment_question_preview = gr.Dataframe(
                     headers=["資料集", "題號", "題目", "正確答案", "題目來源", "答案來源"],
                     interactive=False,
@@ -4893,27 +4340,27 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     "無根據主張數只計回答中沒有來源支持的事實主張；拒答欄僅對預期無答案題填「正確」或「錯誤」，其餘填「不適用」。"
                 )
                 experiment_summary_table = gr.Dataframe(
-                    headers=list(EXPERIMENT_SUMMARY_HEADERS),
+                    headers=["實驗組名稱", "檢索策略", "回答模型", "評測模型（評審）", "題數", "已完成", "得分正確率", "來源分數", "綜合得分率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "無檢索證據題數", "檢索指標狀態", "平均延遲（秒）", "P95 延遲（秒）", "平均搜尋步數", "平均 Agent 模型呼叫", "成本", "答案要點覆蓋率（人工）", "含無根據主張的回答率", "平均無根據主張數", "拒答正確率（人工）", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * len(EXPERIMENT_SUMMARY_HEADERS),
+                    datatype=["str"] * 28,
                     label="實驗組摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_dataset_summary_table = gr.Dataframe(
-                    headers=list(EXPERIMENT_DATASET_SUMMARY_HEADERS),
+                    headers=["實驗組名稱", "題目集", "檢索策略", "回答模型", "題數", "已回答", "已評判", "得分正確率", "Evidence Hit Rate", "Evidence Precision", "Document Hit Rate", "檢索指標狀態", "答案要點覆蓋率", "含無根據主張回答率", "平均無根據主張數", "拒答正確率", "人工複核題數", "Average EM", "Average F1", "Average Term Hit", "Average Term Coverage"],
                     interactive=False,
-                    datatype=["str"] * len(EXPERIMENT_DATASET_SUMMARY_HEADERS),
+                    datatype=["str"] * 21,
                     label="實驗組 × 題目集摘要",
                     wrap=True,
                     visible=False,
                 )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定"],
                     interactive=True,
-                    datatype=["str"] * 8 + ["markdown"] + ["str"] * 2,
-                    column_widths=["6%", "8%", "4%", "8%", "11%", "18%", "13%", "6%", "11%", "8%", "7%"],
-                    label="逐題實驗結果（不執行模型評測也可手動編輯得分；得分可填百分比或 0／1／2）",
+                    datatype=["str"] * 8 + ["markdown"] + ["str"] * 5,
+                    column_widths=["6%", "8%", "4%", "8%", "10%", "15%", "12%", "5%", "9%", "7%", "6%", "4%", "3%", "3%"],
+                    label="逐題實驗結果（不執行模型評測也可手動編輯得分與品質欄位；得分可填百分比或 0／1／2；拒答欄填正確／錯誤／不適用）",
                     wrap=True,
                     visible=False,
                 )
@@ -5256,68 +4703,37 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(**experiment_table_refresh)
         document_view_outputs = [document_table, processing_options_table, target_documents, document_empty_notice]
-        review_sync_event = dict(
-            fn=review_sync,
-            inputs=[document_project, processing_options_table, review_document, review_filter, review_page],
-            outputs=[review_document, review_page, review_image, review_text, review_info, review_filter],
-        )
         documents_tab.select(
             documents_tab_visibility,
             inputs=[document_project, target_documents],
             outputs=[document_table, document_empty_notice, processing_options_section],
-        ).then(**review_sync_event)
-        review_inputs = [document_project, review_document, review_filter, review_page, processing_options_table]
-        review_outputs = [review_page, review_image, review_text, review_info]
+        ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document)
+        review_inputs = [document_project, review_document, review_filter, review_page]
+        review_outputs = [review_table, review_page, review_image, review_text, review_info]
         review_page_outputs = [review_image, review_text, review_info]
-
-        def document_view_keeping_options(project_id: str | None):
-            # Re-rendering the options table here would drop margins typed but not yet saved.
-            table, _rows, targets, notice = document_view(project_id)
-            return table, gr.skip(), targets, notice
-
-        # .input, not .change: review_sync/review_pick set the filter themselves and already refresh the page.
-        review_filter.input(review_refresh, inputs=review_inputs, outputs=review_outputs)
-        review_filter_counts = dict(
-            fn=lambda project_id, filename, review_filter, rows: review_filter_update(
-                project_id, filename, review_filter, rows,
-            )[0],
-            inputs=[document_project, review_document, review_filter, processing_options_table],
-            outputs=review_filter,
-            show_progress="hidden",
-        )
-        review_page.submit(
-            review_page_view, inputs=[document_project, review_document, review_page, processing_options_table],
-            outputs=review_page_outputs,
-        )
-        processing_options_table.select(
-            review_pick,
-            inputs=[document_project, processing_options_table, review_document, review_filter],
-            outputs=[review_document, *review_outputs, review_filter],
-        )
-        processing_options_table.change(**review_sync_event)
+        review_document.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
+        review_filter.change(review_refresh, inputs=review_inputs, outputs=review_outputs)
+        review_page.submit(review_page_view, inputs=[document_project, review_document, review_page], outputs=review_page_outputs)
+        review_table.select(review_select, inputs=[document_project, review_document], outputs=[review_page, *review_page_outputs])
         review_previous.click(review_previous_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
-        review_save_next_button.click(
-            review_save_next,
-            inputs=[document_project, review_document, review_filter, review_page, review_text, processing_options_table],
-            outputs=[review_status, *review_outputs],
-        ).then(**review_filter_counts).then(document_view_keeping_options, inputs=document_project, outputs=document_view_outputs)
+        review_next.click(review_next_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
+        review_save_button.click(
+            review_save, inputs=[document_project, review_document, review_page, review_text], outputs=review_status,
+        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
+            document_view, inputs=document_project, outputs=document_view_outputs
+        )
         review_revert_button.click(
             lambda project_id, filename, page: review_save(project_id, filename, page, None, revert=True),
             inputs=[document_project, review_document, review_page],
             outputs=review_status,
-        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(**review_filter_counts).then(
-            document_view_keeping_options, inputs=document_project, outputs=document_view_outputs
+        ).then(review_refresh, inputs=review_inputs, outputs=review_outputs).then(
+            document_view, inputs=document_project, outputs=document_view_outputs
         )
         review_vision_button.click(
             lambda project_id, filename, page, model, scope, effort: review_extract(project_id, filename, page, True, model, scope, effort),
             inputs=[document_project, review_document, review_page, vision_model, vision_scope, vision_reasoning_effort],
             outputs=[review_text, review_status],
         )
-        bind_job(
-            "vision_retry", review_retry_vision_button, review_retry_vision_stop_button, review_retry_vision,
-            inputs=[*review_inputs, vision_model, vision_scope, vision_reasoning_effort],
-            outputs=[review_status, preprocess_progress, review_screen, *review_outputs, review_filter],
-        ).then(document_view_keeping_options, inputs=document_project, outputs=document_view_outputs)
         review_text_layer_button.click(
             lambda project_id, filename, page: review_extract(project_id, filename, page, False),
             inputs=[document_project, review_document, review_page],
@@ -5343,27 +4759,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[upload_pdf_group, uploaded_files],
         )
         bind_job(
-            "preprocess", preprocess_button, preprocess_stop_button, preprocess_hiding_review,
+            "preprocess", preprocess_button, preprocess_stop_button, preprocess_documents,
             inputs=[document_project, processing_options_table, target_documents, vision_model, vision_scope, vision_reasoning_effort],
-            outputs=[document_result, preprocess_progress, *document_view_outputs, review_screen],
-        ).then(
-            lambda: gr.update(visible=True), outputs=review_screen, show_progress="hidden",
-        ).then(
-            lambda project_id, rows, filename, review_filter, page: review_sync(
-                project_id, rows, filename, review_filter, page, force=True,
-            ),
-            inputs=review_sync_event["inputs"], outputs=review_sync_event["outputs"],
-        ).then(processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section)
-        bind_job(
-            "index", index_button, index_stop_button, build_index_showing_log,
-            inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope, vision_reasoning_effort, indexing_reasoning_effort],
-            outputs=[document_result, indexing_log, document_progress, processing_options_section],
-        ).then(
-            lambda message: gr.update(visible=str(message or "").startswith("❌")),
-            inputs=document_result, outputs=indexing_log, show_progress="hidden",
-        ).then(document_view, inputs=document_project, outputs=document_view_outputs).then(
-            processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section
+            outputs=[document_result, document_progress, *document_view_outputs],
+        ).then(review_document_choices, inputs=[document_project, review_document], outputs=review_document).then(
+            review_refresh, inputs=review_inputs, outputs=review_outputs
         )
+        bind_job(
+            "index", index_button, index_stop_button, build_index,
+            inputs=[document_project, indexing_chat_model, target_documents, processing_options_table, vision_model, vision_scope, vision_reasoning_effort, indexing_reasoning_effort],
+            outputs=[document_result, indexing_log, document_progress],
+        ).then(document_view, inputs=document_project, outputs=document_view_outputs)
         document_refresh_button.click(
             document_view,
             inputs=document_project,
@@ -5382,66 +4788,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[document_project, target_documents, remove_pdf_confirmation],
             outputs=[document_result, *document_view_outputs, remove_pdf_confirmation],
         )
-        experiment_view_outputs = [
-            experiment_status, experiment_question_set_state, experiment_question_preview,
-            experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
-            experiment_max_concurrency, experiment_judge_model,
-            experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode,
-        ]
-        # Changing the question sets clears saved results, so the browser asks first when there are any.
-        clears_results_js = (
-            "(_value, hasResults) => !hasResults || confirm("
-            "'{action}會清除目前的檢索實驗結果，確定嗎？')"
-        )
         experiment_import_button.click(
-            experiment_has_results, inputs=active_project_id, outputs=experiment_has_results_flag,
-        ).then(
-            None,
-            inputs=[experiment_question_file, experiment_has_results_flag],
-            outputs=experiment_question_sets_confirmation,
-            js=clears_results_js.replace("{action}", "匯入並加入題目集"),
-        ).then(
-            import_experiment_questions_checked,
-            inputs=[active_project_id, experiment_question_file, experiment_question_sets_confirmation],
-            outputs=[*experiment_view_outputs, experiment_import_section, experiment_question_file],
+            import_experiment_questions,
+            inputs=[active_project_id, experiment_question_file],
+            outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
+                     experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
+                     experiment_max_concurrency, experiment_judge_model,
+                     experiment_generation_status, experiment_evaluate_button, experiment_evaluation_mode],
         ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
             experiment_progress_views, inputs=active_project_id,
             outputs=[experiment_progress_bar, experiment_evaluate_progress],
         ).then(**experiment_table_refresh)
-        experiment_apply_question_sets_button.click(
-            experiment_has_results, inputs=active_project_id, outputs=experiment_has_results_flag,
-        ).then(
-            None,
-            inputs=[experiment_question_set_selector, experiment_has_results_flag],
-            outputs=experiment_question_sets_confirmation,
-            js=clears_results_js.replace("{action}", "若題目集有變更，"),
-        ).then(
-            apply_experiment_question_sets,
-            inputs=[active_project_id, experiment_question_set_selector, experiment_question_sets_confirmation],
-            outputs=experiment_view_outputs,
-        ).then(refresh_experiment_groups, inputs=experiment_group_revision, outputs=experiment_group_revision).then(
-            experiment_progress_views, inputs=active_project_id,
-            outputs=[experiment_progress_bar, experiment_evaluate_progress],
-        ).then(**experiment_table_refresh)
-        experiment_question_set_selector.input(
-            experiment_selector_input,
-            inputs=experiment_question_set_selector,
-            outputs=[experiment_question_set_selector, experiment_import_section],
-        )
-        # The selector follows the applied question sets, and refreshes when the tab opens because
-        # question sets may have been imported or deleted on 「3 自動問答測試」.
-        experiment_question_set_state.change(
-            experiment_question_set_choices,
-            inputs=[active_project_id, experiment_question_set_state],
-            outputs=experiment_question_set_selector,
-            show_progress="hidden",
-        )
-        experiment_tab.select(
-            experiment_question_set_choices,
-            inputs=[active_project_id, experiment_question_set_state],
-            outputs=experiment_question_set_selector,
-            show_progress="hidden",
-        )
         experiment_add_group_button.click(
             add_experiment_group,
             inputs=[active_project_id, experiment_group_revision],
@@ -5558,54 +4915,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[autoqa_judge_model, autoqa_judge_selection_status],
             show_progress="hidden",
         )
-        autoqa_section_views = dict(
-            fn=autoqa_question_set_section_views,
-            inputs=[automatic_project, autoqa_question_set_selector],
-            outputs=[autoqa_import_section, autoqa_generate_section, autoqa_export_section,
-                     autoqa_delete_question_set_button, autoqa_questions_table],
-            show_progress="hidden",
-        )
-        autoqa_question_set_selector.change(**autoqa_section_views)
         autoqa_question_set_selector.input(
-            select_autoqa_question_set,
+            automatic_qa_saved_view,
             inputs=[automatic_project, autoqa_question_set_selector],
             outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
                      autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type],
         ).then(**autoqa_table_refresh).then(
             automatic_qa_metric_flag_values,
-            inputs=[automatic_project, autoqa_question_set_state],
+            inputs=[automatic_project, autoqa_question_set_selector],
             outputs=[autoqa_enable_llm_judge, autoqa_enable_classic_metrics],
         ).then(
             lambda: (hidden_progress,) * 3,
             outputs=[autoqa_generate_progress, autoqa_answer_progress, autoqa_judge_progress],
         )
-        autoqa_delete_question_set_button.click(
-            None,
-            inputs=autoqa_question_set_selector,
-            outputs=autoqa_delete_question_set_confirmation,
-            js=(
-                "(id) => !id || confirm("
-                "'確定要刪除目前選取的題目集，以及它的回答與評測紀錄嗎？此動作無法復原。')"
-            ),
-        ).then(
-            delete_autoqa_question_set,
-            inputs=[automatic_project, autoqa_question_set_selector, autoqa_delete_question_set_confirmation],
-            outputs=[autoqa_result, autoqa_questions_table, autoqa_question_set_state, autoqa_summary,
-                     autoqa_table, autoqa_generation_status, autoqa_judge_button, autoqa_response_type,
-                     autoqa_delete_question_set_confirmation],
-        ).then(**autoqa_table_refresh).then(
-            automatic_qa_metric_flag_values,
-            inputs=[automatic_project, autoqa_question_set_state],
-            outputs=[autoqa_enable_llm_judge, autoqa_enable_classic_metrics],
-        ).then(
-            autoqa_question_set_choices,
-            inputs=[automatic_project, autoqa_question_set_state],
-            outputs=autoqa_question_set_selector,
-            show_progress="hidden",
-        )
-        # .input fires only for the user's own edits; .change also fired whenever a question set was
-        # loaded, imported, generated or deleted, writing the shown table back to the file.
-        autoqa_questions_table.input(
+        autoqa_questions_table.change(
             autosave_automatic_questions,
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
             outputs=autoqa_result,
@@ -5673,16 +4996,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 outputs=[query_history_table, query_history_ids],
                 show_progress="hidden",
             )
-        query_history_clear.click(
-            None,
-            outputs=query_history_clear_confirmation,
-            js="() => confirm('確定要清除此專案所有手動問答歷史紀錄嗎？此動作無法復原（自動問答紀錄不受影響）。')",
-        ).then(
-            clear_query_history,
-            inputs=[query_project, query_history_clear_confirmation],
-            outputs=[query_history_table, query_history_ids],
-            show_progress="hidden",
-        )
         query_history_table.select(
             select_query_history,
             inputs=[query_project, query_history_ids],
@@ -5891,39 +5204,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs,
         )
-        def initial_model_menus():
-            """Page-load menus: current saved list and defaults, not the values baked in at startup."""
-            return (
-                chat_model_update(), chat_model_update(), chat_model_update(), chat_model_update(),
-                vision_model_update(), judge_model_update(autoqa_judge_model_state()[0]), judge_model_update(),
-            )
-
-        def connection_form_views():
-            """Connection form as saved now; the build-time choices go stale once settings are saved."""
-            models = chat_model_choices()
-            embedding_models = list(connections.available_embedding_models())
-            return (
-                connections.get_api_key() or "",
-                gr.update(choices=models, value=models),
-                gr.update(choices=models, value=connections.get_chat_model()),
-                gr.update(choices=embedding_models, value=connections.get_embedding_model()),
-            )
-
-        demo.load(initial_model_menus, outputs=model_menu_inputs, show_progress="hidden")
         demo.load(
-            connection_form_views,
-            outputs=[api_key, connection_models, chat_model, embedding_model],
-            show_progress="hidden",
+            refresh_model_menus, inputs=model_menu_inputs, outputs=model_menu_inputs, show_progress="hidden",
         )
         demo.load(workspace_tab_states, inputs=active_project_id, outputs=workspace_lock_outputs)
-        # Dropdown choices are baked in when the UI is built; re-read projects on every page load
-        # so projects deleted (or created) since the server started are reflected after a reload.
-        demo.load(
-            refresh_project_views,
-            inputs=[selected_project, active_project_id],
-            outputs=[project_table, selected_project, selected_project_details, active_project_id, active_project_banner],
-            show_progress="hidden",
-        )
         demo.load(
             refresh_autoqa_judge_model_selection,
             outputs=[autoqa_judge_model, autoqa_judge_selection_status],
@@ -5943,7 +5227,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             autoqa_judge_button, autoqa_judge_stop_button,
             experiment_run_button, experiment_run_stop_button,
             experiment_evaluate_button, experiment_evaluate_stop_button,
-            review_retry_vision_button, review_retry_vision_stop_button,
             running_jobs_notice, running_jobs_timer,
         ]
         # A reloaded page reopens the project; jobs started before the reload show their stop
@@ -5955,11 +5238,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             )
         demo.load(
             running_job_views, inputs=active_project_id, outputs=running_job_outputs, show_progress="hidden",
-        ).then(**autoqa_section_views)
-        # The selector may not change when the first question set is still being generated, so the
-        # generate section is also re-checked whenever running jobs are re-checked.
-        for trigger in (active_project_id.change, running_jobs_timer.tick):
-            trigger(**autoqa_section_views, concurrency_limit=None)
+        )
         dashboard_refresh_button.click(render_dashboard, inputs=active_project_id, outputs=dashboard_view)
     return demo
 
