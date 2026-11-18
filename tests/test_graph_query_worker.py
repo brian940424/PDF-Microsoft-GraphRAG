@@ -42,35 +42,6 @@ class GraphQueryWorkerTests(unittest.TestCase):
         self.assertEqual(calls["basic"]["root_dir"], Path("/tmp/project"))
         self.assertTrue(all(call["response_type"] == "List of 3-7 Points" for call in calls.values()))
 
-    def test_basic_embeds_retrieval_query_but_keeps_question_for_the_answer(self):
-        from graphrag.cli import query as cli_query
-        from graphrag.query.structured_search.basic_search.basic_context import BasicSearchContext
-
-        seen = []
-
-        def build_context(self, query, *args, **kwargs):
-            seen.append(query)
-            return "context"
-
-        def run_basic(**kwargs):
-            BasicSearchContext.build_context(object(), kwargs["query"])
-            return "answer", {"sources": []}
-
-        with (
-            patch.object(BasicSearchContext, "build_context", build_context),
-            patch.object(cli_query, "run_basic_search", side_effect=run_basic) as basic,
-        ):
-            for _ in range(2):
-                execute_graph_query({
-                    "root_dir": "/tmp/project",
-                    "question": "煞車排氣順序為何？",
-                    "method": "basic",
-                    "retrieval_query": "Brake bleeding order",
-                })
-
-        self.assertEqual(basic.call_args.kwargs["query"], "煞車排氣順序為何？")
-        self.assertEqual(seen, ["Brake bleeding order", "Brake bleeding order"])
-
     def test_luna_drift_uses_compatibility_adapter(self):
         with patch(
             "automotive_graphrag.drift_compat.run_drift_search",

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import difflib
 import json
 import os
 import shutil
 import tempfile
 import threading
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,10 +18,7 @@ import pymupdf
 from .cancellation import JobStopped, raise_if_stopped
 from .projects import ProjectError, ProjectStore, project_indexing_locked
 from .sectioning import remove_leading_printed_page_number, section_identifier, split_into_sections
-from .vision import (
-    PageAnalyzer, VisionAbort, VisionSettings, analyze_page, detect_document_language, page_needs_vision, render_page,
-    transcription_tokens,
-)
+from .vision import PageAnalyzer, VisionAbort, VisionSettings, analyze_page, detect_document_language, page_needs_vision, render_page
 
 
 class PdfPage(Protocol):
@@ -37,67 +33,6 @@ class PdfDocument(Protocol):
     def __len__(self) -> int: ...
 
     def close(self) -> None: ...
-
-
-MARGIN_OPTION_NAMES = (
-    "header_ignore_percent",
-    "footer_ignore_percent",
-    "left_ignore_percent",
-    "right_ignore_percent",
-)
-
-
-@dataclass(frozen=True, slots=True)
-class IgnoredMargins:
-    """Share of the page height (header/footer) and width (left/right) left out of extraction.
-
-    Left and right margins drop side furniture such as the chapter index tabs that
-    service manuals print along the outer page edge.
-    """
-
-    header: float = 0.0
-    footer: float = 0.0
-    left: float = 0.0
-    right: float = 0.0
-
-    @classmethod
-    def from_options(cls, options: Mapping[str, object]) -> "IgnoredMargins":
-        try:
-            values = [float(options.get(name, 0) or 0) for name in MARGIN_OPTION_NAMES]
-        except (TypeError, ValueError) as exc:
-            raise ProjectError("頁首、頁尾與左右忽略比例必須是數字") from exc
-        if any(not 0 <= value < 100 for value in values):
-            raise ProjectError("頁首、頁尾與左右忽略比例必須介於 0%（含）與 100%（不含）")
-        header, footer, left, right = values
-        if header + footer >= 100:
-            raise ProjectError("頁首與頁尾忽略比例合計必須小於 100%")
-        if left + right >= 100:
-            raise ProjectError("左右忽略比例合計必須小於 100%")
-        return cls(header, footer, left, right)
-
-    @property
-    def is_empty(self) -> bool:
-        return not (self.header or self.footer or self.left or self.right)
-
-    def report_fields(self) -> dict[str, float]:
-        return dict(zip(MARGIN_OPTION_NAMES, (self.header, self.footer, self.left, self.right)))
-
-    def clip(self, page: PdfPage) -> pymupdf.Rect | None:
-        """The page area left after the ignored margins, or None for the whole page."""
-        if self.is_empty:
-            return None
-        try:
-            rect = pymupdf.Rect(
-                float(page.rect.x0), float(page.rect.y0), float(page.rect.x1), float(page.rect.y1),
-            )
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise ValueError("無法取得 PDF 頁面大小以套用忽略比例") from exc
-        return pymupdf.Rect(
-            rect.x0 + rect.width * self.left / 100,
-            rect.y0 + rect.height * self.header / 100,
-            rect.x1 - rect.width * self.right / 100,
-            rect.y1 - rect.height * self.footer / 100,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,26 +63,6 @@ PAGE_RENDER_SCALE = 1.5
 
 
 @dataclass(frozen=True, slots=True)
-class MarginPreview:
-    """One page rendered with its ignored margins shaded, for checking margin settings."""
-
-    page: int
-    pages: int
-    image_png: bytes
-    # Ignored band sizes in PDF points: header, footer, left, right.
-    margin_points: tuple[float, float, float, float]
-    # Text-layer lines that the margins remove from the page.
-    removed_lines: tuple[str, ...]
-    # The page's text layer with the margins applied, as preprocessing would read it.
-    kept_text: str = ""
-
-
-# Fill for the ignored margins in the preview, as RGB fractions, and its opacity.
-MARGIN_PREVIEW_FILL = (0.86, 0.15, 0.15)
-MARGIN_PREVIEW_OPACITY = 0.35
-
-
-@dataclass(frozen=True, slots=True)
 class PageReview:
     page: int
     # "vision", "text", "fallback" (vision failed, text layer kept), "empty" or "error".
@@ -175,30 +90,10 @@ class ProcessingReport:
     vision_pages: int = 0
     vision_fallback_pages: int = 0
     vision_abort_reason: str | None = None
-    # Tokens reported by the vision API for successfully transcribed pages;
-    # `vision_usage_pages` counts the pages whose response included usage.
-    vision_prompt_tokens: int = 0
-    vision_completion_tokens: int = 0
-    vision_usage_pages: int = 0
     edited_pages: int = 0
     stopped: bool = False
     completed_documents: tuple[str, ...] = ()
     unprocessed_documents: tuple[str, ...] = ()
-
-
-VISION_USAGE_FIELDS = ("vision_prompt_tokens", "vision_completion_tokens", "vision_usage_pages")
-
-
-def add_vision_usage(target: dict[str, Any], text: str) -> None:
-    """Add one transcribed page's reported token usage to a report's vision usage fields."""
-    prompt_tokens, completion_tokens = transcription_tokens(text)
-    if prompt_tokens is None and completion_tokens is None:
-        return
-    for field in VISION_USAGE_FIELDS:
-        target.setdefault(field, 0)
-    target["vision_prompt_tokens"] += prompt_tokens or 0
-    target["vision_completion_tokens"] += completion_tokens or 0
-    target["vision_usage_pages"] += 1
 
 
 class DocumentService:
@@ -302,7 +197,8 @@ class DocumentService:
     def processing_options(self, project_id: str) -> dict[str, dict[str, object]]:
         report_by_name = self._document_reports(project_id)
         option_names = (
-            *MARGIN_OPTION_NAMES,
+            "header_ignore_percent",
+            "footer_ignore_percent",
             "start_page",
             "end_page",
         )
@@ -310,32 +206,6 @@ class DocumentService:
             filename: {name: value[name] for name in option_names if name in value}
             for filename, value in report_by_name.items()
         }
-
-    def recover_interrupted_preprocessing(self) -> list[str]:
-        """Restore PROCESSING projects left behind when the app process stopped mid-run.
-
-        Preprocessing runs in a thread of the admin process, so at startup no run can
-        still be alive. Output is written only when a run finishes, so the files on
-        disk are those from before the run; derive the status from them.
-        """
-        recovered: list[str] = []
-        for project in self.projects.list():
-            if project.status != "PROCESSING":
-                continue
-            items = self.list_documents(project.project_id)
-            if not items:
-                status = "EMPTY"
-            elif all(item.preprocessed and item.indexed for item in items):
-                status = "INDEXED"
-            elif any(item.indexed for item in items) or self.indexed_documents(project.project_id):
-                status = "STALE"
-            elif any(item.preprocessed for item in items):
-                status = "READY"
-            else:
-                status = "UPLOADED"
-            self.projects.update_status(project.project_id, status)
-            recovered.append(project.project_id)
-        return recovered
 
     def remove_pdf(self, project_id: str, filename: str) -> None:
         project_path = self.projects.path_for(project_id)
@@ -403,7 +273,6 @@ class DocumentService:
         totals = {
             "pages": 0, "successful_pages": 0, "empty_pages": 0, "error_pages": 0,
             "vision_pages": 0, "vision_fallback_pages": 0, "edited_pages": 0,
-            "vision_prompt_tokens": 0, "vision_completion_tokens": 0, "vision_usage_pages": 0,
         }
         all_edits = self._read_edits(project_id)
         progress = _PageProgress(
@@ -547,7 +416,10 @@ class DocumentService:
                 progress.skip_document(source.name)
             return report
         try:
-            margins = IgnoredMargins.from_options(options)
+            header_ignore_percent, footer_ignore_percent = self._validate_ignored_margins(
+                options.get("header_ignore_percent", 0),
+                options.get("footer_ignore_percent", 0),
+            )
             start_page = self._page_index(options.get("start_page", 0), "起始頁")
             end_value = options.get("end_page", page_count - 1)
             end_page = page_count - 1 if end_value in (None, "") else self._page_index(end_value, "結束頁")
@@ -563,7 +435,8 @@ class DocumentService:
         report.update(
             start_page=start_page,
             end_page=end_page,
-            **margins.report_fields(),
+            header_ignore_percent=header_ignore_percent,
+            footer_ignore_percent=footer_ignore_percent,
             selected_pages=end_page - start_page + 1,
         )
         totals["pages"] += end_page - start_page + 1
@@ -576,14 +449,15 @@ class DocumentService:
             if vision is not None:
                 report.update(vision_model=vision.model, vision_scope=vision.scope)
                 vision_texts = self._transcribe_pages(
-                    selected, texts, report, totals, margins, vision, progress, stop_event,
+                    selected, texts, report, totals, header_ignore_percent, footer_ignore_percent, vision, progress,
+                    stop_event,
                 )
             else:
                 for page_number, page in selected:
                     raise_if_stopped(stop_event)
                     if progress is not None:
                         progress.advance()
-                    self._read_page_text(page, page_number, texts, report, totals, margins)
+                    self._read_page_text(page, page_number, texts, report, totals, header_ignore_percent, footer_ignore_percent)
         finally:
             self._close_document(document)
         report["edited_pages"] = []
@@ -770,203 +644,20 @@ class DocumentService:
     ) -> str:
         """Extract one page again, from its text layer or with `vision`, without saving it."""
         document_report = self._processed_report(project_id, filename)
-        margins = IgnoredMargins.from_options(document_report)
+        header = float(document_report.get("header_ignore_percent", 0))
+        footer = float(document_report.get("footer_ignore_percent", 0))
         document = pymupdf.open(self._source_path(project_id, filename))
         try:
             page = self._load_page(document, page_number)
             if vision is None:
-                return self._extract_page_text(page, margins).strip()
+                return self._extract_page_text(page, header, footer).strip()
             language = detect_document_language(
-                self._extract_page_text(document[index], margins) for index in self._report_indices(document_report)
+                self._extract_page_text(document[index], header, footer) for index in self._report_indices(document_report)
             )
-            image = render_page(page, margins.clip(page))
+            image = render_page(page, self._body_clip(page, header, footer))
         finally:
             document.close()
         return self.page_analyzer(image, page_number, language, vision).strip()
-
-    def retry_vision_fallbacks(
-        self, project_id: str, filename: str, vision: VisionSettings,
-        stop_event: threading.Event | None = None,
-        progress_callback: ProgressCallback | None = None,
-    ) -> tuple[list[int], list[int]]:
-        """Transcribe a preprocessed PDF's Vision-failed pages again and save the ones that succeed.
-
-        Returns (recovered pages, pages still failing). A recovered page leaves
-        `vision_fallback_pages` for `vision_pages`; a manual edit on it is kept and flagged
-        like a re-preprocess would. Setting `stop_event` stops sending new requests and
-        saves the pages finished so far.
-        """
-        project = self.projects.get(project_id)
-        project_path = self.projects.path_for(project_id)
-        if project_indexing_locked(project_path):
-            raise ProjectError("建圖工作執行中，無法修改頁面內容")
-        document_report = self._processed_report(project_id, filename)
-        failed_pages = sorted(int(item["page"]) for item in document_report.get("vision_fallback_pages", []))
-        if not failed_pages:
-            raise ProjectError(f"{filename} 沒有 Vision 失敗的頁面")
-        margins = IgnoredMargins.from_options(document_report)
-        document = pymupdf.open(self._source_path(project_id, filename))
-        try:
-            language = document_report.get("language") or detect_document_language(
-                self._extract_page_text(document[index], margins) for index in self._report_indices(document_report)
-            )
-            images: dict[int, str] = {}
-            errors: dict[int, str] = {}
-            for page_number in failed_pages:
-                page = self._load_page(document, page_number)
-                try:
-                    images[page_number] = render_page(page, margins.clip(page))
-                except Exception as exc:
-                    errors[page_number] = f"頁面渲染失敗：{exc}"
-        finally:
-            document.close()
-
-        abort = threading.Event()
-
-        def analyze(page_number: int) -> str:
-            if (stop_event is not None and stop_event.is_set()) or abort.is_set():
-                raise JobStopped()
-            try:
-                return self.page_analyzer(images[page_number], page_number, language, vision)
-            except VisionAbort:
-                # The error would repeat on every page (bad key, unknown model).
-                abort.set()
-                raise
-
-        transcribed: dict[int, str] = {}
-        usage: dict[str, Any] = {}
-        total = len(failed_pages)
-        done = total - len(images)
-        if progress_callback is not None:
-            progress_callback(done, total, filename)
-        with ThreadPoolExecutor(max_workers=vision.max_workers) as pool:
-            futures = {pool.submit(analyze, page_number): page_number for page_number in images}
-            for future in as_completed(futures):
-                page_number = futures[future]
-                try:
-                    result = future.result()
-                    transcribed[page_number] = result.strip()
-                    add_vision_usage(usage, result)
-                except JobStopped:
-                    pass
-                except Exception as exc:
-                    errors[page_number] = str(exc) or type(exc).__name__
-                done += 1
-                if progress_callback is not None:
-                    progress_callback(done, total, filename)
-
-        processed_directory = project_path / "processed"
-        records = self._read_jsonl(processed_directory / "input.jsonl")
-        report = self._read_report(project_id)
-        stored_report = next(item for item in report.get("documents", []) if item.get("filename") == filename)
-        edits = self._read_edits(project_id)
-        document_edits = edits.setdefault(filename, {})
-        stem = Path(filename).stem
-        for page_number in sorted(transcribed):
-            previous = [
-                item for item in records
-                if item.get("document_id") == filename and item.get("page") == page_number - 1
-            ]
-            last = max(previous, key=lambda item: item.get("block_id", ""), default=None)
-            # Records carry their heading as the section name, except the PDF's default section.
-            incoming_heading = last["section_name"] if last and last.get("section_path") != stem else ""
-            extracted = remove_leading_printed_page_number(transcribed[page_number])
-            sections, _ = split_into_sections(extracted, incoming_heading)
-            extracted = "\n\n".join(section_text for _, section_text in sections)
-            page_records = [
-                item for item in records if item.get("document_id") == filename and item.get("page") == page_number
-            ]
-            was_empty = not page_records
-            entry = document_edits.get(str(page_number))
-            if entry is not None and entry.get("extracted_text", "") != extracted:
-                if "text" in entry:
-                    entry["source_changed"] = True
-                else:
-                    entry["reviewed"] = False
-                entry["extracted_text"] = extracted
-            if entry is not None and "text" not in entry and not entry.get("reviewed"):
-                del document_edits[str(page_number)]
-                entry = None
-            if entry is None or "text" not in entry:
-                records = [item for item in records if item not in page_records]
-                records.extend(
-                    self._page_record(project_id, filename, page_number, section_text, block_number, heading)
-                    for block_number, (heading, section_text) in enumerate(sections, start=1)
-                )
-                if was_empty and extracted:
-                    stored_report["empty_pages"] = max(int(stored_report.get("empty_pages", 0)) - 1, 0)
-                elif not was_empty and not extracted:
-                    stored_report["empty_pages"] = int(stored_report.get("empty_pages", 0)) + 1
-        stored_report["vision_pages"] = sorted({*stored_report.get("vision_pages", []), *transcribed})
-        for field, value in usage.items():
-            stored_report[field] = int(stored_report.get(field, 0)) + value
-        stored_report["vision_fallback_pages"] = [
-            {"page": page_number, "error": errors.get(page_number, item.get("error", ""))}
-            for item in stored_report.get("vision_fallback_pages", [])
-            if (page_number := int(item["page"])) not in transcribed
-        ]
-        if not stored_report["vision_fallback_pages"]:
-            stored_report["vision_abort_reason"] = None
-        if stored_report.get("error_pages"):
-            stored_report["status"] = "PROCESSED_WITH_ERRORS"
-        elif stored_report.get("empty_pages") or stored_report["vision_fallback_pages"]:
-            stored_report["status"] = "PROCESSED_WITH_WARNINGS"
-        else:
-            stored_report["status"] = "PROCESSED"
-        if transcribed:
-            # A new processed_at marks the PDF as changed since the last graph.
-            stored_report["processed_at"] = datetime.now(timezone.utc).isoformat()
-        self._write_jsonl(processed_directory / "input.jsonl", self._sorted_records(records))
-        self._write_edits(project_id, edits)
-        self._write_json(processed_directory / "report.json", report)
-        if transcribed and project.status == "INDEXED":
-            self.projects.update_status(project_id, "STALE")
-        still_failing = [item["page"] for item in stored_report["vision_fallback_pages"]]
-        return sorted(transcribed), still_failing
-
-    def margin_preview(
-        self, project_id: str, filename: str, page_number: int, options: Mapping[str, object],
-    ) -> MarginPreview:
-        """Render a 1-based page with the margins in `options` shaded, without saving anything."""
-        margins = IgnoredMargins.from_options(options)
-        document = pymupdf.open(self._source_path(project_id, filename))
-        try:
-            page = self._load_page(document, page_number)
-            full_lines = [line.strip() for line in self._extract_page_text(page, IgnoredMargins()).splitlines()]
-            kept_text = self._extract_page_text(page, margins).strip()
-            kept_lines = [line.strip() for line in kept_text.splitlines()]
-            removed = tuple(
-                line[2:] for line in difflib.ndiff(full_lines, kept_lines) if line.startswith("- ") and line[2:]
-            )
-            rect = page.rect
-            clip = margins.clip(page) or pymupdf.Rect(rect)
-            bands = (
-                pymupdf.Rect(rect.x0, rect.y0, rect.x1, clip.y0),
-                pymupdf.Rect(rect.x0, clip.y1, rect.x1, rect.y1),
-                pymupdf.Rect(rect.x0, clip.y0, clip.x0, clip.y1),
-                pymupdf.Rect(clip.x1, clip.y0, rect.x1, clip.y1),
-            )
-            # Drawn on the in-memory copy only; the source PDF is never saved.
-            for band in bands:
-                if band.width > 0 and band.height > 0:
-                    page.draw_rect(
-                        band * page.derotation_matrix, color=None, fill=MARGIN_PREVIEW_FILL,
-                        fill_opacity=MARGIN_PREVIEW_OPACITY, overlay=True,
-                    )
-            image = page.get_pixmap(matrix=pymupdf.Matrix(PAGE_RENDER_SCALE, PAGE_RENDER_SCALE), alpha=False).tobytes("png")
-            return MarginPreview(
-                page=page_number,
-                pages=len(document),
-                image_png=image,
-                margin_points=(
-                    round(clip.y0 - rect.y0, 1), round(rect.y1 - clip.y1, 1),
-                    round(clip.x0 - rect.x0, 1), round(rect.x1 - clip.x1, 1),
-                ),
-                removed_lines=removed,
-                kept_text=kept_text,
-            )
-        finally:
-            document.close()
 
     def render_page_image(self, project_id: str, filename: str, page_number: int) -> bytes:
         """The whole 1-based page as PNG, for comparing with its extracted text."""
@@ -1031,11 +722,12 @@ class DocumentService:
         texts: dict[int, str],
         report: dict[str, Any],
         totals: dict[str, int],
-        margins: IgnoredMargins,
+        header_percent: float,
+        footer_percent: float,
     ) -> None:
         """Store the page's text layer in `texts`, or record a page error."""
         try:
-            texts[page_number] = self._extract_page_text(page, margins).strip()
+            texts[page_number] = self._extract_page_text(page, header_percent, footer_percent).strip()
         except Exception as exc:
             report["error_pages"] += 1
             totals["error_pages"] += 1
@@ -1047,7 +739,8 @@ class DocumentService:
         texts: dict[int, str],
         report: dict[str, Any],
         totals: dict[str, int],
-        margins: IgnoredMargins,
+        header_percent: float,
+        footer_percent: float,
         vision: VisionSettings,
         progress: _PageProgress | None,
         stop_event: threading.Event | None = None,
@@ -1060,11 +753,9 @@ class DocumentService:
         repeat on every page (bad key, unknown model) stops further requests.
         """
         for page_number, page in selected:
-            self._read_page_text(page, page_number, texts, report, totals, margins)
+            self._read_page_text(page, page_number, texts, report, totals, header_percent, footer_percent)
         language = detect_document_language(texts.values())
-        report.update(
-            language=language, vision_pages=[], vision_fallback_pages=[], **dict.fromkeys(VISION_USAGE_FIELDS, 0),
-        )
+        report.update(language=language, vision_pages=[], vision_fallback_pages=[])
         vision_texts: dict[int, str] = {}
         stop = threading.Event()
         abort_reasons: list[str] = []
@@ -1096,10 +787,7 @@ class DocumentService:
             for future in done:
                 page_number = pending.pop(future)
                 try:
-                    result = future.result()
-                    vision_texts[page_number] = result.strip()
-                    add_vision_usage(report, result)
-                    add_vision_usage(totals, result)
+                    vision_texts[page_number] = future.result().strip()
                 except JobStopped:
                     advance()
                 except VisionAbort:
@@ -1119,11 +807,7 @@ class DocumentService:
                 if page_number not in texts:
                     advance()
                     continue
-                try:
-                    body = margins.clip(page)
-                except ValueError as exc:
-                    fall_back(page_number, str(exc))
-                    continue
+                body = self._body_clip(page, header_percent, footer_percent)
                 if not page_needs_vision(page, vision.scope, texts[page_number], body):
                     advance()
                     continue
@@ -1148,6 +832,32 @@ class DocumentService:
         return vision_texts
 
     @staticmethod
+    def _body_clip(page: PdfPage, header_percent: float, footer_percent: float) -> pymupdf.Rect | None:
+        """The page area left after ignoring the header and footer, or None for the whole page."""
+        if header_percent == 0 and footer_percent == 0:
+            return None
+        rect = page.rect
+        return pymupdf.Rect(
+            rect.x0,
+            rect.y0 + rect.height * header_percent / 100,
+            rect.x1,
+            rect.y1 - rect.height * footer_percent / 100,
+        )
+
+    @staticmethod
+    def _validate_ignored_margins(header_percent: float, footer_percent: float) -> tuple[float, float]:
+        try:
+            header = float(header_percent)
+            footer = float(footer_percent)
+        except (TypeError, ValueError) as exc:
+            raise ProjectError("頁首與頁尾忽略比例必須是數字") from exc
+        if not 0 <= header < 100 or not 0 <= footer < 100:
+            raise ProjectError("頁首與頁尾忽略比例必須介於 0%（含）與 100%（不含）")
+        if header + footer >= 100:
+            raise ProjectError("頁首與頁尾忽略比例合計必須小於 100%")
+        return header, footer
+
+    @staticmethod
     def _page_index(value: object, label: str) -> int:
         try:
             number = float(value)
@@ -1158,11 +868,21 @@ class DocumentService:
         return int(number)
 
     @staticmethod
-    def _extract_page_text(page: PdfPage, margins: IgnoredMargins) -> str:
-        clip = margins.clip(page)
-        if clip is None:
+    def _extract_page_text(page: PdfPage, header_percent: float, footer_percent: float) -> str:
+        if header_percent == 0 and footer_percent == 0:
             return page.get_text("text") or ""
-        return page.get_text("text", clip=clip) or ""
+
+        try:
+            page_left = float(page.rect.x0)
+            page_top = float(page.rect.y0)
+            page_right = float(page.rect.x1)
+            page_bottom = float(page.rect.y1)
+            page_height = float(page.rect.height)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("無法取得 PDF 頁面高度以套用頁首頁尾忽略比例") from exc
+        clip_top = page_top + page_height * header_percent / 100
+        clip_bottom = page_bottom - page_height * footer_percent / 100
+        return page.get_text("text", clip=(page_left, clip_top, page_right, clip_bottom)) or ""
 
     @staticmethod
     def _close_document(document: PdfDocument) -> None:

@@ -228,33 +228,6 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(summary["summary"]["average_answer_em"], 1.0)
         self.assertEqual(details["question_results"][0]["answer_em"], 1.0)
 
-    def test_saved_run_with_removed_quality_fields_still_loads_and_exports_without_them(self):
-        question_set = self.service.import_question_set("project", self.question_file)
-        group = ExperimentGroup("G01", "實驗組1", "gpt-4o-mini", "local")
-        self.service.save_configuration("project", [group], question_set.question_set_id, 2, "gpt-4.1-mini")
-        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=2)
-        state = self.service.load("project")
-        for item in state["run"]["results"]:
-            item.update(answer_point_coverage_percent=80.0, unsupported_claim_count=1, refusal_correctness="correct")
-        for item in state["run"]["groups"]:
-            item.update(answer_point_coverage_percent=80.0, quality_reviewed_count=2)
-        self.service._write("project", state)
-
-        results = [
-            self.service._result_from_dict(item) for item in self.service.load("project")["run"]["results"]
-        ]
-        summary_path, details_path = self.service.export("project")
-
-        self.assertTrue(results)
-        removed = ("answer_point_coverage_percent", "unsupported_claim_count", "refusal_correctness",
-                   "quality_reviewed_count", "cost_status")
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        details = json.loads(details_path.read_text(encoding="utf-8"))
-        for key in removed:
-            self.assertNotIn(key, summary["groups"][0]["summary"])
-            self.assertNotIn(key, summary["summary"])
-            self.assertNotIn(key, details["question_results"][0])
-
     def test_failed_replacement_keeps_existing_sets_when_source_pages_are_empty(self):
         existing = self.service.import_question_set("project", self.question_file)
         invalid_file = self.root / "invalid-pages.json"
@@ -273,25 +246,20 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(self.service.load("project")["question_set_ids"], [existing.question_set_id])
         self.assertEqual(self.question_sets.get("project", existing.question_set_id), existing)
 
-    def test_importing_new_sets_adds_them_and_keeps_old_sets(self):
+    def test_importing_new_sets_replaces_and_deletes_old_sets(self):
         old_set = self.service.import_question_set("project", self.question_file)
-        state = self.service.load("project")
-        state["run"] = {"status": "stopped"}
-        self.service._write("project", state)
         second_file = self.root / "second-dataset.json"
         second_file.write_text(self.question_file.read_text(encoding="utf-8"), encoding="utf-8")
 
         imported = self.service.import_question_sets("project", [self.question_file, second_file])
 
         imported_ids = [item.question_set_id for item in imported]
-        state = self.service.load("project")
-        self.assertEqual(state["question_set_ids"], [old_set.question_set_id, *imported_ids])
-        self.assertIsNone(state["run"])
-        self.assertTrue(
+        self.assertEqual(self.service.load("project")["question_set_ids"], imported_ids)
+        self.assertFalse(
             (self.projects.path_for("project") / "question_sets" / f"{old_set.question_set_id}.json").exists()
         )
 
-    def test_removing_question_set_keeps_file_and_clears_saved_run(self):
+    def test_removing_question_set_deletes_it_and_clears_saved_run(self):
         question_set = self.service.import_question_set("project", self.question_file)
         state = self.service.load("project")
         state["run"] = {"status": "stopped"}
@@ -301,23 +269,9 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         self.assertEqual(updated["question_set_ids"], [])
         self.assertIsNone(updated["run"])
-        self.assertEqual(self.question_sets.get("project", question_set.question_set_id), question_set)
-
-    def test_set_question_sets_clears_run_only_when_selection_changes(self):
-        first = self.service.import_question_set("project", self.question_file)
-        second = self.question_sets.import_file("project", self.question_file)
-        state = self.service.load("project")
-        state["run"] = {"status": "stopped"}
-        self.service._write("project", state)
-
-        unchanged = self.service.set_question_sets("project", [first.question_set_id])
-        self.assertEqual(unchanged["run"], {"status": "stopped"})
-
-        changed = self.service.set_question_sets("project", [second.question_set_id, first.question_set_id])
-        self.assertEqual(changed["question_set_ids"], [second.question_set_id, first.question_set_id])
-        self.assertIsNone(changed["run"])
-        with self.assertRaises(ProjectError):
-            self.service.set_question_sets("project", ["0" * 32])
+        self.assertFalse(
+            (self.projects.path_for("project") / "question_sets" / f"{question_set.question_set_id}.json").exists()
+        )
 
     def test_run_multiple_question_sets_keeps_dataset_identity_on_every_result(self):
         second_file = self.root / "second-dataset.json"
@@ -1125,7 +1079,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertIn("實驗組摘要", labels)
         self.assertIn("實驗組 × 題目集摘要", labels)
         self.assertIn(
-            "逐題實驗結果（不執行模型評測也可手動編輯得分；得分可填百分比或 0／1／2）",
+            "逐題實驗結果（不執行模型評測也可手動編輯得分與品質欄位；得分可填百分比或 0／1／2；拒答欄填正確／錯誤／不適用）",
             labels,
         )
         button_values = [
@@ -1156,26 +1110,22 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(question_preview["headers"][0], "資料集")
         question_uploader = next(
             config for config in component_configs
-            if config.get("label") == "選擇要加入實驗的 JSON 題目集"
+            if config.get("label") == "選擇要取代目前資料集的 JSON 題目集"
         )
         self.assertEqual(question_uploader["file_count"], "multiple")
-        question_selector = next(
-            config for config in component_configs if config.get("label") == "題目集（可多選）"
-        )
-        self.assertTrue(question_selector["multiselect"])
         experiment_results = next(
             config for config in component_configs if str(config.get("label", "")).startswith("逐題實驗結果")
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
+            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因", "答案要點覆蓋率 %", "無根據主張數", "無答案題拒答判定"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertEqual(experiment_results["datatype"][8], "markdown")
         self.assertTrue(experiment_results["interactive"])
         self.assertEqual(
             experiment_results["column_widths"],
-            ["6%", "8%", "4%", "8%", "11%", "18%", "13%", "6%", "11%", "8%", "7%"],
+            ["6%", "8%", "4%", "8%", "10%", "15%", "12%", "5%", "9%", "7%", "6%", "4%", "3%", "3%"],
         )
         judge_detail = next(
             config for config in component_configs
@@ -1323,108 +1273,3 @@ class RetrievalExperimentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class ExperimentQuestionSetSelectorUiTests(unittest.TestCase):
-    def setUp(self) -> None:
-        from automotive_graphrag.app import create_app
-
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        root = Path(self.temporary_directory.name) / "projects"
-        ProjectStore(root).create(project_id="P", display_name="P", vehicle_name="V", manual_version="1")
-        app = create_app(root)
-        self.functions = {getattr(event.fn, "__name__", ""): event.fn for event in app.fns.values()}
-        apply = self.functions["apply_experiment_question_sets"]
-        closure = dict(zip(apply.__code__.co_freevars, (cell.cell_contents for cell in apply.__closure__)))
-        self.experiments = closure["retrieval_experiments"]
-        running = self.functions["running_job_views"]
-        self.jobs = dict(zip(
-            running.__code__.co_freevars, (cell.cell_contents for cell in running.__closure__)
-        ))["jobs"]
-        question_sets = self.experiments.question_sets
-        self.first = question_sets.create("P", "第一份")
-        self.second = question_sets.create("P", "第二份")
-        self.experiments.set_question_sets("P", [self.first.question_set_id])
-        state = self.experiments.load("P")
-        state["run"] = {"status": "stopped"}
-        self.experiments._write("P", state)
-
-    def tearDown(self) -> None:
-        self.temporary_directory.cleanup()
-
-    def applied(self) -> list[str]:
-        return self.experiments.load("P")["question_set_ids"]
-
-    def test_selector_lists_saved_sets_and_import_option_with_applied_value(self) -> None:
-        from automotive_graphrag.app import EXPERIMENT_IMPORT_OPTION
-
-        update = self.functions["experiment_question_set_choices"]("P", [self.first.question_set_id, "gone"])
-
-        values = [value for _label, value in update["choices"]]
-        self.assertEqual(values[-1], EXPERIMENT_IMPORT_OPTION)
-        self.assertEqual(set(values[:-1]), {self.first.question_set_id, self.second.question_set_id})
-        self.assertEqual(update["value"], [self.first.question_set_id])
-
-    def test_choosing_import_opens_upload_and_drops_the_option(self) -> None:
-        from automotive_graphrag.app import EXPERIMENT_IMPORT_OPTION
-
-        selector, section = self.functions["experiment_selector_input"](
-            [self.first.question_set_id, EXPERIMENT_IMPORT_OPTION]
-        )
-
-        self.assertEqual(selector["value"], [self.first.question_set_id])
-        self.assertTrue(section["visible"])
-
-    def test_has_results_reflects_saved_run(self) -> None:
-        self.assertTrue(self.functions["experiment_has_results"]("P"))
-
-    def test_confirmed_apply_switches_sets_clears_run_and_keeps_files(self) -> None:
-        view = self.functions["apply_experiment_question_sets"]("P", [self.second.question_set_id], True)
-
-        self.assertIn("實驗結果已清除", view[0])
-        self.assertEqual(self.applied(), [self.second.question_set_id])
-        self.assertIsNone(self.experiments.load("P")["run"])
-        self.assertEqual(
-            {item.question_set_id for item in self.experiments.question_sets.list("P")},
-            {self.first.question_set_id, self.second.question_set_id},
-        )
-
-    def test_cancelled_or_unchanged_apply_keeps_results(self) -> None:
-        self.functions["apply_experiment_question_sets"]("P", [self.second.question_set_id], False)
-        view = self.functions["apply_experiment_question_sets"]("P", [self.first.question_set_id], True)
-
-        self.assertIn("未變更", view[0])
-        self.assertEqual(self.applied(), [self.first.question_set_id])
-        self.assertEqual(self.experiments.load("P")["run"], {"status": "stopped"})
-
-    def test_running_experiment_blocks_apply(self) -> None:
-        job = self.jobs.begin("P", "retrieval_answer")
-        try:
-            view = self.functions["apply_experiment_question_sets"]("P", [self.second.question_set_id], True)
-        finally:
-            job.release()
-
-        self.assertIn("執行中", view[0])
-        self.assertEqual(self.applied(), [self.first.question_set_id])
-
-
-class ExperimentSummaryColumnTests(unittest.TestCase):
-    def test_unused_agentic_and_classic_columns_are_dropped(self) -> None:
-        from automotive_graphrag.app import (
-            EXPERIMENT_COST_HEADERS, EXPERIMENT_CLASSIC_HEADERS, EXPERIMENT_SUMMARY_HEADERS,
-            experiment_summary_update,
-        )
-
-        row = list(range(len(EXPERIMENT_SUMMARY_HEADERS)))
-        update = experiment_summary_update(
-            EXPERIMENT_SUMMARY_HEADERS, [row], True, drop=EXPERIMENT_COST_HEADERS + EXPERIMENT_CLASSIC_HEADERS,
-        )
-
-        self.assertEqual(update["value"]["headers"], list(EXPERIMENT_SUMMARY_HEADERS[:15]))
-        self.assertEqual(update["value"]["data"], [row[:15]])
-        self.assertEqual(update["datatype"], ["str"] * 15)
-        for removed in ("成本", "檢索指標狀態", "人工複核題數", "拒答正確率（人工）"):
-            self.assertNotIn(removed, EXPERIMENT_SUMMARY_HEADERS)
-
-        full = experiment_summary_update(EXPERIMENT_SUMMARY_HEADERS, [row], True)
-        self.assertEqual(full["value"]["headers"], list(EXPERIMENT_SUMMARY_HEADERS))
