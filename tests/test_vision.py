@@ -15,6 +15,7 @@ from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.vision import (
     SCOPE_ALL,
     SCOPE_FIGURES,
+    PageTranscription,
     VisionAbort,
     VisionSettings,
     analyze_page,
@@ -121,11 +122,58 @@ class VisionPreprocessTests(unittest.TestCase):
         self.assertEqual(sorted(records), [1, 2])
         self.assertEqual(report.empty_pages, 1)
 
+    def test_reported_token_usage_is_summed_into_reports(self) -> None:
+        usage = {2: {"prompt_tokens": 1500, "completion_tokens": 400}, 3: {"prompt_tokens": 1200, "completion_tokens": 100}}
+
+        def analyzer(image: str, page_number: int, language: str | None, settings: VisionSettings) -> str:
+            return PageTranscription(f"Vision 第 {page_number} 頁 ", usage[page_number])
+
+        report, records, document_report = self.preprocess(analyzer)
+
+        self.assertEqual(records[2], "Vision 第 2 頁")
+        expected = {"vision_prompt_tokens": 2700, "vision_completion_tokens": 500, "vision_usage_pages": 2}
+        self.assertEqual({field: getattr(report, field) for field in expected}, expected)
+        self.assertEqual({field: document_report[field] for field in expected}, expected)
+
+    def test_analyzer_without_usage_reports_zero_measured_pages(self) -> None:
+        report, _, document_report = self.preprocess(RecordingAnalyzer())
+
+        self.assertEqual((report.vision_usage_pages, report.vision_prompt_tokens), (0, 0))
+        self.assertEqual(document_report["vision_usage_pages"], 0)
+
     def test_settings_reject_missing_model_and_unknown_scope(self) -> None:
         with self.assertRaises(ProjectError):
             VisionSettings(model="")
         with self.assertRaises(ProjectError):
             VisionSettings(model="gpt-6-luna", scope="everything")
+
+
+class SideMarginVisionTests(unittest.TestCase):
+    def test_image_inside_ignored_side_margin_does_not_send_page_to_vision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ProjectStore(root / "projects")
+            store.create(project_id="L33-SM3E", display_name="L33", vehicle_name="L33", manual_version="SM3E")
+            pdf = root / "tab.pdf"
+            document = pymupdf.open()
+            page = document.new_page(width=612, height=792)
+            page.insert_text((52, 300), "Remove the two pedal bolts.", fontname="helv")
+            pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 8, 8), False)
+            pixmap.clear_with(0)
+            page.insert_image(pymupdf.Rect(570, 100, 600, 130), stream=pixmap.tobytes("png"))
+            document.save(pdf)
+            document.close()
+            analyzer = RecordingAnalyzer()
+            service = DocumentService(store, page_analyzer=analyzer)
+            service.import_pdfs("L33-SM3E", [pdf])
+            vision = VisionSettings(model="gpt-6-luna", scope=SCOPE_FIGURES)
+
+            service.preprocess("L33-SM3E", vision=vision)
+            self.assertEqual([page for page, _ in analyzer.calls], [1])
+
+            analyzer.calls.clear()
+            service.preprocess("L33-SM3E", {"tab.pdf": {"right_ignore_percent": 8}}, vision=vision)
+            self.assertEqual(analyzer.calls, [])
 
 
 class PageNeedsVisionTests(unittest.TestCase):
@@ -221,6 +269,19 @@ class AnalyzePageTests(unittest.TestCase):
         self.assertIn("Do not transcribe page numbers", payload["messages"][0]["content"])
         self.assertEqual(payload["messages"][1]["content"][1]["image_url"]["url"], "data:image/png;base64,aW1n")
         self.assertEqual(text, "雨刷規格\n\n| 項目 | 值 |\n|---|---|\n| 電壓 | 12V |\n\n連桿位於馬達右側")
+        self.assertIsNone(text.usage)
+
+    def test_returns_reported_token_usage(self) -> None:
+        content = {"page_number": 1, "content": [{"type": "text", "data": "text"}]}
+        response = {
+            "choices": [{"message": {"content": json.dumps(content)}}],
+            "usage": {"prompt_tokens": 1650, "completion_tokens": 512, "total_tokens": 2162},
+        }
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(response).encode()
+            text = analyze_page("aW1n", 1, None, self.settings)
+        self.assertEqual(text, "text")
+        self.assertEqual((text.usage["prompt_tokens"], text.usage["completion_tokens"]), (1650, 512))
 
     def test_selected_reasoning_effort_is_sent_without_sampling_temperature(self) -> None:
         content = {"page_number": 1, "content": [{"type": "text", "data": "text"}]}
@@ -255,6 +316,19 @@ class AnalyzePageTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=error):
             with self.assertRaises(VisionAbort):
                 analyze_page("aW1n", 1, None, self.settings)
+
+    def test_cloudflare_tunnel_error_is_retried(self) -> None:
+        content = {"page_number": 1, "content": [{"type": "text", "data": "ok"}]}
+        success = mock.MagicMock()
+        success.__enter__.return_value.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": json.dumps(content)}}]}
+        ).encode()
+        tunnel_down = urllib.error.HTTPError("url", 530, "", {}, io.BytesIO(b"error code: 1033"))
+        with mock.patch("urllib.request.urlopen", side_effect=[tunnel_down, success]) as urlopen, \
+                mock.patch("automotive_graphrag.vision.time.sleep"):
+            text = analyze_page("aW1n", 1, None, self.settings)
+        self.assertEqual(text, "ok")
+        self.assertEqual(urlopen.call_count, 2)
 
     def test_rejects_malformed_content(self) -> None:
         response = {"choices": [{"message": {"content": '{"content": [{"type": "chart", "data": "x"}]}'}}]}

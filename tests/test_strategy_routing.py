@@ -34,20 +34,20 @@ class StrategyRouterTests(unittest.TestCase):
         self.assertIn("這批手冊涵蓋哪些系統？", prompt)
         self.assertTrue(prompt.startswith("You choose the Microsoft GraphRAG search method"))
 
-    def test_invalid_method_falls_back_to_local(self) -> None:
+    def test_invalid_method_falls_back_to_basic(self) -> None:
         decision = StrategyRouter(lambda *_: {"method": "hybrid", "reason": "x"}).route("q", "m", "u", "k")
 
-        self.assertEqual(decision.method, "local")
+        self.assertEqual(decision.method, "basic")
         self.assertIn("自動判斷失敗", decision.reason)
         self.assertIn("hybrid", decision.reason)
 
-    def test_api_error_falls_back_to_local(self) -> None:
+    def test_api_error_falls_back_to_basic(self) -> None:
         def chat(*_: object) -> object:
             raise ProjectError("策略判斷 API 回應 HTTP 500")
 
         decision = StrategyRouter(chat).route("q", "m", "u", "k")
 
-        self.assertEqual(decision.method, "local")
+        self.assertEqual(decision.method, "basic")
         self.assertIn("HTTP 500", decision.reason)
 
     def test_missing_api_key_falls_back_without_calling_model(self) -> None:
@@ -56,7 +56,7 @@ class StrategyRouterTests(unittest.TestCase):
 
         decision = StrategyRouter(chat).route("q", "m", "u", None)
 
-        self.assertEqual(decision.method, "local")
+        self.assertEqual(decision.method, "basic")
         self.assertIn("API Key", decision.reason)
 
     def test_missing_reason_is_marked(self) -> None:
@@ -64,6 +64,27 @@ class StrategyRouterTests(unittest.TestCase):
 
         self.assertEqual(decision.method, "basic")
         self.assertEqual(decision.reason, "模型未提供原因")
+
+    def test_rewrite_query_returns_manual_language_query_and_records_call(self):
+        prompts = []
+
+        def chat(api_base_url, api_key, model, prompt, reasoning_effort=None):
+            prompts.append(prompt)
+            return {"query": "  Brake bleeding procedure:\n first caliper  "}
+
+        query, calls = StrategyRouter(chat).rewrite_query(
+            "煞車系統排氣時先接哪個卡鉗？", "Connect a vinyl tube", "m", "u", "k",
+        )
+
+        self.assertEqual(query, "Brake bleeding procedure: first caliper")
+        self.assertIn("煞車系統排氣時先接哪個卡鉗？", prompts[0])
+        self.assertIn("Connect a vinyl tube", prompts[0])
+        self.assertEqual([call["stage"] for call in calls], ["query_rewrite"])
+
+    def test_rewrite_query_returns_none_without_key_or_usable_reply(self):
+        self.assertEqual(StrategyRouter(lambda *args: {"query": "x"}).rewrite_query("q", "e", "m", "u", None), (None, ()))
+        query, _ = StrategyRouter(lambda *args: {"text": "x"}).rewrite_query("q", "e", "m", "u", "k")
+        self.assertIsNone(query)
 
 
 class StrategyRankingTests(unittest.TestCase):
@@ -94,7 +115,7 @@ class StrategyRankingTests(unittest.TestCase):
         decision = StrategyRouter(lambda *_: response).route("q", "m", "u", "k")
 
         self.assertIn("hybrid", decision.reason)
-        self.assertEqual(decision.attempt_order, ("local", "basic", "global", "drift"))
+        self.assertEqual(decision.attempt_order, ("basic", "local", "global", "drift"))
 
 
 class AnswerCheckTests(unittest.TestCase):
@@ -318,6 +339,14 @@ class QueryTabAutoStrategyTests(unittest.TestCase):
         _model, other_update = handlers["update_autoqa_model_method_compatibility"]("gpt-4o-mini", "local")
         self.assertEqual(other_update["value"], "local")
         self.assertIn("agentic", [value for _label, value in other_update["choices"]])
+        # Automatic QA defaults to auto: the dropdown starts on the "auto" value, not its label.
+        _model, default_update = handlers["update_autoqa_model_method_compatibility"]("gpt-4o-mini", None)
+        self.assertEqual(default_update["value"], "auto")
+        autoqa_method = next(
+            component.get_config() for component in app.blocks.values()
+            if hasattr(component, "get_config") and component.get_config().get("label") == "檢索模式"
+        )
+        self.assertEqual(autoqa_method["value"], "auto")
 
 
 if __name__ == "__main__":

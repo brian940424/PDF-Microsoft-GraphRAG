@@ -9,6 +9,7 @@ import pandas as pd
 
 from .projects import ProjectError, ProjectStore
 from .source_metadata import SourceMetadataService
+from .variants import project_variants
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,9 @@ class Evidence:
     score: float | None = None
     source_type: str = "text_unit"
     section_path: str = ""
+    variant: str = ""
+    # Set when code, not retrieval, added the item: "duplicate_passage" (F-59) counts as cited.
+    added_by: str = ""
     pages: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
@@ -41,6 +45,14 @@ def evidence_page_label(evidence: Evidence) -> str | None:
     if pages == list(range(pages[0], pages[-1] + 1)) and len(pages) > 1:
         return f"{pages[0]}–{pages[-1]}"
     return ", ".join(str(page) for page in pages)
+
+
+def section_path_with_variant(section_path: str, variant: str) -> str:
+    """Insert the manual variant after the document name: "AV > [NAVIGATION WITH BOSE] > ..."."""
+    if not variant or f"[{variant}]" in section_path:
+        return section_path
+    document, separator, rest = section_path.partition(" > ")
+    return f"{document} > [{variant}]" + (f" > {rest}" if separator else "")
 
 
 class EvidenceService:
@@ -69,6 +81,7 @@ class EvidenceService:
                 for row in text_units.to_dict(orient="records")
             }
             metadata_by_text_unit = {item.text_unit_id: item for item in self.metadata.load(project_id)}
+            variants = self._variants(project_id)
 
             for source in raw_sources:
                 if not isinstance(source, dict) or source.get("in_context") is False:
@@ -81,6 +94,7 @@ class EvidenceService:
                 seen.add(text_unit_id)
                 # This is the UI display order only; GraphRAG does not provide a relevance score here.
                 rank = len(result) + 1
+                variant = variants.get(source_metadata.document_id, {}).get(source_metadata.page, "")
                 result.append(
                     Evidence(
                         evidence_id=f"E{rank}",
@@ -94,7 +108,8 @@ class EvidenceService:
                         page=source_metadata.page,
                         block_id=source_metadata.block_id,
                         text=source_metadata.text,
-                        section_path=source_metadata.section_path,
+                        section_path=section_path_with_variant(source_metadata.section_path, variant),
+                        variant=variant,
                         pages=source_metadata.pages or (source_metadata.page,),
                     )
                 )
@@ -135,6 +150,14 @@ class EvidenceService:
                 )
             )
         return result
+
+    def _variants(self, project_id: str) -> dict[str, dict[int, str]]:
+        """Variant tags by PDF and page; empty when the PDFs cannot be read."""
+        project_path = self.projects.path_for(project_id)
+        try:
+            return project_variants(project_path, project_path / "graphrag" / "output")
+        except Exception:
+            return {}
 
     @staticmethod
     def source_records(context: dict[str, Any]) -> list[dict[str, Any]]:
