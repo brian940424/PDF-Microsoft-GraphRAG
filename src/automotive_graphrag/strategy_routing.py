@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -37,6 +38,8 @@ Available methods:
 - drift: Starts from community reports, generates follow-up sub-questions and answers them with local search over several rounds. Best for complex multi-hop questions that need both broad context and specific details, such as causal chains across systems or diagnosis spanning several components. Slowest and most expensive.
 
 Rank all four methods from most to least suitable. The methods are tried in that order until one finds an answer, so a wrong first choice costs a full extra search. Put basic first for lookups of what the manual states, and when unsure. Put local first only when the question is mainly about relationships between several named components or systems. Put global first only for corpus-wide overview questions. Put drift first only when the question clearly needs multi-step reasoning.
+
+Do not rank drift first for a single setting, one menu path, or a procedure contained in one manual section, even when the question mentions a trigger or several sequential steps. For example, enabling one lock-screen setting after repeated incorrect unlock attempts is a local/basic lookup, not a multi-hop question. Reserve drift for questions that must combine information from distinct sections or topics.
 
 Return a JSON object with exactly these keys:
 - "methods": an array containing "local", "global", "drift" and "basic" exactly once each, most suitable first
@@ -95,6 +98,7 @@ class SearchOutcome:
     payload: Any = None
     # Text units the search put in its context; None when the context is unavailable.
     source_count: int | None = None
+    section_titles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,14 +258,18 @@ def search_with_fallback(
     decision: StrategyDecision,
     search: Callable[[str], SearchOutcome],
     check: Callable[[str], AnswerCheck],
+    question: str = "",
 ) -> FallbackResult:
     """Try each method in ranked order once and stop at the first one that finds an answer."""
     attempts: list[dict[str, Any]] = []
     answered: list[str] = []
+    outcomes: dict[str, SearchOutcome] = {}
     last_failure: SearchOutcome | None = None
     for method in decision.attempt_order:
         started = time.monotonic()
         outcome = search(method)
+        outcomes[method] = outcome
+        drift_unsupported = False
         if outcome.error or not outcome.answer.strip():
             status, detail = "failed", outcome.error or "GraphRAG 未回傳回答"
             last_failure = replace(outcome, error=detail)
@@ -270,7 +278,13 @@ def search_with_fallback(
             detail = f"Local 只取得 {outcome.source_count} 個原文段落（少於 {LOCAL_MIN_SOURCES} 個），證據不足"
             answered.append(method)
         else:
-            verdict = check(outcome.answer)
+            title_match = method != "drift" and any(
+                _section_title_matches(question, title) for title in outcome.section_titles
+            )
+            verdict = AnswerCheck(True, "檢索到與題目功能名稱相符的小節標題") if title_match else check(outcome.answer)
+            if method == "drift" and _drift_answer_is_unsupported(outcome):
+                drift_unsupported = True
+                verdict = AnswerCheck(False, "DRIFT 回答引用未出現在證據中的來源，或表示手冊未提供資訊")
             status, detail = ("found" if verdict.found else "not_found"), verdict.reason
             answered.append(method)
         attempts.append({
@@ -302,6 +316,50 @@ def context_source_count(context: object) -> int | None:
         if item.get("in_context") is not False
     }
     return len(ids)
+
+
+def _section_title_matches(question: str, title: str) -> bool:
+    """Accept specific feature titles; generic headings must not stop strategy fallback."""
+    question_cjk, question_latin = _title_terms(question)
+    title_cjk, title_latin = _title_terms(title)
+    if not title_cjk and not title_latin:
+        return False
+    normalized_question = re.sub(r"[\W_]+", "", question.casefold())
+    normalized_title = re.sub(r"[\W_]+", "", title.casefold())
+    specific_title_cjk = title_cjk - _GENERIC_TITLE_TERMS
+    exact_feature = normalized_title in normalized_question and (
+        bool(specific_title_cjk) or len(title_latin) >= 2
+    )
+    if exact_feature:
+        return True
+    shared_cjk = specific_title_cjk & (question_cjk - _GENERIC_TITLE_TERMS)
+    shared_latin = title_latin & question_latin
+    return len(shared_cjk) >= 2 or bool(shared_cjk and shared_latin)
+
+
+_GENERIC_TITLE_TERMS = {
+    "如何", "可以", "使用", "設定", "功能", "裝置", "手機", "螢幕", "應用", "模式",
+    "開啟", "關閉", "操作", "方法", "步驟", "事項", "資訊", "其他", "管理",
+}
+
+
+def _title_terms(value: str) -> tuple[set[str], set[str]]:
+    cjk_terms: set[str] = set()
+    for run in re.findall(r"[\u3400-\u9fff]+", value):
+        cjk_terms.update(run[index:index + 2] for index in range(len(run) - 1))
+    latin_terms = {term.casefold() for term in re.findall(r"[A-Za-z0-9]{2,}", value)}
+    return cjk_terms, latin_terms
+
+
+def _drift_answer_is_unsupported(outcome: SearchOutcome) -> bool:
+    answer = outcome.answer.casefold()
+    if any(phrase in answer for phrase in ("手冊未提供", "手冊沒有提供", "請查閱手冊", "請查閱使用手冊", "資料未提供", "資料未說明")):
+        return True
+    context = outcome.payload.context if hasattr(outcome.payload, "context") else outcome.payload
+    source_ids = {str(item.get("id", "")) for item in EvidenceService.source_records(context) if item.get("id") is not None}
+    citations = re.findall(r"\[Data:\s*Sources\s*\(([^)]*)\)\]", outcome.answer, flags=re.IGNORECASE)
+    cited_ids = {value.strip() for citation in citations for value in citation.split(",") if value.strip()}
+    return bool(citations and source_ids and not cited_ids.issubset(source_ids))
 
 
 def _attempt_summary(attempts: list[dict[str, Any]]) -> str:

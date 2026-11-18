@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,33 @@ class WorkspaceLockTests(unittest.TestCase):
         banner, *tabs = self.workspace_tab_states("L33-SM3E")
         self.assertIn("目前開啟專案", banner)
         self.assertTrue(all(tab.interactive is True for tab in tabs))
+
+    def test_old_index_with_continued_sections_is_marked_stale(self) -> None:
+        store = ProjectStore(self.root)
+        store.update_status("L33-SM3E", "INDEXED")
+        ConnectionSettings(self.root).save("https://api.openai.com/v1", "sk-test-1234")
+        project_path = store.path_for("L33-SM3E")
+        records = [
+            {"id": "p125", "title": "Manual p125", "text": "DeX 操控方式\n使用鍵盤滑鼠", "document_id": "Manual.pdf",
+             "page": 125, "block_id": "b01", "section_id": "dex", "section_name": "DeX 操控方式",
+             "section_path": "Manual > DeX 操控方式"},
+            {"id": "p126", "title": "Manual p126", "text": "也可使用觸控板與螢幕鍵盤", "document_id": "Manual.pdf",
+             "page": 126, "block_id": "b01", "section_id": "dex", "section_name": "DeX 操控方式",
+             "section_path": "Manual > DeX 操控方式"},
+        ]
+        (project_path / "processed" / "input.jsonl").write_text(
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records), encoding="utf-8",
+        )
+        graph_input = project_path / "graphrag" / "input"
+        graph_input.mkdir(parents=True)
+        (graph_input / "input.jsonl").write_text(
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records), encoding="utf-8",
+        )
+
+        banner, *_ = self.workspace_tab_states("L33-SM3E")
+
+        self.assertIn("狀態：STALE（需重新建圖）", banner)
+        self.assertEqual(store.get("L33-SM3E").status, "STALE")
 
 
 if __name__ == "__main__":

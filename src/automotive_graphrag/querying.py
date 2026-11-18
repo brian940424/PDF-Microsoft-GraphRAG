@@ -43,6 +43,25 @@ _MANUAL_QUERY_ALIASES = {
     "選擇語言": ("語言設定", "變更語言", "系統語言"),
     "未知號碼": ("封鎖未知號碼", "來電封鎖", "封鎖來電"),
     "指紋": ("指紋辨識", "註冊指紋", "指紋解鎖"),
+    "解鎖碼": (
+        "變更螢幕鎖定方式", "鎖定螢幕與 AOD", "安全鎖定設定", "預設螢幕鎖定方式",
+        "連續輸入錯誤解鎖碼", "錯誤解鎖碼達到嘗試上限", "自動原廠重設", "自動原廠重設開關",
+    ),
+    "藍牙無法正常運作": ("重設 Wi-Fi 與藍牙設定", "已註冊的資訊可能會遺失"),
+    "過熱": ("裝置使用時發生過熱情形", "裝置過熱時的處理步驟"),
+    "懸浮翻譯": ("切換逐字或整句翻譯", "聆聽原文發音"),
+    "螢幕錄影": ("S Pen 游標", "顯示游標圖示"),
+    "遠端拍照": (
+        "使用 S Pen 拍照", "按住 S Pen 按鈕連拍", "拍攝多張相片",
+        "變更拍攝模式", "切換相機",
+    ),
+    "隨手便利貼": (
+        "釘選至 Always On Display", "備忘錄尚未儲存", "儲存至 Samsung Notes",
+        "將 S Pen 重新插入插槽",
+    ),
+    "具備超寬頻": (
+        "設定 連接 藍牙 超寬頻 (UWB)", "使用此功能將增加電池用量",
+    ),
 }
 
 
@@ -217,9 +236,16 @@ class QueryService:
                     return SearchOutcome("", str(exc), QueryExecution(1, "", str(exc)))
                 if execution.returncode != 0:
                     return SearchOutcome("", self._last_error(execution), execution)
+                try:
+                    section_titles = tuple(item.section_name for item in self.evidence_service.from_context(
+                        project_id, getattr(execution, "context", {}) or {},
+                    ))
+                except ProjectError:
+                    section_titles = ()
                 return SearchOutcome(
                     (execution.stdout or "").strip(), None, execution,
                     context_source_count(getattr(execution, "context", None)),
+                    section_titles,
                 )
 
             searched: list[str] = []

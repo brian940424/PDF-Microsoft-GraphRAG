@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from automotive_graphrag.evidence import EvidenceService
+from automotive_graphrag.evidence import EvidenceService, evidence_page_label
 from automotive_graphrag.projects import ProjectError, ProjectStore
 
 
@@ -36,6 +36,7 @@ class EvidenceServiceTests(unittest.TestCase):
                 "section_name": "Wiper & Washer",
                 "document_id": "WW.pdf",
                 "page": 25,
+                "pages": [25, 26],
                 "block_id": "b01",
                 "text": "檢查雨刷保險絲",
                 "section_path": "WW > 更換雨刷",
@@ -74,6 +75,8 @@ class EvidenceServiceTests(unittest.TestCase):
         self.assertEqual((evidence[0].document_id, evidence[0].page), ("PG.pdf", 42))
         self.assertEqual(evidence[1].chunk_id, "L33-SM3E-WW-p0025-b01")
         self.assertEqual(evidence[1].section_path, "WW > 更換雨刷")
+        self.assertEqual(evidence[1].pages, (25, 26))
+        self.assertEqual(evidence_page_label(evidence[1]), "25–26")
         self.assertIsNone(evidence[0].score)
 
     def test_text_units_missing_columns_asks_for_rebuild(self) -> None:

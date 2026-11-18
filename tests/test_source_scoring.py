@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from automotive_graphrag.evaluation.source_scoring import (
     cited_evidence,
@@ -91,6 +92,15 @@ class PrintedPageCitationTests(unittest.TestCase):
 
 
 class SourceScoreTests(unittest.TestCase):
+    def test_cross_page_evidence_covers_all_pages_for_source_metrics(self) -> None:
+        cross_page = replace(evidence("1", 125), pages=(125, 126))
+
+        self.assertEqual(source_score("[Data: Sources (1)]", [cross_page], [gold((126,))]), 1.0)
+        self.assertEqual(
+            cited_sources("[Data: Sources (1)]", [cross_page]),
+            [{"document_id": "A.pdf", "document_name": "A.pdf", "pages": [125, 126]}],
+        )
+
     def test_not_applicable_without_gold_or_text_units(self) -> None:
         self.assertIsNone(source_score("[Data: Sources (1)]", [evidence("1", 10)], []))
         report = evidence("9", None, "GraphRAG Community Report", source_type="community_report")

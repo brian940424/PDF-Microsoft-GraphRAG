@@ -16,6 +16,21 @@ _ACTION_HEADING = re.compile(
     r"將.*設為|如何)"
 )
 _BULLET_OR_STEP = re.compile(r"^(?:[•·▪◦※*]|[-–—]|\d+[.、．)]|[（(]\d+[）)])")
+_LATIN_HEADING = re.compile(r"^[A-Z][A-Za-z0-9+.-]*(?:\s+[A-Z][A-Za-z0-9+.-]*){1,4}$")
+_LATIN_HEADING_STOPWORDS = {"after", "before", "do", "for", "from", "how", "if", "in", "on", "the", "this", "to", "use", "when", "with"}
+
+
+def _looks_like_latin_product_heading(value: str) -> bool:
+    words = value.split()
+    if not _LATIN_HEADING.fullmatch(value) or words[0].casefold() in _LATIN_HEADING_STOPWORDS:
+        return False
+    # Generic title-case phrases (for example, "Smart View") occur in body text.
+    # A mixed-case brand token or a short all-caps model acronym is a stronger cue.
+    return any(
+        (any(character.isupper() for character in word[1:]) and any(character.islower() for character in word))
+        or (2 <= len(word) <= 5 and word.isupper())
+        for word in words[1:]
+    )
 
 
 def looks_like_section_heading(line: str) -> bool:
@@ -30,6 +45,8 @@ def looks_like_section_heading(line: str) -> bool:
     if value.endswith(("。", "，", "、", ",", ";", "；", "：", ":", "!", "！", "?", "？")):
         return False
     if _EXPLICIT_HEADING.match(value):
+        return True
+    if _looks_like_latin_product_heading(value):
         return True
     return bool(_ACTION_HEADING.match(value)) and not any(
         marker in value for marker in ("。", "，", "；", ";")

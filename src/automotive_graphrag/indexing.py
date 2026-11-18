@@ -15,13 +15,13 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import yaml
 
 from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
-from .documents import INDEXED_DOCUMENTS_FILE
+from .documents import INDEXED_DOCUMENTS_FILE, SECTIONING_FORMAT_VERSION
 from .projects import ProjectError, ProjectStore, indexing_lock_held, indexing_lock_path
 from .source_metadata import SourceMetadataService
 
@@ -82,6 +82,7 @@ class IndexingResult:
 
 
 class IndexingService:
+    MAX_CONTINUATION_PAGES = 2
     def __init__(
         self,
         projects: ProjectStore,
@@ -157,6 +158,8 @@ class IndexingService:
         if chat_model is not None and chat_model not in self.connection_settings.available_chat_models():
             raise ProjectError(f"不支援的建圖模型：{chat_model}")
         project_path = self.projects.path_for(project_id)
+        if self.preprocessing_needs_refresh(project_path):
+            raise ProjectError("前處理格式已更新，請重新預處理 PDF，再重新建圖")
         graph_root = project_path / "graphrag"
         lock_path = indexing_lock_path(project_path)
         lock_descriptor, stale_lock = self._acquire_lock(lock_path)
@@ -380,11 +383,82 @@ class IndexingService:
         handle, temporary_name = tempfile.mkstemp(dir=input_directory, prefix=".input-", suffix=".jsonl")
         os.close(handle)
         try:
-            shutil.copy2(source, temporary_name)
+            records = IndexingService._merge_continuation_records(
+                [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+            )
+            with open(temporary_name, "w", encoding="utf-8") as target:
+                target.writelines(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n" for record in records)
             os.replace(temporary_name, destination)
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+    @staticmethod
+    def _merge_continuation_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Coalesce one neighboring page when its first chunk continues the same section."""
+        merged: list[dict[str, Any]] = []
+        for record in records:
+            page = record.get("page")
+            if not isinstance(page, int):
+                merged.append(record)
+                continue
+            previous = merged[-1] if merged else None
+            previous_pages = list(previous.get("pages") or [previous.get("page")]) if previous else []
+            first_line = next((line.strip() for line in str(record.get("text", "")).splitlines() if line.strip()), "")
+            continues_section = (
+                previous is not None
+                and previous.get("document_id") == record.get("document_id")
+                and previous.get("section_id") == record.get("section_id")
+                and previous.get("section_path") == record.get("section_path")
+                and " > " in str(record.get("section_path", ""))
+                and isinstance(previous_pages[-1], int)
+                and page == previous_pages[-1] + 1
+                and record.get("block_id") == "b01"
+                and IndexingService._first_nonempty_line(previous.get("text", ""))
+                == str(previous.get("section_name", "")).strip()
+                and first_line != str(record.get("section_name", "")).strip()
+                and len(previous_pages) < IndexingService.MAX_CONTINUATION_PAGES
+            )
+            if not continues_section:
+                merged.append(record)
+                continue
+            previous["text"] = f'{previous.get("text", "")}\n\n{record.get("text", "")}'.strip()
+            previous["pages"] = previous_pages + list(record.get("pages") or [page])
+            page_labels = ", ".join(str(item) for item in previous["pages"])
+            previous["title"] = f'{record.get("document_id", "")} - Pages {page_labels} - {previous.get("section_name", "")}'
+        return merged
+
+    @staticmethod
+    def _first_nonempty_line(text: str) -> str:
+        return next((line.strip() for line in str(text).splitlines() if line.strip()), "")
+
+    @staticmethod
+    def preprocessing_needs_refresh(project_path: Path) -> bool:
+        """Detect processed records created before the current section heading rules."""
+        source = project_path / "processed" / "input.jsonl"
+        if not source.is_file():
+            return False
+        return any(
+            record.get("sectioning_version") != SECTIONING_FORMAT_VERSION
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+            for record in (json.loads(line),)
+        )
+
+    @staticmethod
+    def input_needs_rebuild(project_path: Path) -> bool:
+        """Detect an existing graph input that predates continuation-page coalescing."""
+        source = project_path / "processed" / "input.jsonl"
+        indexed = project_path / "graphrag" / "input" / "input.jsonl"
+        if IndexingService.preprocessing_needs_refresh(project_path):
+            return True
+        if not source.is_file() or not indexed.is_file():
+            return False
+        current_records = [json.loads(line) for line in indexed.read_text(encoding="utf-8").splitlines() if line.strip()]
+        expected_records = IndexingService._merge_continuation_records(
+            [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        )
+        return current_records != expected_records
 
     @staticmethod
     def _configure_api_base(settings_path: Path, api_base_url: str) -> None:

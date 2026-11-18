@@ -26,6 +26,11 @@ class SourceMetadata:
     block_id: str
     text: str
     section_path: str = ""
+    pages: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        values = self.pages or (self.page,)
+        object.__setattr__(self, "pages", tuple(int(page) for page in values))
 
 
 class SourceMetadataService:
@@ -75,6 +80,9 @@ class SourceMetadataService:
             if source is None or any(field not in source for field in required):
                 missing_documents.add(graph_document_id)
                 continue
+            source_pages = source.get("pages")
+            if source_pages is None or len(source_pages) == 0:
+                source_pages = [source["page"]]
             mappings.append(
                 SourceMetadata(
                     text_unit_id=str(row["id"]),
@@ -87,6 +95,7 @@ class SourceMetadataService:
                     block_id=str(source["block_id"]),
                     text=str(row["text"]),
                     section_path=str(source.get("section_path") or source.get("section_name") or ""),
+                    pages=tuple(int(page) for page in source_pages),
                 )
             )
         if missing_documents:

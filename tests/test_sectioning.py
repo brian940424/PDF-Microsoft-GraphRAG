@@ -28,6 +28,22 @@ class SectioningTests(unittest.TestCase):
         self.assertFalse(looks_like_section_heading("輕觸完成後即可使用。"))
         self.assertTrue(looks_like_section_heading("第 2 節 強制重啟"))
 
+    def test_recognizes_mixed_case_product_name_without_splitting_generic_titles(self) -> None:
+        self.assertTrue(looks_like_section_heading("Samsung DeX"))
+        self.assertTrue(looks_like_section_heading("Galaxy AI"))
+        self.assertFalse(looks_like_section_heading("Smart View"))
+        self.assertFalse(looks_like_section_heading("The screen is off"))
+
+    def test_samsung_dex_starts_a_new_section(self) -> None:
+        sections, heading = split_into_sections(
+            "設定手機開放搜尋對象\nSmart View 功能介紹\nSamsung DeX\n使用外接鍵盤與滑鼠。",
+            "設定手機開放搜尋對象",
+        )
+
+        self.assertEqual([name for name, _ in sections], ["設定手機開放搜尋對象", "Samsung DeX"])
+        self.assertIn("Smart View 功能介紹", sections[0][1])
+        self.assertEqual(heading, "Samsung DeX")
+
     def test_removes_an_isolated_folio_near_the_start(self) -> None:
         text = remove_leading_printed_page_number("設定\n177\n變更螢幕鎖定方式\n步驟")
 

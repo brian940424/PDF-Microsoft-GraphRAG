@@ -134,6 +134,7 @@ class DocumentServiceTests(unittest.TestCase):
                 "document_id": "WW.pdf",
                 "page": 1,
                 "block_id": "b01",
+                "sectioning_version": 2,
             },
         )
         details = json.loads((processed / "report.json").read_text())

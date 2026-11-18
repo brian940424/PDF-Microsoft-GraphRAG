@@ -99,6 +99,8 @@ class StrategyRankingTests(unittest.TestCase):
 
         self.assertEqual(decision.attempt_order, ("drift", "global", "basic", "local"))
         self.assertIn('"methods"', prompts[0])
+        self.assertIn("Do not rank drift first for a single setting", prompts[0])
+        self.assertIn("Reserve drift for questions that must combine information from distinct sections", prompts[0])
 
     def test_partial_ranking_is_completed_with_default_order_without_duplicates(self) -> None:
         response = {"methods": ["global", "global", "basic"], "reason": "x"}
@@ -216,6 +218,69 @@ class SearchWithFallbackTests(unittest.TestCase):
                     StrategyDecision("local", "原因"), search, lambda _: AnswerCheck(True, "ok"),
                 )
                 self.assertEqual((tried, result.found), (["local"], True))
+
+    def test_matching_section_title_accepts_answer_without_overstrict_check(self) -> None:
+        checked: list[str] = []
+        result = search_with_fallback(
+            StrategyDecision("basic", "原因"),
+            lambda method: SearchOutcome("回答", payload={}, section_titles=("關閉螢幕時辨識指紋",)),
+            lambda answer: checked.append(answer) or AnswerCheck(False, "未找到"),
+            question="螢幕關閉時辨識指紋如何設定？",
+        )
+        self.assertEqual((result.method, result.found), ("basic", True))
+        self.assertEqual(checked, [])
+
+    def test_generic_s_pen_title_does_not_stop_fallback_for_specific_questions(self) -> None:
+        questions = (
+            "使用 S Pen 的懸浮翻譯時，要如何切換逐字或整句翻譯？",
+            "螢幕錄影時，如何在畫面上顯示 S Pen 游標？",
+            "如何用 S Pen 按鈕遠端拍照？拍照時要如何變更拍攝模式？",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                tried: list[str] = []
+
+                def search(method: str) -> SearchOutcome:
+                    tried.append(method)
+                    if method == "local":
+                        return SearchOutcome(
+                            "提供的資料未說明這項操作。", source_count=8,
+                            section_titles=("使用 S Pen",),
+                        )
+                    return SearchOutcome(
+                        "找到具體操作步驟。", source_count=3,
+                        section_titles=("使用 S Pen 拍照",),
+                    )
+
+                result = search_with_fallback(
+                    StrategyDecision("local", "specific manual lookup"), search,
+                    lambda answer: AnswerCheck("未說明" not in answer, "answer check"),
+                    question,
+                )
+
+                self.assertEqual(tried[:2], ["local", "basic"])
+                self.assertEqual((result.method, result.found), ("basic", True))
+
+    def test_unsupported_drift_does_not_override_rejected_basic_answer(self) -> None:
+        tried: list[str] = []
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            if method == "local":
+                return SearchOutcome("Local answer")
+            if method == "basic":
+                return SearchOutcome("Basic 正確答案", payload={"sources": [{"id": "1"}]})
+            return SearchOutcome("手冊未提供此設定，請查閱使用手冊。", payload={"sources": [{"id": "2"}]})
+        result = search_with_fallback(
+            StrategyDecision("local", "原因", ("local", "basic", "drift")), search,
+            lambda _: AnswerCheck(False, "答案檢查未通過"), question="如何設定？",
+        )
+        self.assertEqual(tried, ["local", "basic", "drift", "global"])
+        self.assertFalse(result.found)
+        self.assertEqual(result.outcome.answer, NOT_FOUND_ANSWER)
+        self.assertEqual(
+            [item["status"] for item in result.attempts],
+            ["not_found", "not_found", "not_found", "not_found"],
+        )
 
 
 class AnswerCheckPromptTests(unittest.TestCase):
