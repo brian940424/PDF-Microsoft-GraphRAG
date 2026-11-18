@@ -31,6 +31,20 @@ class Evidence:
     variant: str = ""
     # Set when code, not retrieval, added the item: "duplicate_passage" (F-59) counts as cited.
     added_by: str = ""
+    pages: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pages", tuple(int(page) for page in self.pages))
+
+
+def evidence_page_label(evidence: Evidence) -> str | None:
+    """Format one or multiple original PDF pages for compact evidence tables."""
+    pages = sorted(set(evidence.pages or ((evidence.page,) if evidence.page is not None else ())))
+    if not pages:
+        return None
+    if pages == list(range(pages[0], pages[-1] + 1)) and len(pages) > 1:
+        return f"{pages[0]}–{pages[-1]}"
+    return ", ".join(str(page) for page in pages)
 
 
 def section_path_with_variant(section_path: str, variant: str) -> str:
@@ -96,6 +110,7 @@ class EvidenceService:
                         text=source_metadata.text,
                         section_path=section_path_with_variant(source_metadata.section_path, variant),
                         variant=variant,
+                        pages=source_metadata.pages or (source_metadata.page,),
                     )
                 )
         if result:
