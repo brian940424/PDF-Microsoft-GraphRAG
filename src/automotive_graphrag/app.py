@@ -19,6 +19,7 @@ import gradio as gr
 from PIL import Image
 
 from .automatic_evaluation import (
+    RUBRIC_MAX_LEVEL,
     AutomaticEvaluationService,
     JudgeScore,
     extra_error_share,
@@ -47,7 +48,7 @@ from .documents import (
     PageReview,
 )
 from .downloads import stage_downloads
-from .evidence import evidence_page_label
+from .evidence import Evidence, evidence_page_label
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService, parse_indexing_progress
 from .evaluation.source_scoring import cited_sources, strip_citations
@@ -1064,6 +1065,71 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if "error" in outcome:
             raise outcome["error"]
         return query_result_outputs(outcome["result"])
+
+    def grade_manual_answer(
+        project_id: str | None,
+        question: str,
+        system_answer: str,
+        reference_answer: str,
+        answer_sources: str,
+        judge_models: object,
+        evaluation_mode: str | None,
+        reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
+        evidence_values: list | None = None,
+    ) -> str:
+        """Score the answer shown in the Q&A tab like a question-set evaluation; nothing is saved."""
+        if not project_id:
+            return "❌ 請先選擇已完成建圖的專案"
+        missing = [
+            label for label, value in (("問題", question), ("系統回答", system_answer), ("正確答案", reference_answer))
+            if not (value or "").strip()
+        ]
+        if missing:
+            return f"❌ 請先填寫：{'、'.join(missing)}"
+        models = list(parse_judge_models(judge_models))
+        if not models:
+            return "❌ 請至少選擇一個評測模型"
+        try:
+            gold = parse_autoqa_sources(answer_sources, ())
+            retrieved = [Evidence(**item) for item in evidence_values or []]
+            result = automatic_evaluation.evaluate_manual_answer(
+                project_id, question.strip(), reference_answer.strip(), system_answer.strip(), models,
+                retrieved=retrieved, answer_sources=gold,
+                evaluation_mode=evaluation_mode or "strict",
+                reasoning_effort=reasoning_effort or DEFAULT_REASONING_EFFORT,
+            )
+        except ProjectError as exc:
+            return f"❌ 評分失敗：{exc}"
+
+        def level(score: float) -> str:
+            return f"Level {round(score * RUBRIC_MAX_LEVEL)}（{score:.0%}）"
+
+        verdict = "✅ 正確" if result.is_correct else "❌ 不正確"
+        if not gold:
+            source = "—（未填答案來源）"
+        elif result.source_score is None:
+            source = "—（本次回答沒有可比對的文字證據）"
+        else:
+            source = f"{result.source_score:.0%}"
+        mode_label = "寬鬆" if evaluation_mode == "lenient" else "嚴格"
+        lines = [
+            f"**LLM 分數：{level(result.score)}｜{verdict}**",
+            f"**來源分數：** {source}｜**綜合分數：** {result.final_score:.0%}",
+            f"* 系統引用：{_autoqa_source_pages(cited_sources(system_answer, retrieved))}",
+            "* 正確來源：" + _autoqa_source_pages([
+                {"document_name": item.document_name or item.document_id, "pages": item.pages} for item in gold
+            ]),
+            f"評分方式：{mode_label}｜評審：{len(result.judges)} 個",
+            "",
+        ]
+        for judge in result.judges:
+            name = judge_model_label(judge.model)
+            if judge.score is None:
+                lines.append(f"- **`{name}`**：⚠️ 失敗（不計入平均）｜{judge.error}")
+            else:
+                extra = "（含正確答案未提及的內容）" if judge.extra_content_error else ""
+                lines.append(f"- **`{name}`**：{level(judge.score)}{extra}｜{judge.reason}")
+        return "\n".join(lines)
 
     def query_result_outputs(query_result):
         hidden = gr.Group(visible=False)
@@ -4478,7 +4544,37 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         elem_id="query-answer",
                     )
                     query_summary = gr.Markdown(label="查詢資訊", elem_id="query-summary", elem_classes=["collapse-when-empty"])
-            
+
+            with gr.Accordion("評分本次回答", open=False):
+                query_reference_answer = gr.Textbox(
+                    label="正確答案", lines=4,
+                    placeholder="輸入此題的正確答案，評測模型會依 0–5 級標準比對上方「系統回答」",
+                )
+                query_answer_sources = gr.Textbox(
+                    label="答案來源（選填）",
+                    placeholder="文件名稱: 頁碼, 頁碼；多份文件以「；」分隔。填寫後會比對回答引用的來源頁（容許 ±1 頁）並計算來源分數",
+                )
+                query_judge_model = gr.Dropdown(
+                    choices=judge_model_choices(), value=autoqa_judge_model_state()[0], label="評測模型",
+                    multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
+                )
+                with gr.Row():
+                    query_judge_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=judge_supports_reasoning(autoqa_judge_model_state()[0]),
+                        info="僅套用到支援推理深度的評審",
+                    )
+                    query_evaluation_mode = gr.Dropdown(
+                        choices=[("嚴格評分", "strict"), ("寬鬆評分（答案完整包含即正確）", "lenient")],
+                        value="strict", label="評分方式",
+                    )
+                query_judge_model.change(
+                    lambda model: gr.update(visible=judge_supports_reasoning(model)),
+                    inputs=query_judge_model, outputs=query_judge_effort,
+                )
+                query_grade_button = gr.Button("評分", variant="primary")
+                query_grade_result = gr.Markdown(elem_classes=["collapse-when-empty"])
+
             with gr.Group(visible=False) as query_evidence_group:
                 gr.Markdown("### Evidence 詳情")
                 query_evidence_state = gr.State([])
@@ -5798,9 +5894,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
             outputs=[autoqa_result, autoqa_json_export],
         )
+        query_grade_button.click(
+            grade_manual_answer,
+            inputs=[
+                query_project, question, query_answer, query_reference_answer, query_answer_sources,
+                query_judge_model, query_evaluation_mode, query_judge_effort, query_evidence_state,
+            ],
+            outputs=query_grade_result,
+        )
+        # A grade belongs to the answer it judged; drop it whenever the answer is replaced.
+        query_history_table.select(lambda: "", outputs=query_grade_result, show_progress="hidden")
+        clear_question_button.click(
+            lambda: ("", "", ""), outputs=[query_reference_answer, query_answer_sources, query_grade_result],
+            show_progress="hidden",
+        )
         ask_button.click(
-            lambda: ("", "", gr.Group(visible=False)),
-            outputs=[query_answer, query_summary, query_evidence_group],
+            lambda: ("", "", gr.Group(visible=False), ""),
+            outputs=[query_answer, query_summary, query_evidence_group, query_grade_result],
             show_progress="hidden",
         ).then(
             ask_question,

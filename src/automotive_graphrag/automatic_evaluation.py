@@ -589,6 +589,62 @@ class AutomaticEvaluationService:
         case = BatchQuestion(question_id, question, correct_answer, answer=system_answer)
         return self._judge_answer(project_id, case, model, evaluation_mode, reasoning_effort)
 
+    def evaluate_manual_answer(
+        self,
+        project_id: str,
+        question: str,
+        correct_answer: str,
+        system_answer: str,
+        models: object,
+        retrieved: Sequence[object] = (),
+        answer_sources: Sequence[object] = (),
+        evaluation_mode: str = "strict",
+        reasoning_effort: str = "medium",
+        source_weight: float = DEFAULT_SOURCE_WEIGHT,
+    ) -> AutomaticEvaluationItem:
+        """Score one ad-hoc answer the way a question-set evaluation scores a question.
+
+        Every judge grades the answer in parallel and the judge score is the average of the
+        judges that succeeded; the cited sources (``retrieved`` evidence the answer cites) are
+        compared with ``answer_sources`` and combined like ``evaluate``. Nothing is saved."""
+        models = self.validate_judge_models(models)
+        question_id = "MANUAL"
+
+        def judge(model: str) -> JudgeScore:
+            try:
+                grade = self.evaluate_single_answer_grade(
+                    project_id, question_id, question, correct_answer, system_answer,
+                    model, evaluation_mode, reasoning_effort,
+                )
+            except Exception as exc:  # noqa: BLE001 - one judge failing keeps the others' scores
+                return JudgeScore(model, None, "", str(exc))
+            return JudgeScore(
+                model, grade.rubric_score, grade.judge_reason, extra_content_error=grade.extra_content_error,
+            )
+
+        with ThreadPoolExecutor(max_workers=len(models)) as pool:
+            judges = tuple(pool.map(judge, models))
+        if all(item.score is None for item in judges):
+            raise ProjectError("；".join(
+                (f"{judge_model_label(item.model)} " if len(judges) > 1 else "") + str(item.error)
+                for item in judges
+            ))
+        average = average_judge_score(judges)
+        source = source_score(
+            system_answer, retrieved, answer_sources,
+            project_document_only_score(self.projects, project_id),
+            PageEquivalence(self.projects.path_for(project_id)),
+        ) if answer_sources else None
+        return AutomaticEvaluationItem(
+            question_id=question_id,
+            is_correct=average >= CORRECT_SCORE,
+            judge_reason=combined_judge_reason(judges),
+            judges=judges,
+            average_score=average,
+            source_score=source,
+            combined_score=combined_score(average, source, source_weight, extra_error_share(judges)),
+        )
+
     def _judge_answer(
         self, project_id: str, case: BatchQuestion, model: str, evaluation_mode: str, reasoning_effort: str,
     ) -> AutomaticEvaluationGrade:
