@@ -165,7 +165,7 @@ class QueryServiceTests(unittest.TestCase):
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v7")
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v8")
 
     def write_text_units(self, *texts: str) -> None:
         pd.DataFrame({"text": list(texts)}).to_parquet(self.graph_root / "output" / "text_units.parquet")
@@ -242,10 +242,10 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(service.history("L33-SM3E"), [result])
 
     def test_auto_query_falls_back_in_ranked_order_and_stops_at_first_answer(self) -> None:
-        runner = ScriptedRunner({"basic": "資料中沒有", "local": None, "global": "找到了", "drift": "不該執行"})
+        runner = ScriptedRunner({"basic": "資料中沒有 [Data: Sources (1)]", "local": None, "global": "找到了 [Data: Sources (1)]", "drift": "不該執行"})
         router = FakeRouter(
             StrategyDecision("basic", "單一數值", ("basic", "local", "global", "drift")),
-            refusals=("資料中沒有",),
+            refusals=("資料中沒有 [Data: Sources (1)]",),
         )
         service = QueryService(
             self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
@@ -254,8 +254,8 @@ class QueryServiceTests(unittest.TestCase):
         result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
 
         self.assertEqual(runner.methods, ["basic", "local", "global"])
-        self.assertEqual(router.checked, ["資料中沒有", "找到了"])
-        self.assertEqual((result.status, result.method, result.answer), ("COMPLETED", "global", "找到了"))
+        self.assertEqual(router.checked, ["資料中沒有 [Data: Sources (1)]", "找到了 [Data: Sources (1)]"])
+        self.assertEqual((result.status, result.method, result.answer), ("COMPLETED", "global", "找到了 [Data: Sources (1)]"))
         self.assertEqual(result.requested_method, "auto")
         self.assertEqual(result.context["sources"][0]["id"], "global")
         self.assertEqual(len(result.evidence), 1)
@@ -274,7 +274,7 @@ class QueryServiceTests(unittest.TestCase):
         class UsageRunner:
             def __call__(self, command: list[str]) -> QueryExecution:
                 method = command[command.index("--method") + 1]
-                answer = "找到了" if method == "local" else "資料中沒有"
+                answer = "找到了 [Data: Sources (1)]" if method == "local" else "資料中沒有 [Data: Sources (1)]"
                 return QueryExecution(0, answer, "", {"sources": [{"id": str(i)} for i in range(8)]},
                                       (usage("search", 1000),))
 
@@ -284,7 +284,7 @@ class QueryServiceTests(unittest.TestCase):
                                         (usage("routing", 10),))
 
             def check_answer(self, question: str, answer: str, *_: object) -> AnswerCheck:
-                return AnswerCheck(answer != "資料中沒有", "檢查", (usage("answer_check", 20),))
+                return AnswerCheck(answer != "資料中沒有 [Data: Sources (1)]", "檢查", (usage("answer_check", 20),))
 
         service = QueryService(
             self.store, UsageRunner(), self.connections, evidence_service=FakeEvidenceService(),
@@ -304,7 +304,7 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(metadata["cost_status"], "measured")
 
     def test_auto_query_skips_local_answer_built_on_too_few_sources(self) -> None:
-        runner = ScriptedRunner({"local": "相簿群組的步驟", "basic": "聯絡人群組的步驟", "global": "不該執行", "drift": "不該執行"})
+        runner = ScriptedRunner({"local": "相簿群組的步驟", "basic": "聯絡人群組的步驟 [Data: Sources (1)]", "global": "不該執行", "drift": "不該執行"})
         router = FakeRouter(StrategyDecision("local", "具體事實"))
         service = QueryService(
             self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
@@ -313,8 +313,8 @@ class QueryServiceTests(unittest.TestCase):
         result = service.ask("L33-SM3E", "如何建立聯絡人群組？", method="auto", chat_model="gpt-4.1-mini")
 
         self.assertEqual(runner.methods, ["local", "basic"])
-        self.assertEqual(router.checked, ["聯絡人群組的步驟"])
-        self.assertEqual((result.method, result.answer), ("basic", "聯絡人群組的步驟"))
+        self.assertEqual(router.checked, ["聯絡人群組的步驟 [Data: Sources (1)]"])
+        self.assertEqual((result.method, result.answer), ("basic", "聯絡人群組的步驟 [Data: Sources (1)]"))
         attempts = result.execution_metadata["strategy_attempts"]
         self.assertEqual([(item["method"], item["status"]) for item in attempts], [("local", "not_found"), ("basic", "found")])
         self.assertIn("只取得 1 個原文段落", attempts[0]["detail"])

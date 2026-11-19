@@ -519,7 +519,7 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         received = []
         self.service.router = FakeRouter()  # type: ignore[assignment]
-        self.service.query_function = lambda *args: (received.append(args) or "回答", {})
+        self.service.query_function = lambda *args: (received.append(args) or "回答 [Data: Sources (1)]", {})
         state = self.service.add_group("project")
         group_id = state["groups"][0]["group_id"]
         self.service.set_group_method("project", group_id, "auto")
@@ -585,14 +585,14 @@ class RetrievalExperimentTests(unittest.TestCase):
             received.append(args[2])
             if args[2] == "local":
                 return ("來源未說明，只提到別的功能", {"sources": [{"id": str(index)} for index in range(3)]})
-            return ("回答", {"sources": [{"id": str(index)} for index in range(10)]})
+            return ("回答 [Data: Sources (1)]", {"sources": [{"id": str(index)} for index in range(10)]})
 
         self.service.query_function = query
 
         result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
 
         self.assertEqual(received, ["local", "basic"])
-        self.assertEqual((result.routed_method, result.actual_answer), ("basic", "回答"))
+        self.assertEqual((result.routed_method, result.actual_answer), ("basic", "回答 [Data: Sources (1)]"))
         self.assertEqual(
             [(item["method"], item["status"]) for item in result.execution_trace["strategy_attempts"]],
             [("local", "not_found"), ("basic", "found")],

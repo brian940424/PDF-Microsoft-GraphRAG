@@ -52,6 +52,8 @@ class AnswerPromptTests(unittest.TestCase):
             "qualifiers inside the same sentence or step as the asked content are kept",
             # v7 (F-60): sentence-level citations and the source of the question's situation
             "Cite sentence by sentence", "cite the source that establishes the situation in the question",
+            # v8 (B-14): no general knowledge, even where the GraphRAG base prompt invites it
+            "replace any earlier instruction to incorporate general knowledge", 'never write a "General Knowledge" citation',
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 
