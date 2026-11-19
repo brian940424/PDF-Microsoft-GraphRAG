@@ -360,6 +360,11 @@ class PageReviewUiTests(unittest.TestCase):
         self.assertEqual((message, page, text_value), ("", 2, ""))
         self.assertEqual(self.functions["review_refresh"]("L33-SM3E", "A.pdf", "全部", 1)[2], "甲頁")
         self.assertIn("已是最後一頁", self.functions["review_save_next"]("L33-SM3E", "A.pdf", "全部", 3, "", None, True)[0])
+        # The table refresh after 下一頁 keeps the PDF selection; resetting it to the (empty)
+        # pending PDFs would hide the review section.
+        _, rows, targets, _ = self.functions["document_view_keeping_options"]("L33-SM3E")
+        self.assertIsInstance(rows, type(gr.skip()))
+        self.assertIsInstance(targets, type(gr.skip()))
 
         # 重新前處理 restores the preprocessing interface.
         locked, reprocess, preprocess, *_rest, save_next, text, _, _, _ = mode("L33-SM3E", True)

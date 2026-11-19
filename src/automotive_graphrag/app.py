@@ -5334,9 +5334,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         review_page_outputs = [review_image, review_text, review_info]
 
         def document_view_keeping_options(project_id: str | None):
-            # Re-rendering the options table here would drop margins typed but not yet saved.
-            table, _rows, targets, notice = document_view(project_id)
-            return table, gr.skip(), targets, notice
+            # Re-rendering the options table here would drop margins typed but not yet saved, and
+            # resetting the PDF selection to the pending PDFs would hide the review being used
+            # (after indexing nothing is pending). Page edits never add or remove PDFs.
+            table, _rows, _targets, notice = document_view(project_id)
+            return table, gr.skip(), gr.skip(), notice
 
         # .input, not .change: review_sync/review_pick set the filter themselves and already refresh the page.
         review_filter.input(review_refresh, inputs=review_inputs, outputs=review_outputs)
