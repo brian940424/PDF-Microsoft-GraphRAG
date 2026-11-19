@@ -161,6 +161,10 @@ APP_CSS = """
     padding: var(--spacing-xl) var(--block-padding) !important;
     gap: var(--spacing-xl) !important;
 }
+/* 建圖完成後的檢視模式隱藏編輯按鈕；用 class 而非 visible，避免工作按鈕的狀態輪詢把按鈕重新顯示 */
+.mode-hidden {
+    display: none !important;
+}
 /* 按鈕列總寬與上方元件對齊 */
 .button-row.flush-row {
     padding-left: 0 !important;
@@ -3612,9 +3616,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def review_save_next(
         project_id: str | None, filename: str | None, review_filter: str | None, page: object, text: str | None,
-        option_rows: object | None = None,
+        option_rows: object | None = None, locked: bool = False,
     ):
-        """Save the page, then move to the next page matching the filter."""
+        """Save the page, then move to the next page matching the filter.
+
+        In the read-only view after indexing (``locked``) the page is not saved, only stepped.
+        """
+        if locked:
+            target, *view = review_step(project_id, filename, review_filter, page, 1, option_rows)
+            last = target is not None and page not in (None, "") and target == int(page)
+            return ("已是最後一頁" if last else ""), target, *view
         message = review_save(project_id, filename, page, text)
         if message.startswith("❌"):
             return message, *(gr.skip(),) * 4
@@ -3622,6 +3633,35 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if target == int(page):
             message += "；已是最後一頁"
         return message, target, *view
+
+    def review_mode_view(project_id: str | None, reprocess_requested: bool = False):
+        """Read-only page review once every PDF is in the graph, until 重新前處理 is pressed.
+
+        Outputs: locked flag, 重新前處理, 開始前處理, the editing buttons (Vision, retry Vision,
+        text layer, revert), the save/next button, the editor and the Vision settings.
+        """
+        items = documents.list_documents_if_available(project_id)
+        locked = bool(items) and all(item.preprocessed and item.indexed for item in items) and not reprocess_requested
+        # Hidden with a class: running_job_views re-shows idle start buttons by visibility.
+        hidden = gr.update(elem_classes=["mode-hidden"] if locked else [])
+        return (
+            locked,
+            gr.update(visible=locked),
+            hidden,
+            hidden, hidden, hidden, hidden,
+            gr.update(
+                value="下一頁 ▶" if locked else "儲存並前往下一頁 ▶",
+                variant="secondary" if locked else "primary",
+            ),
+            gr.update(
+                interactive=not locked,
+                label=(
+                    "解析結果（已建圖，僅供對照；要修改請按「重新前處理」）" if locked
+                    else "解析結果（可直接修改，此為送去建圖的文字）"
+                ),
+            ),
+            gr.update(interactive=not locked), gr.update(interactive=not locked), gr.update(interactive=not locked),
+        )
 
     def review_extract(
         project_id: str | None, filename: str | None, page: object, use_vision: bool,
@@ -4239,7 +4279,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         with gr.Row(elem_classes=["button-row", "flush-row"]):
                             upload_button = gr.Button("上傳", variant="primary", elem_classes="rounded-button")
                             cancel_upload_button = gr.Button("取消", elem_classes="rounded-button")
+            # 建圖完成後逐頁檢查只供對照（唯讀）；按「重新前處理」才恢復前處理與修改功能
+            review_locked = gr.State(False)
+            reprocess_requested = gr.State(False)
             with gr.Row():
+                reprocess_button = gr.Button("重新前處理", variant="primary", visible=False)
                 preprocess_button = gr.Button("開始前處理", variant="primary")
                 preprocess_stop_button = gr.Button(JOB_BUTTON_LABELS["preprocess"][1], variant="stop", visible=False)
                 index_button = gr.Button("建立 Graph", variant="primary")
@@ -5261,11 +5305,30 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[document_project, processing_options_table, review_document, review_filter, review_page],
             outputs=[review_document, review_page, review_image, review_text, review_info, review_filter],
         )
+        review_mode_event = dict(
+            fn=review_mode_view,
+            inputs=[document_project, reprocess_requested],
+            outputs=[
+                review_locked, reprocess_button, preprocess_button,
+                review_vision_button, review_retry_vision_button, review_text_layer_button, review_revert_button,
+                review_save_next_button, review_text, vision_model, vision_reasoning_effort, vision_scope,
+            ],
+            show_progress="hidden",
+        )
         documents_tab.select(
             documents_tab_visibility,
             inputs=[document_project, target_documents],
             outputs=[document_table, document_empty_notice, processing_options_section],
-        ).then(**review_sync_event)
+        ).then(**review_sync_event).then(**review_mode_event)
+        # Every document_view refresh (open project, upload, delete, preprocess, index) updates the
+        # table, so the review mode follows whether all PDFs are in the graph.
+        document_table.change(**review_mode_event)
+        active_project_id.change(lambda: False, outputs=reprocess_requested, show_progress="hidden").then(
+            **review_mode_event
+        )
+        reprocess_button.click(lambda: True, outputs=reprocess_requested, show_progress="hidden").then(
+            **review_mode_event
+        )
         review_inputs = [document_project, review_document, review_filter, review_page, processing_options_table]
         review_outputs = [review_page, review_image, review_text, review_info]
         review_page_outputs = [review_image, review_text, review_info]
@@ -5298,7 +5361,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         review_previous.click(review_previous_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
         review_save_next_button.click(
             review_save_next,
-            inputs=[document_project, review_document, review_filter, review_page, review_text, processing_options_table],
+            inputs=[
+                document_project, review_document, review_filter, review_page, review_text, processing_options_table,
+                review_locked,
+            ],
             outputs=[review_status, *review_outputs],
         ).then(**review_filter_counts).then(document_view_keeping_options, inputs=document_project, outputs=document_view_outputs)
         review_revert_button.click(
@@ -5361,9 +5427,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             lambda message: gr.update(visible=str(message or "").startswith("❌")),
             inputs=document_result, outputs=indexing_log, show_progress="hidden",
+        ).then(
+            # A finished graph returns the review to read-only; a failed one stays editable anyway.
+            lambda: False, outputs=reprocess_requested, show_progress="hidden",
         ).then(document_view, inputs=document_project, outputs=document_view_outputs).then(
             processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section
-        )
+        ).then(**review_mode_event)
         document_refresh_button.click(
             document_view,
             inputs=document_project,
