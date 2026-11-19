@@ -275,7 +275,7 @@ docker run --rm --name automotive-graphrag-portal --env-file .env -p 7860:7860 -
 - Chat 預設使用 `gpt-6-luna`；也可在連線設定中勾選 proxy 提供的其他模型。
 - Embedding 使用 `text-embedding-3-small`。
 - 題目生成先縮小頁碼、章節及取樣數量。
-- 自動評測使用既有回答，不要勾選重新執行系統回答。
+- 回答與評測分開執行：「3 自動問答測試」的「③ 評測回答」與「4 檢索實驗」的評測都只使用既有回答，調整評審設定時不必重新產生回答。
 - 系統的題目生成與 Judge 均以每批一次 API 呼叫為設計目標。
 
 ## 非 Docker 啟動方式
@@ -287,7 +287,8 @@ docker run --rm --name automotive-graphrag-portal --env-file .env -p 7860:7860 -
 Linux／macOS：
 
 ```bash
-python3 -m venv .venv
+python3.12 --version   # 需 3.11 以上；沒有 3.12 時可改用 python3.11
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e ".[test]"
@@ -332,10 +333,10 @@ Windows PowerShell（單行）：
 $env:GRADIO_SERVER_PORT="7860"; .\.venv\Scripts\automotive-graphrag.exe
 ```
 
-啟動管理後台：
+啟動管理後台（與一般入口同時執行時需用不同連接埠）：
 
 ```bash
-automotive-graphrag-admin
+GRADIO_SERVER_PORT=7861 automotive-graphrag-admin
 ```
 
 Windows PowerShell（請在另一個視窗執行，單行）：
