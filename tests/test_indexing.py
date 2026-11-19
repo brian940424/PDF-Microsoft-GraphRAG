@@ -144,6 +144,34 @@ class IndexingServiceTests(unittest.TestCase):
         self.assertEqual(indexed[1]["page"], 127)
         self.assertNotIn("pages", indexed[1])
 
+    def test_graph_input_built_before_heading_context_is_not_stale(self) -> None:
+        project_path = self.store.path_for("L33-SM3E")
+        records = [
+            {"id": "p216", "title": "T", "text": "AV CONTROL UNIT\nReference Value\nINFOID:1\nPHYSICAL VALUES\nBody.",
+             "document_id": "AV.pdf", "page": 216, "block_id": "b01", "section_id": "AV", "section_name": "AV",
+             "section_path": "AV", "sectioning_version": SECTIONING_FORMAT_VERSION},
+            {"id": "p217", "title": "T", "text": "| 25 (G) | Reverse signal | Battery voltage |",
+             "document_id": "AV.pdf", "page": 217, "block_id": "b01", "section_id": "AV", "section_name": "AV",
+             "section_path": "AV", "sectioning_version": SECTIONING_FORMAT_VERSION},
+        ]
+        (project_path / "processed" / "input.jsonl").write_text(
+            "".join(json.dumps(item) + "\n" for item in records), encoding="utf-8",
+        )
+        graph_input = project_path / "graphrag" / "input"
+        graph_input.mkdir(parents=True)
+        legacy = IndexingService._merge_continuation_records(records)
+        (graph_input / "input.jsonl").write_text("".join(json.dumps(item) + "\n" for item in legacy), encoding="utf-8")
+
+        self.assertFalse(IndexingService.input_needs_rebuild(project_path))
+
+        IndexingService._sync_input(project_path, project_path / "graphrag")
+        indexed = [json.loads(line) for line in (graph_input / "input.jsonl").read_text().splitlines()]
+        self.assertTrue(indexed[1]["text"].startswith("AV > AV CONTROL UNIT > Reference Value > PHYSICAL VALUES\n\n"))
+        self.assertFalse(IndexingService.input_needs_rebuild(project_path))
+
+        (graph_input / "input.jsonl").write_text(json.dumps({**legacy[0], "text": "other"}) + "\n", encoding="utf-8")
+        self.assertTrue(IndexingService.input_needs_rebuild(project_path))
+
     def test_sync_input_limits_continuation_merge_to_two_pages(self) -> None:
         project_path = self.store.path_for("L33-SM3E")
         graph_root = project_path / "graphrag"
