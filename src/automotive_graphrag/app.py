@@ -51,6 +51,8 @@ from .evidence import evidence_page_label
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService, parse_indexing_progress
 from .evaluation.source_scoring import cited_sources, strip_citations
+from .project_archive import export_project as build_project_archive
+from .project_archive import import_project as restore_project_archive
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_generation import GeneratedQuestion, QuestionGenerationService
@@ -3268,6 +3270,34 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         next_active = None if project_id == active_id else active_id
         return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None, next_active), False
 
+    def export_selected_project(project_id: str | None, include_cache: bool):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return "❌ 請先選擇專案", gr.File(value=None, visible=False)
+        try:
+            archive = build_project_archive(store, project_id, include_cache=bool(include_cache))
+        except ProjectError as exc:
+            return f"❌ {exc}", gr.File(value=None, visible=False)
+        size_mb = archive.stat().st_size / 1024 / 1024
+        return (
+            f"✅ 已匯出專案 {project_id}（{size_mb:.1f} MB），請下載下方檔案",
+            gr.File(value=str(archive), visible=True),
+        )
+
+    def import_project_archive(uploaded, active_id: str | None):
+        path = uploaded if isinstance(uploaded, str) or uploaded is None else getattr(uploaded, "name", None)
+        if not path:
+            return "❌ 請先選擇要匯入的專案檔", *refresh_project_views(None, active_id), None
+        try:
+            project = restore_project_archive(store, path)
+        except ProjectError as exc:
+            return f"❌ {exc}", *refresh_project_views(None, active_id), None
+        return (
+            f"✅ 已匯入專案 {project.project_id}，可按「開啟專案」開始使用",
+            *refresh_project_views(project.project_id, active_id),
+            None,
+        )
+
     def processing_option_rows(
         project_id: str | None,
         targets: list[str] | None,
@@ -4151,9 +4181,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     with gr.Row(elem_classes="button-row"):
                         open_project_button = gr.Button("開啟專案", variant="primary", elem_classes="rounded-button")
                         update_project_enabled_button = gr.Button("更新啟用狀態", elem_classes="rounded-button")
+                        export_project_button = gr.Button("匯出專案", elem_classes="rounded-button")
                         delete_button = gr.Button("刪除專案", variant="stop", elem_classes="rounded-button")
+                    export_include_cache = gr.Checkbox(
+                        label="匯出時包含 GraphRAG LLM 快取",
+                        info="快取檔案較大；只有在匯入後要重新建圖並沿用既有 LLM 結果時才需要。已建圖的結果一律會匯出。",
+                        value=False,
+                    )
+                    project_export_file = gr.File(label="專案匯出檔", visible=False, interactive=False)
                     # 由刪除按鈕的確認對話框寫入，不顯示於畫面
                     delete_confirmation = gr.Checkbox(visible=False)
+                with gr.Accordion("匯入專案", open=False):
+                    project_import_file = gr.File(
+                        label="專案匯出檔（由本系統「匯出專案」產生的 .zip）",
+                        file_types=[".zip"],
+                        type="filepath",
+                    )
+                    with gr.Row(elem_classes="button-row"):
+                        import_project_button = gr.Button("匯入專案", variant="primary", elem_classes="rounded-button")
                 open_project_result = gr.Markdown()
                 project_activation_result = gr.Markdown()
 
@@ -5229,9 +5274,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 project_enabled_value(selected_project_id(project_id)),
                 gr.Group(visible=project_id == NEW_PROJECT_OPTION),
                 gr.Button(visible=project_id != NEW_PROJECT_OPTION),
+                gr.Button(visible=project_id != NEW_PROJECT_OPTION),
+                gr.File(value=None, visible=False),
             ),
             inputs=selected_project,
-            outputs=[selected_project_details, project_enabled, new_project_group, delete_button],
+            outputs=[selected_project_details, project_enabled, new_project_group, delete_button,
+                     export_project_button, project_export_file],
+        )
+        export_project_button.click(
+            export_selected_project,
+            inputs=[selected_project, export_include_cache],
+            outputs=[result, project_export_file],
+        )
+        import_project_button.click(
+            import_project_archive,
+            inputs=[project_import_file, active_project_id],
+            outputs=[result, project_table, selected_project, selected_project_details,
+                     active_project_id, active_project_banner, project_import_file],
         )
         update_project_enabled_button.click(
             update_project_enabled,
