@@ -12,7 +12,7 @@ import queue
 import threading
 import time
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import gradio as gr
@@ -89,6 +89,28 @@ AUTOQA_GENERATE_OPTION = "__generate_questions__"
 AUTOQA_GENERATE_LABEL = "+ 自動生成題目..."
 AUTOQA_ACTION_OPTIONS = (AUTOQA_IMPORT_OPTION, AUTOQA_GENERATE_OPTION)
 EXPERIMENT_IMPORT_OPTION = AUTOQA_IMPORT_OPTION
+DISPLAY_TIMEZONE = timezone(timedelta(hours=8), "Asia/Taipei")
+"""Timestamps are stored in UTC and shown in Taiwan time (no daylight saving), whatever the host's zone."""
+
+
+def display_time(value: object, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """ISO timestamp in Taiwan time; naive values are taken as UTC and unparsable ones kept as is."""
+    if not value:
+        return ""
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except ValueError:
+        return str(value)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(DISPLAY_TIMEZONE).strftime(fmt)
+
+
+def project_table_rows(store: ProjectStore) -> list[list[str | int]]:
+    """Project table rows with the update time shown in Taiwan time."""
+    return [[*row[:-1], display_time(row[-1])] for row in store.table_rows()]
+
+
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = [
@@ -928,7 +950,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     )
 
     def refresh_projects() -> list[list[str | int]]:
-        return store.table_rows()
+        return project_table_rows(store)
 
     def project_choices() -> list[tuple[str, str]]:
         return [(project.display_name, project.project_id) for project in store.list()]
@@ -1125,7 +1147,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         for judge in result.judges:
             name = judge_model_label(judge.model)
             if judge.score is None:
-                lines.append(f"- **`{name}`**：⚠️ 失敗（不計入平均）｜{judge.error}")
+                lines.append(f"\t- **`{name}`**：⚠️ 失敗（不計入平均）｜{judge.error}")
             else:
                 extra = "（含正確答案未提及的內容）" if judge.extra_content_error else ""
                 lines.append(f"- **`{name}`**：{level(judge.score)}{extra}｜{judge.reason}")
@@ -1138,7 +1160,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             method_label = f"自動 → {method_label}"
         summary = (
             f"狀態：{query_result.status}｜方法：{method_label}｜"
-            f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
+            f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{display_time(query_result.completed_at)}"
         )
         if query_result.routing_reason:
             detail_label = "Agentic 搜尋狀態" if query_result.requested_method == "agentic" else "選擇原因"
@@ -1186,7 +1208,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         records = manual_query_history(project_id)
         rows = [
             [
-                format_history_time(item.completed_at),
+                display_time(item.completed_at),
                 item.question if len(item.question) <= 60 else item.question[:60] + "…",
                 QUERY_METHOD_LABELS.get(item.method, item.method)
                 + ("（自動）" if item.requested_method == "auto" else ""),
@@ -1209,12 +1231,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             raise gr.Error(str(exc)) from exc
         gr.Info(f"已清除 {removed} 筆手動問答紀錄")
         return load_query_history(project_id)
-
-    def format_history_time(value: str) -> str:
-        try:
-            return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return value
 
     def select_query_history(project_id: str | None, query_ids: list[str], evt: gr.SelectData):
         row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
@@ -1770,10 +1786,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return gr.update(choices=[], value=None)
         choices = []
         for item in saved_sets:
-            try:
-                created = datetime.fromisoformat(item.imported_at).astimezone().strftime("%Y-%m-%d %H:%M")
-            except ValueError:
-                created = item.imported_at
+            created = display_time(item.imported_at, "%Y-%m-%d %H:%M")
             choices.append((
                 f"{item.name}｜{len(item.questions)} 題｜{created}｜{item.question_set_id[:8]}",
                 item.question_set_id,
@@ -3045,10 +3058,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             question_set = question_sets.get(project_id, question_set_id)
         except ProjectError as exc:
             return f"**目前題目集：** ❌ {exc}"
-        try:
-            created = datetime.fromisoformat(question_set.imported_at).astimezone().strftime("%Y-%m-%d %H:%M")
-        except ValueError:
-            created = question_set.imported_at
+        created = display_time(question_set.imported_at, "%Y-%m-%d %H:%M")
         return (
             f"**目前題目集：** {question_set.name}｜{len(question_set.questions)} 題｜"
             f"建立於 {created}｜ID `{question_set.question_set_id[:8]}`"
@@ -3305,13 +3315,13 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     def update_project_enabled(project_id: str | None, enabled: bool):
         project_id = selected_project_id(project_id)
         if not project_id:
-            return "❌ 請先選擇專案", store.table_rows(), {}
+            return "❌ 請先選擇專案", project_table_rows(store), {}
         try:
             project = store.set_enabled(project_id, enabled)
         except ProjectError as exc:
-            return f"❌ {exc}", store.table_rows(), project_details(project_id)
+            return f"❌ {exc}", project_table_rows(store), project_details(project_id)
         state = "啟用" if project.enabled else "停用"
-        return f"✅ 已{state}專案 {project.project_id}", store.table_rows(), asdict(project)
+        return f"✅ 已{state}專案 {project.project_id}", project_table_rows(store), asdict(project)
 
     def refresh_project_views(project_id: str | None, active_id: str | None):
         available_ids = {project.project_id for project in store.list()}
@@ -3319,7 +3329,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         active = active_id if active_id in available_ids else None
         choices = project_selector_choices()
         return (
-            store.table_rows(),
+            project_table_rows(store),
             gr.Dropdown(choices=choices, value=selected),
             project_details(selected),
             active,
@@ -4192,7 +4202,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             selector = gr.Dropdown(choices=project_selector_choices())
             return (
                 f"❌ {exc}",
-                store.table_rows(),
+                project_table_rows(store),
                 project_id,
                 display_name,
                 vehicle_name,
@@ -4209,7 +4219,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         return (
             f"✅ 已建立專案 {project.project_id}",
-            store.table_rows(),
+            project_table_rows(store),
             "",
             "",
             "",
@@ -4567,6 +4577,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     query_evaluation_mode = gr.Dropdown(
                         choices=[("嚴格評分", "strict"), ("寬鬆評分（答案完整包含即正確）", "lenient")],
                         value="strict", label="評分方式",
+                        info="寬鬆模式涵蓋正解核心資訊即可，不因答案較詳細而扣錯。",
                     )
                 query_judge_model.change(
                     lambda model: gr.update(visible=judge_supports_reasoning(model)),
@@ -5894,14 +5905,25 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
             outputs=[autoqa_result, autoqa_json_export],
         )
+        # The result box collapses while empty, hiding Gradio's loading overlay; show a pending
+        # message and lock the button so the judges' wait is visible.
         query_grade_button.click(
+            lambda models: (
+                f"⏳ 評分中…（{max(len(parse_judge_models(models)), 1)} 個評審，視模型可能需要數十秒）",
+                gr.update(interactive=False),
+            ),
+            inputs=query_judge_model,
+            outputs=[query_grade_result, query_grade_button],
+            show_progress="hidden",
+        ).then(
             grade_manual_answer,
             inputs=[
                 query_project, question, query_answer, query_reference_answer, query_answer_sources,
                 query_judge_model, query_evaluation_mode, query_judge_effort, query_evidence_state,
             ],
             outputs=query_grade_result,
-        )
+            show_progress="hidden",
+        ).then(lambda: gr.update(interactive=True), outputs=query_grade_button, show_progress="hidden")
         # A grade belongs to the answer it judged; drop it whenever the answer is replaced.
         query_history_table.select(lambda: "", outputs=query_grade_result, show_progress="hidden")
         clear_question_button.click(
