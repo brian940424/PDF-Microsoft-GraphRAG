@@ -77,6 +77,9 @@ from .vision import DEFAULT_VISION_SCOPE, SCOPE_ALL, SCOPE_DIAGRAMS, SCOPE_FIGUR
 
 NEW_PROJECT_OPTION = "__new_project__"
 NEW_PROJECT_LABEL = "+ 新增專案..."
+IMPORT_PROJECT_OPTION = "__import_project__"
+IMPORT_PROJECT_LABEL = "↑ 匯入專案..."
+SPECIAL_PROJECT_OPTIONS = {NEW_PROJECT_OPTION, IMPORT_PROJECT_OPTION}
 UPLOAD_PDF_OPTION = "__upload_pdf__"
 UPLOAD_PDF_LABEL = "+ 上傳 PDF..."
 AUTOQA_IMPORT_OPTION = "__import_question_set__"
@@ -930,10 +933,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return [(project.display_name, project.project_id) for project in store.list()]
 
     def project_selector_choices() -> list[tuple[str, str]]:
-        return [*project_choices(), (NEW_PROJECT_LABEL, NEW_PROJECT_OPTION)]
+        return [*project_choices(), (NEW_PROJECT_LABEL, NEW_PROJECT_OPTION), (IMPORT_PROJECT_LABEL, IMPORT_PROJECT_OPTION)]
 
     def selected_project_id(project_id: str | None) -> str | None:
-        return None if project_id == NEW_PROJECT_OPTION else project_id
+        return None if project_id in SPECIAL_PROJECT_OPTIONS else project_id
 
     def api_key_ready(project_id: str | None) -> bool:
         try:
@@ -3246,7 +3249,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def refresh_project_views(project_id: str | None, active_id: str | None):
         available_ids = {project.project_id for project in store.list()}
-        selected = project_id if project_id in available_ids or project_id == NEW_PROJECT_OPTION else None
+        selected = project_id if project_id in available_ids or project_id in SPECIAL_PROJECT_OPTIONS else None
         active = active_id if active_id in available_ids else None
         choices = project_selector_choices()
         return (
@@ -4183,22 +4186,11 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         update_project_enabled_button = gr.Button("更新啟用狀態", elem_classes="rounded-button")
                         export_project_button = gr.Button("匯出專案", elem_classes="rounded-button")
                         delete_button = gr.Button("刪除專案", variant="stop", elem_classes="rounded-button")
-                    export_include_cache = gr.Checkbox(
-                        label="匯出時包含 GraphRAG LLM 快取",
-                        info="快取檔案較大；只有在匯入後要重新建圖並沿用既有 LLM 結果時才需要。已建圖的結果一律會匯出。",
-                        value=False,
-                    )
+                    # 由匯出按鈕的確認對話框寫入（是否包含 LLM 快取），不顯示於畫面
+                    export_include_cache = gr.Checkbox(visible=False)
                     project_export_file = gr.File(label="專案匯出檔", visible=False, interactive=False)
                     # 由刪除按鈕的確認對話框寫入，不顯示於畫面
                     delete_confirmation = gr.Checkbox(visible=False)
-                with gr.Accordion("匯入專案", open=False):
-                    project_import_file = gr.File(
-                        label="專案匯出檔（由本系統「匯出專案」產生的 .zip）",
-                        file_types=[".zip"],
-                        type="filepath",
-                    )
-                    with gr.Row(elem_classes="button-row"):
-                        import_project_button = gr.Button("匯入專案", variant="primary", elem_classes="rounded-button")
                 open_project_result = gr.Markdown()
                 project_activation_result = gr.Markdown()
 
@@ -4213,7 +4205,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         description = gr.Textbox(label="說明", lines=3)
                         with gr.Row(elem_classes="button-row"):
                             create_button = gr.Button("建立專案", variant="primary", elem_classes="rounded-button")
-            # 建立與刪除專案的結果
+            with gr.Group(visible=False) as import_project_group:
+                with gr.Accordion("匯入專案", open=True, elem_classes=["static-section", "bold-title"]):
+                    with gr.Group():
+                        project_import_file = gr.File(
+                            label="專案匯出檔（由本系統「匯出專案」產生的 .zip）",
+                            file_types=[".zip"],
+                            type="filepath",
+                        )
+                        with gr.Row(elem_classes="button-row"):
+                            # 檔案上傳完成前停用，避免在上傳途中送出空值
+                            import_project_button = gr.Button(
+                                "匯入專案", variant="primary", interactive=False, elem_classes="rounded-button"
+                            )
+            # 建立、匯入與刪除專案的結果
             result = gr.Markdown()
 
             with gr.Accordion("專案清單", open=True, elem_classes=["static-section", "bold-title"]):
@@ -5271,20 +5276,40 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         selected_project.change(
             lambda project_id: (
                 project_details_view(selected_project_id(project_id)),
-                project_enabled_value(selected_project_id(project_id)),
+                gr.Checkbox(
+                    value=project_enabled_value(selected_project_id(project_id)),
+                    visible=project_id not in SPECIAL_PROJECT_OPTIONS,
+                ),
+                gr.Button(visible=project_id not in SPECIAL_PROJECT_OPTIONS),
+                gr.Button(visible=project_id not in SPECIAL_PROJECT_OPTIONS),
                 gr.Group(visible=project_id == NEW_PROJECT_OPTION),
-                gr.Button(visible=project_id != NEW_PROJECT_OPTION),
-                gr.Button(visible=project_id != NEW_PROJECT_OPTION),
+                gr.Group(visible=project_id == IMPORT_PROJECT_OPTION),
+                gr.Button(visible=project_id not in SPECIAL_PROJECT_OPTIONS),
+                gr.Button(visible=project_id not in SPECIAL_PROJECT_OPTIONS),
                 gr.File(value=None, visible=False),
             ),
             inputs=selected_project,
-            outputs=[selected_project_details, project_enabled, new_project_group, delete_button,
-                     export_project_button, project_export_file],
+            outputs=[selected_project_details, project_enabled, open_project_button, update_project_enabled_button,
+                     new_project_group, import_project_group,
+                     delete_button, export_project_button, project_export_file],
         )
         export_project_button.click(
+            None,
+            outputs=export_include_cache,
+            js=(
+                "() => confirm('匯出時是否一併包含 GraphRAG LLM 快取？\\n\\n"
+                "已建圖的結果一律會匯出。快取檔案較大，只有在匯入後要重新建圖並沿用既有 LLM 結果時才需要。\\n\\n"
+                "按「確定」包含快取；按「取消」不包含快取。')"
+            ),
+        ).then(
             export_selected_project,
             inputs=[selected_project, export_include_cache],
             outputs=[result, project_export_file],
+        )
+        project_import_file.change(
+            lambda path: gr.Button(interactive=bool(path)),
+            inputs=project_import_file,
+            outputs=import_project_button,
         )
         import_project_button.click(
             import_project_archive,
