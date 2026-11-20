@@ -9,10 +9,12 @@ from automotive_graphrag.strategy_routing import (
     AnswerCheck,
     LOCAL_MIN_SOURCES,
     NOT_FOUND_ANSWER,
+    PARTIAL_ANSWER_NOTE,
     SearchOutcome,
     StrategyDecision,
     StrategyRouter,
     context_source_count,
+    evidence_page_records,
     search_with_fallback,
 )
 
@@ -133,6 +135,24 @@ class AnswerCheckTests(unittest.TestCase):
         self.assertIn("問題", prompts[0])
         self.assertIn("沒有資料", prompts[0])
 
+    def test_partial_verdict_is_parsed_only_when_not_found(self) -> None:
+        responses = {
+            "partial": {"found": False, "partial": True, "answered_parts": 1, "missing": "失效保護與解除條件", "reason": "只答出偵測條件"},
+            "found_wins": {"found": True, "partial": True, "answered_parts": 3, "missing": "x", "reason": "ok"},
+            "bad_parts": {"found": False, "partial": True, "answered_parts": True, "reason": "r"},
+            "not_partial": {"found": False, "partial": False, "answered_parts": 2, "missing": "x", "reason": "r"},
+        }
+        expected = {
+            "partial": (False, True, 1, "失效保護與解除條件"),
+            "found_wins": (True, False, 0, ""),
+            "bad_parts": (False, True, 1, ""),
+            "not_partial": (False, False, 0, ""),
+        }
+        for name, response in responses.items():
+            with self.subTest(name=name):
+                check = StrategyRouter(lambda *_, response=response: response).check_answer("q", "a", "m", "u", "k")
+                self.assertEqual((check.found, check.partial, check.answered_parts, check.missing), expected[name])
+
     def test_unusable_check_accepts_the_answer(self) -> None:
         def broken(*_: object) -> object:
             raise ProjectError("HTTP 500")
@@ -184,6 +204,89 @@ class SearchWithFallbackTests(unittest.TestCase):
         self.assertFalse(result.found)
         self.assertEqual((result.method, result.outcome.answer), ("basic", NOT_FOUND_ANSWER))
         self.assertIsNone(result.outcome.error)
+
+    def test_attempts_record_answer_and_evidence_pages(self) -> None:
+        pages = ({"document": "BCS.pdf", "page": 70},)
+
+        def search(method: str) -> SearchOutcome:
+            return SearchOutcome(f"{method} 答案 [Data: Sources (1)]", evidence_pages=pages)
+
+        result = search_with_fallback(
+            StrategyDecision("basic", "原因"), search, lambda _: AnswerCheck(False, "沒有"),
+        )
+
+        self.assertEqual(result.outcome.answer, NOT_FOUND_ANSWER)
+        self.assertEqual(
+            [(item["answer"], item["evidence"]) for item in result.attempts],
+            [(f"{method} 答案 [Data: Sources (1)]", [{"document": "BCS.pdf", "page": 70}])
+             for method in ("basic", "local", "global", "drift")],
+        )
+
+    def test_best_partial_answer_replaces_not_found_reply(self) -> None:
+        verdicts = {
+            "basic": AnswerCheck(False, "只答一項", partial=True, answered_parts=1, missing="失效保護、解除條件"),
+            "local": AnswerCheck(False, "答兩項", partial=True, answered_parts=2, missing="解除條件"),
+            "global": AnswerCheck(False, "也答兩項", partial=True, answered_parts=2, missing="x"),
+            "drift": AnswerCheck(False, "沒有"),
+        }
+        tried: list[str] = []
+
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            return SearchOutcome(f"{method} 偵測條件 [Data: Sources (1)]")
+
+        result = search_with_fallback(StrategyDecision("basic", "原因"), search, lambda _: verdicts[tried[-1]])
+
+        self.assertEqual((result.found, result.partial, result.method), (False, True, "local"))
+        self.assertEqual(
+            result.outcome.answer,
+            "local 偵測條件 [Data: Sources (1)]\n\n" + PARTIAL_ANSWER_NOTE.format(missing="解除條件"),
+        )
+        self.assertEqual(
+            [item["status"] for item in result.attempts], ["partial", "partial", "partial", "not_found"],
+        )
+        self.assertEqual(result.attempts[1]["answered_parts"], 2)
+        self.assertEqual(result.attempts[1]["missing"], "解除條件")
+        self.assertIn("採用 Local 的部分回答", result.reason)
+        self.assertIn("Basic 只找到部分答案", result.reason)
+
+    def test_found_answer_still_wins_over_earlier_partial(self) -> None:
+        tried: list[str] = []
+
+        def check(_: str) -> AnswerCheck:
+            if tried[-1] == "basic":
+                return AnswerCheck(False, "部分", partial=True, answered_parts=1)
+            return AnswerCheck(True, "ok")
+
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            return SearchOutcome(f"{method} [Data: Sources (1)]", source_count=10)
+
+        result = search_with_fallback(StrategyDecision("basic", "原因"), search, check)
+
+        self.assertEqual((result.found, result.partial, result.method), (True, False, "local"))
+        self.assertEqual(result.outcome.answer, "local [Data: Sources (1)]")
+
+    def test_unsupported_answer_is_never_kept_as_partial(self) -> None:
+        result = search_with_fallback(
+            StrategyDecision("basic", "原因"),
+            lambda method: SearchOutcome("", "壞了") if method == "global" else SearchOutcome("沒有引用的回答"),
+            lambda _: AnswerCheck(False, "部分", partial=True, answered_parts=1),
+        )
+
+        self.assertFalse(result.partial)
+        self.assertEqual(result.outcome.answer, NOT_FOUND_ANSWER)
+
+    def test_evidence_page_records_dedupe_document_pages(self) -> None:
+        class Item:
+            def __init__(self, document_id: str, page: int | None, pages: tuple[int, ...] = ()) -> None:
+                self.document_id, self.page, self.pages = document_id, page, pages
+
+        records = evidence_page_records([Item("A.pdf", 3), Item("A.pdf", 3), Item("B.pdf", 4, (4, 5))])
+
+        self.assertEqual(records, (
+            {"document": "A.pdf", "page": 3}, {"document": "B.pdf", "page": 4}, {"document": "B.pdf", "page": 5},
+        ))
 
     def test_local_with_too_few_sources_falls_back_without_checking(self) -> None:
         checked: list[str] = []

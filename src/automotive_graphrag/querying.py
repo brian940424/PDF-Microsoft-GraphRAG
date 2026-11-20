@@ -31,7 +31,9 @@ from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, ta
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
 from .query_translation import document_language_sample, needs_rewrite
-from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
+from .strategy_routing import (
+    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
+)
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
@@ -237,15 +239,16 @@ class QueryService:
                 if execution.returncode != 0:
                     return SearchOutcome("", self._last_error(execution), execution)
                 try:
-                    section_titles = tuple(item.section_name for item in self.evidence_service.from_context(
+                    attempt_evidence = self.evidence_service.from_context(
                         project_id, getattr(execution, "context", {}) or {},
-                    ))
-                except ProjectError:
-                    section_titles = ()
+                    )
+                except (ProjectError, OSError, ValueError):
+                    attempt_evidence = []
                 return SearchOutcome(
                     (execution.stdout or "").strip(), None, execution,
                     context_source_count(getattr(execution, "context", None)),
-                    section_titles,
+                    tuple(item.section_name for item in attempt_evidence),
+                    evidence_page_records(attempt_evidence),
                 )
 
             searched: list[str] = []
@@ -267,6 +270,12 @@ class QueryService:
             normalized_method, routing_reason = fallback.method, fallback.reason
             execution_metadata["strategy_attempts"] = list(fallback.attempts)
             result = fallback.outcome.payload or QueryExecution(0, fallback.outcome.answer, "")
+            if fallback.partial:
+                execution_metadata["partial_answer"] = True
+                result = QueryExecution(
+                    result.returncode, fallback.outcome.answer, result.stderr or "",
+                    getattr(result, "context", None) or {}, tuple(getattr(result, "llm_calls", ()) or ()),
+                )
         elif normalized_method == AGENTIC_METHOD:
             def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
                 search_command = query_command(search_method, search_question)

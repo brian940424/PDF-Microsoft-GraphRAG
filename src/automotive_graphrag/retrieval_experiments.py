@@ -50,7 +50,9 @@ from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
 from .answer_prompts import install_answer_prompts
 from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, aggregate_cost, query_cost_summary, tag_calls, usage_metadata
-from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
+from .strategy_routing import (
+    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
+)
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
@@ -1280,8 +1282,13 @@ class RetrievalExperimentService:
                         answer_value, context_value = run_strategy(strategy)
                     except Exception as exc:
                         return SearchOutcome("", str(exc))
+                    try:
+                        pages = evidence_page_records(self._resolved_evidence(project_id, context_value)) if isinstance(context_value, dict) else ()
+                    except (ProjectError, OSError, ValueError, TypeError):
+                        pages = ()
                     return SearchOutcome(
                         str(answer_value), None, context_value, context_source_count(context_value),
+                        evidence_pages=pages,
                     )
 
                 searched: list[str] = []
@@ -1305,6 +1312,8 @@ class RetrievalExperimentService:
                 method = routed_method = fallback.method
                 routing_reason = fallback.reason
                 execution_trace = {"strategy_attempts": list(fallback.attempts)}
+                if fallback.partial:
+                    execution_trace["partial_answer"] = True
                 if fallback.outcome.error:
                     raise ProjectError(fallback.outcome.error)
                 answer, context = fallback.outcome.answer, fallback.outcome.payload or {}

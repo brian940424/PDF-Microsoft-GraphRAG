@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .connections import chat_completion_api_params, extract_json_object, llm_request_headers
 from .evidence import EvidenceService
@@ -25,6 +25,7 @@ FALLBACK_METHOD = "basic"
 DEFAULT_METHOD_ORDER = ("basic", "local", "global", "drift")
 METHOD_LABELS = {"local": "Local", "global": "Global", "drift": "DRIFT", "basic": "Basic"}
 NOT_FOUND_ANSWER = "已依序嘗試所有檢索策略，仍未在文件中找到答案。"
+PARTIAL_ANSWER_NOTE = "（部分回答：已依序嘗試所有檢索策略，以下部分仍未在文件中找到：{missing}）"
 # Local fills about 10 text units with default settings; far fewer means the matched entities
 # barely link to the question's passage, so its answer is not trusted and the next method runs.
 LOCAL_MIN_SOURCES = 7
@@ -60,8 +61,13 @@ Set "found" to false if any of these is true, even when the answer also contains
 
 Set "found" to true if the answer directly gives substantive information about the main point, even if it is incomplete or notes that a minor detail (such as an exact duration) is not specified. Do not otherwise judge whether the answer is factually correct.
 
+When "found" is false, also decide whether the answer is partial: the question asks for several things (for example a detection condition, a fail-safe action and a cancellation condition) and the answer gives substantive information from the documents about at least one of them, while saying the others are not stated or leaving them out. An answer that only describes a different feature, or gives nothing substantive about what the question asks, is not partial.
+
 Return a JSON object with exactly these keys:
 - "found": a JSON boolean
+- "partial": a JSON boolean, true only when "found" is false and the answer is partial as described above
+- "answered_parts": an integer, how many of the things the question asks for the answer substantively covers (0 when "partial" is false)
+- "missing": when "partial" is true, a short phrase in Traditional Chinese naming what the answer does not cover; otherwise ""
 - "reason": one short sentence in Traditional Chinese
 
 Question:
@@ -89,6 +95,10 @@ class AnswerCheck:
     found: bool
     reason: str
     llm_calls: tuple[dict[str, Any], ...] = field(default=(), compare=False)
+    # F-52: the answer covers part of the question; only meaningful when found is False.
+    partial: bool = False
+    answered_parts: int = 0
+    missing: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +109,8 @@ class SearchOutcome:
     # Text units the search put in its context; None when the context is unavailable.
     source_count: int | None = None
     section_titles: tuple[str, ...] = ()
+    # Document and page of each retrieved passage, in context order, for the attempt record (F-52).
+    evidence_pages: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +120,8 @@ class FallbackResult:
     found: bool
     reason: str
     attempts: tuple[dict[str, Any], ...]
+    # True when no method found the answer and the best partial answer was kept (F-52).
+    partial: bool = False
 
 
 ChatFunction = Callable[..., object]
@@ -147,7 +161,14 @@ class StrategyRouter:
             response = self._ask(prompt, model, api_base_url, api_key, reasoning_effort, ANSWER_CHECK_STAGE, calls)
             if not isinstance(response, dict) or not isinstance(response.get("found"), bool):
                 raise ProjectError("答案檢查回應缺少 found 布林值")
-            return AnswerCheck(response["found"], str(response.get("reason", "")).strip(), tuple(calls))
+            found = response["found"]
+            partial = not found and response.get("partial") is True
+            parts = response.get("answered_parts")
+            answered_parts = max(parts, 1) if partial and isinstance(parts, int) and not isinstance(parts, bool) else int(partial)
+            return AnswerCheck(
+                found, str(response.get("reason", "")).strip(), tuple(calls),
+                partial, answered_parts, str(response.get("missing") or "").strip() if partial else "",
+            )
         except ProjectError as exc:
             return AnswerCheck(True, f"答案檢查失敗（{exc}），採用目前回答", tuple(calls))
 
@@ -260,15 +281,19 @@ def search_with_fallback(
     check: Callable[[str], AnswerCheck],
     question: str = "",
 ) -> FallbackResult:
-    """Try each method in ranked order once and stop at the first one that finds an answer."""
+    """Try each method in ranked order once and stop at the first one that finds an answer.
+
+    When none finds it, the partial answer covering the most of the question is kept (earliest on
+    a tie) instead of the canned not-found reply (F-52).
+    """
     attempts: list[dict[str, Any]] = []
     answered: list[str] = []
-    outcomes: dict[str, SearchOutcome] = {}
+    partials: list[tuple[str, SearchOutcome, AnswerCheck]] = []
     last_failure: SearchOutcome | None = None
     for method in decision.attempt_order:
         started = time.monotonic()
         outcome = search(method)
-        outcomes[method] = outcome
+        verdict: AnswerCheck | None = None
         if outcome.error or not outcome.answer.strip():
             status, detail = "failed", outcome.error or "GraphRAG 未回傳回答"
             last_failure = replace(outcome, error=detail)
@@ -287,22 +312,50 @@ def search_with_fallback(
                 verdict = AnswerCheck(True, "檢索到與題目功能名稱相符的小節標題")
             else:
                 verdict = check(outcome.answer)
-            status, detail = ("found" if verdict.found else "not_found"), verdict.reason
+            status = "found" if verdict.found else "partial" if verdict.partial else "not_found"
+            detail = verdict.reason
             answered.append(method)
-        attempts.append({
+            if status == "partial":
+                partials.append((method, outcome, verdict))
+        attempt: dict[str, Any] = {
             "method": method, "status": status, "detail": detail,
             "duration_seconds": round(time.monotonic() - started, 3),
-        })
+            "answer": outcome.answer,
+            "evidence": list(outcome.evidence_pages),
+        }
+        if status == "partial" and verdict is not None:
+            attempt["answered_parts"] = verdict.answered_parts
+            if verdict.missing:
+                attempt["missing"] = verdict.missing
+        attempts.append(attempt)
         if status == "found":
             earlier = _attempt_summary(attempts[:-1])
             reason = decision.reason + (
                 f"（{earlier}，改用 {METHOD_LABELS[method]} 找到答案）" if earlier else ""
             )
             return FallbackResult(method, outcome, True, reason, tuple(attempts))
+    if partials:
+        method, outcome, verdict = max(partials, key=lambda item: item[2].answered_parts)
+        note = PARTIAL_ANSWER_NOTE.format(missing=verdict.missing or "題目其餘部分")
+        reason = f"{decision.reason}（{_attempt_summary(attempts)}，採用 {METHOD_LABELS[method]} 的部分回答）"
+        return FallbackResult(
+            method, replace(outcome, answer=f"{outcome.answer.rstrip()}\n\n{note}"), False, reason,
+            tuple(attempts), partial=True,
+        )
     reason = f"{decision.reason}（{_attempt_summary(attempts)}）"
     if answered:
         return FallbackResult(answered[0], SearchOutcome(NOT_FOUND_ANSWER), False, reason, tuple(attempts))
     return FallbackResult(decision.method, last_failure, False, reason, tuple(attempts))
+
+
+def evidence_page_records(evidence: Iterable[Any]) -> tuple[dict[str, Any], ...]:
+    """Distinct document/page pairs of retrieved passages in context order, without passage text."""
+    pairs: dict[tuple[str, int | None], None] = {}
+    for item in evidence:
+        pages = tuple(getattr(item, "pages", ()) or ()) or (getattr(item, "page", None),)
+        for page in pages:
+            pairs.setdefault((str(getattr(item, "document_id", "")), page), None)
+    return tuple({"document": document, "page": page} for document, page in pairs)
 
 
 def context_source_count(context: object) -> int | None:
@@ -394,5 +447,5 @@ def _unsupported_answer_reason(method: str, outcome: SearchOutcome) -> str:
 
 
 def _attempt_summary(attempts: list[dict[str, Any]]) -> str:
-    wording = {"not_found": "未找到答案", "failed": "查詢失敗"}
+    wording = {"not_found": "未找到答案", "partial": "只找到部分答案", "failed": "查詢失敗"}
     return "、".join(f"{METHOD_LABELS[item['method']]} {wording[item['status']]}" for item in attempts)

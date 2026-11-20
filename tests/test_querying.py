@@ -334,6 +334,35 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(result.context, {})
         self.assertIn("Global 查詢失敗", result.routing_reason)
 
+    def test_auto_query_keeps_partial_answer_with_attempt_evidence(self) -> None:
+        class PartialRouter(FakeRouter):
+            def check_answer(self, question: str, answer: str, *_: object) -> AnswerCheck:
+                self.checked.append(answer)
+                if answer.startswith("偵測條件"):
+                    return AnswerCheck(False, "只答出偵測條件", partial=True, answered_parts=1, missing="解除條件")
+                return AnswerCheck(False, "沒有")
+
+        runner = ScriptedRunner({
+            "basic": "偵測條件 [Data: Sources (1)]", "local": "沒有 [Data: Sources (1)]",
+            "global": "沒有", "drift": "沒有 [Data: Sources (1)]",
+        })
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(),
+            router=PartialRouter(StrategyDecision("basic", "具體事實")),
+        )
+
+        result = service.ask("L33-SM3E", "B2562 偵測與解除條件？", method="auto", chat_model="gpt-4.1-mini")
+
+        self.assertEqual(result.method, "basic")
+        self.assertTrue(result.answer.startswith("偵測條件 [Data: Sources (1)]"))
+        self.assertIn("解除條件", result.answer.splitlines()[-1])
+        self.assertTrue(result.execution_metadata["partial_answer"])
+        self.assertEqual(len(result.evidence), 1)
+        attempts = result.execution_metadata["strategy_attempts"]
+        self.assertEqual(attempts[0]["status"], "partial")
+        self.assertEqual(attempts[0]["evidence"], [{"document": "WW.pdf", "page": 25}])
+        self.assertEqual(attempts[1]["answer"], "沒有 [Data: Sources (1)]")
+
     def test_auto_query_fails_when_every_method_fails(self) -> None:
         runner = ScriptedRunner(dict.fromkeys(("local", "basic", "global", "drift")))
         router = FakeRouter(StrategyDecision("local", "具體事實"))
