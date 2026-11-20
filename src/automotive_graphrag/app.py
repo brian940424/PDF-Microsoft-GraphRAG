@@ -4748,7 +4748,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     )
                     autoqa_judge_concurrency = gr.Number(
                         label="每個評審的並行請求數", value=3, minimum=1, maximum=32, precision=0,
-                        info="每個評審模型各自同時送出的請求上限，不同模型分開計算（總並行數 = 此值 × 評審數）；調高較快，但容易碰到供應商速率限制（HTTP 429），同一供應商的多個模型可能共用限制",
+                        info="每個評審模型各自同時送出的請求上限，不同模型分開計算（總並行數 = 此值 × 評審數）；調高較快，但容易碰到供應商速率限制（HTTP 429）",
                     )
                 autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
                 autoqa_judge_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_evaluate"][1], variant="stop", visible=False)
