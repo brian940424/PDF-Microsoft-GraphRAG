@@ -1462,10 +1462,10 @@ class RetrievalExperimentService:
             ),
         )
         if enable_llm_judge:
-            # Every judge gets the identical grading prompt; judges run one after another so the
-            # case still occupies a single slot of the experiment's concurrency limit.
-            judges = []
-            for model in parse_judge_models(judge_model):
+            # Every judge gets the identical grading prompt. Judges run at the same time so the
+            # case takes as long as the slowest judge, while the case still occupies a single
+            # slot of the experiment's concurrency limit (that limit counts questions).
+            def judge_with(model: str) -> JudgeScore:
                 try:
                     judged = self.judging.evaluate_single_answer_grade(
                         project_id, question.question_id, question.question,
@@ -1473,12 +1473,19 @@ class RetrievalExperimentService:
                         evaluation_mode=evaluation_mode,
                         reasoning_effort=judge_reasoning_effort,
                     )
-                    judges.append(JudgeScore(
+                    return JudgeScore(
                         model, float(judged.score), judged.judge_reason,
                         extra_content_error=judged.extra_content_error,
-                    ))
+                    )
                 except Exception as exc:
-                    judges.append(JudgeScore(model, None, "", str(exc)))
+                    return JudgeScore(model, None, "", str(exc))
+
+            judge_models = parse_judge_models(judge_model)
+            if len(judge_models) > 1:
+                with ThreadPoolExecutor(max_workers=len(judge_models)) as judge_pool:
+                    judges = list(judge_pool.map(judge_with, judge_models))
+            else:
+                judges = [judge_with(model) for model in judge_models]
             average = average_judge_score(judges)
             if average is None:
                 error = "；".join(

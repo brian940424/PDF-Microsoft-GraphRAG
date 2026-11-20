@@ -318,7 +318,8 @@ class AutomaticEvaluationService:
     ) -> AutomaticEvaluationResult:
         """Judge saved answers; with several models every judge scores each question and the
         question score is the average of the judges that succeeded. The combined score mixes
-        that judge score with the cited-source score by ``source_weight``.
+        that judge score with the cited-source score by ``source_weight``. ``concurrency`` limits
+        the in-flight requests of each judge model separately.
 
         Setting `stop_event` sends no new judge requests (requests already sent finish); only
         questions scored by every judge are saved and the result is marked ``stopped``."""
@@ -379,9 +380,13 @@ class AutomaticEvaluationService:
                 raise_if_stopped(stop_event)
                 return self.evaluate_single_answer(*args, **kwargs)
 
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            # Each judge model gets its own pool so `concurrency` is a per-model limit: judges are
+            # often on different providers with separate rate limits, and a slow or throttled
+            # model must not hold slots the other models could use.
+            pools = {judge_model: ThreadPoolExecutor(max_workers=concurrency) for judge_model in models}
+            try:
                 futures = {
-                    pool.submit(
+                    pools[judge_model].submit(
                         judge_one,
                         project_id,
                         item.question_id,
@@ -413,6 +418,9 @@ class AutomaticEvaluationService:
                     finished += 1
                     if progress_callback:
                         progress_callback(finished, total_calls)
+            finally:
+                for pool in pools.values():
+                    pool.shutdown(wait=True)
             for question in eligible:
                 if len(verdicts[question.question_id]) < len(models):
                     continue  # Not finished before the stop; the question stays unjudged.

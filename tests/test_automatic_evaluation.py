@@ -783,6 +783,80 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "並行數必須介於 1 到 32"):
             service.evaluate("L33-SM3E", self.question_set_id, concurrency=0)
 
+    def test_evaluation_concurrency_is_counted_per_judge_model(self) -> None:
+        panel = ["gpt-4.1-mini", "claude-judge", "gemini-flash"]
+        self.connections.save("http://localhost:4000", "sk", "claude-judge", "text-embedding-3-small", panel, [])
+
+        class PanelJudge:
+            def __init__(self, slow_model=None):
+                self.slow_model = slow_model
+                self.active: dict[str, int] = {}
+                self.maximum: dict[str, int] = {}
+                self.total_maximum = 0
+                self.finished: list[str] = []
+                self.lock = threading.Lock()
+
+            def __call__(self, base_url, api_key, model, prompt):
+                question_id = case_id(prompt)
+                with self.lock:
+                    self.active[model] = self.active.get(model, 0) + 1
+                    self.maximum[model] = max(self.maximum.get(model, 0), self.active[model])
+                    self.total_maximum = max(self.total_maximum, sum(self.active.values()))
+                time.sleep(0.4 if model == self.slow_model else 0.05)
+                with self.lock:
+                    self.active[model] -= 1
+                    self.finished.append(model)
+                if model == self.slow_model:
+                    raise RuntimeError("HTTP 429")
+                return {"item": {"question_id": question_id, "level": 5, "reason": "符合"}}
+
+        judge = PanelJudge()
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+        service.evaluate("L33-SM3E", self.question_set_id, model=panel, concurrency=1)
+        # One slot per judge: three requests in flight, never two for the same model.
+        self.assertEqual(judge.maximum, {model: 1 for model in panel})
+        self.assertEqual(judge.total_maximum, 3)
+
+        judge = PanelJudge()
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+        service.evaluate("L33-SM3E", self.question_set_id, model=panel, concurrency=2)
+        self.assertEqual(judge.maximum, {model: 2 for model in panel})
+        self.assertEqual(judge.total_maximum, 6)
+
+        # A slow, failing judge does not hold up the others; questions average the judges that succeeded.
+        judge = PanelJudge(slow_model="gpt-4.1-mini")
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, judge)
+        result = service.evaluate("L33-SM3E", self.question_set_id, model=panel, concurrency=1)
+        self.assertEqual(judge.finished[-2:], ["gpt-4.1-mini", "gpt-4.1-mini"])
+        self.assertEqual(sorted(judge.finished[:4]), sorted(["claude-judge", "gemini-flash"] * 2))
+        self.assertEqual(result.question_count, 2)
+        self.assertEqual([judge_score.score for judge_score in result.items[0].judges], [None, 1.0, 1.0])
+        self.assertIn("部分評審失敗", result.judge_error)
+
+    def test_stop_sends_no_new_requests_and_saves_fully_judged_questions(self) -> None:
+        panel = ["gpt-4.1-mini", "claude-judge"]
+        self.connections.save("http://localhost:4000", "sk", "claude-judge", "text-embedding-3-small", panel, [])
+        stop = threading.Event()
+        calls: list[tuple[str, str]] = []
+        lock = threading.Lock()
+
+        def client(_url, _key, model, prompt):
+            question_id = case_id(prompt)
+            with lock:
+                calls.append((model, question_id))
+                if len(calls) == 2:
+                    stop.set()  # Both judges of Q0001 are in flight; Q0002 is still queued.
+            time.sleep(0.05)
+            return {"item": {"question_id": question_id, "level": 5, "reason": "符合"}}
+
+        service = AutomaticEvaluationService(self.store, self.question_sets, self.connections, client)
+        result = service.evaluate("L33-SM3E", self.question_set_id, model=panel, concurrency=1, stop_event=stop)
+
+        self.assertTrue(result.stopped)
+        self.assertEqual(sorted(calls), sorted((model, "Q0001") for model in panel))
+        self.assertEqual([item.question_id for item in result.items], ["Q0001"])
+        self.assertEqual(service.last_result("L33-SM3E", self.question_set_id).items[0].question_id, "Q0001")
+
     def test_cited_sources_only_lift_answers_wrong_because_of_added_content(self) -> None:
         class CitingRunner(AnswerRunner):
             def ask(self, *args, **kwargs):
@@ -1080,7 +1154,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         self.assertIn("檢索並生成回答", button_values)
         self.assertIn("評測回答", button_values)
         self.assertIn("匯出評測結果（JSON／CSV）", button_values)
-        self.assertIn("評測請求並行數", labels)
+        self.assertIn("每個評審的並行請求數", labels)
         self.assertIn("本次回答模型", labels)
         self.assertEqual(sum(label == "回答格式" for label in labels), 1)
         compatibility_handler = next(

@@ -3,6 +3,7 @@ import json
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -863,6 +864,44 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(len(details["question_results"][0]["judge_scores"]), 3)
         with self.assertRaisesRegex(ProjectError, "最多選擇 5"):
             self.service.save_configuration("project", [group], question_set.question_set_id, 1, [*panel, *(f"x{i}" for i in range(3))])
+
+    def test_judge_panel_runs_judges_of_one_case_at_the_same_time(self):
+        class SlowPanelJudge:
+            def __init__(self):
+                self.active = 0
+                self.maximum = 0
+                self.lock = threading.Lock()
+
+            def evaluate_single_answer_grade(self, project_id, question_id, question, correct, actual, model,
+                                             evaluation_mode="strict", reasoning_effort="medium"):
+                with self.lock:
+                    self.active += 1
+                    self.maximum = max(self.maximum, self.active)
+                time.sleep({"gpt-4o-mini": 0.1, "gpt-4.1-mini": 0.2, "gpt-6-luna": 0.3}[model])
+                with self.lock:
+                    self.active -= 1
+                return SimpleNamespace(
+                    question_id=question_id, score=2, judge_reason=model, extra_content_error=False,
+                )
+
+        judge = SlowPanelJudge()
+        self.service.judging = judge
+        question_set = self.question_sets.create_with_questions(
+            "project", "parallel-panel", [BatchQuestion("Q1", "問題一", "答案一")]
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        panel = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-6-luna"]
+        self.service.save_configuration("project", [group], question_set.question_set_id, 1, panel)
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=1)
+
+        started = time.monotonic()
+        run = self.service.evaluate_answers("project", question_set.question_set_id, judge_model=panel, max_concurrency=1)
+        elapsed = time.monotonic() - started
+
+        # All three judges overlap: the case takes about as long as the slowest judge (0.3s), not the sum (0.6s).
+        self.assertEqual(judge.maximum, 3)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual([item.model for item in run.results[0].judge_scores], panel)
 
     def test_lenient_evaluation_uses_lenient_judge_prompt_and_persists_mode(self):
         judge = FakeJudge(lenient_result=True)
