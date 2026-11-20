@@ -19,6 +19,8 @@ import re
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .answer_revision import revise_answer
+
 EXTRACTION_HEADING = "-----Extracted source sentences-----"
 NO_EXTRACTION = "NONE"
 
@@ -93,13 +95,16 @@ ContextTransform = Callable[[str, Any], Any]
 def install_two_stage_basic(
     context_transform: ContextTransform | None = None,
     report: dict[str, Any] | None = None,
+    revise: bool = False,
 ) -> None:
     """Patch GraphRAG BasicSearch.stream_search (used by the query API) to answer in two stages.
 
     `context_transform(query, context_result)` may replace the retrieved context first, for
     example to drop sources of another manual variant; it applies to both stages. Questions
     that are not comparisons skip the extraction call and answer in one stage. `report`, when
-    given, receives `two_stage` (whether the extraction call ran).
+    given, receives `two_stage` (whether the extraction call ran) and, with `revise`,
+    `qualifier_revision`. With `revise`, the whole answer is collected and checked once more
+    against its cited sources (`answer_revision`), then yielded as a single chunk.
     """
     from graphrag.query.structured_search.basic_search.search import BasicSearch
 
@@ -124,10 +129,17 @@ def install_two_stage_basic(
             augmented = result
         builder.build_context = lambda *args, **kwargs: augmented
         try:
-            async for token in original(self, query, conversation_history):
-                yield token
+            if not revise:
+                async for token in original(self, query, conversation_history):
+                    yield token
+                return
+            draft = "".join([token async for token in original(self, query, conversation_history)])
         finally:
             builder.__dict__.pop("build_context", None)
+        answer, revision = await revise_answer(self.model, query, draft, augmented.context_records, self.model_params)
+        if report is not None:
+            report["qualifier_revision"] = revision
+        yield answer
 
     stream_search._two_stage_patch = True  # type: ignore[attr-defined]
     stream_search.__wrapped__ = original  # type: ignore[attr-defined]

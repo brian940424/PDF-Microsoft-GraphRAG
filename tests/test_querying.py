@@ -165,7 +165,7 @@ class QueryServiceTests(unittest.TestCase):
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v8")
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v9")
 
     def write_text_units(self, *texts: str) -> None:
         pd.DataFrame({"text": list(texts)}).to_parquet(self.graph_root / "output" / "text_units.parquet")

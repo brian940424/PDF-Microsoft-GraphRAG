@@ -99,7 +99,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
             variant_report.update(report)
             return selected
 
-        install_two_stage_basic(select_variants, extraction_report)
+        install_two_stage_basic(select_variants, extraction_report, revise=True)
         answer, context = cli_query.run_basic_search(
             data_dir=None,
             root_dir=root_dir,
