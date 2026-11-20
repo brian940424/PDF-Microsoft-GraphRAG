@@ -56,6 +56,8 @@ from .project_archive import export_project as build_project_archive
 from .project_archive import import_project as restore_project_archive
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
+from .query_cache import QueryResultCache
+from .graph_index_cache import GraphIndexManager
 from .question_generation import GeneratedQuestion, QuestionGenerationService
 from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
 from .reviews import ReviewService
@@ -653,6 +655,7 @@ JOB_STOPPING_LABEL = "停止中…"
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
+    os.environ.setdefault("GRAPHRAG_MAX_LOADED_PROJECTS", "1")
     store = ProjectStore(project_root or os.environ.get("PROJECTS_ROOT", "projects"))
     connections = ConnectionSettings(store.root)
     documents = DocumentService(store)
@@ -1053,6 +1056,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         chat_model: str | None,
         response_type: str,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        bypass_cache: bool = False,
         progress=gr.Progress(),
     ):
         hidden = gr.Group(visible=False)
@@ -1066,6 +1070,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 outcome["result"] = querying.ask(
                     project_id, question, method, chat_model=chat_model, response_type=response_type,
                     source="manual", reasoning_effort=reasoning_effort,
+                    bypass_cache=bypass_cache,
                 )
             except Exception as exc:  # noqa: BLE001 - 交回主執行緒處理
                 outcome["error"] = exc
@@ -1162,6 +1167,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f"狀態：{query_result.status}｜方法：{method_label}｜"
             f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{display_time(query_result.completed_at)}"
         )
+        if query_result.query_cache_hit:
+            summary += f"｜⚡ 來自快取（原耗時 {query_result.execution_metadata.get('original_latency_sec', '未知')} 秒）"
         if query_result.routing_reason:
             detail_label = "Agentic 搜尋狀態" if query_result.requested_method == "agentic" else "選擇原因"
             summary += f"\n\n**{detail_label}：** {query_result.routing_reason}"
@@ -2613,7 +2620,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def generate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
-        judge_model: str | None, job: Job | None = None,
+        judge_model: str | None, bypass_cache: bool = True, job: Job | None = None,
     ):
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
@@ -2667,6 +2674,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         update_callback=publish_progress,
                         judge_model=judge_model,
                         stop_event=stop_event_of(job),
+                        bypass_cache=bool(bypass_cache),
                     )
                 except BaseException as exc:
                     outcome["error"] = exc
@@ -2915,6 +2923,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def generate_automatic_answers(
         project_id, question_set_id, rows, answer_model, answer_effort, method, concurrency, response_type,
+        bypass_cache=False,
         job: Job | None = None,
     ):
         # 輸出最後兩項為回答與評測進度條；重新生成回答後舊的評測進度隱藏
@@ -2938,6 +2947,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     reasoning_effort=answer_effort,
                     progress_callback=progress,
                     stop_event=stop_event_of(job),
+                    bypass_cache=bool(bypass_cache),
                 ),
                 render_answers,
                 job,
@@ -3305,6 +3315,31 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         # 沒有專案資料時隱藏，避免顯示空白的 JSON 區塊
         details = project_details(project_id)
         return gr.JSON(value=details, visible=bool(details))
+
+    def project_cache_status(project_id: str | None) -> str:
+        if not project_id:
+            return "查詢快取：尚未選擇專案"
+        try:
+            count = QueryResultCache(store.path_for(project_id)).count()
+        except (OSError, ValueError):
+            return "查詢快取：目前無法讀取"
+        if count < 0:
+            return "查詢快取資料庫損毀；執行清除可重建資料庫"
+        resident = project_id in GraphIndexManager.instance().loaded_projects()
+        memory_status = "圖譜已常駐記憶體" if resident else "圖譜尚未載入記憶體"
+        return f"{memory_status}｜本專案查詢快取：{count} 筆"
+
+    def clear_project_query_cache(project_id: str | None):
+        if not project_id:
+            return "❌ 請先開啟專案", project_cache_status(None)
+        try:
+            count = QueryResultCache(store.path_for(project_id)).clear()
+            released = GraphIndexManager.instance().clear(project_id)
+        except (OSError, ValueError) as exc:
+            return f"❌ 清除查詢快取失敗：{exc}", project_cache_status(project_id)
+        if count < 0:
+            return f"✅ 已移除損毀的查詢快取資料庫並釋放 {released} 組記憶體索引", project_cache_status(project_id)
+        return f"✅ 已清除 {count} 筆查詢快取並釋放 {released} 組記憶體索引", project_cache_status(project_id)
 
     def project_enabled_value(project_id: str | None) -> bool:
         try:
@@ -4416,6 +4451,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 index_stop_button = gr.Button(JOB_BUTTON_LABELS["index"][1], variant="stop", visible=False)
                 document_refresh_button = gr.Button("重新整理")
                 remove_pdf_button = gr.Button("刪除所選 PDF", variant="stop")
+            with gr.Row():
+                clear_project_query_cache_button = gr.Button("清除本專案快取", size="sm")
+                project_query_cache_status = gr.Markdown("圖譜尚未載入記憶體｜本專案查詢快取：0 筆")
+                project_query_cache_action_status = gr.Markdown()
             # 由刪除按鈕的確認對話框寫入，不顯示於畫面
             remove_pdf_confirmation = gr.Checkbox(visible=False)
             
@@ -4545,6 +4584,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     )
                     with gr.Row():
                         ask_button = gr.Button("送出問題", variant="primary")
+                        query_bypass_cache = gr.Checkbox(label="略過快取重新生成", value=False)
                         clear_question_button = gr.Button("清除")
                 with gr.Column():
                     query_answer = gr.Textbox(
@@ -4708,6 +4748,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="回答格式",
                     )
                 autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
+                autoqa_bypass_cache = gr.Checkbox(label="略過查詢快取（強制重跑）", value=False)
                 autoqa_answer_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_answer"][1], variant="stop", visible=False)
                 autoqa_answer_progress = gr.HTML(label="檢索與回答進度", visible=False)
                 autoqa_answer_model.input(
@@ -5033,6 +5074,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 experiment_add_group_button = gr.Button("新增實驗組")
 
             with gr.Accordion("③ 檢索並生成答案", open=True, elem_classes=["static-section", "bold-title"]):
+                experiment_bypass_cache = gr.Checkbox(
+                    label="略過查詢快取（強制重跑）", value=True,
+                )
                 with gr.Row():
                     experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
                 with gr.Row():
@@ -5626,6 +5670,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(document_view, inputs=document_project, outputs=document_view_outputs).then(
             processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section
         ).then(**review_mode_event)
+        clear_project_query_cache_button.click(
+            clear_project_query_cache,
+            inputs=active_project_id,
+            outputs=[project_query_cache_action_status, project_query_cache_status],
+            show_progress="hidden",
+        )
+        active_project_id.change(
+            project_cache_status,
+            inputs=active_project_id,
+            outputs=project_query_cache_status,
+            show_progress="hidden",
+        )
         document_refresh_button.click(
             document_view,
             inputs=document_project,
@@ -5742,7 +5798,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         bind_job(
             "retrieval_answer", experiment_run_button, experiment_run_stop_button,
             generate_retrieval_experiment_answers,
-            inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
+            inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency,
+                    experiment_judge_model, experiment_bypass_cache],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
                      experiment_max_concurrency, experiment_judge_model,
@@ -5878,7 +5935,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
                 autoqa_answer_model, autoqa_answer_effort, autoqa_method, autoqa_answer_concurrency,
-                autoqa_response_type,
+                autoqa_response_type, autoqa_bypass_cache,
             ],
             outputs=[autoqa_generation_status, autoqa_summary, autoqa_table, autoqa_judge_button,
                      autoqa_answer_progress, autoqa_judge_progress],
@@ -5936,7 +5993,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             show_progress="hidden",
         ).then(
             ask_question,
-            inputs=[query_project, question, query_method, query_chat_model, query_response_type, query_reasoning_effort],
+            inputs=[query_project, question, query_method, query_chat_model, query_response_type,
+                    query_reasoning_effort, query_bypass_cache],
             outputs=[
                 query_answer,
                 query_summary,

@@ -41,12 +41,15 @@ class UserPortalService:
             raise ProjectError("此專案目前未啟用或索引不可用，請聯絡管理者")
         return project
 
-    def ask(self, project_id: str, question: str) -> QueryResult:
+    def ask(self, project_id: str, question: str, bypass_cache: bool = False) -> QueryResult:
         self.selected_project(project_id)
+        if bypass_cache:
+            return self.queries.ask(project_id, question, "local", source="portal", bypass_cache=True)
         return self.queries.ask(project_id, question, "local", source="portal")
 
 
 def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
+    os.environ.setdefault("GRAPHRAG_MAX_LOADED_PROJECTS", "2")
     store = ProjectStore(project_root or os.environ.get("PROJECTS_ROOT", "projects"))
     connections = ConnectionSettings(store.root)
     queries = QueryService(store, connection_settings=connections)
@@ -75,27 +78,33 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
         return ""
 
     def project_view(project_id: str | None):
-        empty = ("", "", [], gr.Dropdown(choices=[]), "", [], "", gr.Button(interactive=False))
+        empty = (
+            "", "", [], gr.Dropdown(choices=[]), "", [], "",
+            gr.Button(interactive=False), gr.Button(interactive=False),
+        )
         if not project_id:
             return ("### 尚未選擇車型／專案", *empty)
         try:
             project = portal.selected_project(project_id)
         except ProjectError as exc:
-            return ("### 專案無法使用", f"❌ {exc}", "", [], gr.Dropdown(choices=[]), "", [], "", gr.Button(interactive=False))
+            return (
+                "### 專案無法使用", f"❌ {exc}", "", [], gr.Dropdown(choices=[]), "", [], "",
+                gr.Button(interactive=False), gr.Button(interactive=False),
+            )
         header = (
             f"### {project.display_name}\n"
             f"車型：`{project.vehicle_name}`｜手冊版本：`{project.manual_version}`"
         )
-        return (header, *empty[:-1], gr.Button(interactive=True))
+        return (header, *empty[:-2], gr.Button(interactive=True), gr.Button(interactive=True))
 
-    def ask(project_id: str | None, question: str):
+    def ask(project_id: str | None, question: str, bypass_cache: bool = False):
         empty = ("", [], gr.Dropdown(choices=[]), "", [], "")
         yield ("⏳ 正在查詢維修手冊，完成後將顯示回答與 Evidence…", *empty)
         if not project_id:
             yield ("❌ 請先選擇車型／專案", *empty)
             return
         try:
-            result = portal.ask(project_id, question)
+            result = portal.ask(project_id, question, bypass_cache)
         except ProjectError as exc:
             yield (f"❌ {exc}", *empty)
             return
@@ -115,7 +124,10 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
         detail = evidence_detail(selected, values) if selected else ""
         warning = "" if result.evidence else "\n\n> ⚠️ 此回答沒有可回連的來源證據，請人工確認。"
         yield (
-            f"✅ 回答完成｜耗時 {result.duration_seconds:.3f} 秒",
+            f"✅ 回答完成｜耗時 {result.duration_seconds:.3f} 秒" + (
+                f"｜⚡ 來自快取（原耗時 {result.execution_metadata.get('original_latency_sec', '未知')} 秒）"
+                if result.query_cache_hit else ""
+            ),
             f"{result.answer}{warning}",
             rows,
             selector,
@@ -159,6 +171,7 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question = gr.Textbox(label="維修問題", lines=6)
                 with gr.Row():
                     ask_button = gr.Button("送出問題", variant="primary", interactive=False)
+                    regenerate_button = gr.Button("重新生成（略過快取）", interactive=False)
                     clear_button = gr.Button("清除")
                 status = gr.Markdown()
             with gr.Column():
@@ -207,10 +220,16 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
                 evidence_state,
                 query_id_state,
                 ask_button,
+                regenerate_button,
             ],
         )
         ask_button.click(
             ask,
+            inputs=[project_selector, question],
+            outputs=[status, answer, evidence_table, evidence_selector, evidence_markdown, evidence_state, query_id_state],
+        )
+        regenerate_button.click(
+            lambda project_id, prompt: ask(project_id, prompt, True),
             inputs=[project_selector, question],
             outputs=[status, answer, evidence_table, evidence_selector, evidence_markdown, evidence_state, query_id_state],
         )

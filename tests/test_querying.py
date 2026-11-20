@@ -136,6 +136,66 @@ class QueryServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    def test_query_result_cache_hits_normalized_query_and_bypass_recomputes(self) -> None:
+        runner = FakeQueryRunner()
+        service = QueryService(self.store, runner, self.connections)
+
+        first = service.ask("L33-SM3E", "  P0300   MISFIRE? ")
+        cached = service.ask("L33-SM3E", "p0300 misfire?")
+        refreshed = service.ask("L33-SM3E", "p0300 misfire?", bypass_cache=True)
+
+        self.assertEqual(len(runner.commands), 2)
+        self.assertFalse(first.query_cache_hit)
+        self.assertTrue(cached.query_cache_hit)
+        self.assertTrue(refreshed.query_cache_hit is False)
+        self.assertEqual(cached.question, "p0300 misfire?")
+        self.assertEqual(cached.answer, first.answer)
+        self.assertEqual(cached.evidence, first.evidence)
+        records = service.history("L33-SM3E")
+        self.assertEqual([item.query_cache_hit for item in records], [False, True, False])
+
+    def test_corrupt_query_cache_falls_back_to_graph_query(self) -> None:
+        cache_path = self.store.path_for("L33-SM3E") / "cache" / "query_cache.db"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(b"corrupt database")
+        runner = FakeQueryRunner()
+
+        result = QueryService(self.store, runner, self.connections).ask("L33-SM3E", "如何檢修？")
+
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertEqual(len(runner.commands), 1)
+
+    def test_in_process_query_receives_preloaded_frames_and_records_index_cache_metrics(self) -> None:
+        class FakeIndexManager:
+            def __init__(self):
+                self.calls = 0
+                self.frames = {"entities": object()}
+
+            def get(self, project_id, project_path):
+                self.calls += 1
+                return self.frames, self.calls > 1, 0.125 if self.calls == 1 else 0.0
+
+        manager = FakeIndexManager()
+        calls = []
+
+        def fake_graph_query(payload, frames):
+            calls.append((payload, frames))
+            return {"answer": "in-process answer", "context": {}, "llm_calls": []}
+
+        service = QueryService(self.store, connection_settings=self.connections)
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_QUERY_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_index_cache.GraphIndexManager.instance", return_value=manager,
+        ), patch("automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=fake_graph_query):
+            first = service.ask("L33-SM3E", "問題一")
+            second = service.ask("L33-SM3E", "問題二")
+
+        self.assertEqual(manager.calls, 2)
+        self.assertIs(calls[0][1], manager.frames)
+        self.assertFalse(first.index_cache_hit)
+        self.assertEqual(first.index_load_sec, 0.125)
+        self.assertTrue(second.index_cache_hit)
+        self.assertEqual(second.index_load_sec, 0.0)
+
     def test_local_query_uses_selected_project_and_saves_history(self) -> None:
         runner = FakeQueryRunner()
         service = QueryService(self.store, runner, self.connections)
@@ -212,13 +272,15 @@ class QueryServiceTests(unittest.TestCase):
     def test_worker_payload_carries_retrieval_query(self) -> None:
         payloads: list[dict[str, object]] = []
 
-        def fake_worker(environment, package_root, payload, timeout_seconds, stop_event):
-            payloads.append(json.loads(payload))
-            return subprocess.CompletedProcess([], 0, json.dumps({"answer": "a", "context": {}}), "")
+        def fake_query(payload, preloaded=None):
+            payloads.append(payload)
+            return {"answer": "a", "context": {}, "llm_calls": []}
 
         command = ["python", "-m", "graphrag", "query", "--root", str(self.graph_root), "--method", "basic",
                    "--response-type", "Single Paragraph", "--retrieval-query", "Brake bleeding order", "煞車排氣？"]
-        with patch.object(QueryService, "_run_worker", side_effect=fake_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=fake_query,
+        ):
             QueryService._run(command)
             QueryService._run(command[:-3] + ["煞車排氣？"])
 
@@ -484,15 +546,14 @@ class QueryServiceTests(unittest.TestCase):
     def test_gpt6_drift_uses_compatible_entrypoint(self) -> None:
         service = QueryService(self.store, connection_settings=self.connections)
 
-        def run_worker(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            payload = json.loads(str(kwargs["input"]))
+        def run_query(payload: dict[str, object], _preloaded=None):
             self.assertEqual(payload["method"], "drift")
             self.assertEqual(payload["model"], "gpt-6-luna")
-            return subprocess.CompletedProcess(
-                command, 0, json.dumps({"answer": "Luna DRIFT 回答", "context": {"sources": []}}), ""
-            )
+            return {"answer": "Luna DRIFT 回答", "context": {"sources": []}, "llm_calls": []}
 
-        with patch("automotive_graphrag.querying.subprocess.run", side_effect=run_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_query,
+        ):
             result = service.ask("L33-SM3E", "測試 GPT-6", method="drift", chat_model="gpt-6-luna")
 
         self.assertEqual(result.status, "COMPLETED")
@@ -527,20 +588,17 @@ class QueryServiceTests(unittest.TestCase):
         )
         calls: list[dict[str, object]] = []
 
-        def run_worker(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            payload = json.loads(str(kwargs["input"]))
+        def run_query(payload: dict[str, object], _preloaded=None):
             calls.append(payload)
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps({
-                    "answer": f"{payload['method']} answer",
-                    "context": {"sources": [{"id": "7", "text": "來源"}]},
-                }),
-                "",
-            )
+            return {
+                "answer": f"{payload['method']} answer",
+                "context": {"sources": [{"id": "7", "text": "來源"}]},
+                "llm_calls": [],
+            }
 
-        with patch("automotive_graphrag.querying.subprocess.run", side_effect=run_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_query,
+        ):
             results = [
                 service.ask("L33-SM3E", "測試證據", method=method)
                 for method in ("local", "global", "drift", "basic")

@@ -1174,7 +1174,7 @@ class AutomaticEvaluationServiceTests(unittest.TestCase):
         ])
         ask_handler = next(fn for fn in app.fns.values() if getattr(fn.fn, "__name__", "") == "ask_question")
         # Single-query now also accepts the reasoning-effort control.
-        self.assertEqual(len(ask_handler.inputs), 6)
+        self.assertEqual(len(ask_handler.inputs), 7)
         self.assertNotIn(
             "autosave_automatic_qa_judgements",
             [getattr(fn.fn, "__name__", "") for fn in app.fns.values()],

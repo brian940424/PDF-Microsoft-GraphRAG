@@ -290,11 +290,14 @@ def _atomic_json(path: Path, value: Any) -> None:
             os.unlink(temporary)
 
 
-def _unit_locations(output_directory: Path) -> dict[str, tuple[str, int | None]]:
+def _unit_locations(output_directory: Path, text_units: Any = None) -> dict[str, tuple[str, int | None]]:
     """Map GraphRAG short text-unit ids to (PDF filename, page)."""
     import pandas as pd
 
-    text_units = pd.read_parquet(output_directory / "text_units.parquet", columns=["id", "human_readable_id"])
+    if text_units is None:
+        text_units = pd.read_parquet(output_directory / "text_units.parquet", columns=["id", "human_readable_id"])
+    else:
+        text_units = text_units[["id", "human_readable_id"]]
     short_by_id = {str(row["id"]): str(row["human_readable_id"]) for row in text_units.to_dict(orient="records")}
     locations: dict[str, tuple[str, int | None]] = {}
     for line in (output_directory / "source_metadata.jsonl").read_text(encoding="utf-8").splitlines():
@@ -312,6 +315,7 @@ def _replace_with_earliest(
     kept: list[VariantSource], catalog: Mapping[str, Mapping[int, str]], project_path: Path,
     output_directory: Path, locations: Mapping[str, tuple[str, int | None]],
     named: Mapping[str, Iterable[str]] | None = None,
+    text_units: Any = None,
 ) -> tuple[list[VariantSource], list[dict[str, Any]]]:
     """Swap sources of a later variant chapter for the text units of the first chapter with the same page."""
     import pandas as pd
@@ -336,7 +340,10 @@ def _replace_with_earliest(
               for unit in units_by_page.get((source.document_id, earlier[source.key]), [])}
     texts: dict[str, str] = {}
     if wanted:
-        text_units = pd.read_parquet(output_directory / "text_units.parquet", columns=["human_readable_id", "text"])
+        if text_units is None:
+            text_units = pd.read_parquet(output_directory / "text_units.parquet", columns=["human_readable_id", "text"])
+        else:
+            text_units = text_units[["human_readable_id", "text"]]
         texts = {str(row["human_readable_id"]): str(row["text"]) for row in text_units.to_dict(orient="records")
                  if str(row["human_readable_id"]) in wanted}
     result: list[VariantSource] = []
@@ -361,7 +368,9 @@ def _replace_with_earliest(
     return result, replaced
 
 
-def select_basic_context(result: Any, question: str, root: Path) -> tuple[Any, dict[str, Any]]:
+def select_basic_context(
+    result: Any, question: str, root: Path, text_units: Any = None,
+) -> tuple[Any, dict[str, Any]]:
     """Apply variant selection to a GraphRAG Basic context and tag each kept source with its variant."""
     import dataclasses
 
@@ -374,7 +383,7 @@ def select_basic_context(result: Any, question: str, root: Path) -> tuple[Any, d
     catalog = project_variants(project_path_for_index_root(root), output_directory.resolve())
     if not any(len(set(pages.values())) >= 2 for pages in catalog.values()):
         return result, {}
-    locations = _unit_locations(output_directory)
+    locations = _unit_locations(output_directory, text_units)
     sources = []
     for row in frame.to_dict(orient="records"):
         key = str(row["id"])
@@ -395,7 +404,7 @@ def select_basic_context(result: Any, question: str, root: Path) -> tuple[Any, d
     ]
     kept, report = select_sources(sources, question, catalog)
     kept, replaced = _replace_with_earliest(
-        kept, catalog, project_path, output_directory, locations, report["named_variants"],
+        kept, catalog, project_path, output_directory, locations, report["named_variants"], text_units,
     )
     report["replaced"] = replaced
     kept_rows = {source.key: source for source in kept}

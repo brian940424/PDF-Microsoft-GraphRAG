@@ -19,6 +19,7 @@ PROJECT_DIRECTORIES = (
     "source",
     "processed",
     "graphrag",
+    "cache",
     "question_sets",
     "runs",
     "exports",
