@@ -1,5 +1,9 @@
 """Restore qualifiers that a Basic answer dropped from the sentences it cites (F-56).
 
+Currently off: the query worker does not pass `revise=True`. With it on, the SM3E Q2 rerun
+(2026-11-20, three strict judges) scored 16/30 against 17/30, because the restored test
+conditions and explanations were judged as content the reference answer does not have.
+
 The answer call keeps the main action and the numbers of a source sentence but often drops
 the rest of that same sentence: its condition, a joined action, the end point, the result or
 what happens in the other cases. Prompt rules alone did not fix this (v5), and copying the
