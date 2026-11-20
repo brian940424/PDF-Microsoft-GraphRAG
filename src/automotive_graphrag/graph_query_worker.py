@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .answer_extraction import install_two_stage_basic
+from .cross_references import capture_basic_retrieval, follow_references
 from .llm_usage import install_litellm_recorder
 from .variants import select_basic_context
 from .querying import QueryService
@@ -47,6 +48,7 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     llm_calls: list[dict[str, Any]] = []
     variant_report: dict[str, Any] = {}
     extraction_report: dict[str, Any] = {}
+    cross_reference_report: dict[str, Any] = {}
     install_litellm_recorder(llm_calls)
     common = {
         "data_dir": None,
@@ -78,7 +80,16 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
         if retrieval_query:
             use_retrieval_query_for_basic(retrieval_query)
 
+        retrieval: dict[str, Any] = {}
+        capture_basic_retrieval(retrieval)
+
         def select_variants(query: str, result: Any) -> Any:
+            try:
+                result, reference_report = follow_references(result, retrieval, root_dir)
+            except Exception as exc:  # following references must never block an answer
+                reference_report = {"error": str(exc)}
+            if reference_report:
+                cross_reference_report.update(reference_report)
             try:
                 # A rewritten retrieval query carries variant names of a question in another language.
                 selected, report = select_basic_context(result, f"{query}\n{retrieval_query}", root_dir)
@@ -100,6 +111,8 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
     serialized = QueryService._serialize_context(context)
     if variant_report and isinstance(serialized, dict):
         serialized["variant_selection"] = variant_report
+    if cross_reference_report and isinstance(serialized, dict):
+        serialized["cross_references"] = cross_reference_report
     if extraction_report and isinstance(serialized, dict):
         serialized["answer_extraction"] = extraction_report
     return {
