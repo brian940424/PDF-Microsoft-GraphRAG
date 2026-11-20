@@ -61,6 +61,38 @@ class StrategyRouterTests(unittest.TestCase):
         self.assertEqual(decision.method, "basic")
         self.assertIn("API Key", decision.reason)
 
+    def test_comparison_question_tries_basic_first_and_keeps_ranking_as_fallback(self) -> None:
+        response = {"methods": ["drift", "local", "basic", "global"], "reason": "需結合不同章節"}
+
+        for question in (
+            "Compare the additional service required when replacing the BCM with the AV control unit.",
+            "QR25DE 與 VQ35DE 在加速踏板處理上有什麼不同？",
+        ):
+            with self.subTest(question=question):
+                decision = StrategyRouter(lambda *_: response).route(question, "m", "u", "k")
+
+                self.assertEqual(decision.method, "basic")
+                self.assertEqual(decision.attempt_order, ("basic", "drift", "local", "global"))
+                self.assertIn("需結合不同章節", decision.reason)
+                self.assertIn("比較題固定先用 Basic", decision.reason)
+                self.assertIn("DRIFT", decision.reason)
+
+    def test_non_comparison_question_keeps_model_ranking(self) -> None:
+        response = {"methods": ["drift", "local", "basic", "global"], "reason": "多步推理"}
+
+        decision = StrategyRouter(lambda *_: response).route("How is the BCM replaced?", "m", "u", "k")
+
+        self.assertEqual(decision.method, "drift")
+        self.assertEqual(decision.reason, "多步推理")
+
+    def test_comparison_question_already_basic_first_is_unchanged(self) -> None:
+        response = {"methods": ["basic", "drift", "local", "global"], "reason": "查原文"}
+
+        decision = StrategyRouter(lambda *_: response).route("What is the difference between A and B?", "m", "u", "k")
+
+        self.assertEqual(decision.reason, "查原文")
+        self.assertEqual(decision.attempt_order, ("basic", "drift", "local", "global"))
+
     def test_missing_reason_is_marked(self) -> None:
         decision = StrategyRouter(lambda *_: {"method": "basic"}).route("q", "m", "u", "k")
 

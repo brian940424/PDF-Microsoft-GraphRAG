@@ -11,6 +11,7 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable
 
+from .answer_extraction import needs_two_stage
 from .connections import chat_completion_api_params, extract_json_object, llm_request_headers
 from .evidence import EvidenceService
 from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, ROUTING_STAGE, call_record
@@ -146,7 +147,7 @@ class StrategyRouter:
             )
         except ProjectError as exc:
             decision = self._fallback(str(exc))
-        return replace(decision, llm_calls=tuple(calls))
+        return replace(basic_first_for_comparison(question, decision), llm_calls=tuple(calls))
 
     def check_answer(
         self, question: str, answer: str, model: str, api_base_url: str, api_key: str | None,
@@ -273,6 +274,21 @@ def chat_with_usage(
         raise
     calls.append(call_record(stage, None, model, usage or None, time.monotonic() - started))
     return response
+
+
+def basic_first_for_comparison(question: str, decision: StrategyDecision) -> StrategyDecision:
+    """Try Basic first for comparison questions; the rest of the ranking stays as the fallback order.
+
+    Only Basic runs the two-stage answer that copies each object's sentences before answering
+    (`answer_extraction`). The router tends to rank DRIFT first for comparisons because they span
+    several manual sections; SM3E Q1 Q26 then cost about 770k tokens and dropped the BCS p.79
+    keyfob re-registration twice, while Basic wrote it in nearly every run (F-55, 2026-11-20).
+    """
+    if decision.method == "basic" or not needs_two_stage(question):
+        return decision
+    ranking = ("basic", *(method for method in decision.attempt_order if method != "basic"))
+    reason = f"{decision.reason}（比較題固定先用 Basic 兩階段作答，原排序第一為 {METHOD_LABELS[decision.method]}）"
+    return replace(decision, method="basic", reason=reason, ranking=ranking)
 
 
 def search_with_fallback(
