@@ -47,7 +47,7 @@ _SAMPLE_CACHE: dict[tuple[str, float], tuple[str | None, str]] = {}
 _SAMPLE_LOCK = threading.Lock()
 
 
-def document_language_sample(graph_root: Path) -> tuple[str | None, str]:
+def document_language_sample(graph_root: Path, text_units: pd.DataFrame | None = None) -> tuple[str | None, str]:
     """Return the manual's dominant script and a short excerpt, read from the indexed text units."""
     path = graph_root / "output" / "text_units.parquet"
     try:
@@ -58,10 +58,13 @@ def document_language_sample(graph_root: Path) -> tuple[str | None, str]:
         cached = _SAMPLE_CACHE.get(key)
     if cached is not None:
         return cached
-    try:
-        texts = pd.read_parquet(path, columns=["text"])["text"].head(SAMPLE_TEXT_UNITS)
-    except (OSError, ValueError, KeyError):
-        return None, ""
+    if text_units is not None and "text" in text_units.columns:
+        texts = text_units["text"].head(SAMPLE_TEXT_UNITS)
+    else:
+        try:
+            texts = pd.read_parquet(path, columns=["text"])["text"].head(SAMPLE_TEXT_UNITS)
+        except (OSError, ValueError, KeyError):
+            return None, ""
     joined = "\n".join(str(text) for text in texts if isinstance(text, str))
     excerpt = next((str(text) for text in texts if isinstance(text, str) and len(text) > 200), joined)
     result = (text_script(joined), excerpt[:SAMPLE_EXCERPT_CHARS])

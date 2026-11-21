@@ -326,6 +326,54 @@ class PageReviewUiTests(unittest.TestCase):
         self.assertIn("尚未前處理", message)
         self.assertFalse(isinstance(page, int))
 
+    def test_review_is_read_only_after_indexing_until_reprocess_is_requested(self) -> None:
+        mode = self.functions["review_mode_view"]
+        locked, reprocess, preprocess, vision, retry, text_layer, revert, save_next, text, *settings = mode("L33-SM3E")
+        # Preprocessed but not yet in the graph: the full preprocessing review.
+        self.assertFalse(locked)
+        self.assertFalse(reprocess["visible"])
+        self.assertEqual(preprocess["elem_classes"], [])
+        self.assertEqual(save_next["value"], "儲存並前往下一頁 ▶")
+        self.assertTrue(text["interactive"])
+
+        store = ProjectStore(self.root)
+        processed_at = DocumentService(store).list_documents("L33-SM3E")[0].processed_at
+        graph = store.path_for("L33-SM3E") / "graphrag"
+        graph.mkdir(parents=True, exist_ok=True)
+        (graph / "indexed_documents.json").write_text(json.dumps({"A.pdf": processed_at}), encoding="utf-8")
+
+        locked, reprocess, preprocess, vision, retry, text_layer, revert, save_next, text, *settings = mode("L33-SM3E")
+        # Indexed: only previous/next stay, the editor and Vision settings are read-only,
+        # and 開始前處理 gives way to 重新前處理.
+        self.assertTrue(locked)
+        self.assertTrue(reprocess["visible"])
+        for button in (preprocess, vision, retry, text_layer, revert):
+            self.assertEqual(button["elem_classes"], ["mode-hidden"])
+        self.assertEqual(save_next["value"], "下一頁 ▶")
+        self.assertFalse(text["interactive"])
+        self.assertTrue(all(not setting["interactive"] for setting in settings))
+
+        # 下一頁 only steps through pages; nothing is saved.
+        message, page, _, text_value, _ = self.functions["review_save_next"](
+            "L33-SM3E", "A.pdf", "全部", 1, "不該被儲存", None, True,
+        )
+        self.assertEqual((message, page, text_value), ("", 2, ""))
+        self.assertEqual(self.functions["review_refresh"]("L33-SM3E", "A.pdf", "全部", 1)[2], "甲頁")
+        self.assertIn("已是最後一頁", self.functions["review_save_next"]("L33-SM3E", "A.pdf", "全部", 3, "", None, True)[0])
+        # The table refresh after 下一頁 keeps the PDF selection; resetting it to the (empty)
+        # pending PDFs would hide the review section.
+        _, rows, targets, _ = self.functions["document_view_keeping_options"]("L33-SM3E")
+        self.assertIsInstance(rows, type(gr.skip()))
+        self.assertIsInstance(targets, type(gr.skip()))
+
+        # 重新前處理 restores the preprocessing interface.
+        locked, reprocess, preprocess, *_rest, save_next, text, _, _, _ = mode("L33-SM3E", True)
+        self.assertFalse(locked)
+        self.assertFalse(reprocess["visible"])
+        self.assertEqual(preprocess["elem_classes"], [])
+        self.assertEqual(save_next["value"], "儲存並前往下一頁 ▶")
+        self.assertTrue(text["interactive"])
+
     def test_settings_and_review_section_is_open_whenever_pdfs_are_selected(self) -> None:
         update = self.functions["processing_section_update"]
         self.assertEqual((update("L33-SM3E", ["A.pdf"]).visible, update("L33-SM3E", ["A.pdf"]).open), (True, True))

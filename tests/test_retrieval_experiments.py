@@ -3,6 +3,7 @@ import json
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -519,7 +520,7 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         received = []
         self.service.router = FakeRouter()  # type: ignore[assignment]
-        self.service.query_function = lambda *args: (received.append(args) or "回答", {})
+        self.service.query_function = lambda *args: (received.append(args) or "回答 [Data: Sources (1)]", {})
         state = self.service.add_group("project")
         group_id = state["groups"][0]["group_id"]
         self.service.set_group_method("project", group_id, "auto")
@@ -585,14 +586,14 @@ class RetrievalExperimentTests(unittest.TestCase):
             received.append(args[2])
             if args[2] == "local":
                 return ("來源未說明，只提到別的功能", {"sources": [{"id": str(index)} for index in range(3)]})
-            return ("回答", {"sources": [{"id": str(index)} for index in range(10)]})
+            return ("回答 [Data: Sources (1)]", {"sources": [{"id": str(index)} for index in range(10)]})
 
         self.service.query_function = query
 
         result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
 
         self.assertEqual(received, ["local", "basic"])
-        self.assertEqual((result.routed_method, result.actual_answer), ("basic", "回答"))
+        self.assertEqual((result.routed_method, result.actual_answer), ("basic", "回答 [Data: Sources (1)]"))
         self.assertEqual(
             [(item["method"], item["status"]) for item in result.execution_trace["strategy_attempts"]],
             [("local", "not_found"), ("basic", "found")],
@@ -864,6 +865,44 @@ class RetrievalExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "最多選擇 5"):
             self.service.save_configuration("project", [group], question_set.question_set_id, 1, [*panel, *(f"x{i}" for i in range(3))])
 
+    def test_judge_panel_runs_judges_of_one_case_at_the_same_time(self):
+        class SlowPanelJudge:
+            def __init__(self):
+                self.active = 0
+                self.maximum = 0
+                self.lock = threading.Lock()
+
+            def evaluate_single_answer_grade(self, project_id, question_id, question, correct, actual, model,
+                                             evaluation_mode="strict", reasoning_effort="medium"):
+                with self.lock:
+                    self.active += 1
+                    self.maximum = max(self.maximum, self.active)
+                time.sleep({"gpt-4o-mini": 0.1, "gpt-4.1-mini": 0.2, "gpt-6-luna": 0.3}[model])
+                with self.lock:
+                    self.active -= 1
+                return SimpleNamespace(
+                    question_id=question_id, score=2, judge_reason=model, extra_content_error=False,
+                )
+
+        judge = SlowPanelJudge()
+        self.service.judging = judge
+        question_set = self.question_sets.create_with_questions(
+            "project", "parallel-panel", [BatchQuestion("Q1", "問題一", "答案一")]
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        panel = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-6-luna"]
+        self.service.save_configuration("project", [group], question_set.question_set_id, 1, panel)
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=1)
+
+        started = time.monotonic()
+        run = self.service.evaluate_answers("project", question_set.question_set_id, judge_model=panel, max_concurrency=1)
+        elapsed = time.monotonic() - started
+
+        # All three judges overlap: the case takes about as long as the slowest judge (0.3s), not the sum (0.6s).
+        self.assertEqual(judge.maximum, 3)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual([item.model for item in run.results[0].judge_scores], panel)
+
     def test_lenient_evaluation_uses_lenient_judge_prompt_and_persists_mode(self):
         judge = FakeJudge(lenient_result=True)
         self.service.judging = judge
@@ -955,26 +994,18 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         calls = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             calls[payload["method"]] = {
                 **payload,
                 "output_is_symlink": (root / "output").is_symlink(),
                 "completion_model": settings["completion_models"]["default"]["model"],
-                "cwd": str(kwargs["cwd"]),
             }
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps({"answer": "answer", "context": {}}),
-                "",
-            )
+            return {"answer": "answer", "context": {}, "llm_calls": []}
 
-        with patch(
-            "automotive_graphrag.retrieval_experiments.subprocess.run",
-            side_effect=run_worker,
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
         ) as worker:
             for method in ("local", "global", "drift", "basic"):
                 answer, _ = self.service._graphrag_query(
@@ -985,7 +1016,6 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(worker.call_count, 4)
         self.assertEqual(set(calls), {"local", "global", "drift", "basic"})
         self.assertTrue(all(call["output_is_symlink"] for call in calls.values()))
-        self.assertTrue(all(call["cwd"] == str(Path(__file__).parents[1]) for call in calls.values()))
         self.assertTrue(all(call["completion_model"] == "gpt-4.1-mini" for call in calls.values()))
         self.assertTrue(all(call["response_type"] == "List of 3-7 Points" for call in calls.values()))
 
@@ -1009,14 +1039,15 @@ class RetrievalExperimentTests(unittest.TestCase):
         (graph_root / "settings.yaml").write_text("completion_models: {default: {model: old}}\n", encoding="utf-8")
         captured = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             captured["settings"] = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             captured["basic_prompt"] = Path(captured["settings"]["basic_search"]["prompt"]).read_text(encoding="utf-8")
-            return subprocess.CompletedProcess(command, 0, json.dumps({"answer": "ok", "context": {}}), "")
+            return {"answer": "ok", "context": {}, "llm_calls": []}
 
-        with patch("automotive_graphrag.retrieval_experiments.subprocess.run", side_effect=run_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
+        ):
             self.service._graphrag_query(
                 "project", "q", "basic", "gpt-4.1-mini",
                 strategy_parameters={"k": 17, "max_context_tokens": 8000},
@@ -1035,23 +1066,16 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         captured = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             captured["model"] = settings["completion_models"]["default"]["model"]
             captured["args"] = settings["completion_models"]["default"]["call_args"]
             captured["output_is_symlink"] = (root / "output").is_symlink()
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps({"answer": "Luna DRIFT answer", "context": {"sources": []}}),
-                "",
-            )
+            return {"answer": "Luna DRIFT answer", "context": {"sources": []}, "llm_calls": []}
 
-        with patch(
-            "automotive_graphrag.retrieval_experiments.subprocess.run",
-            side_effect=run_worker,
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
         ) as adapter:
             answer, _context = self.service._graphrag_query(
                 "project", "測試", "drift", "gpt-6-luna", reasoning_effort="high"

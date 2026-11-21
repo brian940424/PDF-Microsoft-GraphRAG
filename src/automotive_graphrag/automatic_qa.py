@@ -239,6 +239,7 @@ class AutomaticQATestService:
         progress_callback: Callable[[int, int], None] | None = None,
         reasoning_effort: str = "medium",
         stop_event: threading.Event | None = None,
+        bypass_cache: bool = False,
     ) -> AutomaticQAReport:
         """Generate and persist answers only; judging is a separate user action."""
         report = self._run_existing(
@@ -255,6 +256,7 @@ class AutomaticQATestService:
             progress_callback=progress_callback,
             reasoning_effort=reasoning_effort,
             stop_event=stop_event,
+            bypass_cache=bypass_cache,
         )
         self.judging.clear_result(project_id, question_set_id)
         return report
@@ -345,6 +347,7 @@ class AutomaticQATestService:
         progress_callback: Callable[[int, int], None] | None = None,
         reasoning_effort: str = "medium",
         stop_event: threading.Event | None = None,
+        bypass_cache: bool = False,
     ) -> AutomaticQAReport:
         """Answer every question. Setting `stop_event` sends no new questions and terminates the
         running query workers; answered questions are saved and the rest go back to PENDING."""
@@ -355,6 +358,8 @@ class AutomaticQATestService:
         def answer(item: BatchQuestion) -> QueryResult:
             raise_if_stopped(stop_event)
             kwargs = {"stop_event": stop_event} if stop_event is not None else {}
+            if bypass_cache:
+                kwargs["bypass_cache"] = True
             return self.querying.ask(
                 question_set.project_id, item.question, method,
                 chat_model=answer_model, response_type=response_type, source="automatic_qa",

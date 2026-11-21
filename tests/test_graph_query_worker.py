@@ -6,6 +6,45 @@ from automotive_graphrag.graph_query_worker import execute_graph_query
 
 
 class GraphQueryWorkerTests(unittest.TestCase):
+    def test_preloaded_frames_bypass_graph_rag_disk_table_reader_for_every_strategy(self):
+        from graphrag.cli import query as cli_query
+        import pandas as pd
+
+        required = {
+            "local": ["communities", "community_reports", "text_units", "relationships", "entities"],
+            "global": ["entities", "communities", "community_reports"],
+            "drift": ["communities", "community_reports", "text_units", "relationships", "entities"],
+            "basic": ["text_units"],
+        }
+        frames = {name: pd.DataFrame({"id": [name]}) for names in required.values() for name in names}
+        resolved = []
+
+        def search(name):
+            def run(**kwargs):
+                values = cli_query._resolve_output_files(config=None, output_list=required[name])
+                resolved.append((name, values))
+                return "answer", {"sources": []}
+            return run
+
+        original_resolver = cli_query._resolve_output_files
+        with (
+            patch.object(cli_query, "run_local_search", side_effect=search("local")),
+            patch.object(cli_query, "run_global_search", side_effect=search("global")),
+            patch.object(cli_query, "run_basic_search", side_effect=search("basic")),
+            patch("automotive_graphrag.drift_compat.run_drift_search", side_effect=lambda **kwargs: search("drift")()),
+        ):
+            for method in ("local", "global", "drift", "basic"):
+                result = execute_graph_query({
+                    "root_dir": "/tmp/project", "question": "question", "method": method,
+                }, frames)
+                self.assertEqual(result["answer"], "answer")
+
+        self.assertEqual(cli_query._resolve_output_files, original_resolver)
+        self.assertEqual({name for name, _ in resolved}, set(required))
+        for name, values in resolved:
+            self.assertEqual(set(values), set(required[name]))
+            self.assertTrue(all(values[item] is frames[item] for item in required[name]))
+
     def test_routes_strategies_to_graph_rag_cli_functions(self):
         from graphrag.cli import query as cli_query
 

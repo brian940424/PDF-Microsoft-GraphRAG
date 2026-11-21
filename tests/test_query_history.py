@@ -62,6 +62,7 @@ class QueryHistoryUiTests(unittest.TestCase):
 
         self.assertEqual(ids, ["q3", "q1"])
         self.assertEqual(rows[0][1:], ["手動問題", "Global（自動）", "COMPLETED", 5.0])
+        self.assertEqual(rows[0][0], "2026-10-25 09:00:05")  # stored UTC, shown in Taiwan time
         self.assertEqual(self.functions["load_query_history"](None), ([], []))
 
     def test_history_is_limited_and_truncates_long_questions(self) -> None:

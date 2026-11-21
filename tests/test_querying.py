@@ -1,5 +1,6 @@
 import subprocess
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from automotive_graphrag.agentic_search import AgenticDecision
 from automotive_graphrag.querying import QueryExecution, QueryService, expand_manual_query
 from automotive_graphrag.source_metadata import SourceMetadata
 from automotive_graphrag.strategy_routing import AnswerCheck, NOT_FOUND_ANSWER, StrategyDecision
+from automotive_graphrag.semantic_query_cache import write_project_mode
 
 
 class FakeQueryRunner:
@@ -136,6 +138,96 @@ class QueryServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    def test_query_result_cache_hits_normalized_query_and_bypass_recomputes(self) -> None:
+        runner = FakeQueryRunner()
+        service = QueryService(self.store, runner, self.connections)
+
+        first = service.ask("L33-SM3E", "  P0300   MISFIRE? ")
+        cached = service.ask("L33-SM3E", "p0300 misfire?")
+        refreshed = service.ask("L33-SM3E", "p0300 misfire?", bypass_cache=True)
+
+        self.assertEqual(len(runner.commands), 2)
+        self.assertFalse(first.query_cache_hit)
+        self.assertTrue(cached.query_cache_hit)
+        self.assertTrue(refreshed.query_cache_hit is False)
+        self.assertEqual(cached.question, "p0300 misfire?")
+        self.assertEqual(cached.answer, first.answer)
+        self.assertEqual(cached.evidence, first.evidence)
+        records = service.history("L33-SM3E")
+        self.assertEqual([item.query_cache_hit for item in records], [False, True, False])
+
+    def test_semantic_serving_reuses_complete_result_for_guarded_paraphrase(self) -> None:
+        runner = ContextQueryRunner()
+        embeddings = []
+
+        def embed(text, model, project_id):
+            embeddings.append((text, model, project_id))
+            return [1.0, 0.0], 2.5
+
+        write_project_mode(self.store.path_for("L33-SM3E"), "serving")
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(), semantic_embedder=embed,
+        )
+        with patch.dict(os.environ, {
+            "GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE": "true",
+            "GRAPHRAG_SEMANTIC_QUERY_CACHE_THRESHOLD": "0.9",
+            "GRAPHRAG_SEMANTIC_QUERY_CACHE_MIN_MARGIN": "0.0",
+        }):
+            first = service.ask("L33-SM3E", "How do I inspect the wiper fuse?")
+            second = service.ask("L33-SM3E", "How can I inspect the wiper fuse?")
+
+        self.assertEqual(len(runner.commands) if hasattr(runner, "commands") else 1, 1)
+        self.assertIn("semantic_cache_hit", first.execution_metadata, first.execution_metadata)
+        self.assertFalse(first.execution_metadata["semantic_cache_hit"])
+        self.assertTrue(second.execution_metadata["semantic_cache_hit"])
+        self.assertFalse(second.query_cache_hit)
+        self.assertEqual(second.execution_metadata["query_cache_type"], "semantic")
+        self.assertEqual(second.question, "How can I inspect the wiper fuse?")
+        self.assertEqual(second.evidence, first.evidence)
+        self.assertEqual(len(embeddings), 2)
+
+    def test_corrupt_query_cache_falls_back_to_graph_query(self) -> None:
+        cache_path = self.store.path_for("L33-SM3E") / "cache" / "query_cache.db"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(b"corrupt database")
+        runner = FakeQueryRunner()
+
+        result = QueryService(self.store, runner, self.connections).ask("L33-SM3E", "如何檢修？")
+
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertEqual(len(runner.commands), 1)
+
+    def test_in_process_query_receives_preloaded_frames_and_records_index_cache_metrics(self) -> None:
+        class FakeIndexManager:
+            def __init__(self):
+                self.calls = 0
+                self.frames = {"entities": object()}
+
+            def get(self, project_id, project_path):
+                self.calls += 1
+                return self.frames, self.calls > 1, 0.125 if self.calls == 1 else 0.0
+
+        manager = FakeIndexManager()
+        calls = []
+
+        def fake_graph_query(payload, frames):
+            calls.append((payload, frames))
+            return {"answer": "in-process answer", "context": {}, "llm_calls": []}
+
+        service = QueryService(self.store, connection_settings=self.connections)
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_QUERY_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_index_cache.GraphIndexManager.instance", return_value=manager,
+        ), patch("automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=fake_graph_query):
+            first = service.ask("L33-SM3E", "問題一")
+            second = service.ask("L33-SM3E", "問題二")
+
+        self.assertEqual(manager.calls, 2)
+        self.assertIs(calls[0][1], manager.frames)
+        self.assertFalse(first.index_cache_hit)
+        self.assertEqual(first.index_load_sec, 0.125)
+        self.assertTrue(second.index_cache_hit)
+        self.assertEqual(second.index_load_sec, 0.0)
+
     def test_local_query_uses_selected_project_and_saves_history(self) -> None:
         runner = FakeQueryRunner()
         service = QueryService(self.store, runner, self.connections)
@@ -165,7 +257,7 @@ class QueryServiceTests(unittest.TestCase):
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v7")
+        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v8")
 
     def write_text_units(self, *texts: str) -> None:
         pd.DataFrame({"text": list(texts)}).to_parquet(self.graph_root / "output" / "text_units.parquet")
@@ -212,13 +304,15 @@ class QueryServiceTests(unittest.TestCase):
     def test_worker_payload_carries_retrieval_query(self) -> None:
         payloads: list[dict[str, object]] = []
 
-        def fake_worker(environment, package_root, payload, timeout_seconds, stop_event):
-            payloads.append(json.loads(payload))
-            return subprocess.CompletedProcess([], 0, json.dumps({"answer": "a", "context": {}}), "")
+        def fake_query(payload, preloaded=None):
+            payloads.append(payload)
+            return {"answer": "a", "context": {}, "llm_calls": []}
 
         command = ["python", "-m", "graphrag", "query", "--root", str(self.graph_root), "--method", "basic",
                    "--response-type", "Single Paragraph", "--retrieval-query", "Brake bleeding order", "煞車排氣？"]
-        with patch.object(QueryService, "_run_worker", side_effect=fake_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=fake_query,
+        ):
             QueryService._run(command)
             QueryService._run(command[:-3] + ["煞車排氣？"])
 
@@ -242,10 +336,10 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(service.history("L33-SM3E"), [result])
 
     def test_auto_query_falls_back_in_ranked_order_and_stops_at_first_answer(self) -> None:
-        runner = ScriptedRunner({"basic": "資料中沒有", "local": None, "global": "找到了", "drift": "不該執行"})
+        runner = ScriptedRunner({"basic": "資料中沒有 [Data: Sources (1)]", "local": None, "global": "找到了 [Data: Sources (1)]", "drift": "不該執行"})
         router = FakeRouter(
             StrategyDecision("basic", "單一數值", ("basic", "local", "global", "drift")),
-            refusals=("資料中沒有",),
+            refusals=("資料中沒有 [Data: Sources (1)]",),
         )
         service = QueryService(
             self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
@@ -254,8 +348,8 @@ class QueryServiceTests(unittest.TestCase):
         result = service.ask("L33-SM3E", "問題", method="auto", chat_model="gpt-4.1-mini")
 
         self.assertEqual(runner.methods, ["basic", "local", "global"])
-        self.assertEqual(router.checked, ["資料中沒有", "找到了"])
-        self.assertEqual((result.status, result.method, result.answer), ("COMPLETED", "global", "找到了"))
+        self.assertEqual(router.checked, ["資料中沒有 [Data: Sources (1)]", "找到了 [Data: Sources (1)]"])
+        self.assertEqual((result.status, result.method, result.answer), ("COMPLETED", "global", "找到了 [Data: Sources (1)]"))
         self.assertEqual(result.requested_method, "auto")
         self.assertEqual(result.context["sources"][0]["id"], "global")
         self.assertEqual(len(result.evidence), 1)
@@ -274,7 +368,7 @@ class QueryServiceTests(unittest.TestCase):
         class UsageRunner:
             def __call__(self, command: list[str]) -> QueryExecution:
                 method = command[command.index("--method") + 1]
-                answer = "找到了" if method == "local" else "資料中沒有"
+                answer = "找到了 [Data: Sources (1)]" if method == "local" else "資料中沒有 [Data: Sources (1)]"
                 return QueryExecution(0, answer, "", {"sources": [{"id": str(i)} for i in range(8)]},
                                       (usage("search", 1000),))
 
@@ -284,7 +378,7 @@ class QueryServiceTests(unittest.TestCase):
                                         (usage("routing", 10),))
 
             def check_answer(self, question: str, answer: str, *_: object) -> AnswerCheck:
-                return AnswerCheck(answer != "資料中沒有", "檢查", (usage("answer_check", 20),))
+                return AnswerCheck(answer != "資料中沒有 [Data: Sources (1)]", "檢查", (usage("answer_check", 20),))
 
         service = QueryService(
             self.store, UsageRunner(), self.connections, evidence_service=FakeEvidenceService(),
@@ -304,7 +398,7 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(metadata["cost_status"], "measured")
 
     def test_auto_query_skips_local_answer_built_on_too_few_sources(self) -> None:
-        runner = ScriptedRunner({"local": "相簿群組的步驟", "basic": "聯絡人群組的步驟", "global": "不該執行", "drift": "不該執行"})
+        runner = ScriptedRunner({"local": "相簿群組的步驟", "basic": "聯絡人群組的步驟 [Data: Sources (1)]", "global": "不該執行", "drift": "不該執行"})
         router = FakeRouter(StrategyDecision("local", "具體事實"))
         service = QueryService(
             self.store, runner, self.connections, evidence_service=FakeEvidenceService(), router=router,
@@ -313,8 +407,8 @@ class QueryServiceTests(unittest.TestCase):
         result = service.ask("L33-SM3E", "如何建立聯絡人群組？", method="auto", chat_model="gpt-4.1-mini")
 
         self.assertEqual(runner.methods, ["local", "basic"])
-        self.assertEqual(router.checked, ["聯絡人群組的步驟"])
-        self.assertEqual((result.method, result.answer), ("basic", "聯絡人群組的步驟"))
+        self.assertEqual(router.checked, ["聯絡人群組的步驟 [Data: Sources (1)]"])
+        self.assertEqual((result.method, result.answer), ("basic", "聯絡人群組的步驟 [Data: Sources (1)]"))
         attempts = result.execution_metadata["strategy_attempts"]
         self.assertEqual([(item["method"], item["status"]) for item in attempts], [("local", "not_found"), ("basic", "found")])
         self.assertIn("只取得 1 個原文段落", attempts[0]["detail"])
@@ -484,15 +578,14 @@ class QueryServiceTests(unittest.TestCase):
     def test_gpt6_drift_uses_compatible_entrypoint(self) -> None:
         service = QueryService(self.store, connection_settings=self.connections)
 
-        def run_worker(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            payload = json.loads(str(kwargs["input"]))
+        def run_query(payload: dict[str, object], _preloaded=None):
             self.assertEqual(payload["method"], "drift")
             self.assertEqual(payload["model"], "gpt-6-luna")
-            return subprocess.CompletedProcess(
-                command, 0, json.dumps({"answer": "Luna DRIFT 回答", "context": {"sources": []}}), ""
-            )
+            return {"answer": "Luna DRIFT 回答", "context": {"sources": []}, "llm_calls": []}
 
-        with patch("automotive_graphrag.querying.subprocess.run", side_effect=run_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_query,
+        ):
             result = service.ask("L33-SM3E", "測試 GPT-6", method="drift", chat_model="gpt-6-luna")
 
         self.assertEqual(result.status, "COMPLETED")
@@ -527,20 +620,17 @@ class QueryServiceTests(unittest.TestCase):
         )
         calls: list[dict[str, object]] = []
 
-        def run_worker(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            payload = json.loads(str(kwargs["input"]))
+        def run_query(payload: dict[str, object], _preloaded=None):
             calls.append(payload)
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps({
-                    "answer": f"{payload['method']} answer",
-                    "context": {"sources": [{"id": "7", "text": "來源"}]},
-                }),
-                "",
-            )
+            return {
+                "answer": f"{payload['method']} answer",
+                "context": {"sources": [{"id": "7", "text": "來源"}]},
+                "llm_calls": [],
+            }
 
-        with patch("automotive_graphrag.querying.subprocess.run", side_effect=run_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_query,
+        ):
             results = [
                 service.ask("L33-SM3E", "測試證據", method=method)
                 for method in ("local", "global", "drift", "basic")

@@ -269,7 +269,6 @@ def search_with_fallback(
         started = time.monotonic()
         outcome = search(method)
         outcomes[method] = outcome
-        drift_unsupported = False
         if outcome.error or not outcome.answer.strip():
             status, detail = "failed", outcome.error or "GraphRAG 未回傳回答"
             last_failure = replace(outcome, error=detail)
@@ -278,13 +277,16 @@ def search_with_fallback(
             detail = f"Local 只取得 {outcome.source_count} 個原文段落（少於 {LOCAL_MIN_SOURCES} 個），證據不足"
             answered.append(method)
         else:
-            title_match = method != "drift" and any(
+            unsupported = _unsupported_answer_reason(method, outcome)
+            title_match = not unsupported and method != "drift" and any(
                 _section_title_matches(question, title) for title in outcome.section_titles
             )
-            verdict = AnswerCheck(True, "檢索到與題目功能名稱相符的小節標題") if title_match else check(outcome.answer)
-            if method == "drift" and _drift_answer_is_unsupported(outcome):
-                drift_unsupported = True
-                verdict = AnswerCheck(False, "DRIFT 回答引用未出現在證據中的來源，或表示手冊未提供資訊")
+            if unsupported:
+                verdict = AnswerCheck(False, unsupported)
+            elif title_match:
+                verdict = AnswerCheck(True, "檢索到與題目功能名稱相符的小節標題")
+            else:
+                verdict = check(outcome.answer)
             status, detail = ("found" if verdict.found else "not_found"), verdict.reason
             answered.append(method)
         attempts.append({
@@ -351,15 +353,44 @@ def _title_terms(value: str) -> tuple[set[str], set[str]]:
     return cjk_terms, latin_terms
 
 
-def _drift_answer_is_unsupported(outcome: SearchOutcome) -> bool:
-    answer = outcome.answer.casefold()
-    if any(phrase in answer for phrase in ("手冊未提供", "手冊沒有提供", "請查閱手冊", "請查閱使用手冊", "資料未提供", "資料未說明")):
-        return True
+_DATA_CITATION = re.compile(r"\[\s*Data\s*:([^\]]*)\]", re.IGNORECASE)
+_SOURCES_CITATION = re.compile(r"Sources\s*\(([^)]*)\)", re.IGNORECASE)
+_EVIDENCE_CITATION = re.compile(r"\[E\d+\]")
+_DRIFT_UNSTATED_PHRASES = (
+    "手冊未提供", "手冊沒有提供", "請查閱手冊", "請查閱使用手冊", "資料未提供", "資料未說明",
+)
+
+
+def _unsupported_answer_reason(method: str, outcome: SearchOutcome) -> str:
+    """Why an answer cannot be traced to retrieved passages; empty when it can (B-14).
+
+    Local, Basic and DRIFT answers must cite text units (``Sources``) or Agentic ``E`` ids.
+    An answer citing ``General Knowledge`` or only reports was not written from the manual.
+    Global cites community reports by design and is not checked.
+    """
+    if method == "global":
+        return ""
+    label = METHOD_LABELS.get(method, method)
+    blocks = _DATA_CITATION.findall(outcome.answer)
+    if any("general knowledge" in block.casefold() for block in blocks):
+        return f"{label} 回答引用一般知識（General Knowledge），不是文件內容"
+    cited_ids = {
+        value.strip()
+        for block in blocks for group in _SOURCES_CITATION.findall(block)
+        for value in group.split(",") if value.strip()
+    }
+    if not cited_ids and not _EVIDENCE_CITATION.search(outcome.answer):
+        return f"{label} 回答沒有引用任何原文段落"
+    if method != "drift":
+        return ""
+    if any(phrase in outcome.answer.casefold() for phrase in _DRIFT_UNSTATED_PHRASES):
+        return "DRIFT 回答表示手冊未提供資訊"
     context = outcome.payload.context if hasattr(outcome.payload, "context") else outcome.payload
     source_ids = {str(item.get("id", "")) for item in EvidenceService.source_records(context) if item.get("id") is not None}
-    citations = re.findall(r"\[Data:\s*Sources\s*\(([^)]*)\)\]", outcome.answer, flags=re.IGNORECASE)
-    cited_ids = {value.strip() for citation in citations for value in citation.split(",") if value.strip()}
-    return bool(citations and source_ids and not cited_ids.issubset(source_ids))
+    numeric_ids = {value for value in cited_ids if value != "+more"}
+    if source_ids and not numeric_ids.issubset(source_ids):
+        return "DRIFT 回答引用未出現在證據中的來源"
+    return ""
 
 
 def _attempt_summary(attempts: list[dict[str, Any]]) -> str:

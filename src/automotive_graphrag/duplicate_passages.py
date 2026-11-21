@@ -190,6 +190,7 @@ def expansion_locations(
 
 def with_duplicate_citations(
     projects: Any, project_id: str, answer: str, evidence: Sequence[Any], context: Mapping[str, Any] | None = None,
+    text_units: Any = None,
 ) -> tuple[tuple[Any, ...], list[dict[str, Any]]]:
     """Append Evidence for the other pages of repeated passages the answer used.
 
@@ -233,7 +234,10 @@ def with_duplicate_citations(
     metadata_by_page: dict[tuple[str, int], list[Any]] = {}
     for item in SourceMetadataService(projects).load(project_id):
         metadata_by_page.setdefault((item.document_id, item.page), []).append(item)
-    text_units = pd.read_parquet(output_directory / "text_units.parquet", columns=["id", "human_readable_id"])
+    if text_units is None:
+        text_units = pd.read_parquet(output_directory / "text_units.parquet", columns=["id", "human_readable_id"])
+    else:
+        text_units = text_units[["id", "human_readable_id"]]
     short_id = {str(row["id"]): str(row["human_readable_id"]) for row in text_units.to_dict(orient="records")}
     for document_id, page in locations:
         units = metadata_by_page.get((document_id, page))

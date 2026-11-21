@@ -100,6 +100,36 @@ class ProjectStoreTests(unittest.TestCase):
             [available.project_id],
         )
 
+    def test_portal_defaults_are_per_project_persisted_and_legacy_projects_get_defaults(self) -> None:
+        project = self.create_project()
+        other = self.create_project(project_id="T30-SM5E", display_name="T30 / SM5E")
+
+        self.assertEqual(self.store.get_portal_defaults(project.project_id), {
+            "method": "local",
+            "chat_model": "",
+            "reasoning_effort": "medium",
+            "response_type": "Single Paragraph",
+        })
+        saved = self.store.set_portal_defaults(project.project_id, {
+            "method": "global",
+            "chat_model": "gpt-6-luna",
+            "reasoning_effort": "high",
+            "response_type": "List of 3-7 Points",
+        })
+
+        self.assertEqual(self.store.get_portal_defaults(project.project_id), saved)
+        self.assertEqual(self.store.get_portal_defaults(other.project_id)["method"], "local")
+
+    def test_portal_defaults_reject_unsupported_values(self) -> None:
+        project = self.create_project()
+        for overrides in (
+            {"method": "agentic"},
+            {"reasoning_effort": "maximum"},
+            {"response_type": "free-form"},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ProjectError):
+                self.store.set_portal_defaults(project.project_id, overrides)
+
     def test_required_display_fields_are_validated(self) -> None:
         with self.assertRaisesRegex(ProjectError, "顯示名稱為必填"):
             self.create_project(display_name="  ")

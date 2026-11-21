@@ -12,11 +12,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v7"
+ANSWER_PROMPT_VERSION = "answer-requirements-v8"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
 ANSWER_REQUIREMENTS = """---Answer requirements---
+
+Answer only from the data.
+- These requirements replace any earlier instruction to incorporate general knowledge. Do not use general knowledge, and never write a "General Knowledge" citation.
+- Every statement in the answer must come from the data and cite its source identifiers. If the data does not contain the answer, say only that the provided data does not state it; do not answer from what is commonly known about the topic.
 
 Scope: answer only what the question asks.
 - Answer about the exact feature, app, setting, component or procedure in the question. When the data describes similarly named functions (for example the same feature name in another app, or another way to do a similar task), use only the passages about the one asked and do not mix in the others.
