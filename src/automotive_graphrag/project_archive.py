@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -31,6 +32,8 @@ EXCLUDED_NAMES = {".env", INDEXING_LOCK_FILE}
 CACHE_DIRECTORY = PurePosixPath("graphrag", "cache")
 CACHE_DIRECTORIES = (CACHE_DIRECTORY, PurePosixPath("cache"))
 MAX_UNCOMPRESSED_BYTES = 20 * 1024**3
+# Files whose `project_id` fields are rewritten when a project is imported under a new ID.
+REWRITTEN_SUFFIXES = {".json", ".jsonl"}
 
 
 def export_project(store: ProjectStore, project_id: str, *, include_cache: bool = False) -> Path:
@@ -105,8 +108,38 @@ def _validated_members(archive: zipfile.ZipFile, project_id: str) -> list[zipfil
     return members
 
 
-def import_project(store: ProjectStore, archive_path: str | Path) -> Project:
-    """Restore a project exported by `export_project`; refuses to overwrite an existing project."""
+def _rewrite_project_id_fields(project_path: Path, old_id: str, new_id: str) -> None:
+    """Point every `"project_id": "<old_id>"` field in the project's JSON/JSONL files at `new_id`.
+
+    Lines are rewritten in place so file formatting is preserved. Chunk and document IDs that merely
+    start with the old ID are left alone: they are opaque keys shared with the built graph files.
+    """
+    pattern = re.compile(rb'("project_id"\s*:\s*)"' + re.escape(old_id.encode()) + rb'"')
+    replacement = rb'\g<1>"' + new_id.encode() + rb'"'
+    for path in project_path.rglob("*"):
+        if path.suffix not in REWRITTEN_SUFFIXES or path.is_symlink() or not path.is_file():
+            continue
+        rewritten = path.with_name(path.name + ".rewrite")
+        changed = False
+        with path.open("rb") as source, rewritten.open("wb") as output:
+            for line in source:
+                new_line = pattern.sub(replacement, line)
+                changed = changed or new_line != line
+                output.write(new_line)
+        if changed:
+            os.replace(rewritten, path)
+        else:
+            rewritten.unlink()
+
+
+def import_project(store: ProjectStore, archive_path: str | Path, *, project_id: str | None = None) -> Project:
+    """Restore a project exported by `export_project`; refuses to overwrite an existing project.
+
+    `project_id` imports the project under a new Project ID instead of the one stored in the archive.
+    """
+    new_id = (project_id or "").strip()
+    if new_id and not PROJECT_ID_PATTERN.fullmatch(new_id):
+        raise ProjectError("新的 Project ID 只能包含英文、數字、底線與連字號")
     try:
         archive = zipfile.ZipFile(archive_path)
     except (OSError, zipfile.BadZipFile) as exc:
@@ -116,9 +149,12 @@ def import_project(store: ProjectStore, archive_path: str | Path) -> Project:
         project_id = str(manifest.get("project_id") or "")
         if not PROJECT_ID_PATTERN.fullmatch(project_id):
             raise ProjectError("專案檔中的 Project ID 格式不正確")
-        destination = store.root / project_id
+        target_id = new_id or project_id
+        destination = store.root / target_id
         if destination.exists():
-            raise ProjectError(f"Project ID 已存在：{project_id}，請先刪除或改名既有專案後再匯入")
+            if new_id:
+                raise ProjectError(f"Project ID 已存在：{target_id}，請換一個新的 Project ID")
+            raise ProjectError(f"Project ID 已存在：{target_id}，請在「新的 Project ID」輸入其他名稱後再匯入")
         members = _validated_members(archive, project_id)
         try:
             metadata = json.loads(archive.read(f"{project_id}/project.json").decode("utf-8"))
@@ -146,14 +182,16 @@ def import_project(store: ProjectStore, archive_path: str | Path) -> Project:
             staged_project = staging / project_id
             for directory in PROJECT_DIRECTORIES:
                 (staged_project / directory).mkdir(parents=True, exist_ok=True)
+            if target_id != project_id:
+                _rewrite_project_id_fields(staged_project, project_id, target_id)
             try:
                 os.rename(staged_project, destination)
             except OSError as exc:
                 if destination.exists():
-                    raise ProjectError(f"Project ID 已存在：{project_id}") from exc
+                    raise ProjectError(f"Project ID 已存在：{target_id}") from exc
                 raise
         except OSError as exc:
             raise ProjectError(f"無法匯入專案：{exc}") from exc
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-    return store.get(project_id)
+    return store.get(target_id)

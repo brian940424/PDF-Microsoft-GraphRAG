@@ -3580,18 +3580,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.File(value=str(archive), visible=True),
         )
 
-    def import_project_archive(uploaded, active_id: str | None):
+    def import_project_archive(uploaded, new_project_id: str | None, active_id: str | None):
         path = uploaded if isinstance(uploaded, str) or uploaded is None else getattr(uploaded, "name", None)
+        # 失敗時保留已上傳的檔案與輸入的新 ID，讓使用者改名後可直接重試
+        keep_inputs = (gr.update(), gr.update())
         if not path:
-            return "❌ 請先選擇要匯入的專案檔", *refresh_project_views(None, active_id), None
+            return "❌ 請先選擇要匯入的專案檔", *refresh_project_views(None, active_id), *keep_inputs
         try:
-            project = restore_project_archive(store, path)
+            project = restore_project_archive(store, path, project_id=new_project_id)
         except ProjectError as exc:
-            return f"❌ {exc}", *refresh_project_views(None, active_id), None
+            return f"❌ {exc}", *refresh_project_views(None, active_id), *keep_inputs
         return (
             f"✅ 已匯入專案 {project.project_id}，可按「開啟專案」開始使用",
             *refresh_project_views(project.project_id, active_id),
             None,
+            "",
         )
 
     def processing_option_rows(
@@ -4548,6 +4551,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             label="專案匯出檔（由本系統「匯出專案」產生的 .zip）",
                             file_types=[".zip"],
                             type="filepath",
+                        )
+                        project_import_new_id = gr.Textbox(
+                            label="新的 Project ID（選填）",
+                            placeholder="留空則沿用匯出檔中的 Project ID；與既有專案同名時填入新名稱",
                         )
                         with gr.Row(elem_classes="button-row"):
                             # 檔案上傳完成前停用，避免在上傳途中送出空值
@@ -5733,9 +5740,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         import_project_button.click(
             import_project_archive,
-            inputs=[project_import_file, active_project_id],
+            inputs=[project_import_file, project_import_new_id, active_project_id],
             outputs=[result, project_table, selected_project, selected_project_details,
-                     active_project_id, active_project_banner, project_import_file],
+                     active_project_id, active_project_banner, project_import_file, project_import_new_id],
         )
         update_project_enabled_button.click(
             update_project_enabled,
