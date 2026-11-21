@@ -57,6 +57,7 @@ from .project_archive import import_project as restore_project_archive
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_generation import GeneratedQuestion, QuestionGenerationService
+from .strategy_questions import DEFAULT_STRATEGY_MIX
 from .question_sets import (
     ANSWER_SCOPE_LABELS, DESIGN_STRATEGY_LABELS, BatchQuestion, GoldEvidence, QuestionSetService, infer_answer_scope, question_design_label,
 )
@@ -2925,7 +2926,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return "✅ 題目與來源已自動儲存至目前專案"
 
     def generate_automatic_qa(
-        project_id, count, parallel_generation, generation_model, generation_effort, method, job: Job | None = None,
+        project_id, count, parallel_generation, generation_model, generation_effort, method,
+        by_strategy=False, basic_share=0, local_share=0, drift_share=0, global_share=0, job: Job | None = None,
     ):
         # 輸出最後三項依序為生題、回答、評測進度條；換題目後舊的回答與評測進度一併隱藏
         if not project_id:
@@ -2939,6 +2941,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     gr.update(value=task_progress_markup(fraction, "生題中", description), visible=True),
                     hidden_progress, hidden_progress)
 
+        strategy_mix = (
+            {"basic": basic_share, "local": local_share, "drift": drift_share, "global": global_share}
+            if by_strategy else None
+        )
         try:
             yield render_generation(0, "準備開始")
             question_set = yield from stream_with_progress(
@@ -2951,6 +2957,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     reasoning_effort=generation_effort,
                     progress_callback=report,
                     stop_event=stop_event_of(job),
+                    strategy_mix=strategy_mix,
                 ),
                 render_generation,
                 job,
@@ -2972,6 +2979,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generation_progress = task_progress_markup(generated / target if target else 0, "已停止", f"完成 {generated} / {target} 題")
         else:
             headline = f"✅ 已生成 {generated} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。"
+            if strategy_mix is not None:
+                headline += f"\n\n{question_set.description}"
             generation_progress = task_progress_markup(1, "生成完成", f"共 {generated} 題")
         yield (
             f"{headline}\n\n{question_set.description}",
@@ -4731,7 +4740,24 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
                             label="推理深度", visible=model_supports_reasoning(connections.get_chat_model()),
                         )
-                        autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                        autoqa_parallel_generation = gr.Checkbox(label="允許平行生題（不同 PDF 或不同策略）", value=False)
+                    with gr.Row(equal_height=True):
+                        autoqa_by_strategy = gr.Checkbox(
+                            label="依四種檢索策略出題", value=True,
+                            info="總題數＝每份 PDF 題數 × PDF 數，依配比分給各策略；關閉時每份 PDF 只出單頁 Basic 題",
+                        )
+                        autoqa_basic_share = gr.Number(label="Basic 配比（%）", value=DEFAULT_STRATEGY_MIX["basic"], minimum=0, maximum=100)
+                        autoqa_local_share = gr.Number(label="Local 配比（%）", value=DEFAULT_STRATEGY_MIX["local"], minimum=0, maximum=100)
+                        autoqa_drift_share = gr.Number(label="DRIFT 配比（%）", value=DEFAULT_STRATEGY_MIX["drift"], minimum=0, maximum=100)
+                        autoqa_global_share = gr.Number(
+                            label="Global 配比（%）", value=DEFAULT_STRATEGY_MIX["global"], minimum=0, maximum=100,
+                            info="標準答案只涵蓋抽到的頁面，需人工審核；可設 0",
+                        )
+                    autoqa_by_strategy.change(
+                        lambda enabled: [gr.update(interactive=enabled)] * 4,
+                        inputs=autoqa_by_strategy,
+                        outputs=[autoqa_basic_share, autoqa_local_share, autoqa_drift_share, autoqa_global_share],
+                    )
                     autoqa_generation_model.change(
                         lambda model: gr.update(visible=model_supports_reasoning(model)),
                         inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
@@ -5861,6 +5887,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[
                 automatic_project, autoqa_questions_per_pdf, autoqa_parallel_generation,
                 autoqa_generation_model, autoqa_generation_effort, autoqa_method,
+                autoqa_by_strategy, autoqa_basic_share, autoqa_local_share, autoqa_drift_share, autoqa_global_share,
             ],
             outputs=[
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,

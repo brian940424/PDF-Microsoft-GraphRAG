@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import threading
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Callable
 
@@ -12,10 +14,11 @@ from .cancellation import JobStopped, raise_if_stopped
 from .automatic_evaluation import AutomaticEvaluationResult, AutomaticEvaluationService
 from .projects import ProjectError, ProjectStore
 from .question_generation import QuestionGenerationService, normalize_question
-from .question_sets import BatchQuestion, QuestionSet, QuestionSetService
+from .question_sets import DESIGN_STRATEGIES, DESIGN_STRATEGY_LABELS, BatchQuestion, QuestionSet, QuestionSetService, infer_answer_scope
 from .querying import QueryResult, QueryService
 from .retrieval_evaluation import RetrievalEvaluationResult, RetrievalEvaluationService
 from .source_sampling import SourceSamplingService
+from .strategy_questions import StrategyQuestionGenerator
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +46,7 @@ class AutomaticQATestService:
         question_sets: QuestionSetService,
         judging: AutomaticEvaluationService,
         retrieval: RetrievalEvaluationService,
+        strategy_generator: StrategyQuestionGenerator | None = None,
     ) -> None:
         self.projects = projects
         self.sampling = sampling
@@ -51,6 +55,16 @@ class AutomaticQATestService:
         self.question_sets = question_sets
         self.judging = judging
         self.retrieval = retrieval
+        self._strategy_generator = strategy_generator
+
+    @property
+    def strategy_generator(self) -> StrategyQuestionGenerator:
+        """Built on first use from the generation service's connections and client (tests may fake both)."""
+        if self._strategy_generator is None:
+            self._strategy_generator = StrategyQuestionGenerator(
+                self.projects, self.generation.connections, self.generation.client,
+            )
+        return self._strategy_generator
 
     def generate_question_set(
         self,
@@ -62,9 +76,13 @@ class AutomaticQATestService:
         reasoning_effort: str = "medium",
         progress_callback: Callable[[float, str], None] | None = None,
         stop_event: threading.Event | None = None,
+        strategy_mix: Mapping[str, float] | None = None,
     ) -> QuestionSet:
         """Generate and save a question set.
 
+        With `strategy_mix` (strategy → share), `questions_per_pdf` × PDF count questions are split
+        across Basic／Local／DRIFT／Global by `StrategyQuestionGenerator`; without it, each PDF gets
+        single-page Basic questions.
         Setting `stop_event` sends no further generation requests (requests already sent finish)
         and saves the questions generated so far; with none, JobStopped is raised and nothing is saved.
         """
@@ -82,6 +100,11 @@ class AutomaticQATestService:
         if not pdf_ids:
             raise ProjectError("此專案尚未匯入 PDF")
         samples = self.sampling.scan(project_id, minimum_characters=1)
+        if strategy_mix is not None:
+            return self._generate_by_strategy(
+                project_id, samples, questions_per_pdf * len(pdf_ids), strategy_mix, parallel_pdf_generation,
+                generation_model, method, reasoning_effort, progress_callback, stop_event,
+            )
         accepted: dict[str, list] = {document_id: [] for document_id in pdf_ids}
         seen: set[str] = set()
         errors: list[str] = []
@@ -166,6 +189,10 @@ class AutomaticQATestService:
                         gold_evidence=question.gold_evidence,
                         question_source_evidence=question.question_source_evidence,
                         answer_source_evidence=question.answer_source_evidence or question.gold_evidence,
+                        # One sampled page per question: a single-page Basic lookup.
+                        design_strategy="basic",
+                        answer_scope=infer_answer_scope(question.answer_source_evidence or question.gold_evidence),
+                        answer_scope_inferred=True,
                     )
                 )
         if not batch_questions and stopped:
@@ -186,6 +213,91 @@ class AutomaticQATestService:
             method=method,
         )
         return question_set
+
+    def _generate_by_strategy(
+        self, project_id, samples, total, strategy_mix, parallel, generation_model, method,
+        reasoning_effort, progress_callback, stop_event,
+    ) -> QuestionSet:
+        if progress_callback:
+            progress_callback(0, "正在依策略尋找相關原文")
+        result = self.strategy_generator.generate(
+            project_id, samples, total, strategy_mix, generation_model,
+            reasoning_effort=reasoning_effort, parallel=parallel,
+            progress_callback=progress_callback, stop_event=stop_event,
+        )
+        stopped = bool(stop_event is not None and stop_event.is_set())
+        if not result.questions:
+            if stopped:
+                raise JobStopped("已停止，尚未生成任何題目")
+            detail = "；".join((*result.notes, *result.errors)[:4])
+            raise ProjectError("未能生成任何有效題目" + (f"：{detail}" if detail else ""))
+        if progress_callback:
+            progress_callback(1, "已停止，正在儲存已生成的題目" if stopped else "題目生成完成，正在儲存題目集")
+        batch_questions = [
+            BatchQuestion(
+                question_id=f"Q{index:04d}",
+                question=item.question,
+                reference_answer=item.reference_answer,
+                gold_evidence=item.answer_source_evidence,
+                question_source_evidence=item.question_source_evidence,
+                answer_source_evidence=item.answer_source_evidence,
+                design_strategy=item.design_strategy,
+                answer_scope=item.answer_scope,
+                answer_scope_inferred=True,
+            )
+            for index, item in enumerate(result.questions, start=1)
+        ]
+        counts = {strategy: 0 for strategy in DESIGN_STRATEGIES}
+        for item in result.questions:
+            counts[item.design_strategy] += 1
+        description = (
+            ("已停止，部分題目。" if stopped else "")
+            + f"依策略出題（目標 {total} 題）："
+            + "、".join(f"{DESIGN_STRATEGY_LABELS[key]} {value}" for key, value in counts.items() if value)
+            + f"；生題模型 {generation_model}。"
+            + ("Global 題的標準答案只涵蓋抽到的頁面，需人工審核。" if counts["global"] else "")
+            + ("".join(f"{note}。" for note in result.notes))
+            + (f"未完成項目 {len(result.errors)} 筆，詳見出題紀錄。" if result.errors else "")
+        )
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        question_set = self.question_sets.create_with_questions(
+            project_id, f"自動問答測試-{stamp}", batch_questions, description=description, method=method,
+        )
+        self._write_design_log(project_id, question_set, result, strategy_mix, generation_model)
+        return question_set
+
+    def _write_design_log(self, project_id, question_set, result, strategy_mix, generation_model) -> None:
+        """Record why each question was built from its pages (DRIFT reasoning chains, Local entities)."""
+        payload = {
+            "question_set_id": question_set.question_set_id,
+            "generation_model": generation_model,
+            "strategy_mix": dict(strategy_mix),
+            "quotas": result.quotas,
+            "notes": result.notes,
+            "errors": result.errors,
+            "skipped_bundles": result.skipped,
+            "questions": [
+                {
+                    "question_id": batch.question_id,
+                    **{key: value for key, value in asdict(item).items()
+                       if key in {"design_strategy", "answer_scope", "bundle_id", "hint", "reasoning_chain", "entities"}},
+                }
+                for batch, item in zip(question_set.questions, result.questions)
+            ],
+        }
+        path = self.projects.path_for(project_id) / "runs" / f"question-design-{question_set.question_set_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        QuestionSetService._atomic_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+    def question_design_log(self, project_id: str, question_set_id: str) -> dict | None:
+        """The strategy generation record of a question set, or None for sets made otherwise."""
+        if not question_set_id.isalnum():
+            return None
+        path = self.projects.path_for(project_id) / "runs" / f"question-design-{question_set_id}.json"
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
 
     def generate_and_run(
         self,
