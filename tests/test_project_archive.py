@@ -30,6 +30,8 @@ class ProjectArchiveTests(unittest.TestCase):
         (root / "graphrag" / "output" / "entities.parquet").write_bytes(b"graph")
         (root / "graphrag" / "cache").mkdir()
         (root / "graphrag" / "cache" / "llm.json").write_text("{}")
+        (root / "cache").mkdir(exist_ok=True)
+        (root / "cache" / "query_cache.db").write_text("cache")
         (root / "graphrag" / ".env").write_text("GRAPHRAG_API_KEY=secret")
         self.base = base
 
@@ -48,6 +50,7 @@ class ProjectArchiveTests(unittest.TestCase):
         self.assertEqual((root / "source" / "manual.pdf").read_bytes(), b"%PDF-1.4")
         self.assertFalse((root / "graphrag" / ".env").exists())
         self.assertFalse((root / "graphrag" / "cache").exists())
+        self.assertFalse((root / "cache" / "query_cache.db").exists())
         self.assertTrue((root / "exports").is_dir())
         self.assertEqual([p.name for p in self.target.root.iterdir()], ["L33-SM3E"])
 
@@ -57,6 +60,7 @@ class ProjectArchiveTests(unittest.TestCase):
         import_project(self.target, archive)
 
         self.assertTrue((self.target.root / "L33-SM3E" / "graphrag" / "cache" / "llm.json").is_file())
+        self.assertTrue((self.target.root / "L33-SM3E" / "cache" / "query_cache.db").is_file())
 
     def test_import_refuses_existing_project_id(self) -> None:
         archive = export_project(self.source, "L33-SM3E")

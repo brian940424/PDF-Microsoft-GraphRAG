@@ -13,6 +13,8 @@
 - [安裝與啟動](docs/02_安裝與啟動.md)
 - [操作指南](docs/04_使用指南.md)
 - [檢索實驗策略與參數](docs/08_檢索實驗與策略參數.md)
+- [回答與圖譜快取機制（含語意快取觸發方式與設定）](docs/14_回答與圖譜快取機制說明.md)
+- [語意快取改善計畫（目前暫不實作）](docs/15_快取機制之語意快取改善計畫.md)
 - [題目集 JSON 格式](docs/05_題目集格式.md)
 - [開發進度指揮中心（3D 進度儀表板）](progress-dashboard/README.md)
 
@@ -186,6 +188,60 @@ CF_ACCESS_CLIENT_SECRET=your-cloudflare-access-client-secret
 以 `--env-file` 傳入時，上述設定都會成為環境變數。非 Docker 的本機 `.env` 只提供 API Key 與 Cloudflare Access 憑證，Base URL 與模型請改用環境變數或管理後台設定。
 
 若選擇由管理後台儲存連線設定，設定會寫入持久化 Volume 內的 `.connection.json`，並優先於環境變數與 `.env`；儲存後再改這些值不會生效。請將該 Volume 視為敏感資料並限制存取。
+
+### 查詢與語意快取環境變數
+
+下列變數由管理後台及一般使用者入口各自的**服務程序環境**讀取。Docker 可把它們放入 `--env-file` 使用的 `.env`；本機直接執行時，專案的 `.env` 只會自動讀取 API Key 與 Cloudflare Access 憑證，快取變數需先在啟動 shell 設定／export，再啟動服務。變更後需重啟對應服務。
+
+| 變數 | 預設值 | 用途 |
+|---|---:|---|
+| `GRAPHRAG_ENABLE_QUERY_CACHE` | `true` | 磁碟回答快取總開關。設 `false`／`0`／`no`／`off` 時 exact 與 semantic 結果快取都不會執行。 |
+| `GRAPHRAG_QUERY_CACHE_TTL_SECONDS` | `2592000`（30 天） | 每專案 SQLite exact／semantic entries 的存活秒數。 |
+| `GRAPHRAG_QUERY_CACHE_MAX_BYTES` | `524288000`（500 MiB） | 每專案 exact 與 semantic entries 共用的容量上限；超限時淘汰較舊／較少使用的項目。 |
+| `GRAPHRAG_ENABLE_INDEX_CACHE` | `true` | 程序內 GraphRAG 索引快取開關；與回答快取分開控制。 |
+| `GRAPHRAG_MAX_LOADED_PROJECTS` | 管理後台 `1`；一般入口 `2` | 每個服務程序可常駐 RAM 的索引專案數。 |
+| `GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE` | `false` | 語意快取全域 master switch。只有設為 `true`／`1`／`yes`／`on` 才允許 Shadow／Serving；打開它**不會**自動啟用所有專案。 |
+| `GRAPHRAG_SEMANTIC_QUERY_CACHE_THRESHOLD` | 無 | Serving 必填，校準後的 cosine 相似度門檻，範圍 `0 < threshold <= 1`。未設定或無效時 Serving 停用；不要使用未校準的猜測值。 |
+| `GRAPHRAG_SEMANTIC_QUERY_CACHE_MIN_MARGIN` | 無 | Serving 必填，最佳候選與次佳候選的校準分數差，範圍 `0 <= margin <= 1`。未設定或無效時 Serving 停用。 |
+| `GRAPHRAG_SEMANTIC_QUERY_CACHE_TOP_K` | `5` | 語意候選數，允許 `1`～`20`。無效值會停用該次語意查找。 |
+
+語意是否實際觸發由**全域開關、專案模式及單次查詢條件共同決定**：全域開關必須開啟、`GRAPHRAG_ENABLE_QUERY_CACHE` 必須啟用、專案在第 0 頁設為 `shadow` 或 `serving`，且此問題 exact miss、沒有 bypass。專案模式寫在專案根目錄 `query_cache_settings.json`，新專案預設 `off`；因此其他仍為 `off` 的專案不會因全域 master switch 打開而呼叫 Embedding。若某專案已是 Shadow／Serving，打開全域開關後它才會開始依該模式運作。管理後台與 portal 是不同程序；要讓兩個入口都使用相同模式，必須讓兩個程序取得相同環境變數。
+
+快取觸發順序：
+
+1. Exact cache 先查；命中就直接回傳，不呼叫 Embedding。這是預期行為，測 Shadow 時應用未曾精確查詢過的改寫問題。
+2. `off`、全域開關關閉、回答快取總開關關閉、bypass，或不支援的查詢種類，都不呼叫 Embedding。自動問答／檢索實驗預設 bypass 時亦略過 semantic lookup。
+3. `shadow` 在 exact miss 時呼叫一次 Embedding，記錄候選判斷後仍執行 fresh GraphRAG 查詢；有無 threshold 不改變 Shadow 不回傳候選的行為。每筆 miss 會增加 Embedding API 延遲與可能費用。
+4. `serving` 除以上條件外，threshold 和 margin 必須都有效；候選還需通過 scope、hard guards、相似度與 margin，才會重用舊結果。未校準前不要設 serving 或填入臆測門檻。
+
+範例：Docker `--env-file` 使用的設定應保持語意總開關關閉：
+
+```dotenv
+GRAPHRAG_ENABLE_QUERY_CACHE=true
+GRAPHRAG_QUERY_CACHE_TTL_SECONDS=2592000
+GRAPHRAG_QUERY_CACHE_MAX_BYTES=524288000
+GRAPHRAG_ENABLE_INDEX_CACHE=true
+GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=false
+GRAPHRAG_SEMANTIC_QUERY_CACHE_TOP_K=5
+```
+
+若要在本機測 Shadow，先在啟動兩個服務的 shell 設定全域開關，例如 `export GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=true`；再於後台只把指定測試專案切成 `shadow`，其他專案維持 `off`，然後重啟要觀察的服務。Serving 的 threshold／margin 必須先完成獨立 holdout 校準，並依專案改善計畫驗收，不能把本文件中的預設值當成門檻建議。本機 Shadow 測試流程與紀錄欄位見[快取機制說明](docs/14_回答與圖譜快取機制說明.md)及[語意快取改善計畫](docs/15_快取機制之語意快取改善計畫.md)。
+
+Linux／macOS 本機啟動範例（管理後台和 portal 是不同程序，因此在兩個終端機都設定開關）：
+
+```bash
+# Terminal 1: admin
+export GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=true
+export PROJECTS_ROOT="$PWD/projects"
+GRADIO_SERVER_PORT=7861 automotive-graphrag-admin
+
+# Terminal 2: portal
+export GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=true
+export PROJECTS_ROOT="/absolute/path/to/the/project/projects"
+automotive-graphrag
+```
+
+Windows PowerShell 在啟動每個服務的視窗執行 `$env:GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE="true"`，並設定相同的 `$env:PROJECTS_ROOT`；管理後台使用連接埠 7861，portal 使用 7860。重啟服務才會讀取新的 process environment。全域開關開啟後，只有後台設定成 Shadow／Serving 的專案會嘗試語意查找；其他專案維持 `off`。
 
 ## 部署後如何啟動
 

@@ -60,7 +60,9 @@ class EvidenceService:
         self.projects = projects
         self.metadata = metadata or SourceMetadataService(projects)
 
-    def from_context(self, project_id: str, context: dict[str, Any]) -> list[Evidence]:
+    def from_context(
+        self, project_id: str, context: dict[str, Any], text_units: pd.DataFrame | None = None,
+    ) -> list[Evidence]:
         raw_sources = self.source_records(context)
         result: list[Evidence] = []
         seen: set[str] = set()
@@ -69,13 +71,18 @@ class EvidenceService:
             text_units_path = output / "text_units.parquet"
             if not text_units_path.is_file():
                 raise ProjectError("找不到 GraphRAG text_units.parquet")
-            try:
-                text_units = pd.read_parquet(text_units_path, columns=["id", "human_readable_id"])
-            except (KeyError, ValueError) as exc:
-                # A build killed midway can leave text_units.parquet without these columns.
-                raise ProjectError(
-                    "索引輸出不完整（text_units.parquet 缺少 id／human_readable_id 欄位），請重新建圖"
-                ) from exc
+            if text_units is None:
+                try:
+                    text_units = pd.read_parquet(text_units_path, columns=["id", "human_readable_id"])
+                except (KeyError, ValueError) as exc:
+                    # A build killed midway can leave text_units.parquet without these columns.
+                    raise ProjectError(
+                        "索引輸出不完整（text_units.parquet 缺少 id／human_readable_id 欄位），請重新建圖"
+                    ) from exc
+            elif not {"id", "human_readable_id"}.issubset(text_units.columns):
+                raise ProjectError("索引輸出不完整（text_units 缺少 id／human_readable_id 欄位），請重新建圖")
+            else:
+                text_units = text_units[["id", "human_readable_id"]]
             full_id_by_short_id = {
                 str(row["human_readable_id"]): str(row["id"])
                 for row in text_units.to_dict(orient="records")

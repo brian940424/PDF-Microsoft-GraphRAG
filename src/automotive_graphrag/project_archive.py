@@ -29,6 +29,7 @@ BUSY_STATUSES = {"INDEXING", "PROCESSING"}
 # Per-project secrets and transient lock files never leave the machine.
 EXCLUDED_NAMES = {".env", INDEXING_LOCK_FILE}
 CACHE_DIRECTORY = PurePosixPath("graphrag", "cache")
+CACHE_DIRECTORIES = (CACHE_DIRECTORY, PurePosixPath("cache"))
 MAX_UNCOMPRESSED_BYTES = 20 * 1024**3
 
 
@@ -55,7 +56,7 @@ def export_project(store: ProjectStore, project_id: str, *, include_cache: bool 
                 relative = PurePosixPath(path.relative_to(project_path).as_posix())
                 if path.is_symlink() or not path.is_file() or path.name in EXCLUDED_NAMES:
                     continue
-                if not include_cache and relative.parts[:2] == CACHE_DIRECTORY.parts:
+                if not include_cache and any(relative.parts[: len(item.parts)] == item.parts for item in CACHE_DIRECTORIES):
                     continue
                 archive.write(path, f"{project.project_id}/{relative}")
     except OSError as exc:

@@ -144,3 +144,12 @@ def install_two_stage_basic(
     stream_search._two_stage_patch = True  # type: ignore[attr-defined]
     stream_search.__wrapped__ = original  # type: ignore[attr-defined]
     BasicSearch.stream_search = stream_search  # type: ignore[method-assign]
+
+
+def reset_two_stage_basic() -> None:
+    """Remove the request-scoped Basic search wrapper installed for one GraphRAG query."""
+    from graphrag.query.structured_search.basic_search.search import BasicSearch
+
+    current = BasicSearch.stream_search
+    if getattr(current, "_two_stage_patch", False):
+        BasicSearch.stream_search = current.__wrapped__  # type: ignore[method-assign]

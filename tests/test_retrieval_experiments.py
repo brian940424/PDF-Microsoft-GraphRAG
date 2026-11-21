@@ -1061,26 +1061,18 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         calls = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             calls[payload["method"]] = {
                 **payload,
                 "output_is_symlink": (root / "output").is_symlink(),
                 "completion_model": settings["completion_models"]["default"]["model"],
-                "cwd": str(kwargs["cwd"]),
             }
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps({"answer": "answer", "context": {}}),
-                "",
-            )
+            return {"answer": "answer", "context": {}, "llm_calls": []}
 
-        with patch(
-            "automotive_graphrag.retrieval_experiments.subprocess.run",
-            side_effect=run_worker,
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
         ) as worker:
             for method in ("local", "global", "drift", "basic"):
                 answer, _ = self.service._graphrag_query(
@@ -1091,7 +1083,6 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(worker.call_count, 4)
         self.assertEqual(set(calls), {"local", "global", "drift", "basic"})
         self.assertTrue(all(call["output_is_symlink"] for call in calls.values()))
-        self.assertTrue(all(call["cwd"] == str(Path(__file__).parents[1]) for call in calls.values()))
         self.assertTrue(all(call["completion_model"] == "gpt-4.1-mini" for call in calls.values()))
         self.assertTrue(all(call["response_type"] == "List of 3-7 Points" for call in calls.values()))
 
@@ -1115,14 +1106,15 @@ class RetrievalExperimentTests(unittest.TestCase):
         (graph_root / "settings.yaml").write_text("completion_models: {default: {model: old}}\n", encoding="utf-8")
         captured = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             captured["settings"] = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             captured["basic_prompt"] = Path(captured["settings"]["basic_search"]["prompt"]).read_text(encoding="utf-8")
-            return subprocess.CompletedProcess(command, 0, json.dumps({"answer": "ok", "context": {}}), "")
+            return {"answer": "ok", "context": {}, "llm_calls": []}
 
-        with patch("automotive_graphrag.retrieval_experiments.subprocess.run", side_effect=run_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
+        ):
             self.service._graphrag_query(
                 "project", "q", "basic", "gpt-4.1-mini",
                 strategy_parameters={"k": 17, "max_context_tokens": 8000},
@@ -1141,23 +1133,16 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         captured = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             captured["model"] = settings["completion_models"]["default"]["model"]
             captured["args"] = settings["completion_models"]["default"]["call_args"]
             captured["output_is_symlink"] = (root / "output").is_symlink()
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps({"answer": "Luna DRIFT answer", "context": {"sources": []}}),
-                "",
-            )
+            return {"answer": "Luna DRIFT answer", "context": {"sources": []}, "llm_calls": []}
 
-        with patch(
-            "automotive_graphrag.retrieval_experiments.subprocess.run",
-            side_effect=run_worker,
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
         ) as adapter:
             answer, _context = self.service._graphrag_query(
                 "project", "測試", "drift", "gpt-6-luna", reasoning_effort="high"

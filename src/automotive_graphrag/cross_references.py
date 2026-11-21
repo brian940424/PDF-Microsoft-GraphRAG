@@ -49,6 +49,15 @@ def capture_basic_retrieval(capture: dict[str, Any]) -> None:
     VectorStore.similarity_search_by_text = similarity_search_by_text  # type: ignore[method-assign]
 
 
+def reset_capture_basic_retrieval() -> None:
+    """Remove the per-query retrieval capture before another in-process query runs."""
+    from graphrag_vectors.vector_store import VectorStore
+
+    current = VectorStore.similarity_search_by_text
+    if getattr(current, "_capture_patch", False):
+        VectorStore.similarity_search_by_text = current.__wrapped__  # type: ignore[method-assign]
+
+
 def referenced_pages(texts: Iterable[str], documents: Iterable[str]) -> list[tuple[str, int]]:
     """Pages named by "Refer to XX-n" in `texts`, in order of first mention, limited to known documents."""
     known = set(documents)
@@ -140,8 +149,13 @@ def _locations(output_directory: Path) -> dict[str, tuple[str, int]]:
     return locations
 
 
-def follow_references(result: Any, capture: Mapping[str, Any], root: Path) -> tuple[Any, dict[str, Any]]:
-    """Append the passages of nearly-retrieved referenced pages to a GraphRAG Basic context."""
+def follow_references(
+    result: Any, capture: Mapping[str, Any], root: Path, text_units: Any = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Append the passages of nearly-retrieved referenced pages to a GraphRAG Basic context.
+
+    `text_units` is the already loaded index table when the graph index cache supplies one.
+    """
     import pandas as pd
 
     frame = result.context_records.get("sources") if isinstance(result.context_records, dict) else None
@@ -171,7 +185,10 @@ def follow_references(result: Any, capture: Mapping[str, Any], root: Path) -> tu
     if not selected:
         return result, {}
     wanted = {unit for item in selected for unit in item["units"]}
-    text_units = pd.read_parquet(output_directory / "text_units.parquet", columns=["id", "human_readable_id", "text"])
+    if text_units is None:
+        text_units = pd.read_parquet(output_directory / "text_units.parquet", columns=["id", "human_readable_id", "text"])
+    else:
+        text_units = text_units[["id", "human_readable_id", "text"]]
     rows = {str(row["id"]): row for row in text_units.to_dict(orient="records") if str(row["id"]) in wanted}
     known = set(frame["id"].astype(str))
     added = []

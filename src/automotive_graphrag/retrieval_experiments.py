@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import inspect
 import math
 import os
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -51,7 +53,12 @@ from .question_sets import (
 )
 from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
-from .answer_prompts import install_answer_prompts
+from .query_cache import QueryResultCache, index_signature, normalize_query
+from .semantic_query_cache import (
+    candidate as semantic_candidate, proxy_embedding, read_project_mode,
+    scope_hash as semantic_scope_hash, semantic_config,
+)
+from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
 from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, aggregate_cost, query_cost_summary, tag_calls, usage_metadata
 from .strategy_routing import (
     SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
@@ -700,6 +707,7 @@ class RetrievalExperimentService:
         judge_model: str | None = None,
         evaluate: bool = True,
         stop_event: threading.Event | None = None,
+        bypass_cache: bool = True,
     ) -> RetrievalExperimentRun:
         """Setting `stop_event` sends no new requests; requests already sent finish and are saved."""
         if not groups:
@@ -752,7 +760,7 @@ class RetrievalExperimentService:
                 worker = self._run_case if evaluate else self._generate_case
                 futures[executor.submit(
                     worker, project_id, group, question, judge_model,
-                    question_set.question_set_id, question_set.name,
+                    question_set.question_set_id, question_set.name, bypass_cache,
                 )] = (group, question_set, question)
 
         fill_available_workers()
@@ -808,6 +816,7 @@ class RetrievalExperimentService:
         update_callback: UpdateFunction | None = None,
         judge_model: str | None = None,
         stop_event: threading.Event | None = None,
+        bypass_cache: bool = True,
     ) -> RetrievalExperimentRun:
         """Run retrieval and answer generation only; judging is a separate action."""
         return self.run(
@@ -819,6 +828,7 @@ class RetrievalExperimentService:
             judge_model,
             evaluate=False,
             stop_event=stop_event,
+            bypass_cache=bypass_cache,
         )
 
     def evaluate_answers(
@@ -1359,16 +1369,18 @@ class RetrievalExperimentService:
 
     def _run_case(
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
-        dataset_id: str = "", dataset_name: str = "",
+        dataset_id: str = "", dataset_name: str = "", bypass_cache: bool = True,
     ) -> ExperimentQuestionResult:
-        generated = self._generate_case(project_id, group, question, judge_model, dataset_id, dataset_name)
+        generated = self._generate_case(
+            project_id, group, question, judge_model, dataset_id, dataset_name, bypass_cache,
+        )
         if generated.status != "answered":
             return generated
         return self._evaluate_case(project_id, group, question, judge_model, generated)
 
     def _generate_case(
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
-        dataset_id: str = "", dataset_name: str = "",
+        dataset_id: str = "", dataset_name: str = "", bypass_cache: bool = True,
     ) -> ExperimentQuestionResult:
         started_clock = time.monotonic()
         routed_method = routing_reason = ""
@@ -1395,11 +1407,13 @@ class RetrievalExperimentService:
                     item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
                 ) or len(inspect.signature(self.query_function).parameters) >= 7
                 if accepts_strategy_parameters:
+                    kwargs = {"bypass_cache": bypass_cache} if "bypass_cache" in inspect.signature(self.query_function).parameters else {}
                     answer_value, context_value = self.query_function(
-                        *query_arguments, group.strategy_parameters.get(strategy, {})
+                        *query_arguments, group.strategy_parameters.get(strategy, {}), **kwargs
                     )
                 else:
-                    answer_value, context_value = self.query_function(*query_arguments)
+                    kwargs = {"bypass_cache": bypass_cache} if "bypass_cache" in inspect.signature(self.query_function).parameters else {}
+                    answer_value, context_value = self.query_function(*query_arguments, **kwargs)
                 return answer_value, take_search_calls(strategy, context_value)
 
             if group.method == EXPERIMENT_AUTO_METHOD:
@@ -1464,6 +1478,8 @@ class RetrievalExperimentService:
                     kwargs = {}
                     if "timeout_seconds" in signature.parameters:
                         kwargs["timeout_seconds"] = timeout_seconds
+                    if "bypass_cache" in signature.parameters:
+                        kwargs["bypass_cache"] = bypass_cache
                     if accepts_parameters:
                         answer_value, context_value = self.query_function(
                             *arguments, group.strategy_parameters.get(search_method, {}), **kwargs
@@ -1526,10 +1542,22 @@ class RetrievalExperimentService:
             mapping_error = None
             if method in EVIDENCE_METHODS or method == EXPERIMENT_AGENTIC_METHOD:
                 try:
-                    retrieved_evidence = self._resolved_evidence(project_id, context)
+                    text_units = None
+                    if os.environ.get("GRAPHRAG_ENABLE_INDEX_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}:
+                        try:
+                            from .graph_index_cache import GraphIndexManager
+
+                            dataframes, _, _ = GraphIndexManager.instance().get(
+                                project_id, self.projects.path_for(project_id),
+                            )
+                            text_units = dataframes.get("text_units")
+                        except Exception:
+                            text_units = None
+                    retrieved_evidence = self._resolved_evidence(project_id, context, text_units)
                     if answer and retrieved_evidence:
                         retrieved_evidence, _ = with_duplicate_citations(
                             self.projects, project_id, answer, retrieved_evidence, context,
+                            text_units=text_units,
                         )
                     raw_sources = EvidenceService.source_records(context)
                     if raw_sources and not retrieved_evidence:
@@ -1858,11 +1886,13 @@ class RetrievalExperimentService:
         self._write(project_id, state)
         return run
 
-    def _resolved_evidence(self, project_id: str, context: dict[str, object]) -> tuple[Evidence, ...]:
+    def _resolved_evidence(
+        self, project_id: str, context: dict[str, object], text_units=None,
+    ) -> tuple[Evidence, ...]:
         raw = context.get("sources")
         if not isinstance(raw, list) or not raw:
             return ()
-        evidence = EvidenceService(self.projects).from_context(project_id, context)
+        evidence = EvidenceService(self.projects).from_context(project_id, context, text_units=text_units)
         return tuple(evidence)
 
     def _resolved_sources(self, project_id: str, context: dict[str, object]) -> tuple[str, ...]:
@@ -1906,7 +1936,9 @@ class RetrievalExperimentService:
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         strategy_parameters: dict[str, object] | None = None,
         timeout_seconds: float | None = None,
+        bypass_cache: bool = False,
     ) -> tuple[str, dict[str, object]]:
+        query_started = time.monotonic()
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
         if response_type not in EXPERIMENT_RESPONSE_TYPES:
@@ -1938,6 +1970,77 @@ class RetrievalExperimentService:
         for key in EXPERIMENT_STRATEGY_CONFIG_KEYS[method]:
             if key in selected_parameters:
                 section[key] = selected_parameters[key]
+        cache_enabled = os.environ.get("GRAPHRAG_ENABLE_QUERY_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}
+        cache = QueryResultCache(self.projects.path_for(project_id)) if cache_enabled else None
+        cache_key = QueryResultCache.make_key({
+            "project_id": project_id,
+            "index_signature": index_signature(self.projects.path_for(project_id)),
+            "strategy": method,
+            "chat_model": model,
+            "embedding_model": self.connections.get_embedding_model(),
+            "strategy_params": {
+                **selected_parameters,
+                "response_type": response_type,
+                "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
+                "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                "settings_sha256": hashlib.sha256(
+                    json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest(),
+            },
+            "normalized_query": normalize_query(question),
+        })
+        if cache is not None and not bypass_cache:
+            try:
+                cached = cache.get(cache_key)
+            except Exception:  # Cache corruption or SQLite I/O failure falls through to GraphRAG.
+                cached = None
+            if isinstance(cached, dict):
+                context = cached.get("context", {})
+                if isinstance(context, dict):
+                    context = dict(context)
+                    context["query_cache_hit"] = True
+                    context["query_cache_type"] = "exact"
+                    context["original_latency_sec"] = cached.get("original_latency_sec")
+                    context["index_cache_hit"] = False
+                    context["index_load_sec"] = None
+                return str(cached.get("answer", "")), context if isinstance(context, dict) else {}
+        semantic_scope = None
+        semantic_match = None
+        semantic_vector = None
+        semantic_stats: dict[str, object] = {}
+        semantic_mode = read_project_mode(self.projects.path_for(project_id))
+        semantic_options = semantic_config()
+        if (
+            cache is not None and not bypass_cache and semantic_mode in {"shadow", "serving"}
+            and semantic_options is not None and (semantic_mode == "shadow" or semantic_options["calibrated"])
+        ):
+            semantic_scope = {
+                "project_id": project_id, "index_signature": index_signature(self.projects.path_for(project_id)),
+                "requested_strategy": method, "chat_model": model, "embedding_model": self.connections.get_embedding_model(),
+                "embedding_version": "semantic-query-embedding-v1", "normalization": "l2-v1",
+                "response_type": response_type,
+                "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
+                "settings_sha256": hashlib.sha256(json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest(),
+                "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                "strategy_params": selected_parameters,
+                "portal_defaults": self.projects.get_portal_defaults(project_id), "safety_filter_version": 1,
+            }
+            embed = lambda text, selected_model, pid: proxy_embedding(text, selected_model, pid, self.connections)
+            semantic_match, semantic_stats = semantic_candidate(
+                cache, question, semantic_scope, self.connections.get_embedding_model(), embed, semantic_options["top_k"],
+            )
+            semantic_vector = semantic_stats.pop("_query_vector", None)
+            if semantic_match and semantic_mode == "serving":
+                context = semantic_match["value"].get("context", {})
+                context = dict(context) if isinstance(context, dict) else {}
+                context.update({
+                    "semantic_cache_hit": True, "semantic_cache_score": semantic_stats.get("semantic_cache_score"),
+                    "semantic_cache_candidate_id": semantic_match["item_id"],
+                    "semantic_embedding_calls": 1, "semantic_embedding_latency_ms": semantic_stats.get("semantic_embedding_latency_ms"),
+                    "query_cache_hit": False, "query_cache_type": "semantic",
+                    "index_cache_hit": False, "index_load_sec": None,
+                })
+                return str(semantic_match["value"].get("answer", "")), context
         api_key = self.connections.apply_to_environment(project_id)
         del api_key  # GraphRAG reads the standard API key environment variable.
 
@@ -1946,8 +2049,7 @@ class RetrievalExperimentService:
             install_answer_prompts(settings, root)
             (root / "settings.yaml").write_text(yaml.safe_dump(settings, allow_unicode=True, sort_keys=False), encoding="utf-8")
             (root / "output").symlink_to(project_path / "output", target_is_directory=True)
-            worker_payload = json.dumps(
-                {
+            worker_payload = {
                     "root_dir": str(root),
                     "question": question,
                     "method": method,
@@ -1955,40 +2057,84 @@ class RetrievalExperimentService:
                     "response_type": response_type,
                     "community_level": selected_parameters.get("community_level", 2),
                     "dynamic_community_selection": selected_parameters.get("dynamic_community_selection", False),
-                },
-                ensure_ascii=False,
-            )
+                }
             package_root = Path(__file__).resolve().parents[2]
             environment = os.environ.copy()
             source_path = str(package_root / "src")
             environment["PYTHONPATH"] = os.pathsep.join(
                 part for part in (source_path, environment.get("PYTHONPATH", "")) if part
             )
-            result = subprocess.run(
-                [sys.executable, "-m", "automotive_graphrag.graph_query_worker"],
-                cwd=package_root,
-                env=environment,
-                input=worker_payload,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout_seconds,
-            )
-        try:
-            response = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            detail = (result.stderr or result.stdout).strip().splitlines()
-            raise ProjectError(
-                f"GraphRAG 查詢工作程序未回傳有效結果：{detail[-1] if detail else result.returncode}"
-            ) from exc
-        if result.returncode or "error" in response:
-            raise ProjectError(str(response.get("error") or result.stderr or "GraphRAG 查詢失敗"))
+            if timeout_seconds is None:
+                from .graph_query_worker import execute_graph_query
+
+                dataframes = None
+                index_hit = False
+                index_load = None
+                if os.environ.get("GRAPHRAG_ENABLE_INDEX_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}:
+                    try:
+                        from .graph_index_cache import GraphIndexManager
+
+                        dataframes, index_hit, index_load = GraphIndexManager.instance().get(
+                            project_id, self.projects.path_for(project_id),
+                        )
+                    except Exception:
+                        dataframes = None
+                response = execute_graph_query(worker_payload, dataframes)
+                response["index_cache_hit"] = index_hit
+                response["index_load_sec"] = index_load
+            else:
+                result = subprocess.run(
+                    [sys.executable, "-m", "automotive_graphrag.graph_query_worker"],
+                    cwd=package_root,
+                    env=environment,
+                    input=json.dumps(worker_payload, ensure_ascii=False),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=timeout_seconds,
+                )
+                try:
+                    response = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    detail = (result.stderr or result.stdout).strip().splitlines()
+                    raise ProjectError(
+                        f"GraphRAG 查詢工作程序未回傳有效結果：{detail[-1] if detail else result.returncode}"
+                    ) from exc
+                if result.returncode or "error" in response:
+                    raise ProjectError(str(response.get("error") or result.stderr or "GraphRAG 查詢失敗"))
         context = response.get("context", {})
         context = dict(context) if isinstance(context, dict) else {}
+        context["index_cache_hit"] = response.get("index_cache_hit", False)
+        context["index_load_sec"] = response.get("index_load_sec")
+        context["query_cache_hit"] = False
+        context["query_cache_type"] = "bypass" if bypass_cache else "miss"
+        context["semantic_cache_hit"] = False
+        context["semantic_cache_mode"] = semantic_mode
+        context.update(semantic_stats)
         llm_calls = response.get("llm_calls")
         if isinstance(llm_calls, list):
             # Carried out of the worker inside the context; `_generate_case` removes it again.
             context[LLM_CALLS_CONTEXT_KEY] = llm_calls
+        try:
+            cached_context = dict(context)
+            cached_context.pop(LLM_CALLS_CONTEXT_KEY, None)
+            if cache is not None:
+                if str(response.get("answer", "")).strip():
+                    value = {
+                        "answer": str(response.get("answer", "")), "context": cached_context,
+                        "original_latency_sec": round(time.monotonic() - query_started, 3),
+                    }
+                    cache.put(cache_key, value)
+                    if (
+                        semantic_scope is not None and semantic_mode in {"shadow", "serving"}
+                        and isinstance(semantic_vector, list) and cached_context
+                    ):
+                        cache.put_semantic(
+                            uuid.uuid4().hex, semantic_scope_hash(semantic_scope), question,
+                            semantic_vector, value, cache_key,
+                        )
+        except Exception:  # noqa: BLE001 - a failed cache write must not fail an experiment query.
+            pass
         return str(response.get("answer", "")), context
 
     def _validate_groups(self, groups: Sequence[ExperimentGroup]) -> None:

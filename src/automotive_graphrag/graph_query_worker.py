@@ -5,15 +5,19 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
-from .answer_extraction import install_two_stage_basic
-from .cross_references import capture_basic_retrieval, follow_references
+from .answer_extraction import install_two_stage_basic, reset_two_stage_basic
+from .cross_references import capture_basic_retrieval, follow_references, reset_capture_basic_retrieval
 from .llm_usage import install_litellm_recorder
 from .variants import select_basic_context
 from .querying import QueryService
+
+_IN_PROCESS_QUERY_LOCK = threading.RLock()
 
 
 def use_retrieval_query_for_basic(retrieval_query: str) -> None:
@@ -32,8 +36,39 @@ def use_retrieval_query_for_basic(retrieval_query: str) -> None:
     BasicSearchContext.build_context = build_context  # type: ignore[method-assign]
 
 
-def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
+def reset_retrieval_query_for_basic() -> None:
+    """Remove the per-query Basic retrieval rewrite before another in-process query runs."""
+    from graphrag.query.structured_search.basic_search.basic_context import BasicSearchContext
+
+    current = BasicSearchContext.build_context
+    if getattr(current, "_retrieval_query_patch", False):
+        BasicSearchContext.build_context = current.__wrapped__  # type: ignore[method-assign]
+
+
+def execute_graph_query(
+    payload: dict[str, Any], preloaded_dataframes: dict[str, object] | None = None,
+) -> dict[str, Any]:
     """Execute one CLI query and return JSON-safe answer and context data."""
+    # Search adapters patch GraphRAG module-level loaders and callbacks. Keep those
+    # temporary hooks scoped to one request while allowing the loaded tables to persist.
+    with _IN_PROCESS_QUERY_LOCK, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            original_cwd = Path.cwd()
+        except OSError:
+            original_cwd = Path(__file__).resolve().parents[2]
+            os.chdir(original_cwd)
+        try:
+            return _execute_graph_query(payload, preloaded_dataframes)
+        finally:
+            try:
+                os.chdir(original_cwd)
+            except FileNotFoundError:
+                os.chdir(Path(__file__).resolve().parents[2])
+
+
+def _execute_graph_query(
+    payload: dict[str, Any], preloaded_dataframes: dict[str, object] | None,
+) -> dict[str, Any]:
     method = str(payload.get("method", ""))
     root_dir = Path(str(payload["root_dir"]))
     question = str(payload["question"])
@@ -45,11 +80,26 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
 
     from graphrag.cli import query as cli_query
 
+    from . import llm_usage
+
+    previous_recorder_target = llm_usage._recorder_target
     llm_calls: list[dict[str, Any]] = []
     variant_report: dict[str, Any] = {}
     extraction_report: dict[str, Any] = {}
     cross_reference_report: dict[str, Any] = {}
     install_litellm_recorder(llm_calls)
+    original_resolver = cli_query._resolve_output_files
+    if preloaded_dataframes is not None:
+        def resolve_cached_output_files(config, output_list, optional_list=None):
+            missing = [name for name in output_list if name not in preloaded_dataframes]
+            if missing:
+                raise FileNotFoundError(f"GraphRAG 索引缺少必要資料表：{', '.join(missing)}")
+            result = {name: preloaded_dataframes[name] for name in output_list}
+            for name in optional_list or []:
+                result[name] = preloaded_dataframes.get(name)
+            return result
+
+        cli_query._resolve_output_files = resolve_cached_output_files
     common = {
         "data_dir": None,
         "root_dir": root_dir,
@@ -58,56 +108,66 @@ def execute_graph_query(payload: dict[str, Any]) -> dict[str, Any]:
         "query": question,
         "verbose": False,
     }
-    if method == "local":
-        answer, context = cli_query.run_local_search(community_level=community_level, **common)
-    elif method == "global":
-        answer, context = cli_query.run_global_search(
-            community_level=community_level,
-            dynamic_community_selection=dynamic_community_selection,
-            **common,
-        )
-    elif method == "drift":
-        from .drift_compat import run_drift_search
+    try:
+        if method == "local":
+            answer, context = cli_query.run_local_search(community_level=community_level, **common)
+        elif method == "global":
+            answer, context = cli_query.run_global_search(
+                community_level=community_level,
+                dynamic_community_selection=dynamic_community_selection,
+                **common,
+            )
+        elif method == "drift":
+            from .drift_compat import run_drift_search
 
-        answer, context = run_drift_search(
-            root_dir=root_dir,
-            query=question,
-            community_level=community_level,
-            response_type=response_type,
-        )
-    else:
-        retrieval_query = str(payload.get("retrieval_query") or "").strip()
-        if retrieval_query:
-            use_retrieval_query_for_basic(retrieval_query)
+            answer, context = run_drift_search(
+                root_dir=root_dir,
+                query=question,
+                community_level=community_level,
+                response_type=response_type,
+            )
+        else:
+            retrieval_query = str(payload.get("retrieval_query") or "").strip()
+            if retrieval_query:
+                use_retrieval_query_for_basic(retrieval_query)
 
-        retrieval: dict[str, Any] = {}
-        capture_basic_retrieval(retrieval)
+            retrieval: dict[str, Any] = {}
+            capture_basic_retrieval(retrieval)
+            preloaded_text_units = preloaded_dataframes.get("text_units") if preloaded_dataframes is not None else None
 
-        def select_variants(query: str, result: Any) -> Any:
-            try:
-                result, reference_report = follow_references(result, retrieval, root_dir)
-            except Exception as exc:  # following references must never block an answer
-                reference_report = {"error": str(exc)}
-            if reference_report:
-                cross_reference_report.update(reference_report)
-            try:
-                # A rewritten retrieval query carries variant names of a question in another language.
-                selected, report = select_basic_context(result, f"{query}\n{retrieval_query}", root_dir)
-            except Exception as exc:  # variant selection must never block an answer
-                variant_report["error"] = str(exc)
-                return result
-            variant_report.update(report)
-            return selected
+            def select_variants(query: str, result: Any) -> Any:
+                try:
+                    result, reference_report = follow_references(result, retrieval, root_dir, preloaded_text_units)
+                except Exception as exc:  # following references must never block an answer
+                    reference_report = {"error": str(exc)}
+                if reference_report:
+                    cross_reference_report.update(reference_report)
+                try:
+                    # A rewritten retrieval query carries variant names of a question in another language.
+                    selected, report = select_basic_context(
+                        result, f"{query}\n{retrieval_query}", root_dir, preloaded_text_units,
+                    )
+                except Exception as exc:  # variant selection must never block an answer
+                    variant_report["error"] = str(exc)
+                    return result
+                variant_report.update(report)
+                return selected
 
-        install_two_stage_basic(select_variants, extraction_report)  # qualifier revision off: SM3E Q2 rerun 2026-11-20 scored lower (F-56)
-        answer, context = cli_query.run_basic_search(
-            data_dir=None,
-            root_dir=root_dir,
-            response_type=response_type,
-            streaming=False,
-            query=question,
-            verbose=False,
-        )
+            install_two_stage_basic(select_variants, extraction_report)  # qualifier revision off: SM3E Q2 rerun 2026-11-20 scored lower (F-56)
+            answer, context = cli_query.run_basic_search(
+                data_dir=None,
+                root_dir=root_dir,
+                response_type=response_type,
+                streaming=False,
+                query=question,
+                verbose=False,
+            )
+    finally:
+        cli_query._resolve_output_files = original_resolver
+        reset_retrieval_query_for_basic()
+        reset_capture_basic_retrieval()
+        reset_two_stage_basic()
+        llm_usage._recorder_target = previous_recorder_target
     serialized = QueryService._serialize_context(context)
     if variant_report and isinstance(serialized, dict):
         serialized["variant_selection"] = variant_report
