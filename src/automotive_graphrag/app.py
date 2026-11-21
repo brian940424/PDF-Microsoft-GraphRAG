@@ -4742,7 +4742,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         )
                         with gr.Group():
                             autoqa_parallel_generation = gr.Checkbox(label="允許平行生題（不同 PDF 或不同策略）", value=True)
-                            autoqa_by_strategy = gr.Checkbox(label="依四種檢索策略出題（關閉時每份 PDF 只出單頁 Basic 題）", value=True)
+                            autoqa_by_strategy = gr.Checkbox(label="依四種檢索策略出題（關閉時每份只出單頁 Basic 題）", value=True)
                     # 配比只在「依四種檢索策略出題」打勾時顯示
                     with gr.Row(equal_height=True, visible=True) as autoqa_strategy_mix_row:
                         autoqa_basic_share = gr.Number(label="Basic 配比（%）", value=DEFAULT_STRATEGY_MIX["basic"], minimum=0, maximum=100)
