@@ -59,9 +59,11 @@ from .semantic_query_cache import (
     scope_hash as semantic_scope_hash, semantic_config,
 )
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
+from .local_ranking import LOCAL_RANKING_VERSION
 from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, aggregate_cost, query_cost_summary, tag_calls, usage_metadata
 from .strategy_routing import (
-    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
+    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, question_identifiers,
+    search_with_fallback,
 )
 
 
@@ -1452,7 +1454,9 @@ class RetrievalExperimentService:
 
                 decision = self.router.route(question.question, group.answer_model, api_base, api_key, effort)
                 llm_calls.extend(getattr(decision, "llm_calls", ()))
-                fallback = search_with_fallback(decision, search_and_track, check)
+                fallback = search_with_fallback(
+                    decision, search_and_track, check, named_terms=question_identifiers(question.question),
+                )
                 method = routed_method = fallback.method
                 routing_reason = fallback.reason
                 execution_trace = {"strategy_attempts": list(fallback.attempts)}
@@ -1983,6 +1987,7 @@ class RetrievalExperimentService:
                 "response_type": response_type,
                 "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
                 "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                "local_ranking_version": LOCAL_RANKING_VERSION,
                 "settings_sha256": hashlib.sha256(
                     json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
                 ).hexdigest(),
@@ -2022,6 +2027,7 @@ class RetrievalExperimentService:
                 "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
                 "settings_sha256": hashlib.sha256(json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest(),
                 "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                "local_ranking_version": LOCAL_RANKING_VERSION,
                 "strategy_params": selected_parameters,
                 "portal_defaults": self.projects.get_portal_defaults(project_id), "safety_filter_version": 1,
             }

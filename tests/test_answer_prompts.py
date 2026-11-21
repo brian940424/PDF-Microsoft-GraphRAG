@@ -5,6 +5,7 @@ from pathlib import Path
 from automotive_graphrag.answer_prompts import (
     ANSWER_PROMPT_DIRECTORY,
     ANSWER_REQUIREMENTS,
+    INSUFFICIENT_DATA_PHRASE,
     answer_prompts,
     install_answer_prompts,
     with_answer_requirements,
@@ -56,6 +57,17 @@ class AnswerPromptTests(unittest.TestCase):
             "replace any earlier instruction to incorporate general knowledge", 'never write a "General Knowledge" citation',
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
+
+    def test_local_prompt_never_claims_the_manual_lacks_a_point(self) -> None:
+        prompts = answer_prompts()
+        local = prompts["local_search_system_prompt.txt"]
+
+        self.assertIn(INSUFFICIENT_DATA_PHRASE, local)
+        self.assertIn("never write that the manual, the data or the sources do not state", local)
+        self.assertNotIn("say only that the provided data does not state it", local)
+        for name in ("basic_search_system_prompt.txt", "drift_search_system_prompt.txt"):
+            self.assertIn("say only that the provided data does not state it", prompts[name])
+            self.assertNotIn(INSUFFICIENT_DATA_PHRASE, prompts[name])
 
     def test_install_writes_files_and_points_settings_to_absolute_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

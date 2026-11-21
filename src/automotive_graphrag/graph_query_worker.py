@@ -14,6 +14,7 @@ from typing import Any
 from .answer_extraction import install_two_stage_basic, reset_two_stage_basic
 from .cross_references import capture_basic_retrieval, follow_references, reset_capture_basic_retrieval
 from .llm_usage import install_litellm_recorder
+from .local_ranking import install_local_ranking, reset_local_ranking, text_unit_similarity
 from .variants import select_basic_context
 from .querying import QueryService
 
@@ -87,6 +88,7 @@ def _execute_graph_query(
     variant_report: dict[str, Any] = {}
     extraction_report: dict[str, Any] = {}
     cross_reference_report: dict[str, Any] = {}
+    local_ranking_report: dict[str, Any] = {}
     install_litellm_recorder(llm_calls)
     original_resolver = cli_query._resolve_output_files
     if preloaded_dataframes is not None:
@@ -110,6 +112,7 @@ def _execute_graph_query(
     }
     try:
         if method == "local":
+            install_local_ranking(local_ranking_report, text_unit_similarity(root_dir))
             answer, context = cli_query.run_local_search(community_level=community_level, **common)
         elif method == "global":
             answer, context = cli_query.run_global_search(
@@ -167,12 +170,15 @@ def _execute_graph_query(
         reset_retrieval_query_for_basic()
         reset_capture_basic_retrieval()
         reset_two_stage_basic()
+        reset_local_ranking()
         llm_usage._recorder_target = previous_recorder_target
     serialized = QueryService._serialize_context(context)
     if variant_report and isinstance(serialized, dict):
         serialized["variant_selection"] = variant_report
     if cross_reference_report and isinstance(serialized, dict):
         serialized["cross_references"] = cross_reference_report
+    if local_ranking_report and isinstance(serialized, dict):
+        serialized["local_ranking"] = local_ranking_report
     if extraction_report and isinstance(serialized, dict):
         serialized["answer_extraction"] = extraction_report
     return {

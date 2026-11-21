@@ -15,8 +15,10 @@ from automotive_graphrag.strategy_routing import (
     StrategyRouter,
     context_source_count,
     evidence_page_records,
+    question_identifiers,
     search_with_fallback,
 )
+from automotive_graphrag.answer_prompts import INSUFFICIENT_DATA_PHRASE
 
 
 class StrategyRouterTests(unittest.TestCase):
@@ -353,6 +355,63 @@ class SearchWithFallbackTests(unittest.TestCase):
                     StrategyDecision("local", "原因"), search, lambda _: AnswerCheck(True, "ok"),
                 )
                 self.assertEqual((tried, result.found), (["local"], True))
+
+    def test_question_identifiers_keep_codes_and_skip_page_references(self) -> None:
+        self.assertEqual(
+            question_identifiers("C1154 與C1155 的差異？接頭E24端子2、SP130、12V、VDC、參考 AV-97"),
+            ("C1154", "C1155", "E24", "SP130"),
+        )
+
+    def test_local_context_without_named_codes_falls_back_without_checking(self) -> None:
+        # SM3E v4 Q07: Local matched C1154 but its passages were the C1155 steps (F-69).
+        checked: list[str] = []
+        local_context = {"sources": [{"id": str(index), "text": "C1155 BR FLUID LEVEL LOW steps"} for index in range(8)]}
+
+        def search(method: str) -> SearchOutcome:
+            if method == "local":
+                return SearchOutcome("端子檢查 [Data: Sources (1)]", payload=local_context, source_count=8)
+            return SearchOutcome("C1154 步驟 [Data: Sources (2)]", source_count=3)
+
+        def check(answer: str) -> AnswerCheck:
+            checked.append(answer)
+            return AnswerCheck(True, "ok")
+
+        result = search_with_fallback(
+            StrategyDecision("local", "原因"), search, check, named_terms=question_identifiers("C1154 怎麼診斷？"),
+        )
+
+        self.assertEqual((result.method, result.found), ("basic", True))
+        self.assertEqual(checked, ["C1154 步驟 [Data: Sources (2)]"])
+        self.assertEqual(result.attempts[0]["status"], "not_found")
+        self.assertIn("沒有題目點名的 C1154", result.attempts[0]["detail"])
+
+    def test_local_context_with_most_named_codes_is_checked(self) -> None:
+        context = {"sources": [{"id": "1", "text": "C1154 PNP SWITCH and connector E24"}]}
+        result = search_with_fallback(
+            StrategyDecision("local", "原因"),
+            lambda _: SearchOutcome("答案 [Data: Sources (1)]", payload=context, source_count=None),
+            lambda _: AnswerCheck(True, "ok"),
+            named_terms=("C1154", "E24", "M24"),
+        )
+        self.assertEqual((result.method, result.found), ("local", True))
+
+    def test_answer_with_insufficient_data_phrase_is_partial_and_fallback_continues(self) -> None:
+        local_answer = f"拆下飾板 [Data: Sources (1)]。安裝扭力：{INSUFFICIENT_DATA_PHRASE}。"
+
+        def search(method: str) -> SearchOutcome:
+            if method == "local":
+                return SearchOutcome(local_answer)
+            return SearchOutcome("無關 [Data: Sources (2)]")
+
+        def check(answer: str) -> AnswerCheck:
+            return AnswerCheck(answer == local_answer, "檢查")
+
+        result = search_with_fallback(StrategyDecision("local", "原因", ("local", "basic")), search, check)
+
+        self.assertEqual(result.attempts[0]["status"], "partial")
+        self.assertEqual(result.attempts[1]["method"], "basic")
+        self.assertEqual((result.method, result.found, result.partial), ("local", False, True))
+        self.assertIn("目前取得的資料未涵蓋的部分", result.outcome.answer)
 
     def test_matching_section_title_accepts_answer_without_overstrict_check(self) -> None:
         checked: list[str] = []

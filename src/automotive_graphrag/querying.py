@@ -31,9 +31,11 @@ from .evidence import Evidence, EvidenceService
 from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
+from .local_ranking import LOCAL_RANKING_VERSION
 from .query_translation import document_language_sample, needs_rewrite
 from .strategy_routing import (
-    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
+    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, question_identifiers,
+    search_with_fallback,
 )
 from .query_cache import QueryResultCache, index_signature, normalize_query
 from .semantic_query_cache import (
@@ -223,6 +225,7 @@ class QueryService:
                     "reasoning_effort": applied_effort,
                     "settings_sha256": execution_metadata["settings_sha256"],
                     "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                    "local_ranking_version": LOCAL_RANKING_VERSION,
                 },
                 "normalized_query": normalize_query(prompt),
             })
@@ -271,6 +274,7 @@ class QueryService:
                     "response_type": response_type, "reasoning_effort": applied_effort,
                     "settings_sha256": execution_metadata["settings_sha256"],
                     "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                    "local_ranking_version": LOCAL_RANKING_VERSION,
                     "strategy_params": {}, "portal_defaults": portal_defaults,
                     "safety_filter_version": 1,
                 }
@@ -413,7 +417,9 @@ class QueryService:
 
             decision = self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort)
             llm_calls.extend(decision.llm_calls)
-            fallback = search_with_fallback(decision, search_and_track, check)
+            fallback = search_with_fallback(
+                decision, search_and_track, check, named_terms=question_identifiers(prompt),
+            )
             normalized_method, routing_reason = fallback.method, fallback.reason
             execution_metadata["strategy_attempts"] = list(fallback.attempts)
             result = fallback.outcome.payload or QueryExecution(0, fallback.outcome.answer, "")

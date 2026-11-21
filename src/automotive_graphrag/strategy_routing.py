@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable
 
 from .answer_extraction import needs_two_stage
+from .answer_prompts import INSUFFICIENT_DATA_PHRASE, INSUFFICIENT_DATA_PHRASE_EN
 from .connections import chat_completion_api_params, extract_json_object, llm_request_headers
 from .evidence import EvidenceService
 from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, ROUTING_STAGE, call_record
@@ -55,7 +56,7 @@ ANSWER_CHECK_PROMPT = """You check whether a search system found an answer to a 
 First identify the main point of the question: the specific feature, setting, item or procedure it asks about, including the app, device or context it belongs to.
 
 Set "found" to false if any of these is true, even when the answer also contains other related or unrelated information:
-- The answer says the sources or provided data do not state, mention, explain or cover the main point (for example "the provided data does not explain ...", "提供的資料未說明……", "資料未提及……", "沒有相關說明").
+- The answer says the sources or provided data do not state, mention, explain or cover the main point, or that the retrieved data is not sufficient to answer it (for example "the provided data does not explain ...", "提供的資料未說明……", "資料未提及……", "沒有相關說明", "目前取得的資料不足以回答此部分").
 - The answer says it does not know or that the information is unavailable.
 - The answer describes a different feature, app, setting or procedure than the one asked about, such as a similarly named function in another app, instead of answering about the one in the question.
 - The answer does not address the main point of the question.
@@ -291,17 +292,35 @@ def basic_first_for_comparison(question: str, decision: StrategyDecision) -> Str
     return replace(decision, method="basic", reason=reason, ranking=ranking)
 
 
+_IDENTIFIER = re.compile(r"(?<![A-Za-z0-9])(?=[A-Z0-9-]*\d)[A-Z][A-Z0-9-]{2,}(?![A-Za-z0-9])")
+# Manual page references such as "AV-97" point at a page; the passage itself rarely repeats them.
+_PAGE_REFERENCE = re.compile(r"[A-Z]{2,4}-\d{1,3}")
+INSUFFICIENT_DATA_MISSING = "目前取得的資料未涵蓋的部分"
+
+
+def question_identifiers(question: str) -> tuple[str, ...]:
+    """Codes the question names, such as DTCs, connectors and part or material numbers (C1154, E24, SP130)."""
+    return tuple(dict.fromkeys(
+        term for term in _IDENTIFIER.findall(question) if not _PAGE_REFERENCE.fullmatch(term)
+    ))
+
+
 def search_with_fallback(
     decision: StrategyDecision,
     search: Callable[[str], SearchOutcome],
     check: Callable[[str], AnswerCheck],
     question: str = "",
+    named_terms: Iterable[str] = (),
 ) -> FallbackResult:
     """Try each method in ranked order once and stop at the first one that finds an answer.
 
     When none finds it, the partial answer covering the most of the question is kept (earliest on
     a tie) instead of the canned not-found reply (F-52).
+
+    ``named_terms`` are codes the question names (``question_identifiers``). A Local context that
+    lacks at least half of them matched other entities, so its answer is not trusted (F-69).
     """
+    named_terms = tuple(named_terms)
     attempts: list[dict[str, Any]] = []
     answered: list[str] = []
     partials: list[tuple[str, SearchOutcome, AnswerCheck]] = []
@@ -317,6 +336,10 @@ def search_with_fallback(
             status = "not_found"
             detail = f"Local 只取得 {outcome.source_count} 個原文段落（少於 {LOCAL_MIN_SOURCES} 個），證據不足"
             answered.append(method)
+        elif method == "local" and (missing_terms := _missing_named_terms(named_terms, outcome)):
+            status = "not_found"
+            detail = f"Local 取得的原文段落沒有題目點名的 {'、'.join(missing_terms)}，證據不足"
+            answered.append(method)
         else:
             unsupported = _unsupported_answer_reason(method, outcome)
             title_match = not unsupported and method != "drift" and any(
@@ -327,7 +350,7 @@ def search_with_fallback(
             elif title_match:
                 verdict = AnswerCheck(True, "檢索到與題目功能名稱相符的小節標題")
             else:
-                verdict = check(outcome.answer)
+                verdict = _insufficient_as_partial(outcome.answer, check(outcome.answer))
             status = "found" if verdict.found else "partial" if verdict.partial else "not_found"
             detail = verdict.reason
             answered.append(method)
@@ -362,6 +385,32 @@ def search_with_fallback(
     if answered:
         return FallbackResult(answered[0], SearchOutcome(NOT_FOUND_ANSWER), False, reason, tuple(attempts))
     return FallbackResult(decision.method, last_failure, False, reason, tuple(attempts))
+
+
+def _insufficient_as_partial(answer: str, verdict: AnswerCheck) -> AnswerCheck:
+    """An answer marking parts as not covered by the retrieved data has not fully found the answer (F-69)."""
+    folded = answer.casefold()
+    if not verdict.found or (
+        INSUFFICIENT_DATA_PHRASE not in answer and INSUFFICIENT_DATA_PHRASE_EN.casefold() not in folded
+    ):
+        return verdict
+    return replace(
+        verdict, found=False, partial=True, answered_parts=max(verdict.answered_parts, 1),
+        missing=verdict.missing or INSUFFICIENT_DATA_MISSING,
+        reason=f"{verdict.reason}（回答標示部分內容目前取得的資料不足，繼續嘗試其他策略）".strip(),
+    )
+
+
+def _missing_named_terms(named_terms: tuple[str, ...], outcome: SearchOutcome) -> tuple[str, ...]:
+    """Named codes absent from the retrieved passages, when at least half of them are absent."""
+    if not named_terms:
+        return ()
+    context = outcome.payload.context if hasattr(outcome.payload, "context") else outcome.payload
+    if not isinstance(context, dict):
+        return ()
+    text = "\n".join(str(item.get("text", "")) for item in EvidenceService.source_records(context)).casefold()
+    missing = tuple(term for term in named_terms if term.casefold() not in text)
+    return missing if missing and len(missing) * 2 >= len(named_terms) else ()
 
 
 def evidence_page_records(evidence: Iterable[Any]) -> tuple[dict[str, Any], ...]:

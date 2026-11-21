@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v8"
+ANSWER_PROMPT_VERSION = "answer-requirements-v9"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -62,6 +62,26 @@ Wording and citations.
 
 """
 
+_UNSTATED_RULE = (
+    "If the data does not contain the answer, say only that the provided data does not state it; "
+    "do not answer from what is commonly known about the topic."
+)
+# Local sees only the passages linked to a few matched entities, so a missing point usually means
+# the passage was not retrieved, not that the manual lacks it. Claiming the manual does not state
+# it contradicted the reference answers (SM3E v4 Local: 22 of 30 answers, F-69).
+INSUFFICIENT_DATA_PHRASE = "目前取得的資料不足以回答此部分"
+INSUFFICIENT_DATA_PHRASE_EN = "The retrieved data is not sufficient to answer this part"
+LOCAL_UNSTATED_RULE = (
+    "The data holds only some passages of the manual, so a point missing from it may still be in the manual. "
+    "Answer the parts of the question the data supports. For each part it does not support, write exactly "
+    f'"{INSUFFICIENT_DATA_PHRASE}" (or "{INSUFFICIENT_DATA_PHRASE_EN}." when answering in English), '
+    'and never write that the manual, the data or the sources do not state, mention or cover it. '
+    "Do not answer from what is commonly known about the topic."
+)
+LOCAL_ANSWER_REQUIREMENTS = ANSWER_REQUIREMENTS.replace(_UNSTATED_RULE, LOCAL_UNSTATED_RULE)
+if LOCAL_ANSWER_REQUIREMENTS == ANSWER_REQUIREMENTS:  # pragma: no cover - guards an edit of the shared rule
+    raise RuntimeError("Local answer requirements did not replace the unstated-answer rule")
+
 # settings section, settings key, file name
 _PROMPT_TARGETS = (
     ("local_search", "prompt", "local_search_system_prompt.txt"),
@@ -71,12 +91,12 @@ _PROMPT_TARGETS = (
 )
 
 
-def with_answer_requirements(prompt: str) -> str:
+def with_answer_requirements(prompt: str, requirements: str = ANSWER_REQUIREMENTS) -> str:
     """Insert the answer requirements before the last response-format section."""
     position = prompt.rfind(_FORMAT_HEADING)
     if position < 0:
         raise ValueError("GraphRAG prompt has no response-format section")
-    return prompt[:position] + ANSWER_REQUIREMENTS + prompt[position:]
+    return prompt[:position] + requirements + prompt[position:]
 
 
 def answer_prompts() -> dict[str, str]:
@@ -94,7 +114,11 @@ def answer_prompts() -> dict[str, str]:
         "drift_search_system_prompt.txt": DRIFT_LOCAL_SYSTEM_PROMPT,
         "drift_search_reduce_prompt.txt": DRIFT_REDUCE_PROMPT,
     }
-    return {name: with_answer_requirements(text) for name, text in bases.items()}
+    requirements = {"local_search_system_prompt.txt": LOCAL_ANSWER_REQUIREMENTS}
+    return {
+        name: with_answer_requirements(text, requirements.get(name, ANSWER_REQUIREMENTS))
+        for name, text in bases.items()
+    }
 
 
 def install_answer_prompts(settings: dict[str, Any], root: Path) -> None:
