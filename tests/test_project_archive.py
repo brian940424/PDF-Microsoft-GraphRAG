@@ -68,6 +68,67 @@ class ProjectArchiveTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "已存在"):
             import_project(self.source, archive)
 
+    def test_import_conflict_message_suggests_new_project_id(self) -> None:
+        archive = export_project(self.source, "L33-SM3E")
+
+        with self.assertRaisesRegex(ProjectError, "新的 Project ID"):
+            import_project(self.source, archive)
+
+    def test_import_under_new_project_id_keeps_original_project(self) -> None:
+        root = self.source.root / "L33-SM3E"
+        (root / "processed" / "input.jsonl").write_text(
+            '{"id":"L33-SM3E-ACC-p0001-b01","project_id":"L33-SM3E","text":"x"}\n'
+            '{"id":"L33-SM3E-ACC-p0002-b01","project_id":"L33-SM3E","text":"y"}\n'
+        )
+        (root / "question_sets").mkdir(exist_ok=True)
+        (root / "question_sets" / "set.json").write_text(
+            '{\n  "project_id": "L33-SM3E",\n  "note": "project_id is L33-SM3E"\n}'
+        )
+        archive = export_project(self.source, "L33-SM3E")
+
+        project = import_project(self.source, archive, project_id=" L33-SM3E-copy ")
+
+        self.assertEqual(project.project_id, "L33-SM3E-copy")
+        self.assertEqual(project.display_name, "L33 / SM3E")
+        self.assertEqual(project.status, "INDEXED")
+        self.assertEqual({p.project_id for p in self.source.list()}, {"L33-SM3E", "L33-SM3E-copy"})
+        copy = self.source.root / "L33-SM3E-copy"
+        self.assertEqual((copy / "graphrag" / "output" / "entities.parquet").read_bytes(), b"graph")
+        # Only project_id fields change; chunk IDs and free text keep the original ID.
+        self.assertEqual(
+            (copy / "processed" / "input.jsonl").read_text(),
+            '{"id":"L33-SM3E-ACC-p0001-b01","project_id":"L33-SM3E-copy","text":"x"}\n'
+            '{"id":"L33-SM3E-ACC-p0002-b01","project_id":"L33-SM3E-copy","text":"y"}\n',
+        )
+        self.assertEqual(
+            (copy / "question_sets" / "set.json").read_text(),
+            '{\n  "project_id": "L33-SM3E-copy",\n  "note": "project_id is L33-SM3E"\n}',
+        )
+        self.assertEqual(json.loads((root / "project.json").read_text())["project_id"], "L33-SM3E")
+        self.assertIn('"project_id":"L33-SM3E"', (root / "processed" / "input.jsonl").read_text())
+        self.assertEqual([p.name for p in copy.rglob("*.rewrite")], [])
+
+    def test_import_with_same_project_id_as_archive_behaves_like_default(self) -> None:
+        archive = export_project(self.source, "L33-SM3E")
+
+        project = import_project(self.target, archive, project_id="L33-SM3E")
+
+        self.assertEqual(project.project_id, "L33-SM3E")
+
+    def test_import_refuses_new_project_id_that_already_exists(self) -> None:
+        self.source.create(project_id="Other", display_name="Other", vehicle_name="X", manual_version="Y")
+        archive = export_project(self.source, "L33-SM3E")
+
+        with self.assertRaisesRegex(ProjectError, "請換一個新的 Project ID"):
+            import_project(self.source, archive, project_id="Other")
+
+    def test_import_rejects_invalid_new_project_id(self) -> None:
+        archive = export_project(self.source, "L33-SM3E")
+
+        with self.assertRaisesRegex(ProjectError, "只能包含"):
+            import_project(self.target, archive, project_id="../evil")
+        self.assertFalse(self.target.root.exists() and any(self.target.root.iterdir()))
+
     def test_export_refuses_busy_project(self) -> None:
         self.source.update_status("L33-SM3E", "INDEXING")
 
