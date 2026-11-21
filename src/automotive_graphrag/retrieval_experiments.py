@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -50,6 +51,10 @@ from .question_sets import BatchQuestion, QuestionSetService
 from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
 from .query_cache import QueryResultCache, index_signature, normalize_query
+from .semantic_query_cache import (
+    candidate as semantic_candidate, proxy_embedding, read_project_mode,
+    scope_hash as semantic_scope_hash, semantic_config,
+)
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
 from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, aggregate_cost, query_cost_summary, tag_calls, usage_metadata
 from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
@@ -1851,10 +1856,48 @@ class RetrievalExperimentService:
                 if isinstance(context, dict):
                     context = dict(context)
                     context["query_cache_hit"] = True
+                    context["query_cache_type"] = "exact"
                     context["original_latency_sec"] = cached.get("original_latency_sec")
                     context["index_cache_hit"] = False
                     context["index_load_sec"] = None
                 return str(cached.get("answer", "")), context if isinstance(context, dict) else {}
+        semantic_scope = None
+        semantic_match = None
+        semantic_vector = None
+        semantic_stats: dict[str, object] = {}
+        semantic_mode = read_project_mode(self.projects.path_for(project_id))
+        semantic_options = semantic_config()
+        if (
+            cache is not None and not bypass_cache and semantic_mode in {"shadow", "serving"}
+            and semantic_options is not None and (semantic_mode == "shadow" or semantic_options["calibrated"])
+        ):
+            semantic_scope = {
+                "project_id": project_id, "index_signature": index_signature(self.projects.path_for(project_id)),
+                "requested_strategy": method, "chat_model": model, "embedding_model": self.connections.get_embedding_model(),
+                "embedding_version": "semantic-query-embedding-v1", "normalization": "l2-v1",
+                "response_type": response_type,
+                "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
+                "settings_sha256": hashlib.sha256(json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest(),
+                "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                "strategy_params": selected_parameters,
+                "portal_defaults": self.projects.get_portal_defaults(project_id), "safety_filter_version": 1,
+            }
+            embed = lambda text, selected_model, pid: proxy_embedding(text, selected_model, pid, self.connections)
+            semantic_match, semantic_stats = semantic_candidate(
+                cache, question, semantic_scope, self.connections.get_embedding_model(), embed, semantic_options["top_k"],
+            )
+            semantic_vector = semantic_stats.pop("_query_vector", None)
+            if semantic_match and semantic_mode == "serving":
+                context = semantic_match["value"].get("context", {})
+                context = dict(context) if isinstance(context, dict) else {}
+                context.update({
+                    "semantic_cache_hit": True, "semantic_cache_score": semantic_stats.get("semantic_cache_score"),
+                    "semantic_cache_candidate_id": semantic_match["item_id"],
+                    "semantic_embedding_calls": 1, "semantic_embedding_latency_ms": semantic_stats.get("semantic_embedding_latency_ms"),
+                    "query_cache_hit": False, "query_cache_type": "semantic",
+                    "index_cache_hit": False, "index_load_sec": None,
+                })
+                return str(semantic_match["value"].get("answer", "")), context
         api_key = self.connections.apply_to_environment(project_id)
         del api_key  # GraphRAG reads the standard API key environment variable.
 
@@ -1920,6 +1963,11 @@ class RetrievalExperimentService:
         context = dict(context) if isinstance(context, dict) else {}
         context["index_cache_hit"] = response.get("index_cache_hit", False)
         context["index_load_sec"] = response.get("index_load_sec")
+        context["query_cache_hit"] = False
+        context["query_cache_type"] = "bypass" if bypass_cache else "miss"
+        context["semantic_cache_hit"] = False
+        context["semantic_cache_mode"] = semantic_mode
+        context.update(semantic_stats)
         llm_calls = response.get("llm_calls")
         if isinstance(llm_calls, list):
             # Carried out of the worker inside the context; `_generate_case` removes it again.
@@ -1929,10 +1977,19 @@ class RetrievalExperimentService:
             cached_context.pop(LLM_CALLS_CONTEXT_KEY, None)
             if cache is not None:
                 if str(response.get("answer", "")).strip():
-                    cache.put(cache_key, {
+                    value = {
                         "answer": str(response.get("answer", "")), "context": cached_context,
                         "original_latency_sec": round(time.monotonic() - query_started, 3),
-                    })
+                    }
+                    cache.put(cache_key, value)
+                    if (
+                        semantic_scope is not None and semantic_mode in {"shadow", "serving"}
+                        and isinstance(semantic_vector, list) and cached_context
+                    ):
+                        cache.put_semantic(
+                            uuid.uuid4().hex, semantic_scope_hash(semantic_scope), question,
+                            semantic_vector, value, cache_key,
+                        )
         except Exception:  # noqa: BLE001 - a failed cache write must not fail an experiment query.
             pass
         return str(response.get("answer", "")), context

@@ -57,6 +57,7 @@ from .project_archive import import_project as restore_project_archive
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .query_cache import QueryResultCache
+from .semantic_query_cache import read_project_mode, semantic_config, write_project_mode
 from .graph_index_cache import GraphIndexManager
 from .question_generation import GeneratedQuestion, QuestionGenerationService
 from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
@@ -1169,6 +1170,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         if query_result.query_cache_hit:
             summary += f"｜⚡ 來自快取（原耗時 {query_result.execution_metadata.get('original_latency_sec', '未知')} 秒）"
+        elif query_result.execution_metadata.get("semantic_cache_hit"):
+            summary += f"｜♻️ 語意相似快取（相似度 {query_result.execution_metadata.get('semantic_cache_score', '—')}；本次未重新檢索）"
         if query_result.routing_reason:
             detail_label = "Agentic 搜尋狀態" if query_result.requested_method == "agentic" else "選擇原因"
             summary += f"\n\n**{detail_label}：** {query_result.routing_reason}"
@@ -3391,6 +3394,59 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}"
         return f"✅ 已儲存專案 {project_id} 的前台預設查詢設定"
 
+    def semantic_mode_view(project_id):
+        project_id = selected_project_id(project_id)
+        return read_project_mode(store.path_for(project_id)) if project_id else "off"
+
+    def semantic_cache_status_view(project_id):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return "語意快取：尚未選擇專案"
+        project_path = store.path_for(project_id)
+        mode = read_project_mode(project_path)
+        config = semantic_config()
+        master = config is not None
+        threshold = f"{config['threshold']} / margin {config['margin']}" if config and config["calibrated"] else "未校準（serving 停用）"
+        cache = QueryResultCache(project_path)
+        semantic_count = cache.semantic_count()
+        hits = 0
+        rejects = 0
+        try:
+            records = (project_path / "runs" / "queries.jsonl").read_text(encoding="utf-8").splitlines()
+            for line in records:
+                record = json.loads(line)
+                metadata = record.get("execution_metadata", {})
+                if metadata.get("semantic_cache_hit"):
+                    hits += 1
+                if metadata.get("semantic_cache_reject_reason"):
+                    rejects += 1
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        top_k = config["top_k"] if config else "5（global default）"
+        global_status = "開啟" if master else "關閉"
+        return (
+            f"模式：**{mode}**｜全域總開關：**{global_status}**  \n"
+            f"Embedding：LiteLLM proxy / `{connections.get_embedding_model()}`｜Threshold / margin：**{threshold}**｜Top-K：**{top_k}**  \n"
+            f"Semantic entries：**{semantic_count}**｜TTL：{cache.ttl_seconds} 秒｜專案共用容量上限：{cache.max_bytes} bytes  \n"
+            f"查詢紀錄統計：semantic hits **{hits}**｜拒絕／未命中原因 **{rejects}**（由 `queries.jsonl` 累計）"
+        )
+
+    def save_semantic_mode(project_id, mode):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return "❌ 請先選擇專案"
+        try:
+            write_project_mode(store.path_for(project_id), mode)
+        except (OSError, ValueError) as exc:
+            return f"❌ 語意快取設定失敗：{exc}"
+        master = os.environ.get("GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE", "false").lower() in {"1", "true", "yes", "on"}
+        if not master and mode != "off":
+            return f"✅ 已設定 {project_id} 為 {mode}。全域總開關目前關閉，需設定 GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=true 才會執行。"
+        config = semantic_config()
+        if mode == "serving" and (config is None or not config["calibrated"]):
+            return f"✅ 已設定 {project_id} 為 serving；但校準 threshold／margin 尚未設定或無效，系統會安全停用語意查找。"
+        return f"✅ 已儲存專案 {project_id} 的語意快取模式：{mode}"
+
     def update_project_enabled(project_id: str | None, enabled: bool):
         project_id = selected_project_id(project_id)
         if not project_id:
@@ -4380,6 +4436,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 with gr.Row():
                     save_portal_defaults_button = gr.Button("儲存前台預設設定", variant="primary")
                     portal_defaults_result = gr.Markdown()
+                gr.Markdown("### 語意快取（預設關閉）")
+                gr.Markdown("Shadow 會呼叫 Embedding API 記錄候選，但仍執行全新查詢；Serving 僅在全域開關及校準門檻有效時回傳相似問題的完整結果。")
+                with gr.Row():
+                    semantic_cache_mode = gr.Dropdown(
+                        choices=[("關閉", "off"), ("觀察（Shadow）", "shadow"), ("服務（Serving）", "serving")],
+                        value="off", label="本專案語意快取模式",
+                    )
+                    save_semantic_cache_mode_button = gr.Button("儲存語意快取模式")
+                semantic_cache_mode_result = gr.Markdown()
+                semantic_cache_status = gr.Markdown("語意快取：尚未選擇專案")
+                refresh_semantic_cache_status_button = gr.Button("重新整理語意快取狀態", size="sm")
 
             with gr.Group(visible=False) as new_project_group:
                 with gr.Accordion("建立新專案", open=True, elem_classes=["static-section", "bold-title"]):
@@ -5525,6 +5592,17 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=selected_project,
             outputs=[portal_default_method, portal_default_chat_model,
                      portal_default_reasoning_effort, portal_default_response_type],
+        )
+        selected_project.change(semantic_mode_view, inputs=selected_project, outputs=semantic_cache_mode)
+        selected_project.change(semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status)
+        refresh_semantic_cache_status_button.click(
+            semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
+        )
+        save_semantic_cache_mode_button.click(
+            save_semantic_mode, inputs=[selected_project, semantic_cache_mode], outputs=semantic_cache_mode_result,
+        )
+        save_semantic_cache_mode_button.click(
+            semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
         )
         save_portal_defaults_button.click(
             save_portal_defaults,

@@ -1,5 +1,6 @@
 import subprocess
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from automotive_graphrag.agentic_search import AgenticDecision
 from automotive_graphrag.querying import QueryExecution, QueryService, expand_manual_query
 from automotive_graphrag.source_metadata import SourceMetadata
 from automotive_graphrag.strategy_routing import AnswerCheck, NOT_FOUND_ANSWER, StrategyDecision
+from automotive_graphrag.semantic_query_cache import write_project_mode
 
 
 class FakeQueryRunner:
@@ -153,6 +155,36 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(cached.evidence, first.evidence)
         records = service.history("L33-SM3E")
         self.assertEqual([item.query_cache_hit for item in records], [False, True, False])
+
+    def test_semantic_serving_reuses_complete_result_for_guarded_paraphrase(self) -> None:
+        runner = ContextQueryRunner()
+        embeddings = []
+
+        def embed(text, model, project_id):
+            embeddings.append((text, model, project_id))
+            return [1.0, 0.0], 2.5
+
+        write_project_mode(self.store.path_for("L33-SM3E"), "serving")
+        service = QueryService(
+            self.store, runner, self.connections, evidence_service=FakeEvidenceService(), semantic_embedder=embed,
+        )
+        with patch.dict(os.environ, {
+            "GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE": "true",
+            "GRAPHRAG_SEMANTIC_QUERY_CACHE_THRESHOLD": "0.9",
+            "GRAPHRAG_SEMANTIC_QUERY_CACHE_MIN_MARGIN": "0.0",
+        }):
+            first = service.ask("L33-SM3E", "How do I inspect the wiper fuse?")
+            second = service.ask("L33-SM3E", "How can I inspect the wiper fuse?")
+
+        self.assertEqual(len(runner.commands) if hasattr(runner, "commands") else 1, 1)
+        self.assertIn("semantic_cache_hit", first.execution_metadata, first.execution_metadata)
+        self.assertFalse(first.execution_metadata["semantic_cache_hit"])
+        self.assertTrue(second.execution_metadata["semantic_cache_hit"])
+        self.assertFalse(second.query_cache_hit)
+        self.assertEqual(second.execution_metadata["query_cache_type"], "semantic")
+        self.assertEqual(second.question, "How can I inspect the wiper fuse?")
+        self.assertEqual(second.evidence, first.evidence)
+        self.assertEqual(len(embeddings), 2)
 
     def test_corrupt_query_cache_falls_back_to_graph_query(self) -> None:
         cache_path = self.store.path_for("L33-SM3E") / "cache" / "query_cache.db"

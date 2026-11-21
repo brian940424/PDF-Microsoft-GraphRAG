@@ -34,6 +34,10 @@ from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
 from .query_translation import document_language_sample, needs_rewrite
 from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
 from .query_cache import QueryResultCache, index_signature, normalize_query
+from .semantic_query_cache import (
+    candidate as semantic_candidate, proxy_embedding, read_project_mode,
+    scope_hash as semantic_scope_hash, semantic_config,
+)
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
@@ -131,6 +135,7 @@ class QueryService:
         evidence_service: EvidenceService | None = None,
         router: StrategyRouter | None = None,
         agentic_search: AgenticSearch | None = None,
+        semantic_embedder: Callable[[str, str, str], tuple[list[float], float]] | None = None,
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
@@ -139,6 +144,7 @@ class QueryService:
         self.evidence_service = evidence_service or EvidenceService(projects)
         self.router = router or StrategyRouter()
         self.agentic_search = agentic_search or AgenticSearch()
+        self.semantic_embedder = semantic_embedder
         self._history_lock = threading.Lock()
 
     def ask(
@@ -199,6 +205,10 @@ class QueryService:
         cache_enabled = os.environ.get("GRAPHRAG_ENABLE_QUERY_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}
         cache = QueryResultCache(project_path) if cache_enabled else None
         cache_key: str | None = None
+        semantic_scope: dict[str, Any] | None = None
+        semantic_stats: dict[str, Any] = {"semantic_cache_hit": False, "semantic_cache_mode": "off", "semantic_embedding_calls": 0}
+        semantic_match: dict[str, Any] | None = None
+        semantic_vector: list[float] | None = None
         if cache is not None:
             cache_key = cache.make_key({
                 "project_id": project_id,
@@ -234,6 +244,7 @@ class QueryService:
                             query_cache_hit=True,
                         )
                         cached_result.execution_metadata["query_cache_hit"] = True
+                        cached_result.execution_metadata["query_cache_type"] = "exact"
                         try:
                             self._append_record(project_path / "runs" / "queries.jsonl", cached_result)
                         except FileNotFoundError:
@@ -241,6 +252,51 @@ class QueryService:
                         return cached_result
                     except (KeyError, TypeError, ValueError, OSError, sqlite3.Error):
                         pass
+            mode = read_project_mode(project_path)
+            semantic_stats["semantic_cache_mode"] = mode
+            config = semantic_config()
+            if (
+                not bypass_cache and normalized_method in QUERY_METHODS | {AUTO_METHOD}
+                and mode in {"shadow", "serving"} and config is not None
+                and (mode == "shadow" or config["calibrated"])
+            ):
+                portal_defaults = self.projects.get_portal_defaults(project_id)
+                semantic_scope = {
+                    "project_id": project_id, "index_signature": index_signature(project_path),
+                    "requested_strategy": normalized_method, "chat_model": selected_model,
+                    "embedding_model": self.connection_settings.get_embedding_model(),
+                    "embedding_version": "semantic-query-embedding-v1", "normalization": "l2-v1",
+                    "response_type": response_type, "reasoning_effort": applied_effort,
+                    "settings_sha256": execution_metadata["settings_sha256"],
+                    "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                    "strategy_params": {}, "portal_defaults": portal_defaults,
+                    "safety_filter_version": 1,
+                }
+                embed = self.semantic_embedder or (
+                    lambda text, model, pid: proxy_embedding(text, model, pid, self.connection_settings)
+                )
+                semantic_match, semantic_stats = semantic_candidate(
+                    cache, prompt, semantic_scope, self.connection_settings.get_embedding_model(), embed, config["top_k"],
+                )
+                semantic_vector = semantic_stats.pop("_query_vector", None)
+                semantic_stats["semantic_cache_mode"] = mode
+                if semantic_match and mode == "serving":
+                    try:
+                        hit_result = self._result_from_dict(semantic_match["value"])
+                        now = datetime.now(timezone.utc).isoformat()
+                        hit_result = dataclass_replace(
+                            hit_result, query_id=uuid.uuid4().hex, question=prompt,
+                            started_at=now, completed_at=now,
+                            duration_seconds=round(time.monotonic() - started_clock, 3),
+                            source=source, query_cache_hit=False,
+                        )
+                        hit_result.execution_metadata.update(semantic_stats)
+                        hit_result.execution_metadata.update({"semantic_cache_hit": True, "query_cache_type": "semantic"})
+                        self._append_record(project_path / "runs" / "queries.jsonl", hit_result)
+                        return hit_result
+                    except (KeyError, TypeError, ValueError, OSError, sqlite3.Error):
+                        semantic_match = None
+                        semantic_stats["semantic_cache_reject_reason"] = "corrupt_candidate_result"
         index_preloaded = False
         index_hit = False
         index_load_seconds: float | None = None
@@ -386,6 +442,9 @@ class QueryService:
         else:
             result = run_query(query_command(normalized_method, retrieval_query, rewrite=True))
         execution_metadata.update(usage_metadata(llm_calls))
+        execution_metadata.update(semantic_stats)
+        execution_metadata.setdefault("semantic_cache_hit", False)
+        execution_metadata.setdefault("query_cache_type", "bypass" if bypass_cache else "miss")
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -445,17 +504,30 @@ class QueryService:
         if query_result.status == "COMPLETED":
             query_result.execution_metadata["original_latency_sec"] = query_result.duration_seconds
             query_result.execution_metadata["cached_at"] = completed.isoformat()
+        if (
+            cache is not None and cache_key is not None and semantic_scope is not None
+            and semantic_stats.get("semantic_cache_mode") in {"shadow", "serving"}
+            and query_result.status == "COMPLETED" and evidence
+            and isinstance(semantic_vector, list)
+        ):
+            try:
+                query_result.execution_metadata["semantic_embedding_calls"] = semantic_stats.get("semantic_embedding_calls", 0)
+                query_result.execution_metadata["query_cache_type"] = "miss"
+                semantic_stats["semantic_embedding_calls"] = 1
+                cache.put_semantic(uuid.uuid4().hex, semantic_scope_hash(semantic_scope), prompt, semantic_vector, asdict(query_result), cache_key)
+            except Exception:
+                # Semantic indexing is best effort and cannot fail a completed answer.
+                pass
+        if cache is not None and cache_key is not None and query_result.status == "COMPLETED":
+            try:
+                cache.put(cache_key, asdict(query_result))
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                pass
         try:
             self._append_record(project_path / "runs" / "queries.jsonl", query_result)
         except FileNotFoundError:
             # A separate admin process may remove the project while a long query is running.
             pass
-        if cache is not None and cache_key is not None and query_result.status == "COMPLETED":
-            try:
-                cache.put(cache_key, asdict(query_result))
-            except (OSError, sqlite3.Error, ValueError, TypeError):
-                # Cache failures must never turn a successful GraphRAG query into an error.
-                pass
         return query_result
 
     def _rewrite_for_manual(

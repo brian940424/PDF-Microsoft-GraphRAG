@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -65,6 +66,29 @@ class QueryResultCacheTests(unittest.TestCase):
             (project / "graphrag" / "last_index_run.json").unlink()
             parquet.write_bytes(b"second version")
             self.assertNotEqual(index_signature(project), fallback)
+
+
+    def test_semantic_candidates_are_scoped_and_clear_with_exact_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = QueryResultCache(Path(directory) / "project", ttl_seconds=60)
+            cache.put_semantic("candidate-a", "scope-a", "inspect wiper fuse", [1.0, 0.0], {"answer": "A"}, "exact-a")
+            self.assertEqual(cache.semantic_candidates("scope-a", [0.9, 0.1], 5)[0]["value"], {"answer": "A"})
+            self.assertEqual(cache.semantic_candidates("scope-b", [1.0, 0.0], 5), [])
+            self.assertEqual(cache.clear(), 1)
+            self.assertEqual(cache.semantic_candidates("scope-a", [1.0, 0.0], 5), [])
+
+    def test_existing_exact_only_database_gets_semantic_table_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            database = project / "cache" / "query_cache.db"
+            database.parent.mkdir(parents=True)
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE query_cache (cache_key TEXT PRIMARY KEY, value TEXT NOT NULL, created REAL NOT NULL, size INTEGER NOT NULL)")
+                connection.execute("INSERT INTO query_cache VALUES('legacy','{\"answer\":\"old\"}',?,15)", (time.time(),))
+            cache = QueryResultCache(project)
+            self.assertEqual(cache.get("legacy"), {"answer": "old"})
+            cache.put_semantic("new", "scope", "query", [1.0], {"answer": "new"}, "legacy")
+            self.assertEqual(cache.count(), 2)
 
 
 class GraphIndexManagerTests(unittest.TestCase):
