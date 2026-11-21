@@ -158,6 +158,13 @@ class CaseServiceTests(unittest.TestCase):
         self.assertIn("預設回答模型", admin_labels)
         self.assertIn("預設推理深度", admin_labels)
         self.assertIn("預設回答格式", admin_labels)
+        portal_defaults_section = next(
+            component.get_config()
+            for component in admin_app.blocks.values()
+            if hasattr(component, "get_config")
+            and component.get_config().get("label") == "前台使用者預設查詢設定（依專案）"
+        )
+        self.assertNotIn("static-section", portal_defaults_section.get("elem_classes", []))
         self.assertNotIn("車型／專案", admin_labels)
         portal_project_dropdowns = [
             component.get_config()

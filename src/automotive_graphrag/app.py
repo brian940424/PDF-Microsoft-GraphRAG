@@ -4349,7 +4349,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 open_project_result = gr.Markdown()
                 project_activation_result = gr.Markdown()
 
-            with gr.Accordion("前台使用者預設查詢設定（依專案）", open=False, elem_classes=["static-section", "bold-title"]):
+            with gr.Accordion("前台使用者預設查詢設定（依專案）", open=False, elem_classes=["bold-title"]):
                 gr.Markdown(
                     "先在上方選擇專案，再調整其前台預設值。設定會套用到一般使用者入口選取此專案後的新查詢。"
                     "模型可選擇沿用全域預設；若要讓前台與管理後台共用回答快取，請讓策略、模型、推理深度與回答格式一致。"
