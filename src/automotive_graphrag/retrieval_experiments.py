@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import inspect
 import math
 import os
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -45,12 +47,22 @@ from .evaluation.classic_metrics import answer_term_scores, exact_match_score, f
 from .duplicate_passages import PageEquivalence, with_duplicate_citations
 from .evaluation.source_scoring import DEFAULT_SOURCE_WEIGHT, combined_score, source_score
 from .projects import ProjectError, ProjectStore
-from .question_sets import BatchQuestion, QuestionSetService
+from .question_sets import (
+    ANSWER_SCOPE_LABELS, ANSWER_SCOPES, DESIGN_STRATEGIES, DESIGN_STRATEGY_LABELS, UNCLASSIFIED_LABEL,
+    BatchQuestion, QuestionSet, QuestionSetService,
+)
 from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
-from .answer_prompts import install_answer_prompts
+from .query_cache import QueryResultCache, index_signature, normalize_query
+from .semantic_query_cache import (
+    candidate as semantic_candidate, proxy_embedding, read_project_mode,
+    scope_hash as semantic_scope_hash, semantic_config,
+)
+from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
 from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, aggregate_cost, query_cost_summary, tag_calls, usage_metadata
-from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
+from .strategy_routing import (
+    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
+)
 
 
 EXPERIMENT_METHODS = ("local", "global", "drift", "basic")
@@ -190,6 +202,9 @@ class ExperimentQuestionResult:
     answer_term_hit: float | None = None
     answer_term_coverage: float | None = None
     source_score: float | None = None
+    # F-66 design metadata copied from the question; "" means unclassified.
+    design_strategy: str = ""
+    answer_scope: str = ""
 
     @property
     def effective_method(self) -> str:
@@ -692,6 +707,7 @@ class RetrievalExperimentService:
         judge_model: str | None = None,
         evaluate: bool = True,
         stop_event: threading.Event | None = None,
+        bypass_cache: bool = True,
     ) -> RetrievalExperimentRun:
         """Setting `stop_event` sends no new requests; requests already sent finish and are saved."""
         if not groups:
@@ -744,7 +760,7 @@ class RetrievalExperimentService:
                 worker = self._run_case if evaluate else self._generate_case
                 futures[executor.submit(
                     worker, project_id, group, question, judge_model,
-                    question_set.question_set_id, question_set.name,
+                    question_set.question_set_id, question_set.name, bypass_cache,
                 )] = (group, question_set, question)
 
         fill_available_workers()
@@ -800,6 +816,7 @@ class RetrievalExperimentService:
         update_callback: UpdateFunction | None = None,
         judge_model: str | None = None,
         stop_event: threading.Event | None = None,
+        bypass_cache: bool = True,
     ) -> RetrievalExperimentRun:
         """Run retrieval and answer generation only; judging is a separate action."""
         return self.run(
@@ -811,6 +828,7 @@ class RetrievalExperimentService:
             judge_model,
             evaluate=False,
             stop_event=stop_event,
+            bypass_cache=bypass_cache,
         )
 
     def evaluate_answers(
@@ -1079,6 +1097,9 @@ class RetrievalExperimentService:
                 },
             })
         expected_count = sum(int(item.get("question_count", 0)) for item in run_groups)
+        question_sets = self._run_question_sets(project_id, run)
+        category_rows = self.category_breakdown(run, question_sets)
+        design_lookup = self._design_lookup(run, question_sets)
         payload = {
             "schema_version": 1,
             "format": "manual-graphrag-experiment-summary",
@@ -1126,6 +1147,7 @@ class RetrievalExperimentService:
                 "average_latency_seconds": self._average_metric(run_groups, "average_latency_seconds"),
             },
             "groups": group_rows,
+            "category_breakdown": category_rows,
             "datasets": [
                 {"question_set_id": item, "name": name}
                 for item, name in zip(
@@ -1159,14 +1181,134 @@ class RetrievalExperimentService:
                 }
                 for group in group_rows
             ],
+            "category_breakdown": category_rows,
             "question_results": [
-                {key: value for key, value in item.items() if key not in LEGACY_QUALITY_KEYS}
+                {
+                    **{key: value for key, value in item.items() if key not in LEGACY_QUALITY_KEYS},
+                    **dict(zip(("design_strategy", "answer_scope"), design_lookup(item))),
+                }
                 for item in run_results
             ],
         }
         self._atomic_write(summary_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         self._atomic_write(details_path, json.dumps(details_payload, ensure_ascii=False, indent=2) + "\n")
         return summary_path, details_path
+
+    def _run_question_sets(self, project_id: str, run: dict[str, object]) -> list[QuestionSet]:
+        """The run's question sets that still exist; deleted sets are skipped."""
+        result = []
+        for question_set_id in self._normalize_question_set_ids(
+            run.get("question_set_ids", run.get("question_set_id", ""))
+        ):
+            try:
+                result.append(self.question_sets.get(project_id, question_set_id))
+            except ProjectError:
+                continue
+        return result
+
+    @staticmethod
+    def _design_lookup(run: dict[str, object], question_sets: Sequence[QuestionSet]):
+        """Return item -> (design_strategy, answer_scope); runs saved before F-66 fall back to the question set."""
+        run_ids = list(run.get("question_set_ids", []) or [run.get("question_set_id", "")])
+        default_dataset = run_ids[0] if len(run_ids) == 1 else ""
+        by_key = {
+            (question_set.question_set_id, question.question_id): question
+            for question_set in question_sets for question in question_set.questions
+        }
+
+        def lookup(item: dict[str, object]) -> tuple[str, str]:
+            if "design_strategy" in item or "answer_scope" in item:
+                return str(item.get("design_strategy") or ""), str(item.get("answer_scope") or "")
+            question = by_key.get((str(item.get("dataset_id") or default_dataset), str(item.get("question_id"))))
+            return (question.design_strategy, question.answer_scope) if question else ("", "")
+
+        return lookup
+
+    @classmethod
+    def category_breakdown(
+        cls, run: dict[str, object], question_sets: Sequence[QuestionSet],
+    ) -> list[dict[str, object]]:
+        """Per experiment group, results grouped by the questions' design strategy and by answer scope (F-66).
+
+        Empty when no question in the run is classified. Source metrics follow the same rules as the
+        group summary: only text-unit evidence from Local／Basic／DRIFT answers is scored.
+        """
+        results = [item for item in run.get("results", []) if isinstance(item, dict)]
+        lookup = cls._design_lookup(run, question_sets)
+        designs = [lookup(item) for item in results]
+        if not any(strategy or scope for strategy, scope in designs):
+            return []
+        run_ids = list(run.get("question_set_ids", []) or [run.get("question_set_id", "")])
+        default_dataset = run_ids[0] if len(run_ids) == 1 else ""
+        gold_by_key = {
+            (question_set.question_set_id, question.question_id): question.gold_evidence or question.answer_source_evidence
+            for question_set in question_sets for question in question_set.questions
+        }
+        dimensions = (
+            ("design_strategy", "設計策略", DESIGN_STRATEGIES, DESIGN_STRATEGY_LABELS, 0),
+            ("answer_scope", "答案範圍", ANSWER_SCOPES, ANSWER_SCOPE_LABELS, 1),
+        )
+        rows: list[dict[str, object]] = []
+        for group in run.get("groups", []):
+            group_id = group.get("group_id")
+            method = str(group.get("method") or "")
+            group_items = [
+                (item, design) for item, design in zip(results, designs) if item.get("group_id") == group_id
+            ]
+            for dimension, dimension_label, values, labels, position in dimensions:
+                for value in (*values, ""):
+                    selected = [item for item, design in group_items if design[position] == value]
+                    if not selected:
+                        continue
+                    full, partial, incorrect, score_sum = cls._grade_counts(
+                        item.get("evaluation_result") for item in selected
+                    )
+                    samples = []
+                    for item in selected:
+                        gold = gold_by_key.get((str(item.get("dataset_id") or default_dataset), str(item.get("question_id"))))
+                        if gold and cls._scores_sources(item, method):
+                            samples.append((cls._result_from_dict(item).retrieved_evidence, gold))
+                    hit_rate, precision, document_hit_rate, _ = (
+                        compute_source_metrics(tuple(samples)) if samples else (None, None, None, 0)
+                    )
+                    count = len(selected)
+                    average_source = cls._mean_present(item.get("source_score") for item in selected)
+                    rows.append({
+                        "group_id": group_id,
+                        "group_name": group.get("group_name"),
+                        "method": method,
+                        "dimension": dimension,
+                        "dimension_label": dimension_label,
+                        "category": value,
+                        "category_label": labels.get(value, UNCLASSIFIED_LABEL),
+                        "question_count": count,
+                        "answered_count": sum(bool(str(item.get("actual_answer") or "").strip()) for item in selected),
+                        "evaluated_count": full + partial + incorrect,
+                        "correct_count": full,
+                        "partial_correct_count": partial,
+                        "incorrect_count": incorrect,
+                        "score_accuracy": round(score_sum / (2 * count), 4) if full + partial + incorrect else None,
+                        "average_source_score": round(average_source, 4) if average_source is not None else None,
+                        "evidence_hit_rate": hit_rate,
+                        "evidence_precision": precision,
+                        "document_hit_rate": document_hit_rate,
+                    })
+        return rows
+
+    @staticmethod
+    def _scores_sources(item: dict[str, object], method: str) -> bool:
+        """True when a result's retrieved evidence counts toward source metrics (see ``_persist_run``)."""
+        if item.get("status") == "failed" or str(item.get("retrieval_metrics_status") or "").startswith("不可計算："):
+            return False
+        if method == EXPERIMENT_AUTO_METHOD:
+            return (item.get("routed_method") or item.get("method")) in EVIDENCE_METHODS
+        if method == EXPERIMENT_AGENTIC_METHOD:
+            return any(
+                isinstance(evidence, dict) and evidence.get("source_type", "text_unit") == "text_unit"
+                or getattr(evidence, "source_type", None) == "text_unit"
+                for evidence in item.get("retrieved_evidence", []) or []
+            )
+        return method in EVIDENCE_METHODS
 
     @staticmethod
     def _retrieval_mode_label(method: str | None) -> str | None:
@@ -1227,16 +1369,18 @@ class RetrievalExperimentService:
 
     def _run_case(
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
-        dataset_id: str = "", dataset_name: str = "",
+        dataset_id: str = "", dataset_name: str = "", bypass_cache: bool = True,
     ) -> ExperimentQuestionResult:
-        generated = self._generate_case(project_id, group, question, judge_model, dataset_id, dataset_name)
+        generated = self._generate_case(
+            project_id, group, question, judge_model, dataset_id, dataset_name, bypass_cache,
+        )
         if generated.status != "answered":
             return generated
         return self._evaluate_case(project_id, group, question, judge_model, generated)
 
     def _generate_case(
         self, project_id: str, group: ExperimentGroup, question: BatchQuestion, judge_model: str,
-        dataset_id: str = "", dataset_name: str = "",
+        dataset_id: str = "", dataset_name: str = "", bypass_cache: bool = True,
     ) -> ExperimentQuestionResult:
         started_clock = time.monotonic()
         routed_method = routing_reason = ""
@@ -1263,11 +1407,13 @@ class RetrievalExperimentService:
                     item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters
                 ) or len(inspect.signature(self.query_function).parameters) >= 7
                 if accepts_strategy_parameters:
+                    kwargs = {"bypass_cache": bypass_cache} if "bypass_cache" in inspect.signature(self.query_function).parameters else {}
                     answer_value, context_value = self.query_function(
-                        *query_arguments, group.strategy_parameters.get(strategy, {})
+                        *query_arguments, group.strategy_parameters.get(strategy, {}), **kwargs
                     )
                 else:
-                    answer_value, context_value = self.query_function(*query_arguments)
+                    kwargs = {"bypass_cache": bypass_cache} if "bypass_cache" in inspect.signature(self.query_function).parameters else {}
+                    answer_value, context_value = self.query_function(*query_arguments, **kwargs)
                 return answer_value, take_search_calls(strategy, context_value)
 
             if group.method == EXPERIMENT_AUTO_METHOD:
@@ -1280,8 +1426,13 @@ class RetrievalExperimentService:
                         answer_value, context_value = run_strategy(strategy)
                     except Exception as exc:
                         return SearchOutcome("", str(exc))
+                    try:
+                        pages = evidence_page_records(self._resolved_evidence(project_id, context_value)) if isinstance(context_value, dict) else ()
+                    except (ProjectError, OSError, ValueError, TypeError):
+                        pages = ()
                     return SearchOutcome(
                         str(answer_value), None, context_value, context_source_count(context_value),
+                        evidence_pages=pages,
                     )
 
                 searched: list[str] = []
@@ -1305,6 +1456,8 @@ class RetrievalExperimentService:
                 method = routed_method = fallback.method
                 routing_reason = fallback.reason
                 execution_trace = {"strategy_attempts": list(fallback.attempts)}
+                if fallback.partial:
+                    execution_trace["partial_answer"] = True
                 if fallback.outcome.error:
                     raise ProjectError(fallback.outcome.error)
                 answer, context = fallback.outcome.answer, fallback.outcome.payload or {}
@@ -1325,6 +1478,8 @@ class RetrievalExperimentService:
                     kwargs = {}
                     if "timeout_seconds" in signature.parameters:
                         kwargs["timeout_seconds"] = timeout_seconds
+                    if "bypass_cache" in signature.parameters:
+                        kwargs["bypass_cache"] = bypass_cache
                     if accepts_parameters:
                         answer_value, context_value = self.query_function(
                             *arguments, group.strategy_parameters.get(search_method, {}), **kwargs
@@ -1387,10 +1542,22 @@ class RetrievalExperimentService:
             mapping_error = None
             if method in EVIDENCE_METHODS or method == EXPERIMENT_AGENTIC_METHOD:
                 try:
-                    retrieved_evidence = self._resolved_evidence(project_id, context)
+                    text_units = None
+                    if os.environ.get("GRAPHRAG_ENABLE_INDEX_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}:
+                        try:
+                            from .graph_index_cache import GraphIndexManager
+
+                            dataframes, _, _ = GraphIndexManager.instance().get(
+                                project_id, self.projects.path_for(project_id),
+                            )
+                            text_units = dataframes.get("text_units")
+                        except Exception:
+                            text_units = None
+                    retrieved_evidence = self._resolved_evidence(project_id, context, text_units)
                     if answer and retrieved_evidence:
                         retrieved_evidence, _ = with_duplicate_citations(
                             self.projects, project_id, answer, retrieved_evidence, context,
+                            text_units=text_units,
                         )
                     raw_sources = EvidenceService.source_records(context)
                     if raw_sources and not retrieved_evidence:
@@ -1429,6 +1596,8 @@ class RetrievalExperimentService:
                 routing_reason=routing_reason,
                 execution_trace=execution_trace,
                 duration_seconds=round(time.monotonic() - started_clock, 3),
+                design_strategy=question.design_strategy,
+                answer_scope=question.answer_scope,
             )
         except Exception as exc:
             return replace(
@@ -1462,10 +1631,10 @@ class RetrievalExperimentService:
             ),
         )
         if enable_llm_judge:
-            # Every judge gets the identical grading prompt; judges run one after another so the
-            # case still occupies a single slot of the experiment's concurrency limit.
-            judges = []
-            for model in parse_judge_models(judge_model):
+            # Every judge gets the identical grading prompt. Judges run at the same time so the
+            # case takes as long as the slowest judge, while the case still occupies a single
+            # slot of the experiment's concurrency limit (that limit counts questions).
+            def judge_with(model: str) -> JudgeScore:
                 try:
                     judged = self.judging.evaluate_single_answer_grade(
                         project_id, question.question_id, question.question,
@@ -1473,12 +1642,19 @@ class RetrievalExperimentService:
                         evaluation_mode=evaluation_mode,
                         reasoning_effort=judge_reasoning_effort,
                     )
-                    judges.append(JudgeScore(
+                    return JudgeScore(
                         model, float(judged.score), judged.judge_reason,
                         extra_content_error=judged.extra_content_error,
-                    ))
+                    )
                 except Exception as exc:
-                    judges.append(JudgeScore(model, None, "", str(exc)))
+                    return JudgeScore(model, None, "", str(exc))
+
+            judge_models = parse_judge_models(judge_model)
+            if len(judge_models) > 1:
+                with ThreadPoolExecutor(max_workers=len(judge_models)) as judge_pool:
+                    judges = list(judge_pool.map(judge_with, judge_models))
+            else:
+                judges = [judge_with(model) for model in judge_models]
             average = average_judge_score(judges)
             if average is None:
                 error = "；".join(
@@ -1561,6 +1737,8 @@ class RetrievalExperimentService:
             answer_reasoning_effort=group.answer_reasoning_effort,
             dataset_id=dataset_id,
             dataset_name=dataset_name,
+            design_strategy=question.design_strategy,
+            answer_scope=question.answer_scope,
         )
 
     def _persist_run(
@@ -1708,11 +1886,13 @@ class RetrievalExperimentService:
         self._write(project_id, state)
         return run
 
-    def _resolved_evidence(self, project_id: str, context: dict[str, object]) -> tuple[Evidence, ...]:
+    def _resolved_evidence(
+        self, project_id: str, context: dict[str, object], text_units=None,
+    ) -> tuple[Evidence, ...]:
         raw = context.get("sources")
         if not isinstance(raw, list) or not raw:
             return ()
-        evidence = EvidenceService(self.projects).from_context(project_id, context)
+        evidence = EvidenceService(self.projects).from_context(project_id, context, text_units=text_units)
         return tuple(evidence)
 
     def _resolved_sources(self, project_id: str, context: dict[str, object]) -> tuple[str, ...]:
@@ -1756,7 +1936,9 @@ class RetrievalExperimentService:
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         strategy_parameters: dict[str, object] | None = None,
         timeout_seconds: float | None = None,
+        bypass_cache: bool = False,
     ) -> tuple[str, dict[str, object]]:
+        query_started = time.monotonic()
         if method not in EXPERIMENT_METHODS:
             raise ProjectError("不支援的 GraphRAG 檢索策略")
         if response_type not in EXPERIMENT_RESPONSE_TYPES:
@@ -1788,6 +1970,77 @@ class RetrievalExperimentService:
         for key in EXPERIMENT_STRATEGY_CONFIG_KEYS[method]:
             if key in selected_parameters:
                 section[key] = selected_parameters[key]
+        cache_enabled = os.environ.get("GRAPHRAG_ENABLE_QUERY_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}
+        cache = QueryResultCache(self.projects.path_for(project_id)) if cache_enabled else None
+        cache_key = QueryResultCache.make_key({
+            "project_id": project_id,
+            "index_signature": index_signature(self.projects.path_for(project_id)),
+            "strategy": method,
+            "chat_model": model,
+            "embedding_model": self.connections.get_embedding_model(),
+            "strategy_params": {
+                **selected_parameters,
+                "response_type": response_type,
+                "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
+                "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                "settings_sha256": hashlib.sha256(
+                    json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest(),
+            },
+            "normalized_query": normalize_query(question),
+        })
+        if cache is not None and not bypass_cache:
+            try:
+                cached = cache.get(cache_key)
+            except Exception:  # Cache corruption or SQLite I/O failure falls through to GraphRAG.
+                cached = None
+            if isinstance(cached, dict):
+                context = cached.get("context", {})
+                if isinstance(context, dict):
+                    context = dict(context)
+                    context["query_cache_hit"] = True
+                    context["query_cache_type"] = "exact"
+                    context["original_latency_sec"] = cached.get("original_latency_sec")
+                    context["index_cache_hit"] = False
+                    context["index_load_sec"] = None
+                return str(cached.get("answer", "")), context if isinstance(context, dict) else {}
+        semantic_scope = None
+        semantic_match = None
+        semantic_vector = None
+        semantic_stats: dict[str, object] = {}
+        semantic_mode = read_project_mode(self.projects.path_for(project_id))
+        semantic_options = semantic_config()
+        if (
+            cache is not None and not bypass_cache and semantic_mode in {"shadow", "serving"}
+            and semantic_options is not None and (semantic_mode == "shadow" or semantic_options["calibrated"])
+        ):
+            semantic_scope = {
+                "project_id": project_id, "index_signature": index_signature(self.projects.path_for(project_id)),
+                "requested_strategy": method, "chat_model": model, "embedding_model": self.connections.get_embedding_model(),
+                "embedding_version": "semantic-query-embedding-v1", "normalization": "l2-v1",
+                "response_type": response_type,
+                "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
+                "settings_sha256": hashlib.sha256(json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest(),
+                "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                "strategy_params": selected_parameters,
+                "portal_defaults": self.projects.get_portal_defaults(project_id), "safety_filter_version": 1,
+            }
+            embed = lambda text, selected_model, pid: proxy_embedding(text, selected_model, pid, self.connections)
+            semantic_match, semantic_stats = semantic_candidate(
+                cache, question, semantic_scope, self.connections.get_embedding_model(), embed, semantic_options["top_k"],
+            )
+            semantic_vector = semantic_stats.pop("_query_vector", None)
+            if semantic_match and semantic_mode == "serving":
+                context = semantic_match["value"].get("context", {})
+                context = dict(context) if isinstance(context, dict) else {}
+                context.update({
+                    "semantic_cache_hit": True, "semantic_cache_score": semantic_stats.get("semantic_cache_score"),
+                    "semantic_cache_candidate_id": semantic_match["item_id"],
+                    "semantic_embedding_calls": 1, "semantic_embedding_latency_ms": semantic_stats.get("semantic_embedding_latency_ms"),
+                    "query_cache_hit": False, "query_cache_type": "semantic",
+                    "index_cache_hit": False, "index_load_sec": None,
+                })
+                return str(semantic_match["value"].get("answer", "")), context
         api_key = self.connections.apply_to_environment(project_id)
         del api_key  # GraphRAG reads the standard API key environment variable.
 
@@ -1796,8 +2049,7 @@ class RetrievalExperimentService:
             install_answer_prompts(settings, root)
             (root / "settings.yaml").write_text(yaml.safe_dump(settings, allow_unicode=True, sort_keys=False), encoding="utf-8")
             (root / "output").symlink_to(project_path / "output", target_is_directory=True)
-            worker_payload = json.dumps(
-                {
+            worker_payload = {
                     "root_dir": str(root),
                     "question": question,
                     "method": method,
@@ -1805,40 +2057,84 @@ class RetrievalExperimentService:
                     "response_type": response_type,
                     "community_level": selected_parameters.get("community_level", 2),
                     "dynamic_community_selection": selected_parameters.get("dynamic_community_selection", False),
-                },
-                ensure_ascii=False,
-            )
+                }
             package_root = Path(__file__).resolve().parents[2]
             environment = os.environ.copy()
             source_path = str(package_root / "src")
             environment["PYTHONPATH"] = os.pathsep.join(
                 part for part in (source_path, environment.get("PYTHONPATH", "")) if part
             )
-            result = subprocess.run(
-                [sys.executable, "-m", "automotive_graphrag.graph_query_worker"],
-                cwd=package_root,
-                env=environment,
-                input=worker_payload,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout_seconds,
-            )
-        try:
-            response = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            detail = (result.stderr or result.stdout).strip().splitlines()
-            raise ProjectError(
-                f"GraphRAG 查詢工作程序未回傳有效結果：{detail[-1] if detail else result.returncode}"
-            ) from exc
-        if result.returncode or "error" in response:
-            raise ProjectError(str(response.get("error") or result.stderr or "GraphRAG 查詢失敗"))
+            if timeout_seconds is None:
+                from .graph_query_worker import execute_graph_query
+
+                dataframes = None
+                index_hit = False
+                index_load = None
+                if os.environ.get("GRAPHRAG_ENABLE_INDEX_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}:
+                    try:
+                        from .graph_index_cache import GraphIndexManager
+
+                        dataframes, index_hit, index_load = GraphIndexManager.instance().get(
+                            project_id, self.projects.path_for(project_id),
+                        )
+                    except Exception:
+                        dataframes = None
+                response = execute_graph_query(worker_payload, dataframes)
+                response["index_cache_hit"] = index_hit
+                response["index_load_sec"] = index_load
+            else:
+                result = subprocess.run(
+                    [sys.executable, "-m", "automotive_graphrag.graph_query_worker"],
+                    cwd=package_root,
+                    env=environment,
+                    input=json.dumps(worker_payload, ensure_ascii=False),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=timeout_seconds,
+                )
+                try:
+                    response = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    detail = (result.stderr or result.stdout).strip().splitlines()
+                    raise ProjectError(
+                        f"GraphRAG 查詢工作程序未回傳有效結果：{detail[-1] if detail else result.returncode}"
+                    ) from exc
+                if result.returncode or "error" in response:
+                    raise ProjectError(str(response.get("error") or result.stderr or "GraphRAG 查詢失敗"))
         context = response.get("context", {})
         context = dict(context) if isinstance(context, dict) else {}
+        context["index_cache_hit"] = response.get("index_cache_hit", False)
+        context["index_load_sec"] = response.get("index_load_sec")
+        context["query_cache_hit"] = False
+        context["query_cache_type"] = "bypass" if bypass_cache else "miss"
+        context["semantic_cache_hit"] = False
+        context["semantic_cache_mode"] = semantic_mode
+        context.update(semantic_stats)
         llm_calls = response.get("llm_calls")
         if isinstance(llm_calls, list):
             # Carried out of the worker inside the context; `_generate_case` removes it again.
             context[LLM_CALLS_CONTEXT_KEY] = llm_calls
+        try:
+            cached_context = dict(context)
+            cached_context.pop(LLM_CALLS_CONTEXT_KEY, None)
+            if cache is not None:
+                if str(response.get("answer", "")).strip():
+                    value = {
+                        "answer": str(response.get("answer", "")), "context": cached_context,
+                        "original_latency_sec": round(time.monotonic() - query_started, 3),
+                    }
+                    cache.put(cache_key, value)
+                    if (
+                        semantic_scope is not None and semantic_mode in {"shadow", "serving"}
+                        and isinstance(semantic_vector, list) and cached_context
+                    ):
+                        cache.put_semantic(
+                            uuid.uuid4().hex, semantic_scope_hash(semantic_scope), question,
+                            semantic_vector, value, cache_key,
+                        )
+        except Exception:  # noqa: BLE001 - a failed cache write must not fail an experiment query.
+            pass
         return str(response.get("answer", "")), context
 
     def _validate_groups(self, groups: Sequence[ExperimentGroup]) -> None:

@@ -8,13 +8,14 @@ import hashlib
 import os
 import re
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -31,7 +32,14 @@ from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, ta
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
 from .query_translation import document_language_sample, needs_rewrite
-from .strategy_routing import SearchOutcome, StrategyRouter, context_source_count, search_with_fallback
+from .strategy_routing import (
+    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
+)
+from .query_cache import QueryResultCache, index_signature, normalize_query
+from .semantic_query_cache import (
+    candidate as semantic_candidate, proxy_embedding, read_project_mode,
+    scope_hash as semantic_scope_hash, semantic_config,
+)
 
 
 QUERY_METHODS = {"local", "global", "drift", "basic"}
@@ -84,6 +92,9 @@ class QueryExecution:
     context: dict[str, Any] = field(default_factory=dict)
     # LLM calls the GraphRAG search made, as recorded by the query worker.
     llm_calls: tuple[dict[str, Any], ...] = ()
+    index_cache_hit: bool = False
+    index_load_sec: float | None = None
+    preloaded_dataframes: dict[str, object] | None = None
 
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str] | QueryExecution]
@@ -108,6 +119,9 @@ class QueryResult:
     routing_reason: str | None = None
     source: str | None = None
     execution_metadata: dict[str, Any] = field(default_factory=dict)
+    index_cache_hit: bool = False
+    query_cache_hit: bool = False
+    index_load_sec: float | None = None
 
 
 def _query_worker_command() -> list[str]:
@@ -123,6 +137,7 @@ class QueryService:
         evidence_service: EvidenceService | None = None,
         router: StrategyRouter | None = None,
         agentic_search: AgenticSearch | None = None,
+        semantic_embedder: Callable[[str, str, str], tuple[list[float], float]] | None = None,
     ) -> None:
         self.projects = projects
         self.runner = runner or self._run
@@ -131,6 +146,7 @@ class QueryService:
         self.evidence_service = evidence_service or EvidenceService(projects)
         self.router = router or StrategyRouter()
         self.agentic_search = agentic_search or AgenticSearch()
+        self.semantic_embedder = semantic_embedder
         self._history_lock = threading.Lock()
 
     def ask(
@@ -143,6 +159,7 @@ class QueryService:
         source: str | None = None,
         reasoning_effort: str = "medium",
         stop_event: threading.Event | None = None,
+        bypass_cache: bool = False,
     ) -> QueryResult:
         """Answer one question; setting `stop_event` terminates the query worker and raises JobStopped."""
         raise_if_stopped(stop_event)
@@ -187,7 +204,123 @@ class QueryService:
             "cost_status": "unknown_usage_not_returned_by_query_adapter",
             "settings_sha256": hashlib.sha256((graph_root / "settings.yaml").read_bytes()).hexdigest(),
         }
+        cache_enabled = os.environ.get("GRAPHRAG_ENABLE_QUERY_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}
+        cache = QueryResultCache(project_path) if cache_enabled else None
+        cache_key: str | None = None
+        semantic_scope: dict[str, Any] | None = None
+        semantic_stats: dict[str, Any] = {"semantic_cache_hit": False, "semantic_cache_mode": "off", "semantic_embedding_calls": 0}
+        semantic_match: dict[str, Any] | None = None
+        semantic_vector: list[float] | None = None
+        if cache is not None:
+            cache_key = cache.make_key({
+                "project_id": project_id,
+                "index_signature": index_signature(project_path),
+                "strategy": normalized_method,
+                "chat_model": selected_model,
+                "embedding_model": self.connection_settings.get_embedding_model(),
+                "strategy_params": {
+                    "response_type": response_type,
+                    "reasoning_effort": applied_effort,
+                    "settings_sha256": execution_metadata["settings_sha256"],
+                    "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                },
+                "normalized_query": normalize_query(prompt),
+            })
+            if not bypass_cache:
+                try:
+                    cached = cache.get(cache_key)
+                except (OSError, sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
+                    cached = None
+                if cached is not None:
+                    try:
+                        cached_result = self._result_from_dict(cached)
+                        now = datetime.now(timezone.utc).isoformat()
+                        cached_result = dataclass_replace(
+                            cached_result,
+                            query_id=uuid.uuid4().hex,
+                            question=prompt,
+                            started_at=now,
+                            completed_at=now,
+                            duration_seconds=round(time.monotonic() - started_clock, 3),
+                            source=source,
+                            query_cache_hit=True,
+                        )
+                        cached_result.execution_metadata["query_cache_hit"] = True
+                        cached_result.execution_metadata["query_cache_type"] = "exact"
+                        try:
+                            self._append_record(project_path / "runs" / "queries.jsonl", cached_result)
+                        except FileNotFoundError:
+                            pass
+                        return cached_result
+                    except (KeyError, TypeError, ValueError, OSError, sqlite3.Error):
+                        pass
+            mode = read_project_mode(project_path)
+            semantic_stats["semantic_cache_mode"] = mode
+            config = semantic_config()
+            if (
+                not bypass_cache and normalized_method in QUERY_METHODS | {AUTO_METHOD}
+                and mode in {"shadow", "serving"} and config is not None
+                and (mode == "shadow" or config["calibrated"])
+            ):
+                portal_defaults = self.projects.get_portal_defaults(project_id)
+                semantic_scope = {
+                    "project_id": project_id, "index_signature": index_signature(project_path),
+                    "requested_strategy": normalized_method, "chat_model": selected_model,
+                    "embedding_model": self.connection_settings.get_embedding_model(),
+                    "embedding_version": "semantic-query-embedding-v1", "normalization": "l2-v1",
+                    "response_type": response_type, "reasoning_effort": applied_effort,
+                    "settings_sha256": execution_metadata["settings_sha256"],
+                    "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                    "strategy_params": {}, "portal_defaults": portal_defaults,
+                    "safety_filter_version": 1,
+                }
+                embed = self.semantic_embedder or (
+                    lambda text, model, pid: proxy_embedding(text, model, pid, self.connection_settings)
+                )
+                semantic_match, semantic_stats = semantic_candidate(
+                    cache, prompt, semantic_scope, self.connection_settings.get_embedding_model(), embed, config["top_k"],
+                )
+                semantic_vector = semantic_stats.pop("_query_vector", None)
+                semantic_stats["semantic_cache_mode"] = mode
+                if semantic_match and mode == "serving":
+                    try:
+                        hit_result = self._result_from_dict(semantic_match["value"])
+                        now = datetime.now(timezone.utc).isoformat()
+                        hit_result = dataclass_replace(
+                            hit_result, query_id=uuid.uuid4().hex, question=prompt,
+                            started_at=now, completed_at=now,
+                            duration_seconds=round(time.monotonic() - started_clock, 3),
+                            source=source, query_cache_hit=False,
+                        )
+                        hit_result.execution_metadata.update(semantic_stats)
+                        hit_result.execution_metadata.update({"semantic_cache_hit": True, "query_cache_type": "semantic"})
+                        self._append_record(project_path / "runs" / "queries.jsonl", hit_result)
+                        return hit_result
+                    except (KeyError, TypeError, ValueError, OSError, sqlite3.Error):
+                        semantic_match = None
+                        semantic_stats["semantic_cache_reject_reason"] = "corrupt_candidate_result"
+        index_preloaded = False
+        index_hit = False
+        index_load_seconds: float | None = None
+        index_dataframes: dict[str, object] | None = None
+        if (
+            not self._custom_runner and stop_event is None and normalized_method != AGENTIC_METHOD
+            and os.environ.get("GRAPHRAG_ENABLE_INDEX_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}
+        ):
+            index_preloaded = True
+            try:
+                from .graph_index_cache import GraphIndexManager
+
+                index_dataframes, index_hit, index_load_seconds = GraphIndexManager.instance().get(
+                    project_id, project_path,
+                )
+            except Exception:
+                index_dataframes = None
         llm_calls: list[dict[str, Any]] = []
+        index_cache_stats: list[tuple[bool, float | None]] = (
+            [(index_hit, index_load_seconds)] if index_preloaded else []
+        )
+        index_stats_recorded = index_preloaded
         retrieval_query = expand_manual_query(prompt)
         if retrieval_query != prompt:
             execution_metadata["expanded_retrieval_query"] = retrieval_query
@@ -196,13 +329,25 @@ class QueryService:
                 raise_if_stopped(stop_event)
                 execution = self.runner(command)
             else:
-                execution = self._run(command, stop_event=stop_event)
+                execution = self._run(
+                    command,
+                    stop_event=stop_event,
+                    preloaded_dataframes=index_dataframes if index_preloaded else None,
+                    index_cache_hit=index_hit if index_preloaded else None,
+                    index_load_sec=index_load_seconds,
+                )
             record_search_calls(command, execution)
             return execution
 
         def record_search_calls(command: list[str], execution: object) -> None:
+            nonlocal index_dataframes, index_stats_recorded
             method_name = command[command.index("--method") + 1] if "--method" in command else None
             llm_calls.extend(tag_calls(getattr(execution, "llm_calls", ()) or (), SEARCH_STAGE, method_name))
+            if hasattr(execution, "index_cache_hit") and not index_stats_recorded:
+                index_cache_stats.append((bool(getattr(execution, "index_cache_hit")), getattr(execution, "index_load_sec", None)))
+                index_stats_recorded = True
+            if getattr(execution, "preloaded_dataframes", None) is not None:
+                index_dataframes = execution.preloaded_dataframes
 
         rewritten: list[str | None] = []
 
@@ -210,7 +355,8 @@ class QueryService:
             """Rewrite the question into the manual's language once, on the first Basic search (F-53)."""
             if not rewritten:
                 rewritten.append(self._rewrite_for_manual(
-                    project_id, graph_root, prompt, selected_model, applied_effort, llm_calls, execution_metadata,
+                    project_id, graph_root, prompt, selected_model, applied_effort,
+                    llm_calls, execution_metadata, (index_dataframes or {}).get("text_units"),
                 ))
             return rewritten[0]
 
@@ -237,15 +383,19 @@ class QueryService:
                 if execution.returncode != 0:
                     return SearchOutcome("", self._last_error(execution), execution)
                 try:
-                    section_titles = tuple(item.section_name for item in self.evidence_service.from_context(
-                        project_id, getattr(execution, "context", {}) or {},
-                    ))
-                except ProjectError:
-                    section_titles = ()
+                    context_value = getattr(execution, "context", {}) or {}
+                    text_units = (index_dataframes or {}).get("text_units")
+                    attempt_evidence = (
+                        self.evidence_service.from_context(project_id, context_value, text_units=text_units)
+                        if text_units is not None else self.evidence_service.from_context(project_id, context_value)
+                    )
+                except (ProjectError, OSError, ValueError):
+                    attempt_evidence = []
                 return SearchOutcome(
                     (execution.stdout or "").strip(), None, execution,
                     context_source_count(getattr(execution, "context", None)),
-                    section_titles,
+                    tuple(item.section_name for item in attempt_evidence),
+                    evidence_page_records(attempt_evidence),
                 )
 
             searched: list[str] = []
@@ -267,6 +417,12 @@ class QueryService:
             normalized_method, routing_reason = fallback.method, fallback.reason
             execution_metadata["strategy_attempts"] = list(fallback.attempts)
             result = fallback.outcome.payload or QueryExecution(0, fallback.outcome.answer, "")
+            if fallback.partial:
+                execution_metadata["partial_answer"] = True
+                result = QueryExecution(
+                    result.returncode, fallback.outcome.answer, result.stderr or "",
+                    getattr(result, "context", None) or {}, tuple(getattr(result, "llm_calls", ()) or ()),
+                )
         elif normalized_method == AGENTIC_METHOD:
             def execute_search(search_method: str, search_question: str, timeout_seconds: float | None = None):
                 search_command = query_command(search_method, search_question)
@@ -294,6 +450,9 @@ class QueryService:
         else:
             result = run_query(query_command(normalized_method, retrieval_query, rewrite=True))
         execution_metadata.update(usage_metadata(llm_calls))
+        execution_metadata.update(semantic_stats)
+        execution_metadata.setdefault("semantic_cache_hit", False)
+        execution_metadata.setdefault("query_cache_type", "bypass" if bypass_cache else "miss")
         completed = datetime.now(timezone.utc)
         answer = (result.stdout or "").strip() if result.returncode == 0 else ""
         error = None if result.returncode == 0 else self._last_error(result)
@@ -301,7 +460,12 @@ class QueryService:
         evidence: tuple[Evidence, ...] = ()
         if context:
             try:
-                evidence = tuple(self.evidence_service.from_context(project_id, context))
+                text_units = (index_dataframes or {}).get("text_units")
+                evidence_values = (
+                    self.evidence_service.from_context(project_id, context, text_units=text_units)
+                    if text_units is not None else self.evidence_service.from_context(project_id, context)
+                )
+                evidence = tuple(evidence_values)
             except (ProjectError, OSError, ValueError) as exc:
                 context = dict(context)
                 context["_evidence_warning"] = str(exc)
@@ -309,7 +473,10 @@ class QueryService:
             answer = self._align_agentic_citations(answer, context, evidence)
         if answer and evidence:
             try:
-                evidence, added = with_duplicate_citations(self.projects, project_id, answer, evidence, context)
+                evidence, added = with_duplicate_citations(
+                    self.projects, project_id, answer, evidence, context,
+                    text_units=(index_dataframes or {}).get("text_units"),
+                )
             except (ProjectError, OSError, ValueError) as exc:
                 execution_metadata["duplicate_citations_error"] = str(exc)
             else:
@@ -335,7 +502,35 @@ class QueryService:
             routing_reason=routing_reason,
             source=source,
             execution_metadata=execution_metadata,
+            query_cache_hit=False,
+            index_cache_hit=bool(index_cache_stats) and all(hit for hit, _ in index_cache_stats),
+            index_load_sec=(
+                round(sum(load_seconds or 0.0 for _, load_seconds in index_cache_stats), 6)
+                if index_cache_stats else None
+            ),
         )
+        if query_result.status == "COMPLETED":
+            query_result.execution_metadata["original_latency_sec"] = query_result.duration_seconds
+            query_result.execution_metadata["cached_at"] = completed.isoformat()
+        if (
+            cache is not None and cache_key is not None and semantic_scope is not None
+            and semantic_stats.get("semantic_cache_mode") in {"shadow", "serving"}
+            and query_result.status == "COMPLETED" and evidence
+            and isinstance(semantic_vector, list)
+        ):
+            try:
+                query_result.execution_metadata["semantic_embedding_calls"] = semantic_stats.get("semantic_embedding_calls", 0)
+                query_result.execution_metadata["query_cache_type"] = "miss"
+                semantic_stats["semantic_embedding_calls"] = 1
+                cache.put_semantic(uuid.uuid4().hex, semantic_scope_hash(semantic_scope), prompt, semantic_vector, asdict(query_result), cache_key)
+            except Exception:
+                # Semantic indexing is best effort and cannot fail a completed answer.
+                pass
+        if cache is not None and cache_key is not None and query_result.status == "COMPLETED":
+            try:
+                cache.put(cache_key, asdict(query_result))
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                pass
         try:
             self._append_record(project_path / "runs" / "queries.jsonl", query_result)
         except FileNotFoundError:
@@ -352,9 +547,10 @@ class QueryService:
         reasoning_effort: str | None,
         llm_calls: list[dict[str, Any]],
         execution_metadata: dict[str, Any],
+        text_units: pd.DataFrame | None = None,
     ) -> str | None:
         """Return a retrieval query in the manual's language when the question is in another one."""
-        script, excerpt = document_language_sample(graph_root)
+        script, excerpt = document_language_sample(graph_root, text_units)
         rewrite = getattr(self.router, "rewrite_query", None)
         if rewrite is None or not needs_rewrite(question, script):
             return None
@@ -427,6 +623,9 @@ class QueryService:
         command: list[str],
         timeout_seconds: float | None = None,
         stop_event: threading.Event | None = None,
+        preloaded_dataframes: dict[str, object] | None = None,
+        index_cache_hit: bool | None = None,
+        index_load_sec: float | None = None,
     ) -> subprocess.CompletedProcess[str] | QueryExecution:
         method = command[command.index("--method") + 1]
         root = Path(command[command.index("--root") + 1])
@@ -454,7 +653,7 @@ class QueryService:
             part for part in (source_path, environment.get("PYTHONPATH", "")) if part
         )
         worker_payload = json.dumps(
-            {
+            payload := {
                 "root_dir": str(root),
                 "question": question,
                 "method": method,
@@ -464,6 +663,40 @@ class QueryService:
             },
             ensure_ascii=False,
         )
+        if stop_event is None and timeout_seconds is None:
+            try:
+                from .graph_index_cache import GraphIndexManager
+                from .graph_query_worker import execute_graph_query
+
+                preloaded = preloaded_dataframes
+                index_hit = bool(index_cache_hit)
+                index_load = index_load_sec
+                index_cache_enabled = os.environ.get("GRAPHRAG_ENABLE_INDEX_CACHE", "true").strip().lower() not in {
+                    "0", "false", "no", "off",
+                }
+                if index_cache_hit is None and index_cache_enabled:
+                    try:
+                        preloaded, index_hit, index_load = GraphIndexManager.instance().get(
+                            root.parent.name, root.parent,
+                        )
+                    except Exception:
+                        # A stale or unreadable in-memory cache must not block the normal GraphRAG loader.
+                        preloaded = None
+                response = execute_graph_query(payload, preloaded)
+                context = response.get("context", {})
+                llm_calls = response.get("llm_calls", [])
+                return QueryExecution(
+                    0,
+                    str(response.get("answer", "")),
+                    "",
+                    context if isinstance(context, dict) else {},
+                    tuple(item for item in llm_calls if isinstance(item, dict)) if isinstance(llm_calls, list) else (),
+                    index_hit,
+                    index_load,
+                    preloaded,
+                )
+            except Exception as exc:
+                return QueryExecution(1, "", str(exc))
         try:
             completed = QueryService._run_worker(environment, package_root, worker_payload, timeout_seconds, stop_event)
             response = json.loads(completed.stdout)

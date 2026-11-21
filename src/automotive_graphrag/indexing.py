@@ -23,6 +23,7 @@ from .cancellation import JobStopped, ProcessStopWatcher, raise_if_stopped
 from .connections import ConnectionSettings, configure_completion_model, configure_embedding_model
 from .documents import INDEXED_DOCUMENTS_FILE, SECTIONING_FORMAT_VERSION
 from .projects import ProjectError, ProjectStore, indexing_lock_held, indexing_lock_path
+from .chunk_context import contextualize_records
 from .source_metadata import SourceMetadataService
 
 
@@ -383,7 +384,7 @@ class IndexingService:
         handle, temporary_name = tempfile.mkstemp(dir=input_directory, prefix=".input-", suffix=".jsonl")
         os.close(handle)
         try:
-            records = IndexingService._merge_continuation_records(
+            records = IndexingService.graph_input_records(
                 [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
             )
             with open(temporary_name, "w", encoding="utf-8") as target:
@@ -394,10 +395,17 @@ class IndexingService:
                 os.unlink(temporary_name)
 
     @staticmethod
+    def graph_input_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Processed page records as GraphRAG input: continuation pages merged, heading context added."""
+        return contextualize_records(IndexingService._merge_continuation_records(records))
+
+    @staticmethod
     def _merge_continuation_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Coalesce one neighboring page when its first chunk continues the same section."""
         merged: list[dict[str, Any]] = []
         for record in records:
+            # Copy: a merge appends to the previous record, which must not alter the caller's list.
+            record = dict(record)
             page = record.get("page")
             if not isinstance(page, int):
                 merged.append(record)
@@ -455,10 +463,10 @@ class IndexingService:
         if not source.is_file() or not indexed.is_file():
             return False
         current_records = [json.loads(line) for line in indexed.read_text(encoding="utf-8").splitlines() if line.strip()]
-        expected_records = IndexingService._merge_continuation_records(
-            [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
-        )
-        return current_records != expected_records
+        source_records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        legacy_records = IndexingService._merge_continuation_records(source_records)
+        # A graph built before heading context (F-65) stays usable; the next rebuild adds the context.
+        return current_records not in (IndexingService.graph_input_records(source_records), legacy_records)
 
     @staticmethod
     def _configure_api_base(settings_path: Path, api_base_url: str) -> None:

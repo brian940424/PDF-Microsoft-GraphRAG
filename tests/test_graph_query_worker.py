@@ -6,6 +6,45 @@ from automotive_graphrag.graph_query_worker import execute_graph_query
 
 
 class GraphQueryWorkerTests(unittest.TestCase):
+    def test_preloaded_frames_bypass_graph_rag_disk_table_reader_for_every_strategy(self):
+        from graphrag.cli import query as cli_query
+        import pandas as pd
+
+        required = {
+            "local": ["communities", "community_reports", "text_units", "relationships", "entities"],
+            "global": ["entities", "communities", "community_reports"],
+            "drift": ["communities", "community_reports", "text_units", "relationships", "entities"],
+            "basic": ["text_units"],
+        }
+        frames = {name: pd.DataFrame({"id": [name]}) for names in required.values() for name in names}
+        resolved = []
+
+        def search(name):
+            def run(**kwargs):
+                values = cli_query._resolve_output_files(config=None, output_list=required[name])
+                resolved.append((name, values))
+                return "answer", {"sources": []}
+            return run
+
+        original_resolver = cli_query._resolve_output_files
+        with (
+            patch.object(cli_query, "run_local_search", side_effect=search("local")),
+            patch.object(cli_query, "run_global_search", side_effect=search("global")),
+            patch.object(cli_query, "run_basic_search", side_effect=search("basic")),
+            patch("automotive_graphrag.drift_compat.run_drift_search", side_effect=lambda **kwargs: search("drift")()),
+        ):
+            for method in ("local", "global", "drift", "basic"):
+                result = execute_graph_query({
+                    "root_dir": "/tmp/project", "question": "question", "method": method,
+                }, frames)
+                self.assertEqual(result["answer"], "answer")
+
+        self.assertEqual(cli_query._resolve_output_files, original_resolver)
+        self.assertEqual({name for name, _ in resolved}, set(required))
+        for name, values in resolved:
+            self.assertEqual(set(values), set(required[name]))
+            self.assertTrue(all(values[item] is frames[item] for item in required[name]))
+
     def test_routes_strategies_to_graph_rag_cli_functions(self):
         from graphrag.cli import query as cli_query
 
@@ -70,6 +109,39 @@ class GraphQueryWorkerTests(unittest.TestCase):
 
         self.assertEqual(basic.call_args.kwargs["query"], "煞車排氣順序為何？")
         self.assertEqual(seen, ["Brake bleeding order", "Brake bleeding order"])
+
+    def test_basic_restores_retrieval_capture_and_passes_preloaded_text_units_to_reference_following(self):
+        from graphrag.cli import query as cli_query
+        from graphrag_vectors.vector_store import VectorStore
+        import pandas as pd
+
+        original_search = VectorStore.similarity_search_by_text
+        text_units = pd.DataFrame({"id": ["u1"], "human_readable_id": [1], "text": ["text"]})
+        seen = []
+
+        def run_basic(**kwargs):
+            self.assertTrue(getattr(VectorStore.similarity_search_by_text, "_capture_patch", False))
+            return "answer", {"sources": []}
+
+        def capture_selector(selector, report):
+            selector("question", object())
+
+        def fake_follow(result, capture, root, units=None):
+            seen.append(units)
+            return result, {}
+
+        with (
+            patch.object(cli_query, "run_basic_search", side_effect=run_basic),
+            patch("automotive_graphrag.graph_query_worker.install_two_stage_basic", side_effect=capture_selector),
+            patch("automotive_graphrag.graph_query_worker.follow_references", side_effect=fake_follow),
+            patch("automotive_graphrag.graph_query_worker.select_basic_context", side_effect=lambda r, *a: (r, {})),
+        ):
+            execute_graph_query({"root_dir": "/tmp/project", "question": "question", "method": "basic"},
+                                {"text_units": text_units})
+
+        self.assertIs(VectorStore.similarity_search_by_text, original_search)
+        self.assertEqual(len(seen), 1)
+        self.assertIs(seen[0], text_units)
 
     def test_luna_drift_uses_compatibility_adapter(self):
         with patch(

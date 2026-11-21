@@ -9,10 +9,12 @@ from automotive_graphrag.strategy_routing import (
     AnswerCheck,
     LOCAL_MIN_SOURCES,
     NOT_FOUND_ANSWER,
+    PARTIAL_ANSWER_NOTE,
     SearchOutcome,
     StrategyDecision,
     StrategyRouter,
     context_source_count,
+    evidence_page_records,
     search_with_fallback,
 )
 
@@ -58,6 +60,38 @@ class StrategyRouterTests(unittest.TestCase):
 
         self.assertEqual(decision.method, "basic")
         self.assertIn("API Key", decision.reason)
+
+    def test_comparison_question_tries_basic_first_and_keeps_ranking_as_fallback(self) -> None:
+        response = {"methods": ["drift", "local", "basic", "global"], "reason": "需結合不同章節"}
+
+        for question in (
+            "Compare the additional service required when replacing the BCM with the AV control unit.",
+            "QR25DE 與 VQ35DE 在加速踏板處理上有什麼不同？",
+        ):
+            with self.subTest(question=question):
+                decision = StrategyRouter(lambda *_: response).route(question, "m", "u", "k")
+
+                self.assertEqual(decision.method, "basic")
+                self.assertEqual(decision.attempt_order, ("basic", "drift", "local", "global"))
+                self.assertIn("需結合不同章節", decision.reason)
+                self.assertIn("比較題固定先用 Basic", decision.reason)
+                self.assertIn("DRIFT", decision.reason)
+
+    def test_non_comparison_question_keeps_model_ranking(self) -> None:
+        response = {"methods": ["drift", "local", "basic", "global"], "reason": "多步推理"}
+
+        decision = StrategyRouter(lambda *_: response).route("How is the BCM replaced?", "m", "u", "k")
+
+        self.assertEqual(decision.method, "drift")
+        self.assertEqual(decision.reason, "多步推理")
+
+    def test_comparison_question_already_basic_first_is_unchanged(self) -> None:
+        response = {"methods": ["basic", "drift", "local", "global"], "reason": "查原文"}
+
+        decision = StrategyRouter(lambda *_: response).route("What is the difference between A and B?", "m", "u", "k")
+
+        self.assertEqual(decision.reason, "查原文")
+        self.assertEqual(decision.attempt_order, ("basic", "drift", "local", "global"))
 
     def test_missing_reason_is_marked(self) -> None:
         decision = StrategyRouter(lambda *_: {"method": "basic"}).route("q", "m", "u", "k")
@@ -133,6 +167,24 @@ class AnswerCheckTests(unittest.TestCase):
         self.assertIn("問題", prompts[0])
         self.assertIn("沒有資料", prompts[0])
 
+    def test_partial_verdict_is_parsed_only_when_not_found(self) -> None:
+        responses = {
+            "partial": {"found": False, "partial": True, "answered_parts": 1, "missing": "失效保護與解除條件", "reason": "只答出偵測條件"},
+            "found_wins": {"found": True, "partial": True, "answered_parts": 3, "missing": "x", "reason": "ok"},
+            "bad_parts": {"found": False, "partial": True, "answered_parts": True, "reason": "r"},
+            "not_partial": {"found": False, "partial": False, "answered_parts": 2, "missing": "x", "reason": "r"},
+        }
+        expected = {
+            "partial": (False, True, 1, "失效保護與解除條件"),
+            "found_wins": (True, False, 0, ""),
+            "bad_parts": (False, True, 1, ""),
+            "not_partial": (False, False, 0, ""),
+        }
+        for name, response in responses.items():
+            with self.subTest(name=name):
+                check = StrategyRouter(lambda *_, response=response: response).check_answer("q", "a", "m", "u", "k")
+                self.assertEqual((check.found, check.partial, check.answered_parts, check.missing), expected[name])
+
     def test_unusable_check_accepts_the_answer(self) -> None:
         def broken(*_: object) -> object:
             raise ProjectError("HTTP 500")
@@ -152,7 +204,7 @@ class SearchWithFallbackTests(unittest.TestCase):
 
         def search(method: str) -> SearchOutcome:
             tried.append(method)
-            return SearchOutcome("答案")
+            return SearchOutcome("答案 [Data: Sources (1)]")
 
         result = search_with_fallback(
             StrategyDecision("basic", "原因"), search, lambda _: AnswerCheck(True, "ok"),
@@ -185,13 +237,96 @@ class SearchWithFallbackTests(unittest.TestCase):
         self.assertEqual((result.method, result.outcome.answer), ("basic", NOT_FOUND_ANSWER))
         self.assertIsNone(result.outcome.error)
 
+    def test_attempts_record_answer_and_evidence_pages(self) -> None:
+        pages = ({"document": "BCS.pdf", "page": 70},)
+
+        def search(method: str) -> SearchOutcome:
+            return SearchOutcome(f"{method} 答案 [Data: Sources (1)]", evidence_pages=pages)
+
+        result = search_with_fallback(
+            StrategyDecision("basic", "原因"), search, lambda _: AnswerCheck(False, "沒有"),
+        )
+
+        self.assertEqual(result.outcome.answer, NOT_FOUND_ANSWER)
+        self.assertEqual(
+            [(item["answer"], item["evidence"]) for item in result.attempts],
+            [(f"{method} 答案 [Data: Sources (1)]", [{"document": "BCS.pdf", "page": 70}])
+             for method in ("basic", "local", "global", "drift")],
+        )
+
+    def test_best_partial_answer_replaces_not_found_reply(self) -> None:
+        verdicts = {
+            "basic": AnswerCheck(False, "只答一項", partial=True, answered_parts=1, missing="失效保護、解除條件"),
+            "local": AnswerCheck(False, "答兩項", partial=True, answered_parts=2, missing="解除條件"),
+            "global": AnswerCheck(False, "也答兩項", partial=True, answered_parts=2, missing="x"),
+            "drift": AnswerCheck(False, "沒有"),
+        }
+        tried: list[str] = []
+
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            return SearchOutcome(f"{method} 偵測條件 [Data: Sources (1)]")
+
+        result = search_with_fallback(StrategyDecision("basic", "原因"), search, lambda _: verdicts[tried[-1]])
+
+        self.assertEqual((result.found, result.partial, result.method), (False, True, "local"))
+        self.assertEqual(
+            result.outcome.answer,
+            "local 偵測條件 [Data: Sources (1)]\n\n" + PARTIAL_ANSWER_NOTE.format(missing="解除條件"),
+        )
+        self.assertEqual(
+            [item["status"] for item in result.attempts], ["partial", "partial", "partial", "not_found"],
+        )
+        self.assertEqual(result.attempts[1]["answered_parts"], 2)
+        self.assertEqual(result.attempts[1]["missing"], "解除條件")
+        self.assertIn("採用 Local 的部分回答", result.reason)
+        self.assertIn("Basic 只找到部分答案", result.reason)
+
+    def test_found_answer_still_wins_over_earlier_partial(self) -> None:
+        tried: list[str] = []
+
+        def check(_: str) -> AnswerCheck:
+            if tried[-1] == "basic":
+                return AnswerCheck(False, "部分", partial=True, answered_parts=1)
+            return AnswerCheck(True, "ok")
+
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            return SearchOutcome(f"{method} [Data: Sources (1)]", source_count=10)
+
+        result = search_with_fallback(StrategyDecision("basic", "原因"), search, check)
+
+        self.assertEqual((result.found, result.partial, result.method), (True, False, "local"))
+        self.assertEqual(result.outcome.answer, "local [Data: Sources (1)]")
+
+    def test_unsupported_answer_is_never_kept_as_partial(self) -> None:
+        result = search_with_fallback(
+            StrategyDecision("basic", "原因"),
+            lambda method: SearchOutcome("", "壞了") if method == "global" else SearchOutcome("沒有引用的回答"),
+            lambda _: AnswerCheck(False, "部分", partial=True, answered_parts=1),
+        )
+
+        self.assertFalse(result.partial)
+        self.assertEqual(result.outcome.answer, NOT_FOUND_ANSWER)
+
+    def test_evidence_page_records_dedupe_document_pages(self) -> None:
+        class Item:
+            def __init__(self, document_id: str, page: int | None, pages: tuple[int, ...] = ()) -> None:
+                self.document_id, self.page, self.pages = document_id, page, pages
+
+        records = evidence_page_records([Item("A.pdf", 3), Item("A.pdf", 3), Item("B.pdf", 4, (4, 5))])
+
+        self.assertEqual(records, (
+            {"document": "A.pdf", "page": 3}, {"document": "B.pdf", "page": 4}, {"document": "B.pdf", "page": 5},
+        ))
+
     def test_local_with_too_few_sources_falls_back_without_checking(self) -> None:
         checked: list[str] = []
 
         def search(method: str) -> SearchOutcome:
             if method == "local":
                 return SearchOutcome("來源未說明，只提到相簿群組", source_count=LOCAL_MIN_SOURCES - 1)
-            return SearchOutcome("聯絡人群組步驟", source_count=2)
+            return SearchOutcome("聯絡人群組步驟 [Data: Sources (1)]", source_count=2)
 
         def check(answer: str) -> AnswerCheck:
             checked.append(answer)
@@ -200,7 +335,7 @@ class SearchWithFallbackTests(unittest.TestCase):
         result = search_with_fallback(StrategyDecision("local", "原因"), search, check)
 
         self.assertEqual((result.method, result.found), ("basic", True))
-        self.assertEqual(checked, ["聯絡人群組步驟"])
+        self.assertEqual(checked, ["聯絡人群組步驟 [Data: Sources (1)]"])
         self.assertEqual(result.attempts[0]["status"], "not_found")
         self.assertIn(f"只取得 {LOCAL_MIN_SOURCES - 1} 個原文段落", result.attempts[0]["detail"])
         self.assertIn("Local 未找到答案，改用 Basic 找到答案", result.reason)
@@ -212,7 +347,7 @@ class SearchWithFallbackTests(unittest.TestCase):
 
                 def search(method: str) -> SearchOutcome:
                     tried.append(method)
-                    return SearchOutcome("答案", source_count=count)
+                    return SearchOutcome("答案 [Data: Sources (1)]", source_count=count)
 
                 result = search_with_fallback(
                     StrategyDecision("local", "原因"), search, lambda _: AnswerCheck(True, "ok"),
@@ -223,7 +358,7 @@ class SearchWithFallbackTests(unittest.TestCase):
         checked: list[str] = []
         result = search_with_fallback(
             StrategyDecision("basic", "原因"),
-            lambda method: SearchOutcome("回答", payload={}, section_titles=("關閉螢幕時辨識指紋",)),
+            lambda method: SearchOutcome("回答 [Data: Sources (1)]", payload={}, section_titles=("關閉螢幕時辨識指紋",)),
             lambda answer: checked.append(answer) or AnswerCheck(False, "未找到"),
             question="螢幕關閉時辨識指紋如何設定？",
         )
@@ -248,7 +383,7 @@ class SearchWithFallbackTests(unittest.TestCase):
                             section_titles=("使用 S Pen",),
                         )
                     return SearchOutcome(
-                        "找到具體操作步驟。", source_count=3,
+                        "找到具體操作步驟。 [Data: Sources (1)]", source_count=3,
                         section_titles=("使用 S Pen 拍照",),
                     )
 
@@ -281,6 +416,67 @@ class SearchWithFallbackTests(unittest.TestCase):
             [item["status"] for item in result.attempts],
             ["not_found", "not_found", "not_found", "not_found"],
         )
+
+    def test_answers_not_traceable_to_passages_fall_back_without_checking(self) -> None:
+        context = {"sources": [{"id": "5"}]}
+        cases = {
+            "no citation": ("GPS 需要四顆衛星。", "沒有引用任何原文段落"),
+            "general knowledge": (
+                "GPS 需要四顆衛星。 [Data: General Knowledge (standard GPS principles)]", "一般知識",
+            ),
+            "reports only": ("GPS 需要四顆衛星。 [Data: Reports (3)]", "沒有引用任何原文段落"),
+            "id not in context": ("GPS 需要四顆衛星。 [Data: Sources (99)]", "未出現在證據中"),
+        }
+        for name, (answer, detail) in cases.items():
+            with self.subTest(name):
+                checked: list[str] = []
+
+                def search(method: str) -> SearchOutcome:
+                    if method == "drift":
+                        return SearchOutcome(answer, payload=context)
+                    return SearchOutcome("", "壞了")
+
+                result = search_with_fallback(
+                    StrategyDecision("drift", "原因", ("drift",)), search,
+                    lambda text: checked.append(text) or AnswerCheck(True, "ok"),
+                )
+
+                self.assertFalse(result.found)
+                self.assertEqual(checked, [])
+                self.assertEqual(result.attempts[0]["status"], "not_found")
+                self.assertIn(detail, result.attempts[0]["detail"])
+
+    def test_local_and_basic_answers_also_need_passage_citations(self) -> None:
+        tried: list[str] = []
+
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            if method == "local":
+                return SearchOutcome("開啟設定後點選 Wi-Fi。", source_count=9)
+            return SearchOutcome("開啟設定後點選連線。 [Data: Sources (2, +more)]")
+
+        result = search_with_fallback(
+            StrategyDecision("local", "原因", ("local", "basic")), search,
+            lambda _: AnswerCheck(True, "ok"),
+        )
+
+        self.assertEqual(tried, ["local", "basic"])
+        self.assertEqual((result.method, result.found), ("basic", True))
+        self.assertIn("Local 回答沒有引用任何原文段落", result.attempts[0]["detail"])
+
+    def test_cited_drift_and_uncited_global_answers_are_checked(self) -> None:
+        for method, answer in (
+            ("drift", "答案 [Data: Sources (5, +more)]"),
+            ("drift", "答案 [E2]"),
+            ("global", "總覽 [Data: Reports (1)]"),
+        ):
+            with self.subTest(answer):
+                result = search_with_fallback(
+                    StrategyDecision(method, "原因", (method,)),
+                    lambda _: SearchOutcome(answer, payload={"sources": [{"id": "5"}]}),
+                    lambda _: AnswerCheck(True, "ok"),
+                )
+                self.assertEqual((result.method, result.found), (method, True))
 
 
 class AnswerCheckPromptTests(unittest.TestCase):

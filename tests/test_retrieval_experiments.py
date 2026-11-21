@@ -3,6 +3,7 @@ import json
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -15,7 +16,9 @@ import gradio as gr
 
 from automotive_graphrag.app import (
     EXPERIMENT_STRATEGY_LABELS,
+    _experiment_category_rows,
     _experiment_classic_metric_rows,
+    _experiment_question_cells,
     _experiment_dataset_summary_rows,
     _experiment_grade_label,
     _experiment_judge_cell,
@@ -96,7 +99,7 @@ class RetrievalExperimentTests(unittest.TestCase):
             query_function=query,
         )
         self.question_file = self.root / "questions.json"
-        example = Path(__file__).parents[1] / "docs" / "檢索實驗格式範例.json"
+        example = Path(__file__).parents[1] / "docs" / "06_題目集範例.json"
         self.question_file.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
 
     def test_judge_model_must_be_in_the_saved_model_list(self):
@@ -227,6 +230,71 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertTrue(summary["evaluation"]["enable_classic_metrics"])
         self.assertEqual(summary["summary"]["average_answer_em"], 1.0)
         self.assertEqual(details["question_results"][0]["answer_em"], 1.0)
+
+    def test_results_are_grouped_by_design_strategy_and_answer_scope(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        first, second = question_set.questions
+        # Q2 answered wrong; it targets Local and keeps the cross-page scope inferred from its sources.
+        self.question_sets.update_questions(
+            "project", question_set.question_set_id,
+            (first, replace(second, reference_answer="另一個答案", design_strategy="local")),
+        )
+        group = ExperimentGroup("G01", "實驗組1", "gpt-4o-mini", "local")
+        self.service.save_configuration("project", [group], question_set.question_set_id, 2, "gpt-4.1-mini")
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=2)
+        run = self.service.evaluate_answers("project", question_set.question_set_id)
+
+        by_question = {item.question_id: item for item in run.results}
+        self.assertEqual((by_question["Q0001"].design_strategy, by_question["Q0001"].answer_scope),
+                         ("basic", "single_page"))
+        self.assertEqual((by_question["Q0002"].design_strategy, by_question["Q0002"].answer_scope),
+                         ("local", "cross_page"))
+
+        state = self.service.load("project")
+        breakdown = self.service.category_breakdown(
+            state["run"], self.service._run_question_sets("project", state["run"])
+        )
+        rows = {(item["dimension"], item["category"]): item for item in breakdown}
+        self.assertEqual(set(rows), {
+            ("design_strategy", "basic"), ("design_strategy", "local"),
+            ("answer_scope", "single_page"), ("answer_scope", "cross_page"),
+        })
+        self.assertEqual((rows[("design_strategy", "basic")]["correct_count"],
+                          rows[("design_strategy", "basic")]["score_accuracy"]), (1, 1.0))
+        self.assertEqual((rows[("design_strategy", "local")]["correct_count"],
+                          rows[("design_strategy", "local")]["score_accuracy"]), (0, 0.0))
+        self.assertEqual(rows[("answer_scope", "cross_page")]["category_label"], "跨頁")
+        self.assertEqual(
+            _experiment_category_rows([rows[("design_strategy", "basic")]])[0][:8],
+            ["實驗組1", "Microsoft GraphRAG Local", "設計策略", "Basic", 1, 1, 1, "100.0%"],
+        )
+        cells = _experiment_question_cells(state["run"]["results"][0])
+        self.assertTrue(cells[3].endswith("［Basic／單頁］") or cells[3].endswith("［Local／跨頁］"))
+
+        summary_path, details_path = self.service.export("project")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        details = json.loads(details_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(summary["category_breakdown"]), 4)
+        self.assertEqual(details["category_breakdown"], summary["category_breakdown"])
+        self.assertEqual(
+            {(item["question_id"], item["design_strategy"], item["answer_scope"]) for item in details["question_results"]},
+            {("Q0001", "basic", "single_page"), ("Q0002", "local", "cross_page")},
+        )
+
+        # Runs saved before F-66 have no design fields on results; the question set fills them in.
+        for item in state["run"]["results"]:
+            item.pop("design_strategy")
+            item.pop("answer_scope")
+        self.assertEqual(
+            self.service.category_breakdown(state["run"], self.service._run_question_sets("project", state["run"])),
+            breakdown,
+        )
+
+    def test_category_breakdown_is_empty_for_unclassified_question_sets(self):
+        run = {"groups": [{"group_id": "G01", "group_name": "A", "method": "local"}],
+               "results": [{"group_id": "G01", "question_id": "Q1", "evaluation_result": 2,
+                            "design_strategy": "", "answer_scope": ""}]}
+        self.assertEqual(RetrievalExperimentService.category_breakdown(run, []), [])
 
     def test_saved_run_with_removed_quality_fields_still_loads_and_exports_without_them(self):
         question_set = self.service.import_question_set("project", self.question_file)
@@ -519,7 +587,7 @@ class RetrievalExperimentTests(unittest.TestCase):
 
         received = []
         self.service.router = FakeRouter()  # type: ignore[assignment]
-        self.service.query_function = lambda *args: (received.append(args) or "回答", {})
+        self.service.query_function = lambda *args: (received.append(args) or "回答 [Data: Sources (1)]", {})
         state = self.service.add_group("project")
         group_id = state["groups"][0]["group_id"]
         self.service.set_group_method("project", group_id, "auto")
@@ -585,14 +653,14 @@ class RetrievalExperimentTests(unittest.TestCase):
             received.append(args[2])
             if args[2] == "local":
                 return ("來源未說明，只提到別的功能", {"sources": [{"id": str(index)} for index in range(3)]})
-            return ("回答", {"sources": [{"id": str(index)} for index in range(10)]})
+            return ("回答 [Data: Sources (1)]", {"sources": [{"id": str(index)} for index in range(10)]})
 
         self.service.query_function = query
 
         result = self.service._generate_case("project", group, question, "gpt-4.1-mini")
 
         self.assertEqual(received, ["local", "basic"])
-        self.assertEqual((result.routed_method, result.actual_answer), ("basic", "回答"))
+        self.assertEqual((result.routed_method, result.actual_answer), ("basic", "回答 [Data: Sources (1)]"))
         self.assertEqual(
             [(item["method"], item["status"]) for item in result.execution_trace["strategy_attempts"]],
             [("local", "not_found"), ("basic", "found")],
@@ -864,6 +932,44 @@ class RetrievalExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError, "最多選擇 5"):
             self.service.save_configuration("project", [group], question_set.question_set_id, 1, [*panel, *(f"x{i}" for i in range(3))])
 
+    def test_judge_panel_runs_judges_of_one_case_at_the_same_time(self):
+        class SlowPanelJudge:
+            def __init__(self):
+                self.active = 0
+                self.maximum = 0
+                self.lock = threading.Lock()
+
+            def evaluate_single_answer_grade(self, project_id, question_id, question, correct, actual, model,
+                                             evaluation_mode="strict", reasoning_effort="medium"):
+                with self.lock:
+                    self.active += 1
+                    self.maximum = max(self.maximum, self.active)
+                time.sleep({"gpt-4o-mini": 0.1, "gpt-4.1-mini": 0.2, "gpt-6-luna": 0.3}[model])
+                with self.lock:
+                    self.active -= 1
+                return SimpleNamespace(
+                    question_id=question_id, score=2, judge_reason=model, extra_content_error=False,
+                )
+
+        judge = SlowPanelJudge()
+        self.service.judging = judge
+        question_set = self.question_sets.create_with_questions(
+            "project", "parallel-panel", [BatchQuestion("Q1", "問題一", "答案一")]
+        )
+        group = ExperimentGroup("G01", "Local", "gpt-4o-mini", "local")
+        panel = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-6-luna"]
+        self.service.save_configuration("project", [group], question_set.question_set_id, 1, panel)
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=1)
+
+        started = time.monotonic()
+        run = self.service.evaluate_answers("project", question_set.question_set_id, judge_model=panel, max_concurrency=1)
+        elapsed = time.monotonic() - started
+
+        # All three judges overlap: the case takes about as long as the slowest judge (0.3s), not the sum (0.6s).
+        self.assertEqual(judge.maximum, 3)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual([item.model for item in run.results[0].judge_scores], panel)
+
     def test_lenient_evaluation_uses_lenient_judge_prompt_and_persists_mode(self):
         judge = FakeJudge(lenient_result=True)
         self.service.judging = judge
@@ -955,26 +1061,18 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         calls = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             calls[payload["method"]] = {
                 **payload,
                 "output_is_symlink": (root / "output").is_symlink(),
                 "completion_model": settings["completion_models"]["default"]["model"],
-                "cwd": str(kwargs["cwd"]),
             }
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps({"answer": "answer", "context": {}}),
-                "",
-            )
+            return {"answer": "answer", "context": {}, "llm_calls": []}
 
-        with patch(
-            "automotive_graphrag.retrieval_experiments.subprocess.run",
-            side_effect=run_worker,
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
         ) as worker:
             for method in ("local", "global", "drift", "basic"):
                 answer, _ = self.service._graphrag_query(
@@ -985,7 +1083,6 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertEqual(worker.call_count, 4)
         self.assertEqual(set(calls), {"local", "global", "drift", "basic"})
         self.assertTrue(all(call["output_is_symlink"] for call in calls.values()))
-        self.assertTrue(all(call["cwd"] == str(Path(__file__).parents[1]) for call in calls.values()))
         self.assertTrue(all(call["completion_model"] == "gpt-4.1-mini" for call in calls.values()))
         self.assertTrue(all(call["response_type"] == "List of 3-7 Points" for call in calls.values()))
 
@@ -1009,14 +1106,15 @@ class RetrievalExperimentTests(unittest.TestCase):
         (graph_root / "settings.yaml").write_text("completion_models: {default: {model: old}}\n", encoding="utf-8")
         captured = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             captured["settings"] = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             captured["basic_prompt"] = Path(captured["settings"]["basic_search"]["prompt"]).read_text(encoding="utf-8")
-            return subprocess.CompletedProcess(command, 0, json.dumps({"answer": "ok", "context": {}}), "")
+            return {"answer": "ok", "context": {}, "llm_calls": []}
 
-        with patch("automotive_graphrag.retrieval_experiments.subprocess.run", side_effect=run_worker):
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
+        ):
             self.service._graphrag_query(
                 "project", "q", "basic", "gpt-4.1-mini",
                 strategy_parameters={"k": 17, "max_context_tokens": 8000},
@@ -1035,23 +1133,16 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         captured = {}
 
-        def run_worker(command, **kwargs):
-            payload = json.loads(kwargs["input"])
+        def run_worker(payload, _preloaded=None):
             root = Path(payload["root_dir"])
             settings = yaml.safe_load((root / "settings.yaml").read_text(encoding="utf-8"))
             captured["model"] = settings["completion_models"]["default"]["model"]
             captured["args"] = settings["completion_models"]["default"]["call_args"]
             captured["output_is_symlink"] = (root / "output").is_symlink()
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                json.dumps({"answer": "Luna DRIFT answer", "context": {"sources": []}}),
-                "",
-            )
+            return {"answer": "Luna DRIFT answer", "context": {"sources": []}, "llm_calls": []}
 
-        with patch(
-            "automotive_graphrag.retrieval_experiments.subprocess.run",
-            side_effect=run_worker,
+        with patch.dict("os.environ", {"GRAPHRAG_ENABLE_INDEX_CACHE": "false"}), patch(
+            "automotive_graphrag.graph_query_worker.execute_graph_query", side_effect=run_worker,
         ) as adapter:
             answer, _context = self.service._graphrag_query(
                 "project", "測試", "drift", "gpt-6-luna", reasoning_effort="high"
@@ -1168,7 +1259,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
+            ["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertEqual(experiment_results["datatype"][8], "markdown")
@@ -1183,7 +1274,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             judge_detail["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+            ["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
         )
         classic_table = next(
             config for config in component_configs
@@ -1191,7 +1282,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             classic_table["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+            ["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
         )
         summary_table = next(config for config in component_configs if config.get("label") == "實驗組摘要")
         self.assertEqual(summary_table["headers"][-2:], ["Average Term Hit", "Average Term Coverage"])

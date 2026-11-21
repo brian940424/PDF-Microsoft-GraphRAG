@@ -34,6 +34,8 @@ class SourceSample:
     content_type: str
     character_count: int
     text: str
+    # Heading path of the page ("BR > BRAKE PEDAL"); older batches and records without it use "".
+    section_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +112,7 @@ class SourceSamplingService:
                     content_type=record_type,
                     character_count=len(text),
                     text=text,
+                    section_path=str(record.get("section_path") or record["section_name"]),
                 )
             )
         return sorted(samples, key=lambda item: (item.document_id.casefold(), item.page, item.block_id))

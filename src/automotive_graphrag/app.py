@@ -12,13 +12,14 @@ import queue
 import threading
 import time
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import gradio as gr
 from PIL import Image
 
 from .automatic_evaluation import (
+    RUBRIC_MAX_LEVEL,
     AutomaticEvaluationService,
     JudgeScore,
     extra_error_share,
@@ -47,14 +48,22 @@ from .documents import (
     PageReview,
 )
 from .downloads import stage_downloads
-from .evidence import evidence_page_label
+from .evidence import Evidence, evidence_page_label
 from .ground_truth import GroundTruthService
 from .indexing import IndexingService, parse_indexing_progress
 from .evaluation.source_scoring import cited_sources, strip_citations
+from .project_archive import export_project as build_project_archive
+from .project_archive import import_project as restore_project_archive
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
+from .query_cache import QueryResultCache
+from .semantic_query_cache import read_project_mode, semantic_config, write_project_mode
+from .graph_index_cache import GraphIndexManager
 from .question_generation import GeneratedQuestion, QuestionGenerationService
-from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
+from .strategy_questions import DEFAULT_STRATEGY_MIX
+from .question_sets import (
+    ANSWER_SCOPE_LABELS, DESIGN_STRATEGY_LABELS, BatchQuestion, GoldEvidence, QuestionSetService, infer_answer_scope, question_design_label,
+)
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
 from .retrieval_evaluation import compute_source_metrics
@@ -75,6 +84,9 @@ from .vision import DEFAULT_VISION_SCOPE, SCOPE_ALL, SCOPE_DIAGRAMS, SCOPE_FIGUR
 
 NEW_PROJECT_OPTION = "__new_project__"
 NEW_PROJECT_LABEL = "+ 新增專案..."
+IMPORT_PROJECT_OPTION = "__import_project__"
+IMPORT_PROJECT_LABEL = "↑ 匯入專案..."
+SPECIAL_PROJECT_OPTIONS = {NEW_PROJECT_OPTION, IMPORT_PROJECT_OPTION}
 UPLOAD_PDF_OPTION = "__upload_pdf__"
 UPLOAD_PDF_LABEL = "+ 上傳 PDF..."
 AUTOQA_IMPORT_OPTION = "__import_question_set__"
@@ -83,6 +95,28 @@ AUTOQA_GENERATE_OPTION = "__generate_questions__"
 AUTOQA_GENERATE_LABEL = "+ 自動生成題目..."
 AUTOQA_ACTION_OPTIONS = (AUTOQA_IMPORT_OPTION, AUTOQA_GENERATE_OPTION)
 EXPERIMENT_IMPORT_OPTION = AUTOQA_IMPORT_OPTION
+DISPLAY_TIMEZONE = timezone(timedelta(hours=8), "Asia/Taipei")
+"""Timestamps are stored in UTC and shown in Taiwan time (no daylight saving), whatever the host's zone."""
+
+
+def display_time(value: object, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """ISO timestamp in Taiwan time; naive values are taken as UTC and unparsable ones kept as is."""
+    if not value:
+        return ""
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except ValueError:
+        return str(value)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(DISPLAY_TIMEZONE).strftime(fmt)
+
+
+def project_table_rows(store: ProjectStore) -> list[list[str | int]]:
+    """Project table rows with the update time shown in Taiwan time."""
+    return [[*row[:-1], display_time(row[-1])] for row in store.table_rows()]
+
+
 PROJECT_COLUMNS = ["Project ID", "顯示名稱", "文件數", "索引狀態", "啟用", "更新時間"]
 DOCUMENT_COLUMNS = ["檔名", "頁數", "大小 (bytes)", "前處理", "建圖", "前處理狀態", "空白頁", "錯誤頁", "錯誤"]
 PROCESSING_COLUMNS = [
@@ -160,6 +194,10 @@ APP_CSS = """
     background: var(--block-background-fill) !important;
     padding: var(--spacing-xl) var(--block-padding) !important;
     gap: var(--spacing-xl) !important;
+}
+/* 建圖完成後的檢視模式隱藏編輯按鈕；用 class 而非 visible，避免工作按鈕的狀態輪詢把按鈕重新顯示 */
+.mode-hidden {
+    display: none !important;
 }
 /* 按鈕列總寬與上方元件對齊 */
 .button-row.flush-row {
@@ -559,13 +597,60 @@ def _autoqa_source_cell(question) -> str:
 
 def _experiment_question_cells(item) -> list:
     """實驗組名稱／資料集／題號／來源文件／題目／系統回答／正確答案 shared by every ④ per-question table."""
+    design = question_design_label(item.get("design_strategy") or "", item.get("answer_scope") or "")
+    documents = ", ".join(item.get("source_documents", []))
     return [
         item.get("group_name"),
         f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})",
         item.get("question_id"),
-        ", ".join(item.get("source_documents", [])), item.get("question"),
+        f"{documents}\n［{design}］" if design else documents, item.get("question"),
         item.get("actual_answer"), item.get("correct_answer"),
     ]
+
+
+EXPERIMENT_CATEGORY_HEADERS = (
+    "實驗組名稱", "檢索策略", "分組方式", "類別", "題數", "已評判", "全對題數", "得分正確率", "來源分數",
+    "Evidence Hit Rate", "Document Hit Rate",
+)
+
+
+def _experiment_category_rows(breakdown) -> list[list]:
+    """Rows of RetrievalExperimentService.category_breakdown for the 依題型分組 table."""
+    percent = lambda value, empty="—": f"{value:.1%}" if isinstance(value, (int, float)) else empty
+    return [
+        [
+            item.get("group_name"),
+            EXPERIMENT_STRATEGY_LABELS.get(item.get("method"), item.get("method") or "未設定"),
+            item.get("dimension_label"), item.get("category_label"),
+            item.get("question_count"), item.get("evaluated_count"), item.get("correct_count"),
+            percent(item.get("score_accuracy")), percent(item.get("average_source_score"), "不適用"),
+            percent(item.get("evidence_hit_rate"), "不可計算"), percent(item.get("document_hit_rate"), "不可計算"),
+        ]
+        for item in breakdown
+    ]
+
+
+def _question_design_summary(questions) -> str:
+    """「Basic 3、Local 2；單頁 4（推算 3）」 counts of a question set's design metadata, "" when unclassified."""
+    strategies: dict[str, int] = {}
+    scopes: dict[str, int] = {}
+    inferred = 0
+    for item in questions:
+        if item.design_strategy:
+            strategies[item.design_strategy] = strategies.get(item.design_strategy, 0) + 1
+        if item.answer_scope:
+            scopes[item.answer_scope] = scopes.get(item.answer_scope, 0) + 1
+            inferred += item.answer_scope_inferred
+    parts = []
+    if strategies:
+        parts.append("設計策略 " + "、".join(
+            f"{label} {strategies[key]}" for key, label in DESIGN_STRATEGY_LABELS.items() if key in strategies
+        ))
+    if scopes:
+        parts.append("答案範圍 " + "、".join(
+            f"{label} {scopes[key]}" for key, label in ANSWER_SCOPE_LABELS.items() if key in scopes
+        ) + (f"（{inferred} 題由答案來源推算）" if inferred else ""))
+    return "；".join(parts)
 
 
 def _experiment_judge_detail_models(results) -> list[str]:
@@ -621,6 +706,7 @@ JOB_STOPPING_LABEL = "停止中…"
 
 
 def create_app(project_root: str | Path | None = None) -> gr.Blocks:
+    os.environ.setdefault("GRAPHRAG_MAX_LOADED_PROJECTS", "1")
     store = ProjectStore(project_root or os.environ.get("PROJECTS_ROOT", "projects"))
     connections = ConnectionSettings(store.root)
     documents = DocumentService(store)
@@ -918,16 +1004,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
     )
 
     def refresh_projects() -> list[list[str | int]]:
-        return store.table_rows()
+        return project_table_rows(store)
 
     def project_choices() -> list[tuple[str, str]]:
         return [(project.display_name, project.project_id) for project in store.list()]
 
     def project_selector_choices() -> list[tuple[str, str]]:
-        return [*project_choices(), (NEW_PROJECT_LABEL, NEW_PROJECT_OPTION)]
+        return [*project_choices(), (NEW_PROJECT_LABEL, NEW_PROJECT_OPTION), (IMPORT_PROJECT_LABEL, IMPORT_PROJECT_OPTION)]
 
     def selected_project_id(project_id: str | None) -> str | None:
-        return None if project_id == NEW_PROJECT_OPTION else project_id
+        return None if project_id in SPECIAL_PROJECT_OPTIONS else project_id
 
     def api_key_ready(project_id: str | None) -> bool:
         try:
@@ -1021,6 +1107,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         chat_model: str | None,
         response_type: str,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        bypass_cache: bool = False,
         progress=gr.Progress(),
     ):
         hidden = gr.Group(visible=False)
@@ -1034,6 +1121,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 outcome["result"] = querying.ask(
                     project_id, question, method, chat_model=chat_model, response_type=response_type,
                     source="manual", reasoning_effort=reasoning_effort,
+                    bypass_cache=bypass_cache,
                 )
             except Exception as exc:  # noqa: BLE001 - 交回主執行緒處理
                 outcome["error"] = exc
@@ -1056,6 +1144,71 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             raise outcome["error"]
         return query_result_outputs(outcome["result"])
 
+    def grade_manual_answer(
+        project_id: str | None,
+        question: str,
+        system_answer: str,
+        reference_answer: str,
+        answer_sources: str,
+        judge_models: object,
+        evaluation_mode: str | None,
+        reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
+        evidence_values: list | None = None,
+    ) -> str:
+        """Score the answer shown in the Q&A tab like a question-set evaluation; nothing is saved."""
+        if not project_id:
+            return "❌ 請先選擇已完成建圖的專案"
+        missing = [
+            label for label, value in (("問題", question), ("系統回答", system_answer), ("正確答案", reference_answer))
+            if not (value or "").strip()
+        ]
+        if missing:
+            return f"❌ 請先填寫：{'、'.join(missing)}"
+        models = list(parse_judge_models(judge_models))
+        if not models:
+            return "❌ 請至少選擇一個評測模型"
+        try:
+            gold = parse_autoqa_sources(answer_sources, ())
+            retrieved = [Evidence(**item) for item in evidence_values or []]
+            result = automatic_evaluation.evaluate_manual_answer(
+                project_id, question.strip(), reference_answer.strip(), system_answer.strip(), models,
+                retrieved=retrieved, answer_sources=gold,
+                evaluation_mode=evaluation_mode or "strict",
+                reasoning_effort=reasoning_effort or DEFAULT_REASONING_EFFORT,
+            )
+        except ProjectError as exc:
+            return f"❌ 評分失敗：{exc}"
+
+        def level(score: float) -> str:
+            return f"Level {round(score * RUBRIC_MAX_LEVEL)}（{score:.0%}）"
+
+        verdict = "✅ 正確" if result.is_correct else "❌ 不正確"
+        if not gold:
+            source = "—（未填答案來源）"
+        elif result.source_score is None:
+            source = "—（本次回答沒有可比對的文字證據）"
+        else:
+            source = f"{result.source_score:.0%}"
+        mode_label = "寬鬆" if evaluation_mode == "lenient" else "嚴格"
+        lines = [
+            f"**LLM 分數：{level(result.score)}｜{verdict}**",
+            f"**來源分數：** {source}｜**綜合分數：** {result.final_score:.0%}",
+            f"* 系統引用：{_autoqa_source_pages(cited_sources(system_answer, retrieved))}",
+            "* 正確來源：" + _autoqa_source_pages([
+                {"document_name": item.document_name or item.document_id, "pages": item.pages} for item in gold
+            ]),
+            f"評分方式：{mode_label}｜評審：{len(result.judges)} 個",
+            "",
+        ]
+        for judge in result.judges:
+            name = judge_model_label(judge.model)
+            if judge.score is None:
+                lines.append(f"\t- **`{name}`**：⚠️ 失敗（不計入平均）｜{judge.error}")
+            else:
+                extra = "（含正確答案未提及的內容）" if judge.extra_content_error else ""
+                lines.append(f"- **`{name}`**：{level(judge.score)}{extra}｜{judge.reason}")
+        return "\n".join(lines)
+
     def query_result_outputs(query_result):
         hidden = gr.Group(visible=False)
         method_label = QUERY_METHOD_LABELS.get(query_result.method, query_result.method)
@@ -1063,8 +1216,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             method_label = f"自動 → {method_label}"
         summary = (
             f"狀態：{query_result.status}｜方法：{method_label}｜"
-            f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{query_result.completed_at}"
+            f"耗時：{query_result.duration_seconds:.3f} 秒｜執行時間：{display_time(query_result.completed_at)}"
         )
+        if query_result.query_cache_hit:
+            summary += f"｜⚡ 來自快取（原耗時 {query_result.execution_metadata.get('original_latency_sec', '未知')} 秒）"
+        elif query_result.execution_metadata.get("semantic_cache_hit"):
+            summary += f"｜♻️ 語意相似快取（相似度 {query_result.execution_metadata.get('semantic_cache_score', '—')}；本次未重新檢索）"
         if query_result.routing_reason:
             detail_label = "Agentic 搜尋狀態" if query_result.requested_method == "agentic" else "選擇原因"
             summary += f"\n\n**{detail_label}：** {query_result.routing_reason}"
@@ -1111,7 +1268,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         records = manual_query_history(project_id)
         rows = [
             [
-                format_history_time(item.completed_at),
+                display_time(item.completed_at),
                 item.question if len(item.question) <= 60 else item.question[:60] + "…",
                 QUERY_METHOD_LABELS.get(item.method, item.method)
                 + ("（自動）" if item.requested_method == "auto" else ""),
@@ -1134,12 +1291,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             raise gr.Error(str(exc)) from exc
         gr.Info(f"已清除 {removed} 筆手動問答紀錄")
         return load_query_history(project_id)
-
-    def format_history_time(value: str) -> str:
-        try:
-            return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return value
 
     def select_query_history(project_id: str | None, query_ids: list[str], evt: gr.SelectData):
         row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
@@ -1695,10 +1846,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return gr.update(choices=[], value=None)
         choices = []
         for item in saved_sets:
-            try:
-                created = datetime.fromisoformat(item.imported_at).astimezone().strftime("%Y-%m-%d %H:%M")
-            except ValueError:
-                created = item.imported_at
+            created = display_time(item.imported_at, "%Y-%m-%d %H:%M")
             choices.append((
                 f"{item.name}｜{len(item.questions)} 題｜{created}｜{item.question_set_id[:8]}",
                 item.question_set_id,
@@ -1849,6 +1997,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 ))
                 if question_edited or answer_edited else old.source_documents
             )
+            # A scope inferred from the old answer sources follows the edited sources; a hand-set scope stays.
+            rescope = answer_edited and (old.answer_scope_inferred or not old.answer_scope)
+            new_scope = infer_answer_scope(answer_sources) if rescope else old.answer_scope
             updated.append(replace(
                 old,
                 question=edited[0],
@@ -1857,6 +2008,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question_source_evidence=question_sources,
                 answer_source_evidence=answer_sources,
                 source_documents=source_documents,
+                answer_scope=new_scope,
+                answer_scope_inferred=bool(new_scope) if rescope else old.answer_scope_inferred,
             ))
         if not changed:
             return current
@@ -2146,7 +2299,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             detail_model = detail_models[0] if detail_models else None
         detail_rows = _experiment_judge_detail_rows(results, detail_model, EXPERIMENT_STRATEGY_LABELS) if detail_model else []
         metric_rows = _experiment_classic_metric_rows(results) if enable_classic_metrics else []
+        category_rows = []
+        if project_id and results:
+            try:
+                run = retrieval_experiments.load(project_id).get("run") or {}
+                category_rows = _experiment_category_rows(retrieval_experiments.category_breakdown(
+                    run, retrieval_experiments._run_question_sets(project_id, run),
+                ))
+            except ProjectError:
+                category_rows = []
+        # Shown only after judging, like the other summaries; unclassified question sets have no rows.
+        category_visible = bool(category_rows) and any(
+            item.get("evaluation_result") not in (None, "待評測") for item in results
+        )
         return (
+            gr.update(value=category_rows, visible=category_visible),
             gr.update(visible=bool(detail_rows)),
             gr.update(
                 choices=[(judge_model_label(model), model) for model in detail_models],
@@ -2271,7 +2438,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not imported:
             details = "\n- ".join(import_errors) or "沒有可匯入的題目集"
             return experiment_view(project_id, f"❌ 題目集匯入失敗：\n- {details}")
-        details = "、".join(f"{item.name}（{len(item.questions)} 題）" for item in imported)
+        details = "、".join(
+            f"{item.name}（{len(item.questions)} 題"
+            + (f"；{design}" if (design := _question_design_summary(item.questions)) else "")
+            + "）"
+            for item in imported
+        )
         message = f"✅ 已匯入並加入實驗：{details}"
         if import_errors:
             message += "\n⚠️ 以下檔案未匯入：\n- " + "\n- ".join(import_errors)
@@ -2525,7 +2697,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def generate_retrieval_experiment_answers(
         project_id: str | None, question_set_id: str | None, concurrency,
-        judge_model: str | None, job: Job | None = None,
+        judge_model: str | None, bypass_cache: bool = True, job: Job | None = None,
     ):
         if not project_id:
             view = list(experiment_view(None, "❌ 請先開啟專案"))
@@ -2579,6 +2751,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         update_callback=publish_progress,
                         judge_model=judge_model,
                         stop_event=stop_event_of(job),
+                        bypass_cache=bool(bypass_cache),
                     )
                 except BaseException as exc:
                     outcome["error"] = exc
@@ -2764,7 +2937,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         return "✅ 題目與來源已自動儲存至目前專案"
 
     def generate_automatic_qa(
-        project_id, count, parallel_generation, generation_model, generation_effort, method, job: Job | None = None,
+        project_id, count, parallel_generation, generation_model, generation_effort, method,
+        by_strategy=False, basic_share=0, local_share=0, drift_share=0, global_share=0, job: Job | None = None,
     ):
         # 輸出最後三項依序為生題、回答、評測進度條；換題目後舊的回答與評測進度一併隱藏
         if not project_id:
@@ -2778,6 +2952,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     gr.update(value=task_progress_markup(fraction, "生題中", description), visible=True),
                     hidden_progress, hidden_progress)
 
+        strategy_mix = (
+            {"basic": basic_share, "local": local_share, "drift": drift_share, "global": global_share}
+            if by_strategy else None
+        )
         try:
             yield render_generation(0, "準備開始")
             question_set = yield from stream_with_progress(
@@ -2790,6 +2968,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     reasoning_effort=generation_effort,
                     progress_callback=report,
                     stop_event=stop_event_of(job),
+                    strategy_mix=strategy_mix,
                 ),
                 render_generation,
                 job,
@@ -2811,6 +2990,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             generation_progress = task_progress_markup(generated / target if target else 0, "已停止", f"完成 {generated} / {target} 題")
         else:
             headline = f"✅ 已生成 {generated} 題。請檢查並可直接編輯下表，再選擇匯出或開始測試。"
+            if strategy_mix is not None:
+                headline += f"\n\n{question_set.description}"
             generation_progress = task_progress_markup(1, "生成完成", f"共 {generated} 題")
         yield (
             f"{headline}\n\n{question_set.description}",
@@ -2827,6 +3008,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def generate_automatic_answers(
         project_id, question_set_id, rows, answer_model, answer_effort, method, concurrency, response_type,
+        bypass_cache=False,
         job: Job | None = None,
     ):
         # 輸出最後兩項為回答與評測進度條；重新生成回答後舊的評測進度隱藏
@@ -2850,6 +3032,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     reasoning_effort=answer_effort,
                     progress_callback=progress,
                     stop_event=stop_event_of(job),
+                    bypass_cache=bool(bypass_cache),
                 ),
                 render_answers,
                 job,
@@ -2970,10 +3153,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             question_set = question_sets.get(project_id, question_set_id)
         except ProjectError as exc:
             return f"**目前題目集：** ❌ {exc}"
-        try:
-            created = datetime.fromisoformat(question_set.imported_at).astimezone().strftime("%Y-%m-%d %H:%M")
-        except ValueError:
-            created = question_set.imported_at
+        created = display_time(question_set.imported_at, "%Y-%m-%d %H:%M")
         return (
             f"**目前題目集：** {question_set.name}｜{len(question_set.questions)} 題｜"
             f"建立於 {created}｜ID `{question_set.question_set_id[:8]}`"
@@ -3221,30 +3401,152 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         details = project_details(project_id)
         return gr.JSON(value=details, visible=bool(details))
 
+    def project_cache_status(project_id: str | None) -> str:
+        if not project_id:
+            return "查詢快取：尚未選擇專案"
+        try:
+            count = QueryResultCache(store.path_for(project_id)).count()
+        except (OSError, ValueError):
+            return "查詢快取：目前無法讀取"
+        if count < 0:
+            return "查詢快取資料庫損毀；執行清除可重建資料庫"
+        resident = project_id in GraphIndexManager.instance().loaded_projects()
+        memory_status = "圖譜已常駐記憶體" if resident else "圖譜尚未載入記憶體"
+        return f"{memory_status}｜本專案查詢快取：{count} 筆"
+
+    def clear_project_query_cache(project_id: str | None):
+        if not project_id:
+            return "❌ 請先開啟專案", project_cache_status(None)
+        try:
+            count = QueryResultCache(store.path_for(project_id)).clear()
+            released = GraphIndexManager.instance().clear(project_id)
+        except (OSError, ValueError) as exc:
+            return f"❌ 清除查詢快取失敗：{exc}", project_cache_status(project_id)
+        if count < 0:
+            return f"✅ 已移除損毀的查詢快取資料庫並釋放 {released} 組記憶體索引", project_cache_status(project_id)
+        return f"✅ 已清除 {count} 筆查詢快取並釋放 {released} 組記憶體索引", project_cache_status(project_id)
+
     def project_enabled_value(project_id: str | None) -> bool:
         try:
             return store.get(project_id).enabled if project_id else True
         except ProjectError:
             return True
 
+    def portal_default_model_choices() -> list[tuple[str, str]]:
+        current_model = connections.get_chat_model()
+        return [(f"使用全域預設（{current_model}）", ""), *((model, model) for model in chat_model_choices())]
+
+    def portal_defaults_view(project_id: str | None):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return (
+                gr.update(value="local", choices=STANDARD_QUERY_METHOD_CHOICES),
+                gr.update(value="", choices=portal_default_model_choices()),
+                gr.update(value=DEFAULT_REASONING_EFFORT, choices=REASONING_EFFORT_CHOICES),
+                gr.update(value=DEFAULT_EXPERIMENT_RESPONSE_TYPE, choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS)),
+            )
+        try:
+            defaults = store.get_portal_defaults(project_id)
+        except ProjectError:
+            return (
+                gr.update(), gr.update(), gr.update(), gr.update(),
+            )
+        model_choices = portal_default_model_choices()
+        valid_models = {value for _label, value in model_choices}
+        model = defaults["chat_model"] if defaults["chat_model"] in valid_models else ""
+        return (
+            gr.update(value=defaults["method"], choices=STANDARD_QUERY_METHOD_CHOICES),
+            gr.update(value=model, choices=model_choices),
+            gr.update(value=defaults["reasoning_effort"], choices=REASONING_EFFORT_CHOICES),
+            gr.update(value=defaults["response_type"], choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS)),
+        )
+
+    def save_portal_defaults(project_id, method, chat_model, reasoning_effort, response_type):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return "❌ 請先選擇專案"
+        try:
+            store.set_portal_defaults(project_id, {
+                "method": method,
+                "chat_model": chat_model or "",
+                "reasoning_effort": reasoning_effort,
+                "response_type": response_type,
+            })
+        except ProjectError as exc:
+            return f"❌ {exc}"
+        return f"✅ 已儲存專案 {project_id} 的前台預設查詢設定"
+
+    def semantic_mode_view(project_id):
+        project_id = selected_project_id(project_id)
+        return read_project_mode(store.path_for(project_id)) if project_id else "off"
+
+    def semantic_cache_status_view(project_id):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return "語意快取：尚未選擇專案"
+        project_path = store.path_for(project_id)
+        mode = read_project_mode(project_path)
+        config = semantic_config()
+        master = config is not None
+        threshold = f"{config['threshold']} / margin {config['margin']}" if config and config["calibrated"] else "未校準（serving 停用）"
+        cache = QueryResultCache(project_path)
+        semantic_count = cache.semantic_count()
+        hits = 0
+        rejects = 0
+        try:
+            records = (project_path / "runs" / "queries.jsonl").read_text(encoding="utf-8").splitlines()
+            for line in records:
+                record = json.loads(line)
+                metadata = record.get("execution_metadata", {})
+                if metadata.get("semantic_cache_hit"):
+                    hits += 1
+                if metadata.get("semantic_cache_reject_reason"):
+                    rejects += 1
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        top_k = config["top_k"] if config else "5（global default）"
+        global_status = "開啟" if master else "關閉"
+        return (
+            f"模式：**{mode}**｜全域總開關：**{global_status}**  \n"
+            f"Embedding：LiteLLM proxy / `{connections.get_embedding_model()}`｜Threshold / margin：**{threshold}**｜Top-K：**{top_k}**  \n"
+            f"Semantic entries：**{semantic_count}**｜TTL：{cache.ttl_seconds} 秒｜專案共用容量上限：{cache.max_bytes} bytes  \n"
+            f"查詢紀錄統計：semantic hits **{hits}**｜拒絕／未命中原因 **{rejects}**（由 `queries.jsonl` 累計）"
+        )
+
+    def save_semantic_mode(project_id, mode):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return "❌ 請先選擇專案"
+        try:
+            write_project_mode(store.path_for(project_id), mode)
+        except (OSError, ValueError) as exc:
+            return f"❌ 語意快取設定失敗：{exc}"
+        master = os.environ.get("GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE", "false").lower() in {"1", "true", "yes", "on"}
+        if not master and mode != "off":
+            return f"✅ 已設定 {project_id} 為 {mode}。全域總開關目前關閉，需設定 GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=true 才會執行。"
+        config = semantic_config()
+        if mode == "serving" and (config is None or not config["calibrated"]):
+            return f"✅ 已設定 {project_id} 為 serving；但校準 threshold／margin 尚未設定或無效，系統會安全停用語意查找。"
+        return f"✅ 已儲存專案 {project_id} 的語意快取模式：{mode}"
+
     def update_project_enabled(project_id: str | None, enabled: bool):
         project_id = selected_project_id(project_id)
         if not project_id:
-            return "❌ 請先選擇專案", store.table_rows(), {}
+            return "❌ 請先選擇專案", project_table_rows(store), {}
         try:
             project = store.set_enabled(project_id, enabled)
         except ProjectError as exc:
-            return f"❌ {exc}", store.table_rows(), project_details(project_id)
+            return f"❌ {exc}", project_table_rows(store), project_details(project_id)
         state = "啟用" if project.enabled else "停用"
-        return f"✅ 已{state}專案 {project.project_id}", store.table_rows(), asdict(project)
+        return f"✅ 已{state}專案 {project.project_id}", project_table_rows(store), asdict(project)
 
     def refresh_project_views(project_id: str | None, active_id: str | None):
         available_ids = {project.project_id for project in store.list()}
-        selected = project_id if project_id in available_ids or project_id == NEW_PROJECT_OPTION else None
+        selected = project_id if project_id in available_ids or project_id in SPECIAL_PROJECT_OPTIONS else None
         active = active_id if active_id in available_ids else None
         choices = project_selector_choices()
         return (
-            store.table_rows(),
+            project_table_rows(store),
             gr.Dropdown(choices=choices, value=selected),
             project_details(selected),
             active,
@@ -3263,6 +3565,34 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", *refresh_project_views(project_id, active_id), False
         next_active = None if project_id == active_id else active_id
         return f"✅ 已刪除專案 {project_id}", *refresh_project_views(None, next_active), False
+
+    def export_selected_project(project_id: str | None, include_cache: bool):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return "❌ 請先選擇專案", gr.File(value=None, visible=False)
+        try:
+            archive = build_project_archive(store, project_id, include_cache=bool(include_cache))
+        except ProjectError as exc:
+            return f"❌ {exc}", gr.File(value=None, visible=False)
+        size_mb = archive.stat().st_size / 1024 / 1024
+        return (
+            f"✅ 已匯出專案 {project_id}（{size_mb:.1f} MB），請下載下方檔案",
+            gr.File(value=str(archive), visible=True),
+        )
+
+    def import_project_archive(uploaded, active_id: str | None):
+        path = uploaded if isinstance(uploaded, str) or uploaded is None else getattr(uploaded, "name", None)
+        if not path:
+            return "❌ 請先選擇要匯入的專案檔", *refresh_project_views(None, active_id), None
+        try:
+            project = restore_project_archive(store, path)
+        except ProjectError as exc:
+            return f"❌ {exc}", *refresh_project_views(None, active_id), None
+        return (
+            f"✅ 已匯入專案 {project.project_id}，可按「開啟專案」開始使用",
+            *refresh_project_views(project.project_id, active_id),
+            None,
+        )
 
     def processing_option_rows(
         project_id: str | None,
@@ -3612,9 +3942,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def review_save_next(
         project_id: str | None, filename: str | None, review_filter: str | None, page: object, text: str | None,
-        option_rows: object | None = None,
+        option_rows: object | None = None, locked: bool = False,
     ):
-        """Save the page, then move to the next page matching the filter."""
+        """Save the page, then move to the next page matching the filter.
+
+        In the read-only view after indexing (``locked``) the page is not saved, only stepped.
+        """
+        if locked:
+            target, *view = review_step(project_id, filename, review_filter, page, 1, option_rows)
+            last = target is not None and page not in (None, "") and target == int(page)
+            return ("已是最後一頁" if last else ""), target, *view
         message = review_save(project_id, filename, page, text)
         if message.startswith("❌"):
             return message, *(gr.skip(),) * 4
@@ -3622,6 +3959,35 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if target == int(page):
             message += "；已是最後一頁"
         return message, target, *view
+
+    def review_mode_view(project_id: str | None, reprocess_requested: bool = False):
+        """Read-only page review once every PDF is in the graph, until 重新前處理 is pressed.
+
+        Outputs: locked flag, 重新前處理, 開始前處理, the editing buttons (Vision, retry Vision,
+        text layer, revert), the save/next button, the editor and the Vision settings.
+        """
+        items = documents.list_documents_if_available(project_id)
+        locked = bool(items) and all(item.preprocessed and item.indexed for item in items) and not reprocess_requested
+        # Hidden with a class: running_job_views re-shows idle start buttons by visibility.
+        hidden = gr.update(elem_classes=["mode-hidden"] if locked else [])
+        return (
+            locked,
+            gr.update(visible=locked),
+            hidden,
+            hidden, hidden, hidden, hidden,
+            gr.update(
+                value="下一頁 ▶" if locked else "儲存並前往下一頁 ▶",
+                variant="secondary" if locked else "primary",
+            ),
+            gr.update(
+                interactive=not locked,
+                label=(
+                    "解析結果（已建圖，僅供對照；要修改請按「重新前處理」）" if locked
+                    else "解析結果（可直接修改，此為送去建圖的文字）"
+                ),
+            ),
+            gr.update(interactive=not locked), gr.update(interactive=not locked), gr.update(interactive=not locked),
+        )
 
     def review_extract(
         project_id: str | None, filename: str | None, page: object, use_vision: bool,
@@ -4053,7 +4419,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             selector = gr.Dropdown(choices=project_selector_choices())
             return (
                 f"❌ {exc}",
-                store.table_rows(),
+                project_table_rows(store),
                 project_id,
                 display_name,
                 vehicle_name,
@@ -4070,7 +4436,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         )
         return (
             f"✅ 已建立專案 {project.project_id}",
-            store.table_rows(),
+            project_table_rows(store),
             "",
             "",
             "",
@@ -4111,11 +4477,58 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     with gr.Row(elem_classes="button-row"):
                         open_project_button = gr.Button("開啟專案", variant="primary", elem_classes="rounded-button")
                         update_project_enabled_button = gr.Button("更新啟用狀態", elem_classes="rounded-button")
+                        export_project_button = gr.Button("匯出專案", elem_classes="rounded-button")
                         delete_button = gr.Button("刪除專案", variant="stop", elem_classes="rounded-button")
+                    # 由匯出按鈕的確認對話框寫入（是否包含 LLM 快取），不顯示於畫面
+                    export_include_cache = gr.Checkbox(visible=False)
+                    project_export_file = gr.File(label="專案匯出檔", visible=False, interactive=False)
                     # 由刪除按鈕的確認對話框寫入，不顯示於畫面
                     delete_confirmation = gr.Checkbox(visible=False)
                 open_project_result = gr.Markdown()
                 project_activation_result = gr.Markdown()
+
+            with gr.Accordion("前台使用者預設查詢設定（依專案）", open=False, elem_classes=["bold-title"]):
+                gr.Markdown(
+                    "先在上方選擇專案，再調整其前台預設值。設定會套用到一般使用者入口選取此專案後的新查詢。"
+                    "模型可選擇沿用全域預設；若要讓前台與管理後台共用回答快取，請讓策略、模型、推理深度與回答格式一致。"
+                )
+                with gr.Row():
+                    portal_default_method = gr.Dropdown(
+                        choices=STANDARD_QUERY_METHOD_CHOICES,
+                        value="local",
+                        label="預設搜尋策略",
+                    )
+                    portal_default_chat_model = gr.Dropdown(
+                        choices=portal_default_model_choices(),
+                        value="",
+                        label="預設回答模型",
+                    )
+                with gr.Row():
+                    portal_default_reasoning_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES,
+                        value=DEFAULT_REASONING_EFFORT,
+                        label="預設推理深度",
+                        info="僅支援推理深度的模型會使用此設定。",
+                    )
+                    portal_default_response_type = gr.Dropdown(
+                        choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                        value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+                        label="預設回答格式",
+                    )
+                with gr.Row():
+                    save_portal_defaults_button = gr.Button("儲存前台預設設定", variant="primary")
+                    portal_defaults_result = gr.Markdown()
+                gr.Markdown("### 語意快取（預設關閉）")
+                gr.Markdown("Shadow 會呼叫 Embedding API 記錄候選，但仍執行全新查詢；Serving 僅在全域開關及校準門檻有效時回傳相似問題的完整結果。")
+                with gr.Row():
+                    semantic_cache_mode = gr.Dropdown(
+                        choices=[("關閉", "off"), ("觀察（Shadow）", "shadow"), ("服務（Serving）", "serving")],
+                        value="off", label="本專案語意快取模式",
+                    )
+                    save_semantic_cache_mode_button = gr.Button("儲存語意快取模式")
+                semantic_cache_mode_result = gr.Markdown()
+                semantic_cache_status = gr.Markdown("語意快取：尚未選擇專案")
+                refresh_semantic_cache_status_button = gr.Button("重新整理語意快取狀態", size="sm")
 
             with gr.Group(visible=False) as new_project_group:
                 with gr.Accordion("建立新專案", open=True, elem_classes=["static-section", "bold-title"]):
@@ -4128,7 +4541,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         description = gr.Textbox(label="說明", lines=3)
                         with gr.Row(elem_classes="button-row"):
                             create_button = gr.Button("建立專案", variant="primary", elem_classes="rounded-button")
-            # 建立與刪除專案的結果
+            with gr.Group(visible=False) as import_project_group:
+                with gr.Accordion("匯入專案", open=True, elem_classes=["static-section", "bold-title"]):
+                    with gr.Group():
+                        project_import_file = gr.File(
+                            label="專案匯出檔（由本系統「匯出專案」產生的 .zip）",
+                            file_types=[".zip"],
+                            type="filepath",
+                        )
+                        with gr.Row(elem_classes="button-row"):
+                            # 檔案上傳完成前停用，避免在上傳途中送出空值
+                            import_project_button = gr.Button(
+                                "匯入專案", variant="primary", interactive=False, elem_classes="rounded-button"
+                            )
+            # 建立、匯入與刪除專案的結果
             result = gr.Markdown()
 
             with gr.Accordion("專案清單", open=True, elem_classes=["static-section", "bold-title"]):
@@ -4148,7 +4574,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 elem_classes=["static-section", "bold-title"],
             ):
                 connection_state = gr.Markdown(value=connection_status)
-                gr.Markdown("所有模型都經由 LiteLLM proxy 呼叫，設定方式見 `docs/LiteLLM模型設定.md`。")
+                gr.Markdown("所有模型都經由 LiteLLM proxy 呼叫，設定方式見 `docs/03_LiteLLM模型設定.md`。")
                 with gr.Row():
                     api_base_url = gr.Textbox(
                         label="LiteLLM Base URL",
@@ -4239,13 +4665,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         with gr.Row(elem_classes=["button-row", "flush-row"]):
                             upload_button = gr.Button("上傳", variant="primary", elem_classes="rounded-button")
                             cancel_upload_button = gr.Button("取消", elem_classes="rounded-button")
+            # 建圖完成後逐頁檢查只供對照（唯讀）；按「重新前處理」才恢復前處理與修改功能
+            review_locked = gr.State(False)
+            reprocess_requested = gr.State(False)
             with gr.Row():
+                reprocess_button = gr.Button("重新前處理", variant="primary", visible=False)
                 preprocess_button = gr.Button("開始前處理", variant="primary")
                 preprocess_stop_button = gr.Button(JOB_BUTTON_LABELS["preprocess"][1], variant="stop", visible=False)
                 index_button = gr.Button("建立 Graph", variant="primary")
                 index_stop_button = gr.Button(JOB_BUTTON_LABELS["index"][1], variant="stop", visible=False)
                 document_refresh_button = gr.Button("重新整理")
                 remove_pdf_button = gr.Button("刪除所選 PDF", variant="stop")
+            with gr.Row():
+                clear_project_query_cache_button = gr.Button("清除本專案快取", size="sm")
+                project_query_cache_status = gr.Markdown("圖譜尚未載入記憶體｜本專案查詢快取：0 筆")
+                project_query_cache_action_status = gr.Markdown()
             # 由刪除按鈕的確認對話框寫入，不顯示於畫面
             remove_pdf_confirmation = gr.Checkbox(visible=False)
             
@@ -4375,6 +4809,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     )
                     with gr.Row():
                         ask_button = gr.Button("送出問題", variant="primary")
+                        query_bypass_cache = gr.Checkbox(label="略過快取重新生成", value=False)
                         clear_question_button = gr.Button("清除")
                 with gr.Column():
                     query_answer = gr.Textbox(
@@ -4384,7 +4819,38 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         elem_id="query-answer",
                     )
                     query_summary = gr.Markdown(label="查詢資訊", elem_id="query-summary", elem_classes=["collapse-when-empty"])
-            
+
+            with gr.Accordion("評分本次回答", open=False):
+                query_reference_answer = gr.Textbox(
+                    label="正確答案", lines=4,
+                    placeholder="輸入此題的正確答案，評測模型會依 0–5 級標準比對上方「系統回答」",
+                )
+                query_answer_sources = gr.Textbox(
+                    label="答案來源（選填）",
+                    placeholder="文件名稱: 頁碼, 頁碼；多份文件以「；」分隔。填寫後會比對回答引用的來源頁（容許 ±1 頁）並計算來源分數",
+                )
+                query_judge_model = gr.Dropdown(
+                    choices=judge_model_choices(), value=autoqa_judge_model_state()[0], label="評測模型",
+                    multiselect=True, max_choices=MAX_JUDGE_MODELS, info=judge_panel_info,
+                )
+                with gr.Row():
+                    query_judge_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
+                        label="推理深度", visible=judge_supports_reasoning(autoqa_judge_model_state()[0]),
+                        info="僅套用到支援推理深度的評審",
+                    )
+                    query_evaluation_mode = gr.Dropdown(
+                        choices=[("嚴格評分", "strict"), ("寬鬆評分（答案完整包含即正確）", "lenient")],
+                        value="strict", label="評分方式",
+                        info="寬鬆模式涵蓋正解核心資訊即可，不因答案較詳細而扣錯。",
+                    )
+                query_judge_model.change(
+                    lambda model: gr.update(visible=judge_supports_reasoning(model)),
+                    inputs=query_judge_model, outputs=query_judge_effort,
+                )
+                query_grade_button = gr.Button("評分", variant="primary")
+                query_grade_result = gr.Markdown(elem_classes=["collapse-when-empty"])
+
             with gr.Group(visible=False) as query_evidence_group:
                 gr.Markdown("### Evidence 詳情")
                 query_evidence_state = gr.State([])
@@ -4457,7 +4923,20 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
                             label="推理深度", visible=model_supports_reasoning(connections.get_chat_model()),
                         )
-                        autoqa_parallel_generation = gr.Checkbox(label="允許不同 PDF 平行生題", value=False)
+                        with gr.Group():
+                            autoqa_parallel_generation = gr.Checkbox(label="允許平行生題（不同 PDF 或不同策略）", value=True)
+                            autoqa_by_strategy = gr.Checkbox(label="依四種檢索策略出題（關閉時每份只出單頁 Basic 題）", value=True)
+                    # 配比只在「依四種檢索策略出題」打勾時顯示
+                    with gr.Row(equal_height=True, visible=True) as autoqa_strategy_mix_row:
+                        autoqa_basic_share = gr.Number(label="Basic 配比（%）", value=DEFAULT_STRATEGY_MIX["basic"], minimum=0, maximum=100)
+                        autoqa_local_share = gr.Number(label="Local 配比（%）", value=DEFAULT_STRATEGY_MIX["local"], minimum=0, maximum=100)
+                        autoqa_drift_share = gr.Number(label="DRIFT 配比（%）", value=DEFAULT_STRATEGY_MIX["drift"], minimum=0, maximum=100)
+                        autoqa_global_share = gr.Number(label="Global 配比（%）", value=DEFAULT_STRATEGY_MIX["global"], minimum=0, maximum=100)
+                    autoqa_by_strategy.change(
+                        lambda enabled: gr.update(visible=bool(enabled)),
+                        inputs=autoqa_by_strategy,
+                        outputs=autoqa_strategy_mix_row,
+                    )
                     autoqa_generation_model.change(
                         lambda model: gr.update(visible=model_supports_reasoning(model)),
                         inputs=autoqa_generation_model, outputs=autoqa_generation_effort,
@@ -4507,6 +4986,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         label="回答格式",
                     )
                 autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
+                autoqa_bypass_cache = gr.Checkbox(label="略過查詢快取（強制重跑）", value=False)
                 autoqa_answer_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_answer"][1], variant="stop", visible=False)
                 autoqa_answer_progress = gr.HTML(label="檢索與回答進度", visible=False)
                 autoqa_answer_model.input(
@@ -4546,8 +5026,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         info="僅套用到所有支援推理深度的評審，不支援的照常評分、不受影響"
                     )
                     autoqa_judge_concurrency = gr.Number(
-                        label="評測請求並行數", value=3, minimum=1, maximum=32, precision=0,
-                        info="同時送出的評測請求上限（題數 × 評審數會排隊執行）；調高較快，但容易碰到供應商速率限制（HTTP 429）",
+                        label="每個評審的並行請求數", value=3, minimum=1, maximum=32, precision=0,
+                        info="每個評審模型各自同時送出的請求上限，不同模型分開計算（總並行數 = 此值 × 評審數）；調高較快，但容易碰到供應商速率限制（HTTP 429）",
                     )
                 autoqa_judge_button = gr.Button("評測回答", variant="primary", interactive=False)
                 autoqa_judge_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_evaluate"][1], variant="stop", visible=False)
@@ -4658,7 +5138,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     gr.Markdown(
                         "可一次選多份 JSON，匯入後加入實驗目前的題目集；若任一檔案格式錯誤，整批都不加入。"
                         "題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；"
-                        "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。"
+                        "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/06_題目集範例.json`。"
                     )
                     with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
                         with gr.Group(elem_classes=["file-action-group"]):
@@ -4832,6 +5312,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 experiment_add_group_button = gr.Button("新增實驗組")
 
             with gr.Accordion("③ 檢索並生成答案", open=True, elem_classes=["static-section", "bold-title"]):
+                experiment_bypass_cache = gr.Checkbox(
+                    label="略過查詢快取（強制重跑）", value=True,
+                )
                 with gr.Row():
                     experiment_max_concurrency = gr.Number(label="測試最大並行請求數", value=5, minimum=1, maximum=32, precision=0)
                 with gr.Row():
@@ -4908,8 +5391,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     wrap=True,
                     visible=False,
                 )
+                experiment_category_table = gr.Dataframe(
+                    headers=list(EXPERIMENT_CATEGORY_HEADERS),
+                    interactive=False,
+                    datatype=["str"] * len(EXPERIMENT_CATEGORY_HEADERS),
+                    label="依題型分組（題目集的設計策略與答案範圍）",
+                    wrap=True,
+                    visible=False,
+                )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
                     interactive=True,
                     datatype=["str"] * 8 + ["markdown"] + ["str"] * 2,
                     column_widths=["6%", "8%", "4%", "8%", "11%", "18%", "13%", "6%", "11%", "8%", "7%"],
@@ -4922,7 +5413,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     choices=[], value=None, label="查看評審", visible=False, interactive=True,
                 )
                 experiment_judge_detail_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
                     interactive=False,
                     datatype=["str"] * 10,
                     column_widths=["7%", "8%", "4%", "7%", "11%", "17%", "12%", "6%", "18%", "10%"],
@@ -4932,7 +5423,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
                 experiment_metrics_divider = gr.Markdown("---", visible=False)
                 experiment_metrics_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
                     interactive=False,
                     datatype=["str"] * 11,
                     column_widths=["7%", "8%", "4%", "7%", "13%", "21%", "14%", "5%", "5%", "7%", "9%"],
@@ -4944,7 +5435,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     fn=experiment_result_tables,
                     inputs=[active_project_id, experiment_judge_detail_model,
                             experiment_enable_llm_judge, experiment_enable_classic_metrics],
-                    outputs=[experiment_judge_detail_divider, experiment_judge_detail_model,
+                    outputs=[experiment_category_table, experiment_judge_detail_divider, experiment_judge_detail_model,
                              experiment_judge_detail_table, experiment_metrics_divider, experiment_metrics_table],
                     show_progress="hidden",
                 )
@@ -5182,12 +5673,69 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         selected_project.change(
             lambda project_id: (
                 project_details_view(selected_project_id(project_id)),
-                project_enabled_value(selected_project_id(project_id)),
+                gr.Checkbox(
+                    value=project_enabled_value(selected_project_id(project_id)),
+                    visible=project_id not in SPECIAL_PROJECT_OPTIONS,
+                ),
+                gr.Button(visible=project_id not in SPECIAL_PROJECT_OPTIONS),
+                gr.Button(visible=project_id not in SPECIAL_PROJECT_OPTIONS),
                 gr.Group(visible=project_id == NEW_PROJECT_OPTION),
-                gr.Button(visible=project_id != NEW_PROJECT_OPTION),
+                gr.Group(visible=project_id == IMPORT_PROJECT_OPTION),
+                gr.Button(visible=project_id not in SPECIAL_PROJECT_OPTIONS),
+                gr.Button(visible=project_id not in SPECIAL_PROJECT_OPTIONS),
+                gr.File(value=None, visible=False),
             ),
             inputs=selected_project,
-            outputs=[selected_project_details, project_enabled, new_project_group, delete_button],
+            outputs=[selected_project_details, project_enabled, open_project_button, update_project_enabled_button,
+                     new_project_group, import_project_group,
+                     delete_button, export_project_button, project_export_file],
+        )
+        selected_project.change(
+            portal_defaults_view,
+            inputs=selected_project,
+            outputs=[portal_default_method, portal_default_chat_model,
+                     portal_default_reasoning_effort, portal_default_response_type],
+        )
+        selected_project.change(semantic_mode_view, inputs=selected_project, outputs=semantic_cache_mode)
+        selected_project.change(semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status)
+        refresh_semantic_cache_status_button.click(
+            semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
+        )
+        save_semantic_cache_mode_button.click(
+            save_semantic_mode, inputs=[selected_project, semantic_cache_mode], outputs=semantic_cache_mode_result,
+        )
+        save_semantic_cache_mode_button.click(
+            semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
+        )
+        save_portal_defaults_button.click(
+            save_portal_defaults,
+            inputs=[selected_project, portal_default_method, portal_default_chat_model,
+                    portal_default_reasoning_effort, portal_default_response_type],
+            outputs=portal_defaults_result,
+        )
+        export_project_button.click(
+            None,
+            outputs=export_include_cache,
+            js=(
+                "() => confirm('匯出時是否一併包含 GraphRAG LLM 快取？\\n\\n"
+                "已建圖的結果一律會匯出。快取檔案較大，只有在匯入後要重新建圖並沿用既有 LLM 結果時才需要。\\n\\n"
+                "按「確定」包含快取；按「取消」不包含快取。')"
+            ),
+        ).then(
+            export_selected_project,
+            inputs=[selected_project, export_include_cache],
+            outputs=[result, project_export_file],
+        )
+        project_import_file.change(
+            lambda path: gr.Button(interactive=bool(path)),
+            inputs=project_import_file,
+            outputs=import_project_button,
+        )
+        import_project_button.click(
+            import_project_archive,
+            inputs=[project_import_file, active_project_id],
+            outputs=[result, project_table, selected_project, selected_project_details,
+                     active_project_id, active_project_banner, project_import_file],
         )
         update_project_enabled_button.click(
             update_project_enabled,
@@ -5261,19 +5809,40 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[document_project, processing_options_table, review_document, review_filter, review_page],
             outputs=[review_document, review_page, review_image, review_text, review_info, review_filter],
         )
+        review_mode_event = dict(
+            fn=review_mode_view,
+            inputs=[document_project, reprocess_requested],
+            outputs=[
+                review_locked, reprocess_button, preprocess_button,
+                review_vision_button, review_retry_vision_button, review_text_layer_button, review_revert_button,
+                review_save_next_button, review_text, vision_model, vision_reasoning_effort, vision_scope,
+            ],
+            show_progress="hidden",
+        )
         documents_tab.select(
             documents_tab_visibility,
             inputs=[document_project, target_documents],
             outputs=[document_table, document_empty_notice, processing_options_section],
-        ).then(**review_sync_event)
+        ).then(**review_sync_event).then(**review_mode_event)
+        # Every document_view refresh (open project, upload, delete, preprocess, index) updates the
+        # table, so the review mode follows whether all PDFs are in the graph.
+        document_table.change(**review_mode_event)
+        active_project_id.change(lambda: False, outputs=reprocess_requested, show_progress="hidden").then(
+            **review_mode_event
+        )
+        reprocess_button.click(lambda: True, outputs=reprocess_requested, show_progress="hidden").then(
+            **review_mode_event
+        )
         review_inputs = [document_project, review_document, review_filter, review_page, processing_options_table]
         review_outputs = [review_page, review_image, review_text, review_info]
         review_page_outputs = [review_image, review_text, review_info]
 
         def document_view_keeping_options(project_id: str | None):
-            # Re-rendering the options table here would drop margins typed but not yet saved.
-            table, _rows, targets, notice = document_view(project_id)
-            return table, gr.skip(), targets, notice
+            # Re-rendering the options table here would drop margins typed but not yet saved, and
+            # resetting the PDF selection to the pending PDFs would hide the review being used
+            # (after indexing nothing is pending). Page edits never add or remove PDFs.
+            table, _rows, _targets, notice = document_view(project_id)
+            return table, gr.skip(), gr.skip(), notice
 
         # .input, not .change: review_sync/review_pick set the filter themselves and already refresh the page.
         review_filter.input(review_refresh, inputs=review_inputs, outputs=review_outputs)
@@ -5298,7 +5867,10 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         review_previous.click(review_previous_page, inputs=review_inputs, outputs=[review_page, *review_page_outputs])
         review_save_next_button.click(
             review_save_next,
-            inputs=[document_project, review_document, review_filter, review_page, review_text, processing_options_table],
+            inputs=[
+                document_project, review_document, review_filter, review_page, review_text, processing_options_table,
+                review_locked,
+            ],
             outputs=[review_status, *review_outputs],
         ).then(**review_filter_counts).then(document_view_keeping_options, inputs=document_project, outputs=document_view_outputs)
         review_revert_button.click(
@@ -5361,8 +5933,23 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         ).then(
             lambda message: gr.update(visible=str(message or "").startswith("❌")),
             inputs=document_result, outputs=indexing_log, show_progress="hidden",
+        ).then(
+            # A finished graph returns the review to read-only; a failed one stays editable anyway.
+            lambda: False, outputs=reprocess_requested, show_progress="hidden",
         ).then(document_view, inputs=document_project, outputs=document_view_outputs).then(
             processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section
+        ).then(**review_mode_event)
+        clear_project_query_cache_button.click(
+            clear_project_query_cache,
+            inputs=active_project_id,
+            outputs=[project_query_cache_action_status, project_query_cache_status],
+            show_progress="hidden",
+        )
+        active_project_id.change(
+            project_cache_status,
+            inputs=active_project_id,
+            outputs=project_query_cache_status,
+            show_progress="hidden",
         )
         document_refresh_button.click(
             document_view,
@@ -5480,7 +6067,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         bind_job(
             "retrieval_answer", experiment_run_button, experiment_run_stop_button,
             generate_retrieval_experiment_answers,
-            inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency, experiment_judge_model],
+            inputs=[active_project_id, experiment_question_set_state, experiment_max_concurrency,
+                    experiment_judge_model, experiment_bypass_cache],
             outputs=[experiment_status, experiment_question_set_state, experiment_question_preview,
                      experiment_summary_table, experiment_dataset_summary_table, experiment_result_table,
                      experiment_max_concurrency, experiment_judge_model,
@@ -5518,6 +6106,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[
                 automatic_project, autoqa_questions_per_pdf, autoqa_parallel_generation,
                 autoqa_generation_model, autoqa_generation_effort, autoqa_method,
+                autoqa_by_strategy, autoqa_basic_share, autoqa_local_share, autoqa_drift_share, autoqa_global_share,
             ],
             outputs=[
                 autoqa_result, autoqa_questions_table, autoqa_question_set_state,
@@ -5616,7 +6205,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[
                 automatic_project, autoqa_question_set_state, autoqa_questions_table,
                 autoqa_answer_model, autoqa_answer_effort, autoqa_method, autoqa_answer_concurrency,
-                autoqa_response_type,
+                autoqa_response_type, autoqa_bypass_cache,
             ],
             outputs=[autoqa_generation_status, autoqa_summary, autoqa_table, autoqa_judge_button,
                      autoqa_answer_progress, autoqa_judge_progress],
@@ -5643,13 +6232,39 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             inputs=[automatic_project, autoqa_question_set_state, autoqa_questions_table],
             outputs=[autoqa_result, autoqa_json_export],
         )
+        # The result box collapses while empty, hiding Gradio's loading overlay; show a pending
+        # message and lock the button so the judges' wait is visible.
+        query_grade_button.click(
+            lambda models: (
+                f"⏳ 評分中…（{max(len(parse_judge_models(models)), 1)} 個評審，視模型可能需要數十秒）",
+                gr.update(interactive=False),
+            ),
+            inputs=query_judge_model,
+            outputs=[query_grade_result, query_grade_button],
+            show_progress="hidden",
+        ).then(
+            grade_manual_answer,
+            inputs=[
+                query_project, question, query_answer, query_reference_answer, query_answer_sources,
+                query_judge_model, query_evaluation_mode, query_judge_effort, query_evidence_state,
+            ],
+            outputs=query_grade_result,
+            show_progress="hidden",
+        ).then(lambda: gr.update(interactive=True), outputs=query_grade_button, show_progress="hidden")
+        # A grade belongs to the answer it judged; drop it whenever the answer is replaced.
+        query_history_table.select(lambda: "", outputs=query_grade_result, show_progress="hidden")
+        clear_question_button.click(
+            lambda: ("", "", ""), outputs=[query_reference_answer, query_answer_sources, query_grade_result],
+            show_progress="hidden",
+        )
         ask_button.click(
-            lambda: ("", "", gr.Group(visible=False)),
-            outputs=[query_answer, query_summary, query_evidence_group],
+            lambda: ("", "", gr.Group(visible=False), ""),
+            outputs=[query_answer, query_summary, query_evidence_group, query_grade_result],
             show_progress="hidden",
         ).then(
             ask_question,
-            inputs=[query_project, question, query_method, query_chat_model, query_response_type, query_reasoning_effort],
+            inputs=[query_project, question, query_method, query_chat_model, query_response_type,
+                    query_reasoning_effort, query_bypass_cache],
             outputs=[
                 query_answer,
                 query_summary,

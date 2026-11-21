@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Protocol, Sequence
@@ -18,6 +18,39 @@ from .querying import QueryResult, QueryService
 
 
 QUESTION_STATUSES = {"PENDING", "RUNNING", "COMPLETED", "FAILED"}
+
+# Question design metadata (F-66): the retrieval strategy a question targets and how far its answer spreads.
+DESIGN_STRATEGIES = ("basic", "local", "global", "drift")
+ANSWER_SCOPES = ("single_page", "cross_page", "cross_document")
+DESIGN_STRATEGY_LABELS = {"basic": "Basic", "local": "Local", "global": "Global", "drift": "DRIFT"}
+ANSWER_SCOPE_LABELS = {"single_page": "單頁", "cross_page": "跨頁", "cross_document": "跨檔案"}
+UNCLASSIFIED_LABEL = "未分類"
+
+
+def infer_answer_scope(sources: Sequence["GoldEvidence"]) -> str:
+    """Answer scope implied by answer sources: one page, several pages of one document, or several documents.
+
+    Returns "" when no source names a page, so the question stays unclassified.
+    """
+    pages_by_document: dict[str, set[int]] = {}
+    for item in sources:
+        if item.pages:
+            pages_by_document.setdefault(item.document_name or item.document_id, set()).update(item.pages)
+    if not pages_by_document:
+        return ""
+    if len(pages_by_document) > 1:
+        return "cross_document"
+    return "single_page" if len(next(iter(pages_by_document.values()))) == 1 else "cross_page"
+
+
+def question_design_label(design_strategy: str, answer_scope: str) -> str:
+    """「Local／跨檔案」-style label of a question's design strategy and answer scope; "" when neither is set."""
+    if not design_strategy and not answer_scope:
+        return ""
+    return "／".join((
+        DESIGN_STRATEGY_LABELS.get(design_strategy, UNCLASSIFIED_LABEL),
+        ANSWER_SCOPE_LABELS.get(answer_scope, UNCLASSIFIED_LABEL),
+    ))
 
 
 class QuestionRunner(Protocol):
@@ -56,6 +89,26 @@ class BatchQuestion:
     total_tokens: int | None = None
     first_method: str | None = None
     first_choice_found: bool | None = None
+    # F-66 design metadata; "" means unclassified. answer_scope_inferred marks a scope derived from sources.
+    design_strategy: str = ""
+    answer_scope: str = ""
+    answer_scope_inferred: bool = False
+
+    def reset(self) -> "BatchQuestion":
+        """The same question back to PENDING with its gold data and design metadata but no answer."""
+        return BatchQuestion(
+            question_id=self.question_id,
+            question=self.question,
+            reference_answer=self.reference_answer,
+            answer_aliases=self.answer_aliases,
+            gold_evidence=self.gold_evidence,
+            question_source_evidence=self.question_source_evidence,
+            answer_source_evidence=self.answer_source_evidence,
+            source_documents=self.source_documents,
+            design_strategy=self.design_strategy,
+            answer_scope=self.answer_scope,
+            answer_scope_inferred=self.answer_scope_inferred,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,36 +235,20 @@ class QuestionSetService:
         for item in question_set.questions:
             result = results.get(item.question_id)
             if result is None and item.question_id in reset:
-                questions.append(BatchQuestion(
-                    question_id=item.question_id,
-                    question=item.question,
-                    reference_answer=item.reference_answer,
-                    answer_aliases=item.answer_aliases,
-                    gold_evidence=item.gold_evidence,
-                    question_source_evidence=item.question_source_evidence,
-                    answer_source_evidence=item.answer_source_evidence,
-                    source_documents=item.source_documents,
-                ))
+                questions.append(item.reset())
                 continue
             if result is None:
                 questions.append(item)
                 continue
             questions.append(
-                BatchQuestion(
-                    question_id=item.question_id,
-                    question=item.question,
-                    reference_answer=item.reference_answer,
-                    answer_aliases=item.answer_aliases,
+                replace(
+                    item.reset(),
                     status=result.status,
                     answer=result.answer,
                     error=result.error,
                     duration_seconds=result.duration_seconds,
                     completed_at=result.completed_at,
-                    gold_evidence=item.gold_evidence,
                     retrieved_evidence=result.evidence,
-                    question_source_evidence=item.question_source_evidence,
-                    answer_source_evidence=item.answer_source_evidence,
-                    source_documents=item.source_documents,
                     # Auto queries report the strategy the router picked in ``method``.
                     routed_method=result.method if result.requested_method == "auto" else "",
                     routing_reason=(result.routing_reason or "") if result.requested_method == "auto" else "",
@@ -326,59 +363,33 @@ class QuestionSetService:
 
         questions = list(question_set.questions)
         if not resume:
-            questions = [
-                BatchQuestion(
-                    item.question_id,
-                    item.question,
-                    reference_answer=item.reference_answer,
-                    answer_aliases=item.answer_aliases,
-                    gold_evidence=item.gold_evidence,
-                )
-                if item.question_id in targets
-                else item
-                for item in questions
-            ]
+            questions = [item.reset() if item.question_id in targets else item for item in questions]
         current = self._replace(question_set, questions, method)
         self._write(current)
 
         for index, item in enumerate(questions):
             if item.question_id not in targets:
                 continue
-            questions[index] = BatchQuestion(
-                item.question_id,
-                item.question,
-                reference_answer=item.reference_answer,
-                answer_aliases=item.answer_aliases,
-                status="RUNNING",
-                gold_evidence=item.gold_evidence,
-            )
+            questions[index] = replace(item.reset(), status="RUNNING")
             current = self._replace(current, questions, method)
             self._write(current)
             try:
                 result = self.query_service.ask(project_id, item.question, method, source="question_set")
-                questions[index] = BatchQuestion(
-                    question_id=item.question_id,
-                    question=item.question,
-                    reference_answer=item.reference_answer,
-                    answer_aliases=item.answer_aliases,
+                questions[index] = replace(
+                    item.reset(),
                     status=result.status,
                     answer=result.answer,
                     error=result.error,
                     duration_seconds=result.duration_seconds,
                     completed_at=result.completed_at,
-                    gold_evidence=item.gold_evidence,
                     retrieved_evidence=result.evidence,
                 )
             except Exception as exc:
-                questions[index] = BatchQuestion(
-                    question_id=item.question_id,
-                    question=item.question,
-                    reference_answer=item.reference_answer,
-                    answer_aliases=item.answer_aliases,
+                questions[index] = replace(
+                    item.reset(),
                     status="FAILED",
                     error=str(exc),
                     completed_at=datetime.now(timezone.utc).isoformat(),
-                    gold_evidence=item.gold_evidence,
                 )
             current = self._replace(current, questions, method)
             self._write(current)
@@ -420,14 +431,20 @@ class QuestionSetService:
         for number, item in enumerate(questions, start=1):
             question_sources = item.question_source_evidence or item.gold_evidence
             answer_sources = item.answer_source_evidence or item.gold_evidence
-            rows.append({
+            row: dict[str, object] = {
                 "number": number,
                 "question": item.question,
                 "expected_answer": item.reference_answer,
                 "answer_aliases": list(item.answer_aliases),
                 "question_sources": QuestionSetService._portable_sources_payload(question_sources),
                 "answer_sources": QuestionSetService._portable_sources_payload(answer_sources),
-            })
+            }
+            if item.design_strategy:
+                row["design_strategy"] = item.design_strategy
+            # An inferred scope is recomputed on import, so only a hand-set scope is written back.
+            if item.answer_scope and not item.answer_scope_inferred:
+                row["answer_scope"] = item.answer_scope
+            rows.append(row)
         return {"questions": rows}
 
     def update_gold_evidence(
@@ -474,7 +491,8 @@ class QuestionSetService:
         questions: list[BatchQuestion] = []
         seen: set[str] = set()
         allowed_question_fields = {
-            "number", "question", "expected_answer", "answer_aliases", "question_sources", "answer_sources"
+            "number", "question", "expected_answer", "answer_aliases", "question_sources", "answer_sources",
+            "design_strategy", "answer_scope",
         }
         for index, raw in enumerate(raw_questions):
             location = f"questions[{index}]"
@@ -514,6 +532,20 @@ class QuestionSetService:
             if not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
                 errors.append(f"{location}.answer_aliases：必須是字串陣列")
                 aliases = []
+            design_strategy = raw.get("design_strategy", "")
+            if design_strategy not in ("", *DESIGN_STRATEGIES):
+                errors.append(
+                    f"{location}.design_strategy：必須是 {'、'.join(DESIGN_STRATEGIES)} 之一，收到 {design_strategy!r}"
+                )
+                design_strategy = ""
+            answer_scope = raw.get("answer_scope", "")
+            if answer_scope not in ("", *ANSWER_SCOPES):
+                errors.append(f"{location}.answer_scope：必須是 {'、'.join(ANSWER_SCOPES)} 之一，收到 {answer_scope!r}")
+                answer_scope = ""
+            scope_inferred = False
+            if not answer_scope:
+                answer_scope = infer_answer_scope(answer_sources)
+                scope_inferred = bool(answer_scope)
             if (
                 isinstance(number, int)
                 and number > 0
@@ -534,6 +566,9 @@ class QuestionSetService:
                         source_documents=tuple(dict.fromkeys(
                             item.document_id for item in (*question_sources, *answer_sources)
                         )),
+                        design_strategy=design_strategy,
+                        answer_scope=answer_scope,
+                        answer_scope_inferred=scope_inferred,
                     )
                 )
         if errors:
