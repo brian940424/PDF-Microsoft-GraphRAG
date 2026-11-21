@@ -199,6 +199,9 @@ class ResponseTests(unittest.TestCase):
 
         local = self.bundle("local", sample("BR.pdf", 13), sample("BR.pdf", 48))
         self.assertIn("兩個實體", self.parse("local", local, entities=["STOP LAMP SWITCH"])[2][0])
+        single_page = self.parse("local", local, entities=["STOP LAMP SWITCH", "BRAKE PEDAL"],
+                                 answer_source_sample_ids=[local.samples[0].sample_id])
+        self.assertIn("至少兩個不同頁面", single_page[2][0])
         self.assertEqual(self.parse("local", local, entities=["STOP LAMP SWITCH", "BRAKE PEDAL"])[0][0].answer_scope,
                          "cross_page")
 
@@ -211,6 +214,11 @@ class ResponseTests(unittest.TestCase):
         self.assertEqual(skipped[0]["reason"], "only a table of contents")
         self.assertIn("sample_id", self.parse("basic", bundle, answer_source_sample_ids=["other"])[2][0])
         self.assertIn("繁體中文", self.parse("basic", bundle, question="What is the pad thickness?")[2][0])
+
+    def test_literal_backslash_n_becomes_a_line_break(self):
+        bundle = self.bundle("basic", sample("BR.pdf", 49))
+        questions, _, _ = self.parse("basic", bundle, reference_answer="- 新品 11.0 mm\\n- 極限 2.0 mm")
+        self.assertEqual(questions[0].reference_answer, "- 新品 11.0 mm\n- 極限 2.0 mm")
 
     def test_citation_markers_with_sample_ids_are_removed(self):
         first, second = sample("ACC.pdf", 2), sample("BR.pdf", 3)
@@ -294,6 +302,25 @@ class AutomaticStrategyGenerationTests(unittest.TestCase):
 
         exported = QuestionSetService.to_question_set_json(question_set.questions)["questions"]
         self.assertEqual(exported[-1]["design_strategy"], "drift")
+
+    def test_pages_used_by_one_question_are_not_reused(self):
+        # BR p.15 neighbours BR p.14 and p.16, so after a question on p.14–15 the p.16 page is free only
+        # for one more question; with three Basic questions wanted, the third falls short.
+        result = self.service.strategy_generator.generate(
+            PROJECT, SourceSamplingService(self.store).scan(PROJECT, minimum_characters=1), 6,
+            {"basic": 1}, self.connections.get_chat_model(),
+        )
+        page_sets = [
+            {(item.document_name, page) for item in question.answer_source_evidence for page in item.pages}
+            for question in result.questions
+        ]
+        self.assertGreater(len(page_sets), 1)
+        for index, pages in enumerate(page_sets):
+            for other in page_sets[index + 1:]:
+                self.assertFalse(any(
+                    left[0] == right[0] and abs(left[1] - right[1]) <= 1 for left in pages for right in other
+                ), (pages, other))
+        self.assertIn("Basic 完成", "；".join(result.notes))
 
     def test_nothing_generated_raises_with_the_reason(self):
         def skip_all(base_url, api_key, model, prompt):

@@ -224,21 +224,17 @@ class StrategyBundleBuilder:
                     if extra[0] not in selected:
                         selected.append(extra[0])
             selected = selected[:MAX_LOCAL_SAMPLES]
-            if not selected:
+            # A Local answer must span pages (see _question), so single-page bundles are not used.
+            if len({(item.document_id, item.page) for item in selected}) < 2:
                 continue
             used_pairs.add(pair)
             hint = "Entities: " + ", ".join(names) + ". Graph relationships (summaries, not source text): " + " | ".join(
                 f"{item['source']} — {item['target']}: {str(item.get('description') or '')[:300]}" for item in relations
             )
             bundles.append(SourceBundle(f"local-{len(bundles) + 1}", "local", tuple(selected), hint))
-        # Relationships whose sources span pages first: a single page usually holds one procedure,
-        # which makes a Basic question (the guideline's Local mix is 2 single-page of 8).
-        tiers: dict[tuple[bool, bool], list[SourceBundle]] = {}
+        tiers: dict[bool, list[SourceBundle]] = {}
         for bundle in bundles:
-            tiers.setdefault((
-                bool(PROCESS_WORDS.search(bundle.hint.split(". Graph relationships", 1)[0])),
-                len({(item.document_id, item.page) for item in bundle.samples}) < 2,
-            ), []).append(bundle)
+            tiers.setdefault(bool(PROCESS_WORDS.search(bundle.hint.split(". Graph relationships", 1)[0])), []).append(bundle)
         return [item for key in sorted(tiers) for item in self._spread_by_document(tiers[key])]
 
     def _graph(self, project_id: str):
@@ -406,6 +402,8 @@ COMMON_INSTRUCTIONS = (
     "Reference answers must be complete: keep every required step in order, preconditions, values with units "
     "and conditions, cautions and warnings; when the source differs by model or engine, name the model in the "
     "question or list each variant in the answer.\n"
+    "Include only the facts needed to answer the question. Leave out other cautions or procedures that merely "
+    "appear on the same pages, such as the generic note about disconnecting the CONSULT vehicle interface.\n"
 )
 
 STRATEGY_INSTRUCTIONS = {
@@ -432,6 +430,8 @@ STRATEGY_INSTRUCTIONS = {
         "functions; it asks about their relationship, such as dependency, "
         "exclusion, influence, interaction, sharing, or a prerequisite; the answer draws on what the sources "
         "say about each entity, not on one block of steps.\n"
+        "The answer must use sources from at least two different pages; a question answered by one page is a "
+        "Basic lookup.\n"
         "The reference answer states each entity's role in the relationship and the conditions under which the "
         "relationship holds. The hint's relationship summaries only point to the topic; every fact in the "
         "answer must come from the source text.\n"
@@ -531,7 +531,13 @@ class StrategyQuestionGenerator:
         result.quotas = dict(quotas)
         api_key = self.connections.apply_to_environment(project_id)
         accepted_questions: set[str] = set()
+        # Pages (and their neighbours) already used by an accepted answer: later bundles and questions on
+        # them are skipped, so one topic (a DTC procedure, one wiring page) is not asked several times.
+        used_pages: set[tuple[str, int]] = set()
         finished = {strategy: 0 for strategy in DESIGN_STRATEGIES}
+
+        def overlaps(pages: Sequence[tuple[str, int]]) -> bool:
+            return any(page in used_pages for page in pages)
 
         def report() -> None:
             if progress_callback:
@@ -544,9 +550,15 @@ class StrategyQuestionGenerator:
             while finished[strategy] < quotas[strategy] and queue and failures < 3:
                 raise_if_stopped(stop_event)
                 needed = quotas[strategy] - finished[strategy]
-                batch, queue = queue[:min(BUNDLES_PER_CALL, needed + 1)], queue[min(BUNDLES_PER_CALL, needed + 1):]
+                batch = []
                 with self._lock:
+                    while queue and len(batch) < min(BUNDLES_PER_CALL, needed + 1):
+                        bundle = queue.pop(0)
+                        if not overlaps([(item.document_id, item.page) for item in bundle.samples]):
+                            batch.append(bundle)
                     excluded = sorted(accepted_questions)[-30:]
+                if not batch:
+                    break
                 prompt = self.build_prompt(strategy, batch, excluded)
                 try:
                     response = self._call(api_key, model, prompt, reasoning_effort)
@@ -563,12 +575,27 @@ class StrategyQuestionGenerator:
                         normalized = normalize_question(question.question)
                         if finished[strategy] >= quotas[strategy] or not normalized or normalized in accepted_questions:
                             continue
+                        pages = [
+                            (item.document_name or item.document_id, page)
+                            for item in question.answer_source_evidence for page in item.pages
+                        ]
+                        if overlaps(pages):
+                            # Another strategy running in parallel took these pages first.
+                            result.skipped.append({
+                                "bundle_id": question.bundle_id, "strategy": strategy,
+                                "reason": "答案頁面已被其他題目使用",
+                            })
+                            continue
+                        used_pages.update(
+                            (document, page + offset) for document, page in pages for offset in (-1, 0, 1)
+                        )
                         accepted_questions.add(normalized)
                         result.questions.append(question)
                         finished[strategy] += 1
                     report()
 
-        strategies = [strategy for strategy in DESIGN_STRATEGIES if quotas[strategy]]
+        # Strategies with few bundles go first, so Basic does not take the pages DRIFT／Global need.
+        strategies = [strategy for strategy in ("global", "drift", "local", "basic") if quotas[strategy]]
         report()
         if parallel and len(strategies) > 1:
             with ThreadPoolExecutor(max_workers=len(strategies)) as pool:
@@ -697,8 +724,9 @@ class StrategyQuestionGenerator:
                 raise ProjectError(f"{key} 必須引用該組原文的 sample_id")
             return [source_by_id[value] for value in dict.fromkeys(values)]
 
-        question = _strip_markers(question, source_by_id)
-        answer = _strip_markers(answer, source_by_id)
+        # Some models write a literal backslash-n inside the JSON string instead of a line break.
+        question = _strip_markers(question.replace("\\n", "\n"), source_by_id)
+        answer = _strip_markers(answer.replace("\\n", "\n"), source_by_id)
         question_sources = sources("question_source_sample_ids")
         answer_sources = sources("answer_source_sample_ids")
         documents = {item.document_id for item in answer_sources}
@@ -712,6 +740,8 @@ class StrategyQuestionGenerator:
             entities = tuple(str(item).strip() for item in raw.get("entities") or [] if str(item).strip())
             if len(entities) < 2:
                 raise ProjectError("Local 題必須列出至少兩個實體")
+            if len({(item.document_id, item.page) for item in answer_sources}) < 2:
+                raise ProjectError("Local 題的答案必須引用至少兩個不同頁面，單頁題屬 Basic")
         elif strategy == "drift":
             reasoning_chain = tuple(str(item).strip() for item in raw.get("reasoning_chain") or [] if str(item).strip())
             if len(reasoning_chain) < 2:
