@@ -184,6 +184,31 @@ class CaseServiceTests(unittest.TestCase):
         # 管理後台只能從清單選擇專案（含「+ 新增專案...」），不接受手動輸入
         self.assertFalse(any(config.get("allow_custom_value") for config in admin_project_dropdowns))
 
+    def test_portal_auto_selects_the_only_queryable_project_and_enables_buttons(self) -> None:
+        root = self.root / "single-project-portal"
+        store = ProjectStore(root)
+        store.create(
+            project_id="L33-SM3E",
+            display_name="L33 / SM3E",
+            vehicle_name="L33",
+            manual_version="SM3E",
+        )
+        store.update_status("L33-SM3E", "INDEXED")
+
+        app = create_portal_app(root)
+        configs = [
+            component.get_config()
+            for component in app.blocks.values()
+            if hasattr(component, "get_config")
+        ]
+        project_dropdown = next(config for config in configs if config.get("label") == "車型／專案")
+        ask_button = next(config for config in configs if config.get("value") == "送出問題")
+        regenerate_button = next(config for config in configs if config.get("value") == "重新生成（略過快取）")
+
+        self.assertEqual(project_dropdown.get("value"), "L33-SM3E")
+        self.assertTrue(ask_button.get("interactive"))
+        self.assertTrue(regenerate_button.get("interactive"))
+
 
 if __name__ == "__main__":
     unittest.main()

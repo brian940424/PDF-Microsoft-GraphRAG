@@ -96,6 +96,11 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Button(interactive=False), gr.Button(interactive=False),
         )
         if not project_id:
+            if not portal.choices():
+                return (
+                    "### 目前沒有可查詢的專案", "請管理者確認至少一個專案已完成建圖並啟用。", "", [],
+                    gr.Dropdown(choices=[]), "", [], "", gr.Button(interactive=False), gr.Button(interactive=False),
+                )
             return ("### 尚未選擇車型／專案", *empty)
         try:
             project = portal.selected_project(project_id)
@@ -168,23 +173,43 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
             return f"❌ {exc}", None, None
         return "✅ 已匯出案例紀錄", str(json_path), str(csv_path)
 
+    available_projects = portal.choices()
+    initial_project_id = available_projects[0][1] if len(available_projects) == 1 else None
+    if initial_project_id:
+        initial_project = portal.selected_project(initial_project_id)
+        initial_header = (
+            f"### {initial_project.display_name}\n"
+            f"車型：`{initial_project.vehicle_name}`｜手冊版本：`{initial_project.manual_version}`"
+        )
+    elif available_projects:
+        initial_header = "### 尚未選擇車型／專案"
+    else:
+        initial_header = "### 目前沒有可查詢的專案\n請管理者確認至少一個專案已完成建圖並啟用。"
+
+    def refreshed_project_dropdown(current: str | None):
+        choices = portal.choices()
+        available_ids = {project_id for _label, project_id in choices}
+        value = current if current in available_ids else (choices[0][1] if len(choices) == 1 else None)
+        return gr.Dropdown(choices=choices, value=value, allow_custom_value=True)
+
     with gr.Blocks(title="汽車維修手冊問答助手") as demo:
         gr.Markdown("# 汽車維修手冊問答助手")
         gr.Markdown("選擇車型與手冊版本後輸入維修問題；回答下方會列出採用的原始手冊證據。")
         with gr.Row():
             project_selector = gr.Dropdown(
-                choices=portal.choices(),
+                choices=available_projects,
                 label="車型／專案",
                 allow_custom_value=True,
+                value=initial_project_id,
             )
             refresh_button = gr.Button("重新整理可用專案")
-        project_header = gr.Markdown("### 尚未選擇車型／專案")
+        project_header = gr.Markdown(initial_header)
         with gr.Row():
             with gr.Column():
                 question = gr.Textbox(label="維修問題", lines=6)
                 with gr.Row():
-                    ask_button = gr.Button("送出問題", variant="primary", interactive=False)
-                    regenerate_button = gr.Button("重新生成（略過快取）", interactive=False)
+                    ask_button = gr.Button("送出問題", variant="primary", interactive=bool(initial_project_id))
+                    regenerate_button = gr.Button("重新生成（略過快取）", interactive=bool(initial_project_id))
                     clear_button = gr.Button("清除")
                 status = gr.Markdown()
             with gr.Column():
@@ -212,13 +237,24 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
             gr.Markdown("此區預留給結構化維修步驟、技師處置與完工紀錄。")
 
         refresh_button.click(
-            lambda current: gr.Dropdown(
-                choices=portal.choices(),
-                value=current if current in {value for _, value in portal.choices()} else None,
-                allow_custom_value=True,
-            ),
+            refreshed_project_dropdown,
             inputs=project_selector,
             outputs=project_selector,
+        ).then(
+            project_view,
+            inputs=project_selector,
+            outputs=[
+                project_header,
+                status,
+                answer,
+                evidence_table,
+                evidence_selector,
+                evidence_markdown,
+                evidence_state,
+                query_id_state,
+                ask_button,
+                regenerate_button,
+            ],
         )
         project_selector.change(
             project_view,
