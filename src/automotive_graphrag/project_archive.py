@@ -132,12 +132,21 @@ def _rewrite_project_id_fields(project_path: Path, old_id: str, new_id: str) -> 
             rewritten.unlink()
 
 
-def import_project(store: ProjectStore, archive_path: str | Path, *, project_id: str | None = None) -> Project:
+def import_project(
+    store: ProjectStore,
+    archive_path: str | Path,
+    *,
+    project_id: str | None = None,
+    display_name: str | None = None,
+) -> Project:
     """Restore a project exported by `export_project`; refuses to overwrite an existing project.
 
     `project_id` imports the project under a new Project ID instead of the one stored in the archive.
+    `display_name` replaces the archived display name; when omitted, a project imported under a new
+    Project ID is displayed under that new ID so it is distinguishable from the original.
     """
     new_id = (project_id or "").strip()
+    new_display_name = (display_name or "").strip()
     if new_id and not PROJECT_ID_PATTERN.fullmatch(new_id):
         raise ProjectError("新的 Project ID 只能包含英文、數字、底線與連字號")
     try:
@@ -184,6 +193,13 @@ def import_project(store: ProjectStore, archive_path: str | Path, *, project_id:
                 (staged_project / directory).mkdir(parents=True, exist_ok=True)
             if target_id != project_id:
                 _rewrite_project_id_fields(staged_project, project_id, target_id)
+            # A renamed copy must not show up under the original's name in the project picker.
+            target_display_name = new_display_name or (target_id if target_id != project_id else "")
+            if target_display_name:
+                metadata_path = staged_project / "project.json"
+                staged_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                staged_metadata["display_name"] = target_display_name
+                ProjectStore._write_metadata(metadata_path, staged_metadata)
             try:
                 os.rename(staged_project, destination)
             except OSError as exc:

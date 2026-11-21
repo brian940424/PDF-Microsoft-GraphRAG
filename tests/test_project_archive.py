@@ -89,7 +89,9 @@ class ProjectArchiveTests(unittest.TestCase):
         project = import_project(self.source, archive, project_id=" L33-SM3E-copy ")
 
         self.assertEqual(project.project_id, "L33-SM3E-copy")
-        self.assertEqual(project.display_name, "L33 / SM3E")
+        # Without an explicit display name the copy is shown under its new ID, not the original's name.
+        self.assertEqual(project.display_name, "L33-SM3E-copy")
+        self.assertEqual(self.source.get("L33-SM3E").display_name, "L33 / SM3E")
         self.assertEqual(project.status, "INDEXED")
         self.assertEqual({p.project_id for p in self.source.list()}, {"L33-SM3E", "L33-SM3E-copy"})
         copy = self.source.root / "L33-SM3E-copy"
@@ -114,6 +116,17 @@ class ProjectArchiveTests(unittest.TestCase):
         project = import_project(self.target, archive, project_id="L33-SM3E")
 
         self.assertEqual(project.project_id, "L33-SM3E")
+        self.assertEqual(project.display_name, "L33 / SM3E")
+
+    def test_import_uses_explicit_display_name(self) -> None:
+        archive = export_project(self.source, "L33-SM3E")
+
+        copy = import_project(self.source, archive, project_id="L33-SM3E-copy", display_name=" L33 / SM3E 測試 ")
+        restored = import_project(self.target, archive, display_name="還原版")
+
+        self.assertEqual(copy.display_name, "L33 / SM3E 測試")
+        self.assertEqual(restored.project_id, "L33-SM3E")
+        self.assertEqual(restored.display_name, "還原版")
 
     def test_import_refuses_new_project_id_that_already_exists(self) -> None:
         self.source.create(project_id="Other", display_name="Other", vehicle_name="X", manual_version="Y")
