@@ -4396,7 +4396,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 elem_classes=["static-section", "bold-title"],
             ):
                 connection_state = gr.Markdown(value=connection_status)
-                gr.Markdown("所有模型都經由 LiteLLM proxy 呼叫，設定方式見 `docs/LiteLLM模型設定.md`。")
+                gr.Markdown("所有模型都經由 LiteLLM proxy 呼叫，設定方式見 `docs/03_LiteLLM模型設定.md`。")
                 with gr.Row():
                     api_base_url = gr.Textbox(
                         label="LiteLLM Base URL",
@@ -4740,23 +4740,19 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             choices=REASONING_EFFORT_CHOICES, value=DEFAULT_REASONING_EFFORT,
                             label="推理深度", visible=model_supports_reasoning(connections.get_chat_model()),
                         )
-                        autoqa_parallel_generation = gr.Checkbox(label="允許平行生題（不同 PDF 或不同策略）", value=False)
-                    with gr.Row(equal_height=True):
-                        autoqa_by_strategy = gr.Checkbox(
-                            label="依四種檢索策略出題", value=True,
-                            info="總題數＝每份 PDF 題數 × PDF 數，依配比分給各策略；關閉時每份 PDF 只出單頁 Basic 題",
-                        )
+                        with gr.Group():
+                            autoqa_parallel_generation = gr.Checkbox(label="允許平行生題（不同 PDF 或不同策略）", value=True)
+                            autoqa_by_strategy = gr.Checkbox(label="依四種檢索策略出題（關閉時每份 PDF 只出單頁 Basic 題）", value=True)
+                    # 配比只在「依四種檢索策略出題」打勾時顯示
+                    with gr.Row(equal_height=True, visible=True) as autoqa_strategy_mix_row:
                         autoqa_basic_share = gr.Number(label="Basic 配比（%）", value=DEFAULT_STRATEGY_MIX["basic"], minimum=0, maximum=100)
                         autoqa_local_share = gr.Number(label="Local 配比（%）", value=DEFAULT_STRATEGY_MIX["local"], minimum=0, maximum=100)
                         autoqa_drift_share = gr.Number(label="DRIFT 配比（%）", value=DEFAULT_STRATEGY_MIX["drift"], minimum=0, maximum=100)
-                        autoqa_global_share = gr.Number(
-                            label="Global 配比（%）", value=DEFAULT_STRATEGY_MIX["global"], minimum=0, maximum=100,
-                            info="標準答案只涵蓋抽到的頁面，需人工審核；可設 0",
-                        )
+                        autoqa_global_share = gr.Number(label="Global 配比（%）", value=DEFAULT_STRATEGY_MIX["global"], minimum=0, maximum=100)
                     autoqa_by_strategy.change(
-                        lambda enabled: [gr.update(interactive=enabled)] * 4,
+                        lambda enabled: gr.update(visible=bool(enabled)),
                         inputs=autoqa_by_strategy,
-                        outputs=[autoqa_basic_share, autoqa_local_share, autoqa_drift_share, autoqa_global_share],
+                        outputs=autoqa_strategy_mix_row,
                     )
                     autoqa_generation_model.change(
                         lambda model: gr.update(visible=model_supports_reasoning(model)),
@@ -4958,7 +4954,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     gr.Markdown(
                         "可一次選多份 JSON，匯入後加入實驗目前的題目集；若任一檔案格式錯誤，整批都不加入。"
                         "題目 JSON 欄位為 `number`、`question`、`expected_answer`，以及分開記錄的 `question_sources` / `answer_sources`；"
-                        "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/檢索實驗格式範例.json`。"
+                        "每筆來源由 `document_name` 和 `pages` 配對組成，支援跨頁與跨文件。範例見 `docs/06_題目集範例.json`。"
                     )
                     with gr.Row(equal_height=True, elem_classes=["file-action-row"]):
                         with gr.Group(elem_classes=["file-action-group"]):

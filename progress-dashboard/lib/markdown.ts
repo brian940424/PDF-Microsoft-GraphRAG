@@ -3,7 +3,7 @@ import type { Handoff, HandoffSection, PlanItem } from "./types";
 const PLAN_ROW = /^\|\s*([A-Z]+-\d+)\s*\|/;
 const COMMIT_HASH = /`?\b([0-9a-f]{7,40})\b`?/;
 
-/** 解析 docs/改善計畫.md：狀態總覽表格＋各項目的細節段落。 */
+/** 解析 docs/11_改善計畫.md：狀態總覽表格＋各項目的細節段落。 */
 export function parsePlan(markdown: string): PlanItem[] {
   const lines = markdown.split(/\r?\n/);
   const details = parseDetailSections(lines);
@@ -49,7 +49,7 @@ function parseDetailSections(lines: string[]): Map<string, string> {
   return sections;
 }
 
-/** 解析 docs/交接紀錄.md 第一個「## 目前狀態」段落。 */
+/** 解析 docs/12_交接紀錄.md 第一個「## 目前狀態」段落。 */
 export function parseHandoff(markdown: string): Handoff | null {
   const lines = markdown.split(/\r?\n/);
   const start = lines.findIndex((line) => /^##\s+目前狀態/.test(line));

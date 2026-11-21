@@ -99,7 +99,7 @@ class RetrievalExperimentTests(unittest.TestCase):
             query_function=query,
         )
         self.question_file = self.root / "questions.json"
-        example = Path(__file__).parents[1] / "docs" / "檢索實驗格式範例.json"
+        example = Path(__file__).parents[1] / "docs" / "06_題目集範例.json"
         self.question_file.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
 
     def test_judge_model_must_be_in_the_saved_model_list(self):

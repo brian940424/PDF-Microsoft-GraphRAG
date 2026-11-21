@@ -9,11 +9,11 @@
 
 新版操作說明：
 
-- [功能總覽（管理後台分頁 0 至 5）](docs/功能總覽.md)
-- [安裝與啟動](docs/安裝與啟動.md)
-- [操作指南](docs/使用指南.md)
-- [檢索實驗策略與參數](docs/檢索實驗與策略參數.md)
-- [題目集 JSON 格式](docs/題目集格式.md)
+- [功能總覽（管理後台分頁 0 至 5）](docs/01_功能總覽.md)
+- [安裝與啟動](docs/02_安裝與啟動.md)
+- [操作指南](docs/04_使用指南.md)
+- [檢索實驗策略與參數](docs/08_檢索實驗與策略參數.md)
+- [題目集 JSON 格式](docs/05_題目集格式.md)
 - [開發進度指揮中心（3D 進度儀表板）](progress-dashboard/README.md)
 
 ## 目錄
@@ -101,14 +101,14 @@ API 連線設定保存在 `PROJECTS_ROOT/.connection.json`，由該根目錄下�
 4. 在「2 問答測試」進行單次問答；或在「3 自動問答測試」、「4 檢索實驗」載入題目集進行自動問答與策略比較。
 5. 將已建圖且啟用查詢的專案提供給一般使用者入口。
 
-完整操作方式及題目來源格式請見[新版使用指南](docs/使用指南.md)與[題目集 JSON 格式](docs/題目集格式.md)。
+完整操作方式及題目來源格式請見[新版使用指南](docs/04_使用指南.md)與[題目集 JSON 格式](docs/05_題目集格式.md)。
 
 ## Docker：使用 Dockerfile 建立執行環境
 
 需求：
 
 - Docker Engine 24 或更新版本
-- 可連線至 LiteLLM proxy（OpenAI 相容 API），設定方式見 [docs/LiteLLM模型設定.md](docs/LiteLLM模型設定.md)
+- 可連線至 LiteLLM proxy（OpenAI 相容 API），設定方式見 [docs/03_LiteLLM模型設定.md](docs/03_LiteLLM模型設定.md)
 - 足夠的磁碟空間保存 PDF、Parquet 與 GraphRAG 索引
 
 建立映像：
