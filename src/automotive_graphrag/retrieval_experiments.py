@@ -45,7 +45,10 @@ from .evaluation.classic_metrics import answer_term_scores, exact_match_score, f
 from .duplicate_passages import PageEquivalence, with_duplicate_citations
 from .evaluation.source_scoring import DEFAULT_SOURCE_WEIGHT, combined_score, source_score
 from .projects import ProjectError, ProjectStore
-from .question_sets import BatchQuestion, QuestionSetService
+from .question_sets import (
+    ANSWER_SCOPE_LABELS, ANSWER_SCOPES, DESIGN_STRATEGIES, DESIGN_STRATEGY_LABELS, UNCLASSIFIED_LABEL,
+    BatchQuestion, QuestionSet, QuestionSetService,
+)
 from .retrieval_evaluation import compute_source_metrics
 from .querying import QueryExecution
 from .answer_prompts import install_answer_prompts
@@ -192,6 +195,9 @@ class ExperimentQuestionResult:
     answer_term_hit: float | None = None
     answer_term_coverage: float | None = None
     source_score: float | None = None
+    # F-66 design metadata copied from the question; "" means unclassified.
+    design_strategy: str = ""
+    answer_scope: str = ""
 
     @property
     def effective_method(self) -> str:
@@ -1081,6 +1087,9 @@ class RetrievalExperimentService:
                 },
             })
         expected_count = sum(int(item.get("question_count", 0)) for item in run_groups)
+        question_sets = self._run_question_sets(project_id, run)
+        category_rows = self.category_breakdown(run, question_sets)
+        design_lookup = self._design_lookup(run, question_sets)
         payload = {
             "schema_version": 1,
             "format": "manual-graphrag-experiment-summary",
@@ -1128,6 +1137,7 @@ class RetrievalExperimentService:
                 "average_latency_seconds": self._average_metric(run_groups, "average_latency_seconds"),
             },
             "groups": group_rows,
+            "category_breakdown": category_rows,
             "datasets": [
                 {"question_set_id": item, "name": name}
                 for item, name in zip(
@@ -1161,14 +1171,134 @@ class RetrievalExperimentService:
                 }
                 for group in group_rows
             ],
+            "category_breakdown": category_rows,
             "question_results": [
-                {key: value for key, value in item.items() if key not in LEGACY_QUALITY_KEYS}
+                {
+                    **{key: value for key, value in item.items() if key not in LEGACY_QUALITY_KEYS},
+                    **dict(zip(("design_strategy", "answer_scope"), design_lookup(item))),
+                }
                 for item in run_results
             ],
         }
         self._atomic_write(summary_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         self._atomic_write(details_path, json.dumps(details_payload, ensure_ascii=False, indent=2) + "\n")
         return summary_path, details_path
+
+    def _run_question_sets(self, project_id: str, run: dict[str, object]) -> list[QuestionSet]:
+        """The run's question sets that still exist; deleted sets are skipped."""
+        result = []
+        for question_set_id in self._normalize_question_set_ids(
+            run.get("question_set_ids", run.get("question_set_id", ""))
+        ):
+            try:
+                result.append(self.question_sets.get(project_id, question_set_id))
+            except ProjectError:
+                continue
+        return result
+
+    @staticmethod
+    def _design_lookup(run: dict[str, object], question_sets: Sequence[QuestionSet]):
+        """Return item -> (design_strategy, answer_scope); runs saved before F-66 fall back to the question set."""
+        run_ids = list(run.get("question_set_ids", []) or [run.get("question_set_id", "")])
+        default_dataset = run_ids[0] if len(run_ids) == 1 else ""
+        by_key = {
+            (question_set.question_set_id, question.question_id): question
+            for question_set in question_sets for question in question_set.questions
+        }
+
+        def lookup(item: dict[str, object]) -> tuple[str, str]:
+            if "design_strategy" in item or "answer_scope" in item:
+                return str(item.get("design_strategy") or ""), str(item.get("answer_scope") or "")
+            question = by_key.get((str(item.get("dataset_id") or default_dataset), str(item.get("question_id"))))
+            return (question.design_strategy, question.answer_scope) if question else ("", "")
+
+        return lookup
+
+    @classmethod
+    def category_breakdown(
+        cls, run: dict[str, object], question_sets: Sequence[QuestionSet],
+    ) -> list[dict[str, object]]:
+        """Per experiment group, results grouped by the questions' design strategy and by answer scope (F-66).
+
+        Empty when no question in the run is classified. Source metrics follow the same rules as the
+        group summary: only text-unit evidence from Local／Basic／DRIFT answers is scored.
+        """
+        results = [item for item in run.get("results", []) if isinstance(item, dict)]
+        lookup = cls._design_lookup(run, question_sets)
+        designs = [lookup(item) for item in results]
+        if not any(strategy or scope for strategy, scope in designs):
+            return []
+        run_ids = list(run.get("question_set_ids", []) or [run.get("question_set_id", "")])
+        default_dataset = run_ids[0] if len(run_ids) == 1 else ""
+        gold_by_key = {
+            (question_set.question_set_id, question.question_id): question.gold_evidence or question.answer_source_evidence
+            for question_set in question_sets for question in question_set.questions
+        }
+        dimensions = (
+            ("design_strategy", "設計策略", DESIGN_STRATEGIES, DESIGN_STRATEGY_LABELS, 0),
+            ("answer_scope", "答案範圍", ANSWER_SCOPES, ANSWER_SCOPE_LABELS, 1),
+        )
+        rows: list[dict[str, object]] = []
+        for group in run.get("groups", []):
+            group_id = group.get("group_id")
+            method = str(group.get("method") or "")
+            group_items = [
+                (item, design) for item, design in zip(results, designs) if item.get("group_id") == group_id
+            ]
+            for dimension, dimension_label, values, labels, position in dimensions:
+                for value in (*values, ""):
+                    selected = [item for item, design in group_items if design[position] == value]
+                    if not selected:
+                        continue
+                    full, partial, incorrect, score_sum = cls._grade_counts(
+                        item.get("evaluation_result") for item in selected
+                    )
+                    samples = []
+                    for item in selected:
+                        gold = gold_by_key.get((str(item.get("dataset_id") or default_dataset), str(item.get("question_id"))))
+                        if gold and cls._scores_sources(item, method):
+                            samples.append((cls._result_from_dict(item).retrieved_evidence, gold))
+                    hit_rate, precision, document_hit_rate, _ = (
+                        compute_source_metrics(tuple(samples)) if samples else (None, None, None, 0)
+                    )
+                    count = len(selected)
+                    average_source = cls._mean_present(item.get("source_score") for item in selected)
+                    rows.append({
+                        "group_id": group_id,
+                        "group_name": group.get("group_name"),
+                        "method": method,
+                        "dimension": dimension,
+                        "dimension_label": dimension_label,
+                        "category": value,
+                        "category_label": labels.get(value, UNCLASSIFIED_LABEL),
+                        "question_count": count,
+                        "answered_count": sum(bool(str(item.get("actual_answer") or "").strip()) for item in selected),
+                        "evaluated_count": full + partial + incorrect,
+                        "correct_count": full,
+                        "partial_correct_count": partial,
+                        "incorrect_count": incorrect,
+                        "score_accuracy": round(score_sum / (2 * count), 4) if full + partial + incorrect else None,
+                        "average_source_score": round(average_source, 4) if average_source is not None else None,
+                        "evidence_hit_rate": hit_rate,
+                        "evidence_precision": precision,
+                        "document_hit_rate": document_hit_rate,
+                    })
+        return rows
+
+    @staticmethod
+    def _scores_sources(item: dict[str, object], method: str) -> bool:
+        """True when a result's retrieved evidence counts toward source metrics (see ``_persist_run``)."""
+        if item.get("status") == "failed" or str(item.get("retrieval_metrics_status") or "").startswith("不可計算："):
+            return False
+        if method == EXPERIMENT_AUTO_METHOD:
+            return (item.get("routed_method") or item.get("method")) in EVIDENCE_METHODS
+        if method == EXPERIMENT_AGENTIC_METHOD:
+            return any(
+                isinstance(evidence, dict) and evidence.get("source_type", "text_unit") == "text_unit"
+                or getattr(evidence, "source_type", None) == "text_unit"
+                for evidence in item.get("retrieved_evidence", []) or []
+            )
+        return method in EVIDENCE_METHODS
 
     @staticmethod
     def _retrieval_mode_label(method: str | None) -> str | None:
@@ -1438,6 +1568,8 @@ class RetrievalExperimentService:
                 routing_reason=routing_reason,
                 execution_trace=execution_trace,
                 duration_seconds=round(time.monotonic() - started_clock, 3),
+                design_strategy=question.design_strategy,
+                answer_scope=question.answer_scope,
             )
         except Exception as exc:
             return replace(
@@ -1577,6 +1709,8 @@ class RetrievalExperimentService:
             answer_reasoning_effort=group.answer_reasoning_effort,
             dataset_id=dataset_id,
             dataset_name=dataset_name,
+            design_strategy=question.design_strategy,
+            answer_scope=question.answer_scope,
         )
 
     def _persist_run(

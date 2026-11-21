@@ -16,7 +16,9 @@ import gradio as gr
 
 from automotive_graphrag.app import (
     EXPERIMENT_STRATEGY_LABELS,
+    _experiment_category_rows,
     _experiment_classic_metric_rows,
+    _experiment_question_cells,
     _experiment_dataset_summary_rows,
     _experiment_grade_label,
     _experiment_judge_cell,
@@ -228,6 +230,71 @@ class RetrievalExperimentTests(unittest.TestCase):
         self.assertTrue(summary["evaluation"]["enable_classic_metrics"])
         self.assertEqual(summary["summary"]["average_answer_em"], 1.0)
         self.assertEqual(details["question_results"][0]["answer_em"], 1.0)
+
+    def test_results_are_grouped_by_design_strategy_and_answer_scope(self):
+        question_set = self.service.import_question_set("project", self.question_file)
+        first, second = question_set.questions
+        # Q2 answered wrong; it targets Local and keeps the cross-page scope inferred from its sources.
+        self.question_sets.update_questions(
+            "project", question_set.question_set_id,
+            (first, replace(second, reference_answer="另一個答案", design_strategy="local")),
+        )
+        group = ExperimentGroup("G01", "實驗組1", "gpt-4o-mini", "local")
+        self.service.save_configuration("project", [group], question_set.question_set_id, 2, "gpt-4.1-mini")
+        self.service.generate_answers("project", question_set.question_set_id, [group], max_concurrency=2)
+        run = self.service.evaluate_answers("project", question_set.question_set_id)
+
+        by_question = {item.question_id: item for item in run.results}
+        self.assertEqual((by_question["Q0001"].design_strategy, by_question["Q0001"].answer_scope),
+                         ("basic", "single_page"))
+        self.assertEqual((by_question["Q0002"].design_strategy, by_question["Q0002"].answer_scope),
+                         ("local", "cross_page"))
+
+        state = self.service.load("project")
+        breakdown = self.service.category_breakdown(
+            state["run"], self.service._run_question_sets("project", state["run"])
+        )
+        rows = {(item["dimension"], item["category"]): item for item in breakdown}
+        self.assertEqual(set(rows), {
+            ("design_strategy", "basic"), ("design_strategy", "local"),
+            ("answer_scope", "single_page"), ("answer_scope", "cross_page"),
+        })
+        self.assertEqual((rows[("design_strategy", "basic")]["correct_count"],
+                          rows[("design_strategy", "basic")]["score_accuracy"]), (1, 1.0))
+        self.assertEqual((rows[("design_strategy", "local")]["correct_count"],
+                          rows[("design_strategy", "local")]["score_accuracy"]), (0, 0.0))
+        self.assertEqual(rows[("answer_scope", "cross_page")]["category_label"], "跨頁")
+        self.assertEqual(
+            _experiment_category_rows([rows[("design_strategy", "basic")]])[0][:8],
+            ["實驗組1", "Microsoft GraphRAG Local", "設計策略", "Basic", 1, 1, 1, "100.0%"],
+        )
+        cells = _experiment_question_cells(state["run"]["results"][0])
+        self.assertTrue(cells[3].endswith("［Basic／單頁］") or cells[3].endswith("［Local／跨頁］"))
+
+        summary_path, details_path = self.service.export("project")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        details = json.loads(details_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(summary["category_breakdown"]), 4)
+        self.assertEqual(details["category_breakdown"], summary["category_breakdown"])
+        self.assertEqual(
+            {(item["question_id"], item["design_strategy"], item["answer_scope"]) for item in details["question_results"]},
+            {("Q0001", "basic", "single_page"), ("Q0002", "local", "cross_page")},
+        )
+
+        # Runs saved before F-66 have no design fields on results; the question set fills them in.
+        for item in state["run"]["results"]:
+            item.pop("design_strategy")
+            item.pop("answer_scope")
+        self.assertEqual(
+            self.service.category_breakdown(state["run"], self.service._run_question_sets("project", state["run"])),
+            breakdown,
+        )
+
+    def test_category_breakdown_is_empty_for_unclassified_question_sets(self):
+        run = {"groups": [{"group_id": "G01", "group_name": "A", "method": "local"}],
+               "results": [{"group_id": "G01", "question_id": "Q1", "evaluation_result": 2,
+                            "design_strategy": "", "answer_scope": ""}]}
+        self.assertEqual(RetrievalExperimentService.category_breakdown(run, []), [])
 
     def test_saved_run_with_removed_quality_fields_still_loads_and_exports_without_them(self):
         question_set = self.service.import_question_set("project", self.question_file)
@@ -1207,7 +1274,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             experiment_results["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
+            ["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
         )
         self.assertEqual(experiment_results["datatype"][7], "str")
         self.assertEqual(experiment_results["datatype"][8], "markdown")
@@ -1222,7 +1289,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             judge_detail["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+            ["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
         )
         classic_table = next(
             config for config in component_configs
@@ -1230,7 +1297,7 @@ class RetrievalExperimentTests(unittest.TestCase):
         )
         self.assertEqual(
             classic_table["headers"],
-            ["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+            ["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
         )
         summary_table = next(config for config in component_configs if config.get("label") == "實驗組摘要")
         self.assertEqual(summary_table["headers"][-2:], ["Average Term Hit", "Average Term Coverage"])

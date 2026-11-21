@@ -57,7 +57,9 @@ from .project_archive import import_project as restore_project_archive
 from .projects import ProjectError, ProjectStore
 from .querying import QueryService
 from .question_generation import GeneratedQuestion, QuestionGenerationService
-from .question_sets import BatchQuestion, GoldEvidence, QuestionSetService
+from .question_sets import (
+    ANSWER_SCOPE_LABELS, DESIGN_STRATEGY_LABELS, BatchQuestion, GoldEvidence, QuestionSetService, infer_answer_scope, question_design_label,
+)
 from .reviews import ReviewService
 from .retrieval_evaluation import RetrievalEvaluationService
 from .retrieval_evaluation import compute_source_metrics
@@ -591,13 +593,60 @@ def _autoqa_source_cell(question) -> str:
 
 def _experiment_question_cells(item) -> list:
     """實驗組名稱／資料集／題號／來源文件／題目／系統回答／正確答案 shared by every ④ per-question table."""
+    design = question_design_label(item.get("design_strategy") or "", item.get("answer_scope") or "")
+    documents = ", ".join(item.get("source_documents", []))
     return [
         item.get("group_name"),
         f"{item.get('dataset_name') or '資料集'} ({str(item.get('dataset_id') or '')[:8]})",
         item.get("question_id"),
-        ", ".join(item.get("source_documents", [])), item.get("question"),
+        f"{documents}\n［{design}］" if design else documents, item.get("question"),
         item.get("actual_answer"), item.get("correct_answer"),
     ]
+
+
+EXPERIMENT_CATEGORY_HEADERS = (
+    "實驗組名稱", "檢索策略", "分組方式", "類別", "題數", "已評判", "全對題數", "得分正確率", "來源分數",
+    "Evidence Hit Rate", "Document Hit Rate",
+)
+
+
+def _experiment_category_rows(breakdown) -> list[list]:
+    """Rows of RetrievalExperimentService.category_breakdown for the 依題型分組 table."""
+    percent = lambda value, empty="—": f"{value:.1%}" if isinstance(value, (int, float)) else empty
+    return [
+        [
+            item.get("group_name"),
+            EXPERIMENT_STRATEGY_LABELS.get(item.get("method"), item.get("method") or "未設定"),
+            item.get("dimension_label"), item.get("category_label"),
+            item.get("question_count"), item.get("evaluated_count"), item.get("correct_count"),
+            percent(item.get("score_accuracy")), percent(item.get("average_source_score"), "不適用"),
+            percent(item.get("evidence_hit_rate"), "不可計算"), percent(item.get("document_hit_rate"), "不可計算"),
+        ]
+        for item in breakdown
+    ]
+
+
+def _question_design_summary(questions) -> str:
+    """「Basic 3、Local 2；單頁 4（推算 3）」 counts of a question set's design metadata, "" when unclassified."""
+    strategies: dict[str, int] = {}
+    scopes: dict[str, int] = {}
+    inferred = 0
+    for item in questions:
+        if item.design_strategy:
+            strategies[item.design_strategy] = strategies.get(item.design_strategy, 0) + 1
+        if item.answer_scope:
+            scopes[item.answer_scope] = scopes.get(item.answer_scope, 0) + 1
+            inferred += item.answer_scope_inferred
+    parts = []
+    if strategies:
+        parts.append("設計策略 " + "、".join(
+            f"{label} {strategies[key]}" for key, label in DESIGN_STRATEGY_LABELS.items() if key in strategies
+        ))
+    if scopes:
+        parts.append("答案範圍 " + "、".join(
+            f"{label} {scopes[key]}" for key, label in ANSWER_SCOPE_LABELS.items() if key in scopes
+        ) + (f"（{inferred} 題由答案來源推算）" if inferred else ""))
+    return "；".join(parts)
 
 
 def _experiment_judge_detail_models(results) -> list[str]:
@@ -1937,6 +1986,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 ))
                 if question_edited or answer_edited else old.source_documents
             )
+            # A scope inferred from the old answer sources follows the edited sources; a hand-set scope stays.
+            rescope = answer_edited and (old.answer_scope_inferred or not old.answer_scope)
+            new_scope = infer_answer_scope(answer_sources) if rescope else old.answer_scope
             updated.append(replace(
                 old,
                 question=edited[0],
@@ -1945,6 +1997,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 question_source_evidence=question_sources,
                 answer_source_evidence=answer_sources,
                 source_documents=source_documents,
+                answer_scope=new_scope,
+                answer_scope_inferred=bool(new_scope) if rescope else old.answer_scope_inferred,
             ))
         if not changed:
             return current
@@ -2234,7 +2288,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             detail_model = detail_models[0] if detail_models else None
         detail_rows = _experiment_judge_detail_rows(results, detail_model, EXPERIMENT_STRATEGY_LABELS) if detail_model else []
         metric_rows = _experiment_classic_metric_rows(results) if enable_classic_metrics else []
+        category_rows = []
+        if project_id and results:
+            try:
+                run = retrieval_experiments.load(project_id).get("run") or {}
+                category_rows = _experiment_category_rows(retrieval_experiments.category_breakdown(
+                    run, retrieval_experiments._run_question_sets(project_id, run),
+                ))
+            except ProjectError:
+                category_rows = []
+        # Shown only after judging, like the other summaries; unclassified question sets have no rows.
+        category_visible = bool(category_rows) and any(
+            item.get("evaluation_result") not in (None, "待評測") for item in results
+        )
         return (
+            gr.update(value=category_rows, visible=category_visible),
             gr.update(visible=bool(detail_rows)),
             gr.update(
                 choices=[(judge_model_label(model), model) for model in detail_models],
@@ -2359,7 +2427,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if not imported:
             details = "\n- ".join(import_errors) or "沒有可匯入的題目集"
             return experiment_view(project_id, f"❌ 題目集匯入失敗：\n- {details}")
-        details = "、".join(f"{item.name}（{len(item.questions)} 題）" for item in imported)
+        details = "、".join(
+            f"{item.name}（{len(item.questions)} 題"
+            + (f"；{design}" if (design := _question_design_summary(item.questions)) else "")
+            + "）"
+            for item in imported
+        )
         message = f"✅ 已匯入並加入實驗：{details}"
         if import_errors:
             message += "\n⚠️ 以下檔案未匯入：\n- " + "\n- ".join(import_errors)
@@ -5109,8 +5182,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     wrap=True,
                     visible=False,
                 )
+                experiment_category_table = gr.Dataframe(
+                    headers=list(EXPERIMENT_CATEGORY_HEADERS),
+                    interactive=False,
+                    datatype=["str"] * len(EXPERIMENT_CATEGORY_HEADERS),
+                    label="依題型分組（題目集的設計策略與答案範圍）",
+                    wrap=True,
+                    visible=False,
+                )
                 experiment_result_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "得分（多評審為平均）", "各評審分數", "實際檢索策略", "Agentic 步驟與停止原因"],
                     interactive=True,
                     datatype=["str"] * 8 + ["markdown"] + ["str"] * 2,
                     column_widths=["6%", "8%", "4%", "8%", "11%", "18%", "13%", "6%", "11%", "8%", "7%"],
@@ -5123,7 +5204,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     choices=[], value=None, label="查看評審", visible=False, interactive=True,
                 )
                 experiment_judge_detail_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "評審分數", "評分原因", "實際檢索策略"],
                     interactive=False,
                     datatype=["str"] * 10,
                     column_widths=["7%", "8%", "4%", "7%", "11%", "17%", "12%", "6%", "18%", "10%"],
@@ -5133,7 +5214,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 )
                 experiment_metrics_divider = gr.Markdown("---", visible=False)
                 experiment_metrics_table = gr.Dataframe(
-                    headers=["實驗組名稱", "資料集", "題號", "來源文件", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
+                    headers=["實驗組名稱", "資料集", "題號", "來源文件［題型］", "題目", "系統回答", "正確答案", "EM", "F1", "Term Hit", "Term Coverage"],
                     interactive=False,
                     datatype=["str"] * 11,
                     column_widths=["7%", "8%", "4%", "7%", "13%", "21%", "14%", "5%", "5%", "7%", "9%"],
@@ -5145,7 +5226,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     fn=experiment_result_tables,
                     inputs=[active_project_id, experiment_judge_detail_model,
                             experiment_enable_llm_judge, experiment_enable_classic_metrics],
-                    outputs=[experiment_judge_detail_divider, experiment_judge_detail_model,
+                    outputs=[experiment_category_table, experiment_judge_detail_divider, experiment_judge_detail_model,
                              experiment_judge_detail_table, experiment_metrics_divider, experiment_metrics_table],
                     show_progress="hidden",
                 )

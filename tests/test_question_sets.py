@@ -6,7 +6,9 @@ from pathlib import Path
 
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.querying import QueryResult
-from automotive_graphrag.question_sets import BatchQuestion, GoldEvidence, QuestionSetService
+from automotive_graphrag.question_sets import (
+    BatchQuestion, GoldEvidence, QuestionSetService, infer_answer_scope, question_design_label,
+)
 
 
 class FakeQuestionRunner:
@@ -315,6 +317,80 @@ class QuestionSetServiceTests(unittest.TestCase):
         self.assertEqual(result.questions[0].gold_evidence[0].pages, (25,))
         self.assertEqual(result.questions[0].reference_answer, "參考答案一")
         self.assertEqual(result.questions[0].gold_evidence[0].chunk_ids, ())
+
+
+    def test_infer_answer_scope_from_answer_sources(self) -> None:
+        def source(name: str, *pages: int) -> GoldEvidence:
+            return GoldEvidence(name, tuple(pages), (), name)
+
+        self.assertEqual(infer_answer_scope(()), "")
+        self.assertEqual(infer_answer_scope((source("BR.pdf", 49),)), "single_page")
+        # The same page listed twice is still one page.
+        self.assertEqual(infer_answer_scope((source("BR.pdf", 49), source("BR.pdf", 49))), "single_page")
+        self.assertEqual(infer_answer_scope((source("BR.pdf", 14, 15),)), "cross_page")
+        self.assertEqual(infer_answer_scope((source("BR.pdf", 13), source("BR.pdf", 48))), "cross_page")
+        self.assertEqual(infer_answer_scope((source("BR.pdf", 18), source("ACC.pdf", 3))), "cross_document")
+        self.assertEqual(question_design_label("local", "cross_document"), "Local／跨檔案")
+        self.assertEqual(question_design_label("drift", ""), "DRIFT／未分類")
+        self.assertEqual(question_design_label("", ""), "")
+
+    def test_design_fields_are_optional_validated_and_inferred(self) -> None:
+        value = self.valid_value()
+        questions = value["questions"]  # type: ignore[index]
+        questions[0].update(design_strategy="local", answer_scope="cross_document",
+                            answer_sources=[{"document_name": "BR.pdf", "pages": [18]}])
+        questions[1].update(design_strategy="basic", answer_sources=[{"document_name": "BR.pdf", "pages": [14, 15]}])
+
+        imported = self.service.import_file("L33-SM3E", self.write_question_set(value))
+        first, second, third = imported.questions
+
+        # A hand-set scope wins over the one the sources imply.
+        self.assertEqual((first.design_strategy, first.answer_scope, first.answer_scope_inferred),
+                         ("local", "cross_document", False))
+        self.assertEqual((second.design_strategy, second.answer_scope, second.answer_scope_inferred),
+                         ("basic", "cross_page", True))
+        self.assertEqual((third.design_strategy, third.answer_scope), ("", ""))
+        reloaded = self.service.get("L33-SM3E", imported.question_set_id)
+        self.assertEqual(
+            [(item.design_strategy, item.answer_scope, item.answer_scope_inferred) for item in reloaded.questions],
+            [("local", "cross_document", False), ("basic", "cross_page", True), ("", "", False)],
+        )
+
+        exported = QuestionSetService.to_question_set_json(imported.questions)["questions"]
+        self.assertEqual((exported[0]["design_strategy"], exported[0]["answer_scope"]), ("local", "cross_document"))
+        # Inferred scopes are not written back, so a re-import infers them from the sources again.
+        self.assertEqual(exported[1]["design_strategy"], "basic")
+        self.assertNotIn("answer_scope", exported[1])
+        self.assertNotIn("design_strategy", exported[2])
+
+        rerun = self.service.run("L33-SM3E", imported.question_set_id)
+        self.assertEqual([item.design_strategy for item in rerun.questions], ["local", "basic", ""])
+        self.assertEqual(rerun.questions[1].answer_scope, "cross_page")
+
+    def test_invalid_design_values_name_the_field_and_allowed_values(self) -> None:
+        value = self.valid_value()
+        value["questions"][0]["design_strategy"] = "Basic"  # type: ignore[index]
+        value["questions"][1]["answer_scope"] = "跨頁"  # type: ignore[index]
+
+        with self.assertRaises(ProjectError) as caught:
+            self.service.import_file("L33-SM3E", self.write_question_set(value))
+
+        message = str(caught.exception)
+        self.assertIn("questions[0].design_strategy：必須是 basic、local、global、drift 之一", message)
+        self.assertIn("questions[1].answer_scope：必須是 single_page、cross_page、cross_document 之一", message)
+
+    def test_old_saved_question_sets_without_design_fields_still_load(self) -> None:
+        imported = self.service.import_file("L33-SM3E", self.write_question_set(self.valid_value()))
+        path = self.store.path_for("L33-SM3E") / "question_sets" / f"{imported.question_set_id}.json"
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        for item in saved["questions"]:
+            for key in ("design_strategy", "answer_scope", "answer_scope_inferred"):
+                item.pop(key)
+        path.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+
+        loaded = self.service.get("L33-SM3E", imported.question_set_id)
+
+        self.assertEqual({(item.design_strategy, item.answer_scope) for item in loaded.questions}, {("", "")})
 
 
 if __name__ == "__main__":
