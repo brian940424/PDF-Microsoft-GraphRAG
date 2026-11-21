@@ -3,7 +3,7 @@
 The old automatic generator sampled one page per question, so every question was a single-page
 Basic lookup, and the manual medium／cross_section modes paired unrelated pages into "What is A?
 And B?" questions. Here related source text is found first and then handed to a strategy-specific
-prompt (conditions and counter-examples from docs/07_出題指引_四種檢索策略.md):
+prompt (conditions and counter-examples from docs/05_題目集格式與出題指引.md):
 
 - Basic: one page, or two consecutive pages of the same section (`section_path`).
 - Local: two or three entities joined by GraphRAG relationships, with the source pages of the

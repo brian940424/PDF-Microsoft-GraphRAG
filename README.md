@@ -12,10 +12,10 @@
 - [功能總覽（管理後台分頁 0 至 5）](docs/01_功能總覽.md)
 - [安裝與啟動](docs/02_安裝與啟動.md)
 - [操作指南](docs/04_使用指南.md)
-- [檢索實驗策略與參數](docs/08_檢索實驗與策略參數.md)
-- [回答與圖譜快取機制（含語意快取觸發方式與設定）](docs/14_回答與圖譜快取機制說明.md)
-- [語意快取改善計畫（目前暫不實作）](docs/15_快取機制之語意快取改善計畫.md)
-- [題目集 JSON 格式](docs/05_題目集格式.md)
+- [檢索實驗策略與參數](docs/06_檢索實驗與策略參數.md)
+- [回答與圖譜快取機制（含語意快取觸發方式與設定）](docs/09_回答與圖譜快取機制說明.md)
+- [語意快取改善計畫（目前暫不實作）](docs/10_快取機制之語意快取改善計畫.md)
+- [題目集格式與出題指引](docs/05_題目集格式與出題指引.md)
 - [開發進度指揮中心（3D 進度儀表板）](progress-dashboard/README.md)
 
 ## 目錄
@@ -103,7 +103,7 @@ API 連線設定保存在 `PROJECTS_ROOT/.connection.json`，由該根目錄下�
 4. 在「2 問答測試」進行單次問答；或在「3 自動問答測試」、「4 檢索實驗」載入題目集進行自動問答與策略比較。
 5. 將已建圖且啟用查詢的專案提供給一般使用者入口。
 
-完整操作方式及題目來源格式請見[新版使用指南](docs/04_使用指南.md)與[題目集 JSON 格式](docs/05_題目集格式.md)。
+完整操作方式及題目來源格式請見[新版使用指南](docs/04_使用指南.md)與[題目集格式與出題指引](docs/05_題目集格式與出題指引.md)。
 
 ## Docker：使用 Dockerfile 建立執行環境
 
@@ -225,7 +225,7 @@ GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=false
 GRAPHRAG_SEMANTIC_QUERY_CACHE_TOP_K=5
 ```
 
-若要在本機測 Shadow，先在啟動兩個服務的 shell 設定全域開關，例如 `export GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=true`；再於後台只把指定測試專案切成 `shadow`，其他專案維持 `off`，然後重啟要觀察的服務。Serving 的 threshold／margin 必須先完成獨立 holdout 校準，並依專案改善計畫驗收，不能把本文件中的預設值當成門檻建議。本機 Shadow 測試流程與紀錄欄位見[快取機制說明](docs/14_回答與圖譜快取機制說明.md)及[語意快取改善計畫](docs/15_快取機制之語意快取改善計畫.md)。
+若要在本機測 Shadow，先在啟動兩個服務的 shell 設定全域開關，例如 `export GRAPHRAG_ENABLE_SEMANTIC_QUERY_CACHE=true`；再於後台只把指定測試專案切成 `shadow`，其他專案維持 `off`，然後重啟要觀察的服務。Serving 的 threshold／margin 必須先完成獨立 holdout 校準，並依專案改善計畫驗收，不能把本文件中的預設值當成門檻建議。本機 Shadow 測試流程與紀錄欄位見[快取機制說明](docs/09_回答與圖譜快取機制說明.md)及[語意快取改善計畫](docs/10_快取機制之語意快取改善計畫.md)。
 
 Linux／macOS 本機啟動範例（管理後台和 portal 是不同程序，因此在兩個終端機都設定開關）：
 

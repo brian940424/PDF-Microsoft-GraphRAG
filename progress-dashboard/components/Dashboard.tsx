@@ -322,7 +322,7 @@ function KpiRow({ data, testRunning, onRunTests }: { data: ProgressData; testRun
   return (
     <div className="kpis">
       <Kpi icon="crane" label="計畫完成" value={`${done}`} unit={`/ ${data.plan.length}`}
-        delta={active ? `${active} 施工中` : undefined} sub="docs/11_改善計畫.md" />
+        delta={active ? `${active} 施工中` : undefined} sub="docs/07_改善計畫.md" />
       <Kpi
         icon="check"
         label="測試通過"
@@ -624,7 +624,7 @@ function Tracker({ data, selection }: { data: ProgressData; selection: Selection
             </span>
           )}
         </div>
-        <p>{step ? plainText(step) : "docs/12_交接紀錄.md 沒有「建議下一步」。"}</p>
+        <p>{step ? plainText(step) : "docs/08_交接紀錄.md 沒有「建議下一步」。"}</p>
         <span className="pill" style={{ color: "#2c56e0", background: "#e6edff" }}>{plainText(data.handoff?.title ?? "").replace(/^目前狀態/, "").replace(/[（）()]/g, "") || "交接紀錄"}</span>
       </div>
     </section>
@@ -724,7 +724,7 @@ function TabsCard({ data, statusFilter, setStatusFilter, testRunning, testError,
               <ul>{section.items.map((entry, i) => <li key={i}>{plainText(entry)}</li>)}</ul>
             </div>
           ))}
-          {!handoff.length && <p className="muted pad">找不到 docs/12_交接紀錄.md 的「目前狀態」段落。</p>}
+          {!handoff.length && <p className="muted pad">找不到 docs/08_交接紀錄.md 的「目前狀態」段落。</p>}
         </div>
       )}
     </section>

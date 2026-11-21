@@ -12,8 +12,8 @@ export const REPO_ROOT = path.resolve(process.env.REPO_ROOT ?? path.join(process
 export async function loadProgress(): Promise<ProgressData> {
   const read = (relative: string) => readFile(path.join(REPO_ROOT, relative), "utf-8").catch(() => "");
   const [planMarkdown, handoffMarkdown, git, tests] = await Promise.all([
-    read("docs/11_改善計畫.md"),
-    read("docs/12_交接紀錄.md"),
+    read("docs/07_改善計畫.md"),
+    read("docs/08_交接紀錄.md"),
     readGit(REPO_ROOT),
     readCachedTests(),
   ]);
