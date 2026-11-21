@@ -103,6 +103,11 @@ class IndexingServiceTests(unittest.TestCase):
         )
         graph_input = settings_path.parent / "input" / "input.jsonl"
         self.assertIn('"id":"p1"', graph_input.read_text())
+        extraction = settings["extract_graph"]
+        self.assertIn("DIAGNOSTIC_CODE", extraction["entity_types"])
+        self.assertNotIn("person", [kind.lower() for kind in extraction["entity_types"]])
+        self.assertTrue(Path(extraction["prompt"]).is_absolute())
+        self.assertIn("{input_text}", Path(extraction["prompt"]).read_text(encoding="utf-8"))
 
     def test_sync_input_merges_one_continuation_page_and_preserves_both_page_numbers(self) -> None:
         project_path = self.store.path_for("L33-SM3E")
