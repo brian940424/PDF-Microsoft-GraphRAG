@@ -153,6 +153,7 @@ class CaseServiceTests(unittest.TestCase):
         self.assertIn("案例 JSON", portal_labels)
         self.assertNotIn("LiteLLM Base URL", portal_labels)
         self.assertIn("LiteLLM Base URL", admin_labels)
+        self.assertIn("前台使用者預設查詢設定（依專案）", admin_labels)
         self.assertIn("預設搜尋策略", admin_labels)
         self.assertIn("預設回答模型", admin_labels)
         self.assertIn("預設推理深度", admin_labels)

@@ -3355,19 +3355,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         project_id = selected_project_id(project_id)
         if not project_id:
             return (
-                gr.Group(visible=False), gr.update(), gr.update(), gr.update(), gr.update(),
+                gr.update(value="local", choices=STANDARD_QUERY_METHOD_CHOICES),
+                gr.update(value="", choices=portal_default_model_choices()),
+                gr.update(value=DEFAULT_REASONING_EFFORT, choices=REASONING_EFFORT_CHOICES),
+                gr.update(value=DEFAULT_EXPERIMENT_RESPONSE_TYPE, choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS)),
             )
         try:
             defaults = store.get_portal_defaults(project_id)
         except ProjectError:
             return (
-                gr.Group(visible=True), gr.update(), gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(),
             )
         model_choices = portal_default_model_choices()
         valid_models = {value for _label, value in model_choices}
         model = defaults["chat_model"] if defaults["chat_model"] in valid_models else ""
         return (
-            gr.Group(visible=True),
             gr.update(value=defaults["method"], choices=STANDARD_QUERY_METHOD_CHOICES),
             gr.update(value=model, choices=model_choices),
             gr.update(value=defaults["reasoning_effort"], choices=REASONING_EFFORT_CHOICES),
@@ -4347,38 +4349,37 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 open_project_result = gr.Markdown()
                 project_activation_result = gr.Markdown()
 
-            with gr.Group(visible=False) as portal_defaults_group:
-                with gr.Accordion("前台使用者預設查詢設定（依專案）", open=False, elem_classes=["static-section", "bold-title"]):
-                    gr.Markdown(
-                        "設定會套用到一般使用者入口選取此專案後的新查詢。模型可選擇沿用全域預設；"
-                        "若要讓前台與管理後台共用回答快取，請讓策略、模型、推理深度與回答格式一致。"
+            with gr.Accordion("前台使用者預設查詢設定（依專案）", open=False, elem_classes=["static-section", "bold-title"]):
+                gr.Markdown(
+                    "先在上方選擇專案，再調整其前台預設值。設定會套用到一般使用者入口選取此專案後的新查詢。"
+                    "模型可選擇沿用全域預設；若要讓前台與管理後台共用回答快取，請讓策略、模型、推理深度與回答格式一致。"
+                )
+                with gr.Row():
+                    portal_default_method = gr.Dropdown(
+                        choices=STANDARD_QUERY_METHOD_CHOICES,
+                        value="local",
+                        label="預設搜尋策略",
                     )
-                    with gr.Row():
-                        portal_default_method = gr.Dropdown(
-                            choices=STANDARD_QUERY_METHOD_CHOICES,
-                            value="local",
-                            label="預設搜尋策略",
-                        )
-                        portal_default_chat_model = gr.Dropdown(
-                            choices=portal_default_model_choices(),
-                            value="",
-                            label="預設回答模型",
-                        )
-                    with gr.Row():
-                        portal_default_reasoning_effort = gr.Dropdown(
-                            choices=REASONING_EFFORT_CHOICES,
-                            value=DEFAULT_REASONING_EFFORT,
-                            label="預設推理深度",
-                            info="僅支援推理深度的模型會使用此設定。",
-                        )
-                        portal_default_response_type = gr.Dropdown(
-                            choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
-                            value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
-                            label="預設回答格式",
-                        )
-                    with gr.Row():
-                        save_portal_defaults_button = gr.Button("儲存前台預設設定", variant="primary")
-                        portal_defaults_result = gr.Markdown()
+                    portal_default_chat_model = gr.Dropdown(
+                        choices=portal_default_model_choices(),
+                        value="",
+                        label="預設回答模型",
+                    )
+                with gr.Row():
+                    portal_default_reasoning_effort = gr.Dropdown(
+                        choices=REASONING_EFFORT_CHOICES,
+                        value=DEFAULT_REASONING_EFFORT,
+                        label="預設推理深度",
+                        info="僅支援推理深度的模型會使用此設定。",
+                    )
+                    portal_default_response_type = gr.Dropdown(
+                        choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                        value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+                        label="預設回答格式",
+                    )
+                with gr.Row():
+                    save_portal_defaults_button = gr.Button("儲存前台預設設定", variant="primary")
+                    portal_defaults_result = gr.Markdown()
 
             with gr.Group(visible=False) as new_project_group:
                 with gr.Accordion("建立新專案", open=True, elem_classes=["static-section", "bold-title"]):
@@ -5522,7 +5523,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         selected_project.change(
             portal_defaults_view,
             inputs=selected_project,
-            outputs=[portal_defaults_group, portal_default_method, portal_default_chat_model,
+            outputs=[portal_default_method, portal_default_chat_model,
                      portal_default_reasoning_effort, portal_default_response_type],
         )
         save_portal_defaults_button.click(
