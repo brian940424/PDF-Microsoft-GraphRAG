@@ -41,6 +41,24 @@ class ProjectError(ValueError):
 
 
 INDEXING_LOCK_FILE = ".indexing.lock"
+PORTAL_DEFAULTS_FILE = "portal_defaults.json"
+PORTAL_DEFAULTS = {
+    "method": "local",
+    "chat_model": "",
+    "reasoning_effort": "medium",
+    "response_type": "Single Paragraph",
+}
+PORTAL_DEFAULT_METHODS = frozenset({"auto", "local", "global", "drift", "basic"})
+PORTAL_DEFAULT_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+PORTAL_DEFAULT_RESPONSE_TYPES = frozenset({
+    "Single Sentence",
+    "List of 3-7 Points",
+    "Single Paragraph",
+    "Multi-Page Report",
+    "2-3 concise sentences",
+    "A concise paragraph; use numbered steps only for procedures",
+    "A short answer with no preamble",
+})
 
 
 def indexing_lock_path(project_path: Path) -> Path:
@@ -209,6 +227,26 @@ class ProjectStore:
         self._write_metadata(self.root / project_id / "project.json", value)
         return Project.from_dict(value)
 
+    def get_portal_defaults(self, project_id: str) -> dict[str, str]:
+        """Load per-project public-portal query defaults, falling back for older projects."""
+        path = self.path_for(project_id) / PORTAL_DEFAULTS_FILE
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return dict(PORTAL_DEFAULTS)
+        except json.JSONDecodeError as exc:
+            raise ProjectError("前台預設查詢設定格式錯誤") from exc
+        if not isinstance(value, dict):
+            raise ProjectError("前台預設查詢設定格式錯誤")
+        return self._validate_portal_defaults({**PORTAL_DEFAULTS, **value})
+
+    def set_portal_defaults(self, project_id: str, defaults: dict[str, str]) -> dict[str, str]:
+        """Validate and persist public-portal query defaults for one project."""
+        path = self.path_for(project_id) / PORTAL_DEFAULTS_FILE
+        normalized = self._validate_portal_defaults({**PORTAL_DEFAULTS, **defaults})
+        self._write_metadata(path, normalized)
+        return normalized
+
     def delete(self, project_id: str) -> None:
         project_path = self.path_for(project_id)
         if project_path.is_symlink():
@@ -257,6 +295,27 @@ class ProjectStore:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+    @staticmethod
+    def _validate_portal_defaults(value: dict[str, Any]) -> dict[str, str]:
+        method = value.get("method")
+        chat_model = value.get("chat_model", "")
+        reasoning_effort = value.get("reasoning_effort")
+        response_type = value.get("response_type")
+        if not isinstance(method, str) or method not in PORTAL_DEFAULT_METHODS:
+            raise ProjectError("不支援的前台預設搜尋策略")
+        if not isinstance(chat_model, str):
+            raise ProjectError("前台預設模型格式錯誤")
+        if not isinstance(reasoning_effort, str) or reasoning_effort not in PORTAL_DEFAULT_REASONING_EFFORTS:
+            raise ProjectError("不支援的前台預設推理深度")
+        if not isinstance(response_type, str) or response_type not in PORTAL_DEFAULT_RESPONSE_TYPES:
+            raise ProjectError("不支援的前台預設回答格式")
+        return {
+            "method": method,
+            "chat_model": chat_model.strip(),
+            "reasoning_effort": reasoning_effort,
+            "response_type": response_type,
+        }
 
     @staticmethod
     def _remove_empty_project(project_path: Path) -> None:

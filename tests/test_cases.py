@@ -18,12 +18,17 @@ class StoredQueries:
     def __init__(self, results: list[QueryResult]) -> None:
         self.results = results
         self.calls: list[tuple[str, str, str]] = []
+        self.options: list[dict[str, object]] = []
 
     def history(self, project_id: str) -> list[QueryResult]:
         return [item for item in self.results if item.project_id == project_id]
 
-    def ask(self, project_id: str, question: str, method: str = "local", source: str | None = None) -> QueryResult:
+    def ask(
+        self, project_id: str, question: str, method: str = "local", source: str | None = None,
+        **options: object,
+    ) -> QueryResult:
         self.calls.append((project_id, question, method))
+        self.options.append({"source": source, **options})
         return replace(self.results[0], project_id=project_id, question=question, method=method)
 
 
@@ -103,10 +108,30 @@ class CaseServiceTests(unittest.TestCase):
 
         self.assertEqual(result.project_id, "L33-SM3E")
         self.assertEqual(queries.calls, [("L33-SM3E", "新的維修問題", "local")])
+        self.assertEqual(queries.options[-1], {
+            "source": "portal",
+            "chat_model": None,
+            "response_type": "Single Paragraph",
+            "reasoning_effort": "medium",
+        })
+        self.store.set_portal_defaults("L33-SM3E", {
+            "method": "auto",
+            "chat_model": "gpt-6-luna",
+            "reasoning_effort": "high",
+            "response_type": "List of 3-7 Points",
+        })
+        portal.ask("L33-SM3E", "另一個問題")
+        self.assertEqual(queries.calls[-1], ("L33-SM3E", "另一個問題", "auto"))
+        self.assertEqual(queries.options[-1], {
+            "source": "portal",
+            "chat_model": "gpt-6-luna",
+            "response_type": "List of 3-7 Points",
+            "reasoning_effort": "high",
+        })
         self.store.set_enabled("L33-SM3E", False)
         with self.assertRaisesRegex(ProjectError, "未啟用"):
             portal.ask("L33-SM3E", "不可執行")
-        self.assertEqual(len(queries.calls), 1)
+        self.assertEqual(len(queries.calls), 2)
 
     def test_user_and_admin_apps_expose_separate_controls(self) -> None:
         portal_app = create_portal_app(self.root / "portal-projects")
@@ -128,6 +153,10 @@ class CaseServiceTests(unittest.TestCase):
         self.assertIn("案例 JSON", portal_labels)
         self.assertNotIn("LiteLLM Base URL", portal_labels)
         self.assertIn("LiteLLM Base URL", admin_labels)
+        self.assertIn("預設搜尋策略", admin_labels)
+        self.assertIn("預設回答模型", admin_labels)
+        self.assertIn("預設推理深度", admin_labels)
+        self.assertIn("預設回答格式", admin_labels)
         self.assertNotIn("車型／專案", admin_labels)
         portal_project_dropdowns = [
             component.get_config()

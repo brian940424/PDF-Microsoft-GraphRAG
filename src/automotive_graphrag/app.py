@@ -3347,6 +3347,48 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         except ProjectError:
             return True
 
+    def portal_default_model_choices() -> list[tuple[str, str]]:
+        current_model = connections.get_chat_model()
+        return [(f"使用全域預設（{current_model}）", ""), *((model, model) for model in chat_model_choices())]
+
+    def portal_defaults_view(project_id: str | None):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return (
+                gr.Group(visible=False), gr.update(), gr.update(), gr.update(), gr.update(),
+            )
+        try:
+            defaults = store.get_portal_defaults(project_id)
+        except ProjectError:
+            return (
+                gr.Group(visible=True), gr.update(), gr.update(), gr.update(), gr.update(),
+            )
+        model_choices = portal_default_model_choices()
+        valid_models = {value for _label, value in model_choices}
+        model = defaults["chat_model"] if defaults["chat_model"] in valid_models else ""
+        return (
+            gr.Group(visible=True),
+            gr.update(value=defaults["method"], choices=STANDARD_QUERY_METHOD_CHOICES),
+            gr.update(value=model, choices=model_choices),
+            gr.update(value=defaults["reasoning_effort"], choices=REASONING_EFFORT_CHOICES),
+            gr.update(value=defaults["response_type"], choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS)),
+        )
+
+    def save_portal_defaults(project_id, method, chat_model, reasoning_effort, response_type):
+        project_id = selected_project_id(project_id)
+        if not project_id:
+            return "❌ 請先選擇專案"
+        try:
+            store.set_portal_defaults(project_id, {
+                "method": method,
+                "chat_model": chat_model or "",
+                "reasoning_effort": reasoning_effort,
+                "response_type": response_type,
+            })
+        except ProjectError as exc:
+            return f"❌ {exc}"
+        return f"✅ 已儲存專案 {project_id} 的前台預設查詢設定"
+
     def update_project_enabled(project_id: str | None, enabled: bool):
         project_id = selected_project_id(project_id)
         if not project_id:
@@ -4304,6 +4346,39 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     delete_confirmation = gr.Checkbox(visible=False)
                 open_project_result = gr.Markdown()
                 project_activation_result = gr.Markdown()
+
+            with gr.Group(visible=False) as portal_defaults_group:
+                with gr.Accordion("前台使用者預設查詢設定（依專案）", open=False, elem_classes=["static-section", "bold-title"]):
+                    gr.Markdown(
+                        "設定會套用到一般使用者入口選取此專案後的新查詢。模型可選擇沿用全域預設；"
+                        "若要讓前台與管理後台共用回答快取，請讓策略、模型、推理深度與回答格式一致。"
+                    )
+                    with gr.Row():
+                        portal_default_method = gr.Dropdown(
+                            choices=STANDARD_QUERY_METHOD_CHOICES,
+                            value="local",
+                            label="預設搜尋策略",
+                        )
+                        portal_default_chat_model = gr.Dropdown(
+                            choices=portal_default_model_choices(),
+                            value="",
+                            label="預設回答模型",
+                        )
+                    with gr.Row():
+                        portal_default_reasoning_effort = gr.Dropdown(
+                            choices=REASONING_EFFORT_CHOICES,
+                            value=DEFAULT_REASONING_EFFORT,
+                            label="預設推理深度",
+                            info="僅支援推理深度的模型會使用此設定。",
+                        )
+                        portal_default_response_type = gr.Dropdown(
+                            choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                            value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+                            label="預設回答格式",
+                        )
+                    with gr.Row():
+                        save_portal_defaults_button = gr.Button("儲存前台預設設定", variant="primary")
+                        portal_defaults_result = gr.Markdown()
 
             with gr.Group(visible=False) as new_project_group:
                 with gr.Accordion("建立新專案", open=True, elem_classes=["static-section", "bold-title"]):
@@ -5443,6 +5518,18 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             outputs=[selected_project_details, project_enabled, open_project_button, update_project_enabled_button,
                      new_project_group, import_project_group,
                      delete_button, export_project_button, project_export_file],
+        )
+        selected_project.change(
+            portal_defaults_view,
+            inputs=selected_project,
+            outputs=[portal_defaults_group, portal_default_method, portal_default_chat_model,
+                     portal_default_reasoning_effort, portal_default_response_type],
+        )
+        save_portal_defaults_button.click(
+            save_portal_defaults,
+            inputs=[selected_project, portal_default_method, portal_default_chat_model,
+                    portal_default_reasoning_effort, portal_default_response_type],
+            outputs=portal_defaults_result,
         )
         export_project_button.click(
             None,

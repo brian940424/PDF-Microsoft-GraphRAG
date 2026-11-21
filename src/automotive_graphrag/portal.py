@@ -43,9 +43,22 @@ class UserPortalService:
 
     def ask(self, project_id: str, question: str, bypass_cache: bool = False) -> QueryResult:
         self.selected_project(project_id)
+        defaults = self.projects.get_portal_defaults(project_id)
+        chat_model = defaults["chat_model"] or None
+        connection_settings = getattr(self.queries, "connection_settings", None)
+        if chat_model and connection_settings is not None:
+            available_models = connection_settings.available_chat_models()
+            if available_models and chat_model not in available_models:
+                chat_model = None
+        options = {
+            "chat_model": chat_model,
+            "response_type": defaults["response_type"],
+            "reasoning_effort": defaults["reasoning_effort"],
+            "source": "portal",
+        }
         if bypass_cache:
-            return self.queries.ask(project_id, question, "local", source="portal", bypass_cache=True)
-        return self.queries.ask(project_id, question, "local", source="portal")
+            options["bypass_cache"] = True
+        return self.queries.ask(project_id, question, defaults["method"], **options)
 
 
 def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
@@ -124,7 +137,7 @@ def create_portal_app(project_root: str | Path | None = None) -> gr.Blocks:
         detail = evidence_detail(selected, values) if selected else ""
         warning = "" if result.evidence else "\n\n> ⚠️ 此回答沒有可回連的來源證據，請人工確認。"
         yield (
-            f"✅ 回答完成｜耗時 {result.duration_seconds:.3f} 秒" + (
+            f"✅ 回答完成｜策略 {result.method}｜模型 {result.execution_metadata.get('model', '預設')}｜耗時 {result.duration_seconds:.3f} 秒" + (
                 f"｜⚡ 來自快取（原耗時 {result.execution_metadata.get('original_latency_sec', '未知')} 秒）"
                 if result.query_cache_hit else ""
             ),
