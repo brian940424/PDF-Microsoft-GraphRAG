@@ -3,6 +3,7 @@ import unittest
 from automotive_graphrag.local_ranking import (
     HUB_MIN_TEXT_UNITS,
     exact_entity_titles,
+    hub_threshold,
     install_local_ranking,
     is_hub,
     rank_text_units,
@@ -56,6 +57,33 @@ class RankTextUnitsTests(unittest.TestCase):
     def test_generic_titles_are_hubs(self) -> None:
         self.assertTrue(is_hub("Diagnosis Procedure", 2))
         self.assertFalse(is_hub("C1154 PNP SWITCH", HUB_MIN_TEXT_UNITS - 1))
+
+    def test_hub_threshold_follows_graph_p99_with_floor(self) -> None:
+        self.assertEqual(hub_threshold([]), HUB_MIN_TEXT_UNITS)
+        self.assertEqual(hub_threshold([1] * 99 + [8]), HUB_MIN_TEXT_UNITS)
+        self.assertEqual(hub_threshold([1] * 98 + [18, 18]), 19)
+
+    def test_higher_threshold_keeps_busy_components_regular(self) -> None:
+        units = [f"u{index}" for index in range(12)]
+        texts = {unit: unit for unit in units}
+
+        _, default = rank_text_units([("BRAKE BOOSTER", units)], texts)
+        _, raised = rank_text_units([("BRAKE BOOSTER", units)], texts, hub_min_units=19)
+
+        self.assertEqual(default["hub_entities"], ["BRAKE BOOSTER"])
+        self.assertEqual((raised["hub_entities"], raised["demoted_units"], raised["hub_threshold"]), ([], 0, 19))
+
+    def test_entities_named_in_question_are_never_hubs(self) -> None:
+        units = [f"u{index}" for index in range(HUB_MIN_TEXT_UNITS + 3)]
+        texts = {unit: unit for unit in units}
+
+        _, report = rank_text_units(
+            [("IGNITION SWITCH", units), ("Diagnosis Procedure", ["u0"])], texts,
+            named_titles=("ignition switch",),
+        )
+
+        self.assertEqual(report["hub_entities"], ["Diagnosis Procedure"])
+        self.assertEqual(report["demoted_units"], 0)
 
     def test_unknown_units_are_skipped(self) -> None:
         ordered, report = rank_text_units([("X", ["a", "missing"])], {"a": "a"})

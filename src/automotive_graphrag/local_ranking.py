@@ -8,8 +8,9 @@ C1154 got the neighbouring C1155 steps. This module replaces that ordering:
   full title appears in the question are added to the matched entities first.
 - Units whose heading carries a named code come first, then units whose text does, then the rest.
 - Within each tier, units more similar to the question (text-unit vectors) come first.
-- A hub entity (``HUB_MIN_TEXT_UNITS`` or more units, or a generic title) brings only its most
-  similar unit to the front; its other units, unless another entity links them, go last.
+- A hub entity (a generic title, or at least ``hub_threshold`` units: above the graph's P99 and
+  never below ``HUB_MIN_TEXT_UNITS``) brings only its most similar unit to the front; its other
+  units, unless another entity links them, go last. Entities the question names are never hubs.
 
 Only units linked to a matched entity are used; Local does not borrow Basic's unlinked passages.
 
@@ -27,9 +28,11 @@ from typing import Any, Callable
 
 from .strategy_routing import question_identifiers
 
-LOCAL_RANKING_VERSION = 1
-# SM3E: median 1 linked unit per entity, P99 8.
+LOCAL_RANKING_VERSION = 2
+# Floor of the hub threshold. SM3E (default entity types): median 1 linked unit per entity, P99 8.
+# Manual entity types link more units (temp: P99 18), so the threshold follows each graph's P99.
 HUB_MIN_TEXT_UNITS = 9
+HUB_PERCENTILE = 99
 GENERIC_ENTITY_TITLES = frozenset({
     "DIAGNOSIS PROCEDURE", "DTC CONFIRMATION PROCEDURE", "DTC LOGIC", "INSPECTION END",
     "COMPONENT INSPECTION", "REMOVAL AND INSTALLATION", "NISSAN", "CONSULT",
@@ -55,8 +58,20 @@ def exact_entity_titles(question: str, titles: list[str]) -> list[str]:
     return matched
 
 
-def is_hub(title: str, linked_units: int) -> bool:
-    return linked_units >= HUB_MIN_TEXT_UNITS or title.strip().upper() in GENERIC_ENTITY_TITLES
+def hub_threshold(link_counts: list[int]) -> int:
+    """Smallest linked-unit count that makes an entity a hub: above the graph's P99, at least the floor."""
+    counts = sorted(link_counts)
+    if not counts:
+        return HUB_MIN_TEXT_UNITS
+    rank = (len(counts) - 1) * HUB_PERCENTILE / 100
+    low = math.floor(rank)
+    high = min(low + 1, len(counts) - 1)
+    percentile = counts[low] + (counts[high] - counts[low]) * (rank - low)
+    return max(HUB_MIN_TEXT_UNITS, math.floor(percentile) + 1)
+
+
+def is_hub(title: str, linked_units: int, threshold: int = HUB_MIN_TEXT_UNITS) -> bool:
+    return linked_units >= threshold or title.strip().upper() in GENERIC_ENTITY_TITLES
 
 
 def rank_text_units(
@@ -64,12 +79,16 @@ def rank_text_units(
     texts: dict[str, str],
     codes: tuple[str, ...] = (),
     similarity: dict[str, float] | None = None,
+    hub_min_units: int = HUB_MIN_TEXT_UNITS,
+    named_titles: tuple[str, ...] = (),
 ) -> tuple[list[str], dict[str, Any]]:
     """Order the text unit ids linked to the matched entities.
 
     ``entities`` holds each matched entity's title and linked unit ids, in match order.
+    ``named_titles`` are entities the question names; they are never treated as hubs.
     """
     similarity = similarity or {}
+    named = {title.casefold() for title in named_titles}
     folded_codes = [code.casefold() for code in codes]
 
     def code_tier(unit_id: str) -> int:
@@ -88,7 +107,7 @@ def rank_text_units(
         own = [unit for unit in dict.fromkeys(unit_ids) if unit in texts]
         for unit_id in own:
             first_entity.setdefault(unit_id, order)
-        if is_hub(title, len(unit_ids)):
+        if title.casefold() not in named and is_hub(title, len(unit_ids), hub_min_units):
             hubs.append((title, own))
         else:
             regular.update(own)
@@ -102,6 +121,7 @@ def rank_text_units(
     ordered = sorted(first_entity, key=lambda unit: (unit not in regular, *relevance(unit)))
     report = {
         "version": LOCAL_RANKING_VERSION,
+        "hub_threshold": hub_min_units,
         "hub_entities": [title for title, _ in hubs],
         "candidate_units": len(first_entity),
         "demoted_units": len(first_entity) - len(regular & set(first_entity)),
@@ -133,6 +153,11 @@ def install_local_ranking(
         titles = [entity.title for entity in self.entities.values()]
         exact = exact_entity_titles(query, titles)
         report["exact_entities"] = exact
+        if getattr(self, "_f69_hub_threshold", None) is None:
+            self._f69_hub_threshold = hub_threshold(
+                [len(entity.text_unit_ids or []) for entity in self.entities.values()]
+            )
+        self._f69_exact = tuple(exact)
         self._f69_query = query
         included = list(kwargs.get("include_entity_names") or [])
         kwargs["include_entity_names"] = list(dict.fromkeys([*exact, *included]))
@@ -159,7 +184,10 @@ def install_local_ranking(
                 similarity = similarity_function(self, query)
             except Exception as exc:  # ranking must never block an answer
                 report["similarity_error"] = str(exc)
-        ordered, ranking = rank_text_units(entities, texts, question_identifiers(query), similarity)
+        ordered, ranking = rank_text_units(
+            entities, texts, question_identifiers(query), similarity,
+            getattr(self, "_f69_hub_threshold", None) or HUB_MIN_TEXT_UNITS, getattr(self, "_f69_exact", ()),
+        )
         report.update(ranking)
         units = [self.text_units[unit_id] for unit_id in ordered]
         context_text, context_data = format_text_units(
