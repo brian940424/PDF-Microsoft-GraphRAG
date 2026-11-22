@@ -50,7 +50,7 @@ from .documents import (
 from .downloads import stage_downloads
 from .evidence import Evidence, evidence_page_label
 from .ground_truth import GroundTruthService
-from .indexing import IndexingService, parse_indexing_progress
+from .indexing import IndexingService, condense_indexing_log, parse_indexing_progress
 from .evaluation.source_scoring import cited_sources, strip_citations
 from .project_archive import export_project as build_project_archive
 from .project_archive import import_project as restore_project_archive
@@ -4347,30 +4347,43 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             progress = task_progress_markup(0, "前處理中", "準備開啟 PDF…")
             yield preprocessing, "", progress
         else:
-            yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）", log, index_progress(log)
+            yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）", "", index_progress(log)
+        # The UI gets the condensed log, and only when an update differs from the last one sent:
+        # resending the whole verbose log every 0.25 s froze the browser (SM3E: 1.6 MB).
+        last_sent: tuple[str, str, str] | None = None
         while worker.is_alive() or not events.empty():
             try:
-                kind, value = events.get(timeout=0.25)
+                pending_events = [events.get(timeout=0.25)]
             except queue.Empty:
-                if outcome["phase"] == "index":
-                    yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
-                continue
-            if kind == "preprocess":
-                done, total, name = value
-                progress = task_progress_markup(done / total if total else 0, "前處理中", f"{name}｜已處理 {done} / {total} 頁")
-                yield preprocessing, "", progress
-            elif kind == "log":
-                log += str(value)
-                yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
-            else:
-                yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
+                pending_events = []
+            while True:
+                try:
+                    pending_events.append(events.get_nowait())
+                except queue.Empty:
+                    break
+            update: tuple[str, str, str] | None = None
+            for kind, value in pending_events:
+                if kind == "preprocess":
+                    done, total, name = value
+                    progress = task_progress_markup(done / total if total else 0, "前處理中", f"{name}｜已處理 {done} / {total} 頁")
+                    update = (preprocessing, "", progress)
+                elif kind == "log":
+                    log += str(value)
+            if outcome["phase"] == "index":
+                update = (
+                    f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}",
+                    condense_indexing_log(log), index_progress(log),
+                )
+            if update is not None and update != last_sent:
+                last_sent = update
+                yield update
         worker.join()
         if "error" in outcome:
             error = outcome["error"]
             if outcome["phase"] == "preprocess":
                 yield f"❌ 前處理失敗：{error}", "", progress
             else:
-                yield f"❌ {error}", log, index_progress(log, "建圖失敗")
+                yield f"❌ {error}", condense_indexing_log(log), index_progress(log, "建圖失敗")
             return
         if "preprocess_report" in outcome:
             report = outcome["preprocess_report"]
@@ -4381,7 +4394,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             state = parse_indexing_progress(log)
             yield (
                 f"🛑 已停止：完成 {state.completed_workflows} / {state.total_workflows} 個 workflow｜{result.last_message}",
-                log,
+                condense_indexing_log(log),
                 index_progress(log, "已停止"),
             )
             return
@@ -4395,7 +4408,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             if result.status == "INDEXED"
             else index_progress(log, "建圖失敗")
         )
-        yield summary, log, final_progress
+        yield summary, condense_indexing_log(log), final_progress
 
     def preprocess_hiding_review(*args, **kwargs):
         """Hide the page review while preprocessing rewrites the pages it shows."""

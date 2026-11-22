@@ -502,6 +502,39 @@ class JobButtonTests(unittest.TestCase):
                 first = next(iter(event.fn(*args)))
                 self.assertEqual(len(first), len(event.outputs))
 
+    def test_build_streams_condensed_log_and_finishes_at_full_progress(self) -> None:
+        from types import SimpleNamespace
+
+        from automotive_graphrag.indexing import IndexingResult
+
+        handler = inspect.unwrap(self.events["build_index"].fn)
+        build_index = dict(zip(handler.__code__.co_freevars, (c.cell_contents for c in handler.__closure__)))["build_index"]
+        captured = dict(zip(build_index.__code__.co_freevars, (c.cell_contents for c in build_index.__closure__)))
+        documents, indexing = captured["documents"], captured["indexing"]
+        dump = "WorkflowFunctionOutput(result=[" + "{'id': 'x'}, " * 50_000 + "], stop=False)\n"
+
+        def fake_build(project_id, log_callback, **kwargs):
+            log_callback("Starting pipeline with workflows: a, b\nStarting workflow: a\n")
+            for done in range(1, 2001):
+                log_callback(f"  {done} / 2000 {'.' * (done // 20)}\n")
+            log_callback("Workflow complete: a\n" + dump + "Starting workflow: b\nWorkflow complete: b\nPipeline complete\n")
+            return IndexingResult(project_id, "INDEXED", "", "", 1.0, 0, "Pipeline complete", "indexing.log")
+
+        item = SimpleNamespace(filename="a.pdf", preprocessed=True)
+        with mock.patch.object(documents, "list_documents", return_value=[item]), \
+                mock.patch.object(indexing, "build", side_effect=fake_build):
+            outputs = list(self.events["build_index"].fn("P", None, [], None))
+
+        logs = [output[1]["value"] for output in outputs if isinstance(output[1], dict) and "value" in output[1]]
+        self.assertTrue(logs)
+        self.assertLess(max(len(log) for log in logs), 2_000)
+        self.assertNotIn("WorkflowFunctionOutput", logs[-1])
+        self.assertIn("  2000 / 2000", logs[-1])
+        self.assertIn("100%", outputs[-1][2])
+        self.assertIn("INDEXED", outputs[-1][0])
+        # Unchanged updates are not re-sent.
+        self.assertEqual(len(outputs), len({tuple(map(str, output[:3])) for output in outputs}))
+
     def test_second_start_while_running_is_rejected(self) -> None:
         job = self.jobs.begin("P", "index")
         build = self.events["build_index"].fn

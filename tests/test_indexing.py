@@ -12,7 +12,7 @@ import yaml
 
 from automotive_graphrag.connections import ConnectionSettings, ConnectionTestResult
 from automotive_graphrag.documents import SECTIONING_FORMAT_VERSION
-from automotive_graphrag.indexing import IndexingService, parse_indexing_progress
+from automotive_graphrag.indexing import IndexingService, condense_indexing_log, parse_indexing_progress
 from automotive_graphrag.projects import ProjectError, ProjectStore
 
 
@@ -267,6 +267,45 @@ class IndexingServiceTests(unittest.TestCase):
         service.build("L33-SM3E")
 
         self.assertEqual(json.loads(indexed_path.read_text()), {"WW.pdf": "old"})
+
+    def test_condensed_log_keeps_progress_and_drops_table_dumps(self) -> None:
+        log = "\n".join([
+            "Starting pipeline with workflows: a, b",
+            "Starting workflow: a",
+            "  1 / 3 ...",
+            "  2 / 3 ......",
+            "  3 / 3 .........",
+            "Workflow complete: a",
+            "WorkflowFunctionOutput(result=[{'id': 'x'}], stop=False)",
+            "",
+            "Starting workflow: b",
+            "WorkflowFunctionOutput(result=   id  title",
+            "0  x  y",
+            "[1 rows x 2 columns], stop=False)",
+            "  1 / 2 ...",
+            "x" * 800,
+        ])
+
+        condensed = condense_indexing_log(log)
+
+        self.assertEqual(condensed.splitlines()[:6], [
+            "Starting pipeline with workflows: a, b", "Starting workflow: a", "  3 / 3",
+            "Workflow complete: a", "Starting workflow: b", "  1 / 2",
+        ])
+        self.assertNotIn("WorkflowFunctionOutput", condensed)
+        self.assertNotIn("rows x", condensed)
+        self.assertTrue(condensed.endswith(" …"))
+        self.assertLess(len(condensed.splitlines()[-1]), 510)
+        self.assertEqual(parse_indexing_progress(log).completed_workflows, 1)
+
+    def test_condensed_log_is_bounded_to_its_tail(self) -> None:
+        log = "\n".join(f"line {index}" for index in range(5000))
+
+        condensed = condense_indexing_log(log, max_chars=200)
+
+        self.assertTrue(condensed.startswith("…\nline "))
+        self.assertTrue(condensed.endswith("line 4999"))
+        self.assertLessEqual(len(condensed), 205)
 
     def test_parse_indexing_progress_counts_workflows_and_item_progress(self) -> None:
         log = (
