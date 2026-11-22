@@ -47,6 +47,8 @@ from .semantic_query_cache import (
 QUERY_METHODS = {"local", "global", "drift", "basic"}
 AUTO_METHOD = "auto"
 AGENTIC_METHOD = "agentic"
+# Searches that pick context with the question rewritten into the manual's language (Basic F-53, Local F-69).
+REWRITTEN_QUERY_METHODS = frozenset({"basic", "local"})
 
 _MANUAL_QUERY_ALIASES = {
     "翻譯": ("懸浮翻譯", "翻譯助理", "即時翻譯"),
@@ -355,12 +357,12 @@ class QueryService:
 
         rewritten: list[str | None] = []
 
-        def basic_retrieval_query() -> str | None:
-            """Rewrite the question into the manual's language once, on the first Basic search (F-53)."""
+        def manual_retrieval_query(search_method: str) -> str | None:
+            """Rewrite the question into the manual's language once, on the first Basic or Local search (F-53, F-69)."""
             if not rewritten:
                 rewritten.append(self._rewrite_for_manual(
                     project_id, graph_root, prompt, selected_model, applied_effort,
-                    llm_calls, execution_metadata, (index_dataframes or {}).get("text_units"),
+                    llm_calls, execution_metadata, (index_dataframes or {}).get("text_units"), search_method,
                 ))
             return rewritten[0]
 
@@ -369,8 +371,8 @@ class QueryService:
                 sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
                 "--method", search_method, "--response-type", response_type,
             ]
-            if rewrite and search_method == "basic":
-                retrieval = basic_retrieval_query()
+            if rewrite and search_method in REWRITTEN_QUERY_METHODS:
+                retrieval = manual_retrieval_query(search_method)
                 if retrieval:
                     command += ["--retrieval-query", retrieval]
             return command + [search_question]
@@ -554,6 +556,7 @@ class QueryService:
         llm_calls: list[dict[str, Any]],
         execution_metadata: dict[str, Any],
         text_units: pd.DataFrame | None = None,
+        search_method: str = "basic",
     ) -> str | None:
         """Return a retrieval query in the manual's language when the question is in another one."""
         script, excerpt = document_language_sample(graph_root, text_units)
@@ -564,7 +567,7 @@ class QueryService:
             question, excerpt, model, self.connection_settings.get_api_base_url(),
             self.connection_settings.get_api_key(project_id), reasoning_effort,
         )
-        llm_calls.extend(tag_calls(calls, QUERY_REWRITE_STAGE, "basic"))
+        llm_calls.extend(tag_calls(calls, QUERY_REWRITE_STAGE, search_method))
         if query:
             execution_metadata["retrieval_query"] = query
         else:

@@ -112,7 +112,10 @@ def _execute_graph_query(
     }
     try:
         if method == "local":
-            install_local_ranking(local_ranking_report, text_unit_similarity(root_dir))
+            install_local_ranking(
+                local_ranking_report, text_unit_similarity(root_dir),
+                str(payload.get("retrieval_query") or "").strip() or None,
+            )
             answer, context = cli_query.run_local_search(community_level=community_level, **common)
         elif method == "global":
             answer, context = cli_query.run_global_search(

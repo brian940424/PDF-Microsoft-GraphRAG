@@ -279,7 +279,9 @@ class QueryServiceTests(unittest.TestCase):
         basic, local = commands[:2]
         self.assertEqual(basic[basic.index("--retrieval-query") + 1], "Brake bleeding order")
         self.assertEqual(basic[-1], "煞車排氣順序為何？")
-        self.assertNotIn("--retrieval-query", local)
+        # Local reuses the same rewrite (F-69); the answer still gets the original question.
+        self.assertEqual(local[local.index("--retrieval-query") + 1], "Brake bleeding order")
+        self.assertEqual(local[-1], "煞車排氣順序為何？")
         self.assertEqual(len(router.rewrites), 1)
         self.assertEqual(result.execution_metadata["retrieval_query"], "Brake bleeding order")
         stages = [call["stage"] for call in result.execution_metadata["llm_calls"]]

@@ -14,6 +14,14 @@ C1154 got the neighbouring C1155 steps. This module replaces that ordering:
 
 Only units linked to a matched entity are used; Local does not borrow Basic's unlinked passages.
 
+A question in another language than the manual is replaced by the manual-language query Basic
+already rewrites (F-53) for entity mapping and unit similarity; the answer prompt keeps the
+question. SM3E v4 (Chinese questions, English manuals, ``local_retrieval_probe --hints``): gold
+pages in context 72.6% → 81.1%, questions with no gold page 2 → 0 (Q17 0/6 → 4/6). The matched
+entities already linked most gold pages; the Chinese question's similarity pushed their units
+past the token budget. Adding the closest entities of each part the question names (one more
+rewrite output) did not help (80.0% with the query, 69.5% without it).
+
 Offline probe on SM3E v4 (30 questions, 95 gold pages, ``local_retrieval_probe``): gold pages in
 context 23.2% → 27.4%; the matched entities only reach 28.4% of gold pages, so ranking cannot do
 much more. Capping every entity at 1–3 units or preferring units linked by several entities
@@ -28,7 +36,7 @@ from typing import Any, Callable
 
 from .strategy_routing import question_identifiers
 
-LOCAL_RANKING_VERSION = 2
+LOCAL_RANKING_VERSION = 3
 # Floor of the hub threshold. SM3E (default entity types): median 1 linked unit per entity, P99 8.
 # Manual entity types link more units (temp: P99 18), so the threshold follows each graph's P99.
 HUB_MIN_TEXT_UNITS = 9
@@ -137,11 +145,15 @@ SimilarityFunction = Callable[[Any, str], dict[str, float]]
 
 def install_local_ranking(
     report: dict[str, Any], similarity_function: SimilarityFunction | None = None,
+    retrieval_query: str | None = None,
 ) -> None:
     """Patch GraphRAG Local's context builder for the queries until ``reset_local_ranking``.
 
     ``similarity_function(context_builder, query)`` returns text-unit id → similarity to the query.
+    ``retrieval_query`` is the question rewritten into the manual's language, used in its place
+    for entity mapping and unit similarity.
     """
+    retrieval_query = (retrieval_query or "").strip() or None
     from graphrag.query.context_builder.source_context import build_text_unit_context as format_text_units
     from graphrag.query.structured_search.local_search.mixed_context import LocalSearchMixedContext
 
@@ -151,17 +163,20 @@ def install_local_ranking(
 
     def build_context(self, query: str, *args: Any, **kwargs: Any):
         titles = [entity.title for entity in self.entities.values()]
-        exact = exact_entity_titles(query, titles)
+        exact = exact_entity_titles(f"{query}\n{retrieval_query}" if retrieval_query else query, titles)
         report["exact_entities"] = exact
+        if retrieval_query:
+            report["retrieval_query"] = retrieval_query
         if getattr(self, "_f69_hub_threshold", None) is None:
             self._f69_hub_threshold = hub_threshold(
                 [len(entity.text_unit_ids or []) for entity in self.entities.values()]
             )
         self._f69_exact = tuple(exact)
-        self._f69_query = query
+        search_query = retrieval_query or query
+        self._f69_query = search_query
         included = list(kwargs.get("include_entity_names") or [])
         kwargs["include_entity_names"] = list(dict.fromkeys([*exact, *included]))
-        return original_build(self, query, *args, **kwargs)
+        return original_build(self, search_query, *args, **kwargs)
 
     def build_text_unit_context(
         self, selected_entities: list[Any], max_context_tokens: int = 8000,

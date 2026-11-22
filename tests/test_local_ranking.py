@@ -91,6 +91,38 @@ class RankTextUnitsTests(unittest.TestCase):
 
 
 class InstallLocalRankingTests(unittest.TestCase):
+    def test_retrieval_query_replaces_question_for_mapping_and_similarity(self) -> None:
+        from types import SimpleNamespace
+
+        from graphrag.query.structured_search.local_search.mixed_context import LocalSearchMixedContext
+
+        mapped: list[str] = []
+        original = LocalSearchMixedContext.build_context
+
+        def fake_original(self, query, *args, **kwargs):
+            mapped.append(query)
+            return "context"
+
+        builder = SimpleNamespace(entities={"1": SimpleNamespace(title="C1154 PNP SWITCH", text_unit_ids=["u"])})
+        try:
+            LocalSearchMixedContext.build_context = fake_original
+            for retrieval_query in ("Brake bleeding order for C1154", None):
+                report: dict = {}
+                install_local_ranking(report, None, retrieval_query)
+                LocalSearchMixedContext.build_context(builder, "煞車排氣順序？")
+                if retrieval_query:
+                    self.assertEqual(report["retrieval_query"], retrieval_query)
+                    self.assertEqual(report["exact_entities"], ["C1154 PNP SWITCH"])
+                else:
+                    self.assertNotIn("retrieval_query", report)
+                self.assertEqual(builder._f69_query, retrieval_query or "煞車排氣順序？")
+                reset_local_ranking()
+        finally:
+            reset_local_ranking()
+            LocalSearchMixedContext.build_context = original
+
+        self.assertEqual(mapped, ["Brake bleeding order for C1154", "煞車排氣順序？"])
+
     def test_install_and_reset_restore_graphrag_methods(self) -> None:
         from graphrag.query.structured_search.local_search.mixed_context import LocalSearchMixedContext
 

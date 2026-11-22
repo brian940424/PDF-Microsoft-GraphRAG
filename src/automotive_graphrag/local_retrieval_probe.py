@@ -93,7 +93,34 @@ def local_context_builder(root: Path):
     return engine, short_ids
 
 
-def probe(project: Path, questions: list[dict[str, Any]], mode: str) -> dict[str, Any]:
+def retrieval_hints(
+    project: Path, questions: list[dict[str, Any]], path: Path, model: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Manual-language query per question (Basic's rewrite), from ``path``; missing ones are asked once and saved."""
+    hints: dict[str, dict[str, Any]] = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    missing = [question for question in questions if str(question.get("question_id")) not in hints]
+    if missing:
+        from .query_translation import document_language_sample
+        from .strategy_routing import StrategyRouter
+
+        connections = ConnectionSettings(project.parent)
+        model = model or connections.get_chat_model()
+        _script, excerpt = document_language_sample(project / "graphrag")
+        router = StrategyRouter()
+        for question in missing:
+            query, _calls = router.rewrite_query(
+                question["question"], excerpt, model, connections.get_api_base_url(),
+                connections.get_api_key(project.name),
+            )
+            hints[str(question.get("question_id"))] = {"query": query}
+        path.write_text(json.dumps(hints, ensure_ascii=False, indent=2), encoding="utf-8")
+    return hints
+
+
+def probe(
+    project: Path, questions: list[dict[str, Any]], mode: str,
+    hints: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     root = project / "graphrag"
     unit_pages, with_entity = page_index(root / "output")
     engine, short_ids = local_context_builder(root)
@@ -102,7 +129,8 @@ def probe(project: Path, questions: list[dict[str, Any]], mode: str) -> dict[str
     for question in questions:
         report: dict[str, Any] = {}
         if mode == "ranked":
-            install_local_ranking(report, text_unit_similarity(root))
+            hint = (hints or {}).get(str(question.get("question_id")), {})
+            install_local_ranking(report, text_unit_similarity(root), hint.get("query"))
         try:
             built = engine.context_builder.build_context(query=question["question"], **engine.context_builder_params)
             if asyncio.iscoroutine(built):
@@ -147,15 +175,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("question_set", type=Path, help="question set JSON with gold_evidence pages")
     parser.add_argument("--mode", choices=("baseline", "ranked"), default="ranked")
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--hints", type=Path,
+        help="JSON of the manual-language query per question; missing entries are asked from the chat model and saved",
+    )
+    parser.add_argument("--model", help="chat model for --hints (default: the connection's chat model)")
     args = parser.parse_args(argv)
     # Resolve paths first: loading the GraphRAG config can change the working directory.
     project = args.project.resolve()
     output = args.output.resolve() if args.output else None
+    hints_path = args.hints.resolve() if args.hints else None
     # settings.yaml reads the API key and models from the environment the app normally sets.
     ConnectionSettings(project.parent).apply_to_environment(project.name)
     data = json.loads(args.question_set.read_text(encoding="utf-8"))
     questions = data["questions"] if isinstance(data, dict) else data
-    summary = probe(project, questions, args.mode)
+    hints = retrieval_hints(project, questions, hints_path, args.model) if hints_path else None
+    summary = probe(project, questions, args.mode, hints)
     text = json.dumps(summary, ensure_ascii=False, indent=2)
     if output:
         output.write_text(text, encoding="utf-8")
