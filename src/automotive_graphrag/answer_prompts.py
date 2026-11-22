@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v10"
+ANSWER_PROMPT_VERSION = "answer-requirements-v9"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -28,7 +28,6 @@ Scope: answer only what the question asks.
 - Keep each answer within the single section that directly answers the question. Do not combine adjacent sections just because they share a page.
 - A passage often contains CAUTION, NOTE or WARNING items and background explanations next to the asked content. Leave out every such item that is not part of the answer: warnings about other components or situations, checks or inspections before or after the asked step, reasons why something happens, when or when not to do the task, and alternative part or bolt styles. Include a caution or warning only when the question asks for precautions or warnings, or when the asked task cannot be done correctly without it.
 - For a specification question (torque, dimension, clearance, pressure, capacity, voltage and similar), give only the requested values with their units for the items asked, and no extra sentences.
-- Write only the items the question asks about. Do not write terminals or pin numbers, values (voltages, resistances, torques, dimensions and similar) or operation steps that the question does not ask about, even when they appear in the same passage. This does not remove the steps or conditions of a task the question does ask about; those follow the completeness rules below.
 - Do not add anything the data does not state, such as extra steps, conditions, costs, side effects or general knowledge.
 
 Completeness: do not drop what the asked task needs.
