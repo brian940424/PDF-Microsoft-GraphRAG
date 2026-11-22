@@ -485,6 +485,7 @@ class SearchWithFallbackTests(unittest.TestCase):
             ),
             "reports only": ("GPS 需要四顆衛星。 [Data: Reports (3)]", "沒有引用任何原文段落"),
             "id not in context": ("GPS 需要四顆衛星。 [Data: Sources (99)]", "未出現在證據中"),
+            "short form id not in context": ("GPS 需要四顆衛星。 [Sources: 99]", "未出現在證據中"),
         }
         for name, (answer, detail) in cases.items():
             with self.subTest(name):
@@ -504,6 +505,20 @@ class SearchWithFallbackTests(unittest.TestCase):
                 self.assertEqual(checked, [])
                 self.assertEqual(result.attempts[0]["status"], "not_found")
                 self.assertIn(detail, result.attempts[0]["detail"])
+
+    def test_short_form_sources_citation_counts_as_passage_citation(self) -> None:
+        tried: list[str] = []
+
+        def search(method: str) -> SearchOutcome:
+            tried.append(method)
+            return SearchOutcome("Check the ECM first [Sources: 857].", source_count=9)
+
+        result = search_with_fallback(
+            StrategyDecision("local", "原因", ("local", "basic")), search, lambda answer: AnswerCheck(True, "ok"),
+        )
+
+        self.assertEqual(tried, ["local"])
+        self.assertTrue(result.found)
 
     def test_local_and_basic_answers_also_need_passage_citations(self) -> None:
         tried: list[str] = []

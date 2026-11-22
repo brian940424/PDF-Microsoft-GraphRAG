@@ -5,6 +5,10 @@ number is the text unit's ``human_readable_id``, kept as ``Evidence.context_id``
 Agentic Search form ``[E3]`` (``Evidence.evidence_id``). Only cited evidence that resolves to
 a retrieved text unit with a document/page is compared with the gold answer sources.
 
+Models sometimes drop the ``Data:`` wrapper and write ``[Sources: 857]`` or ``[Source: 12, 34]``
+(SM3E v4 Q12, Q22: both cited gold pages and scored 0); those forms count as the same citation.
+Every module parses citations with ``citation_blocks``/``cited_text_unit_ids``.
+
 Saved answers keep their citations. Evaluation splits them with ``strip_citations`` (the text
 judges and answer metrics see) and ``cited_sources`` (the sources in question-set format).
 """
@@ -26,10 +30,30 @@ DOCUMENT_ONLY_SCORE = 0.5
 Only meaningful with several documents to choose from; single-document projects pass 0.
 """
 
-_DATA_BLOCK = re.compile(r"\[\s*Data\s*:([^\]]*)\]", re.IGNORECASE)
-_SOURCES_GROUP = re.compile(r"Sources\s*\(([^)]*)\)", re.IGNORECASE)
+# "[Data: Sources (1, 2); Reports (3)]", or without the wrapper "[Sources: 1, 2]" / "[Source (1)]".
+_CITATION_BLOCK = re.compile(r"\[\s*((?:Data\s*:|Sources?\b)[^\]]*)\]", re.IGNORECASE)
+_SOURCES_GROUP = re.compile(r"\bSources?\s*(?:\(([^)]*)\)|:\s*([^;()\]]*))", re.IGNORECASE)
 _EVIDENCE_CITATION = re.compile(r"\[(E\d+)\]")
-_ANY_CITATION = re.compile(r"\s*\[\s*Data\s*:[^\]]*\]|\s*\[E\d+\]|\s*\[來源未映射\]", re.IGNORECASE)
+_ANY_CITATION = re.compile(
+    r"\s*\[\s*(?:Data\s*:|Sources?\b)[^\]]*\]|\s*\[E\d+\]|\s*\[來源未映射\]", re.IGNORECASE,
+)
+
+
+def citation_blocks(answer: str) -> list[str]:
+    """Inside text of each GraphRAG citation, e.g. "Data: Sources (1, 2)" or "Sources: 857"."""
+    return _CITATION_BLOCK.findall(answer or "")
+
+
+def cited_text_unit_ids(answer: str) -> list[str]:
+    """``Sources`` record ids the answer cites, first-seen order, without the "+more" marker."""
+    ids: list[str] = []
+    for block in citation_blocks(answer):
+        for in_parentheses, after_colon in _SOURCES_GROUP.findall(block):
+            for part in (in_parentheses or after_colon).split(","):
+                value = part.strip()
+                if value and value.lstrip("+").lower() != "more" and value not in ids:
+                    ids.append(value)
+    return ids
 
 
 def strip_citations(answer: str) -> str:
@@ -39,10 +63,7 @@ def strip_citations(answer: str) -> str:
 
 def cited_source_ids(answer: str) -> tuple[set[str], set[str]]:
     """Return (GraphRAG ``Sources`` ids, Agentic ``E`` ids) cited in the answer."""
-    source_ids: set[str] = set()
-    for block in _DATA_BLOCK.findall(answer or ""):
-        for group in _SOURCES_GROUP.findall(block):
-            source_ids.update(part.strip() for part in group.split(",") if part.strip().isdigit())
+    source_ids = {value for value in cited_text_unit_ids(answer) if value.isdigit()}
     evidence_ids = set(_EVIDENCE_CITATION.findall(answer or ""))
     return source_ids, evidence_ids
 

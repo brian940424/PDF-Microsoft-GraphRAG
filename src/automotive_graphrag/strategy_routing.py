@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable
 from .answer_extraction import needs_two_stage
 from .answer_prompts import INSUFFICIENT_DATA_PHRASE, INSUFFICIENT_DATA_PHRASE_EN
 from .connections import chat_completion_api_params, extract_json_object, llm_request_headers
+from .evaluation.source_scoring import citation_blocks, cited_text_unit_ids
 from .evidence import EvidenceService
 from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, ROUTING_STAGE, call_record
 from .projects import ProjectError
@@ -471,8 +472,6 @@ def _title_terms(value: str) -> tuple[set[str], set[str]]:
     return cjk_terms, latin_terms
 
 
-_DATA_CITATION = re.compile(r"\[\s*Data\s*:([^\]]*)\]", re.IGNORECASE)
-_SOURCES_CITATION = re.compile(r"Sources\s*\(([^)]*)\)", re.IGNORECASE)
 _EVIDENCE_CITATION = re.compile(r"\[E\d+\]")
 _DRIFT_UNSTATED_PHRASES = (
     "手冊未提供", "手冊沒有提供", "請查閱手冊", "請查閱使用手冊", "資料未提供", "資料未說明",
@@ -489,14 +488,10 @@ def _unsupported_answer_reason(method: str, outcome: SearchOutcome) -> str:
     if method == "global":
         return ""
     label = METHOD_LABELS.get(method, method)
-    blocks = _DATA_CITATION.findall(outcome.answer)
+    blocks = citation_blocks(outcome.answer)
     if any("general knowledge" in block.casefold() for block in blocks):
         return f"{label} 回答引用一般知識（General Knowledge），不是文件內容"
-    cited_ids = {
-        value.strip()
-        for block in blocks for group in _SOURCES_CITATION.findall(block)
-        for value in group.split(",") if value.strip()
-    }
+    cited_ids = set(cited_text_unit_ids(outcome.answer))
     if not cited_ids and not _EVIDENCE_CITATION.search(outcome.answer):
         return f"{label} 回答沒有引用任何原文段落"
     if method != "drift":
@@ -505,7 +500,7 @@ def _unsupported_answer_reason(method: str, outcome: SearchOutcome) -> str:
         return "DRIFT 回答表示手冊未提供資訊"
     context = outcome.payload.context if hasattr(outcome.payload, "context") else outcome.payload
     source_ids = {str(item.get("id", "")) for item in EvidenceService.source_records(context) if item.get("id") is not None}
-    numeric_ids = {value for value in cited_ids if value != "+more"}
+    numeric_ids = cited_ids
     if source_ids and not numeric_ids.issubset(source_ids):
         return "DRIFT 回答引用未出現在證據中的來源"
     return ""

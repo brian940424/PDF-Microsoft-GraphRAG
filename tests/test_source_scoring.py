@@ -37,6 +37,16 @@ class CitationParsingTests(unittest.TestCase):
         self.assertEqual(sources, {"12", "34", "56"})
         self.assertEqual(evidence_ids, {"E3"})
 
+    def test_sources_without_data_wrapper_are_citations(self) -> None:
+        # SM3E v4 Q12 / Q22: the model wrote "[Sources: 857]" and both cited gold pages.
+        answer = "Check the ECM first [Sources: 857]. Voice goes over Bluetooth [Source: 365, 373]; see [Sources (12)]."
+        sources, _ = cited_source_ids(answer)
+        self.assertEqual(sources, {"857", "365", "373", "12"})
+        self.assertEqual(strip_citations(answer), "Check the ECM first. Voice goes over Bluetooth; see.")
+        retrieved = [evidence("857", 117, "BRC.pdf"), evidence("365", 303, "AV.pdf", 2), evidence("373", 306, "AV.pdf", 3)]
+        self.assertEqual(source_score("x [Sources: 857]", retrieved, [gold((117,), "BRC.pdf")]), 1.0)
+        self.assertEqual(source_score("x [Sources: 365, 373]", retrieved, [gold((302, 306), "AV.pdf")]), 1.0)
+
     def test_entity_and_report_ids_are_not_sources(self) -> None:
         sources, _ = cited_source_ids("[Data: Entities (1, 2); Reports (3)]")
         self.assertEqual(sources, set())
