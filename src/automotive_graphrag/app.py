@@ -4846,9 +4846,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         inputs=[query_chat_model, query_method],
                         outputs=[query_chat_model, query_method],
                     )
+                    query_bypass_cache = gr.Checkbox(label="略過快取重新生成", value=False)
                     with gr.Row():
                         ask_button = gr.Button("送出問題", variant="primary")
-                        query_bypass_cache = gr.Checkbox(label="略過快取重新生成", value=False)
                         clear_question_button = gr.Button("清除")
                 with gr.Column():
                     query_answer = gr.Textbox(
