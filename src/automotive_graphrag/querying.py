@@ -31,7 +31,7 @@ from .evidence import Evidence, EvidenceService
 from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
-from .local_ranking import LOCAL_RANKING_VERSION
+from .local_ranking import LOCAL_RANKING_VERSION, configure_local_context
 from .query_translation import document_language_sample, needs_rewrite
 from .strategy_routing import (
     SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, question_identifiers,
@@ -811,6 +811,7 @@ class QueryService:
         for model in value.get("embedding_models", {}).values():
             configure_embedding_model(model, embedding_model)
         install_answer_prompts(value, settings_path.parent)
+        configure_local_context(value)
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:

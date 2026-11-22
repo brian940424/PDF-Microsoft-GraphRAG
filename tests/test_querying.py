@@ -256,6 +256,10 @@ class QueryServiceTests(unittest.TestCase):
         )
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
+        # Passages get the Local context share community reports had (F-69).
+        self.assertEqual(
+            (settings["local_search"]["text_unit_prop"], settings["local_search"]["community_prop"]), (0.7, 0.05),
+        )
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
         self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v9")
 

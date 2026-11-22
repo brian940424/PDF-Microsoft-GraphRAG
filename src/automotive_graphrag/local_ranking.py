@@ -37,6 +37,21 @@ from typing import Any, Callable
 from .strategy_routing import question_identifiers
 
 LOCAL_RANKING_VERSION = 3
+# Local context shares for queries (GraphRAG defaults 0.5 / 0.15; the rest holds the entity and
+# relationship tables). Manual answers come from passages, not community summaries. SM3E v4
+# (``local_retrieval_probe``, 12k tokens): gold pages in context 81.1% → 84.2%, pages per question
+# 12.6 → 17.0; 0.8 / 0 gave 85.3% with 19.2 pages. Retrieval experiments keep their own values.
+LOCAL_TEXT_UNIT_PROP = 0.7
+LOCAL_COMMUNITY_PROP = 0.05
+
+
+def configure_local_context(settings: dict[str, Any]) -> None:
+    """Set the Local context shares in a GraphRAG settings dict."""
+    section = settings.get("local_search")
+    if not isinstance(section, dict):
+        section = settings["local_search"] = {}
+    section["text_unit_prop"] = LOCAL_TEXT_UNIT_PROP
+    section["community_prop"] = LOCAL_COMMUNITY_PROP
 # Floor of the hub threshold. SM3E (default entity types): median 1 linked unit per entity, P99 8.
 # Manual entity types link more units (temp: P99 18), so the threshold follows each graph's P99.
 HUB_MIN_TEXT_UNITS = 9
