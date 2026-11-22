@@ -3416,7 +3416,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def clear_project_query_cache(project_id: str | None):
         if not project_id:
-            return "❌ 請先開啟專案", project_cache_status(None)
+            return "❌ 請先選擇專案", project_cache_status(None)
         try:
             count = QueryResultCache(store.path_for(project_id)).clear()
             released = GraphIndexManager.instance().clear(project_id)
@@ -4503,9 +4503,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 open_project_result = gr.Markdown(elem_classes="collapse-when-empty")
                 project_activation_result = gr.Markdown(elem_classes="collapse-when-empty")
 
-            with gr.Accordion("前台使用者預設查詢設定（依專案）", open=False, elem_classes=["bold-title"]):
+            # 開啟專案後才顯示，且只在下拉選單選的就是已開啟專案時顯示
+            with gr.Accordion(
+                "前台使用者預設查詢設定（依專案）", open=False, visible=False, elem_classes=["bold-title"]
+            ) as portal_defaults_section:
                 gr.Markdown(
-                    "先在上方選擇專案，再調整其前台預設值。設定會套用到一般使用者入口選取此專案後的新查詢。"
+                    "調整目前開啟專案的前台預設值。設定會套用到一般使用者入口選取此專案後的新查詢。"
                     "模型可選擇沿用全域預設；若要讓前台與管理後台共用回答快取，請讓策略、模型、推理深度與回答格式一致。"
                 )
 
@@ -4541,9 +4544,12 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                             "儲存前台預設設定", variant="primary", elem_classes="rounded-button"
                         )
                         refresh_semantic_cache_status_button = gr.Button(
-                            "重新整理語意快取狀態", elem_classes="rounded-button"
+                            "重新整理快取狀態", elem_classes="rounded-button"
                         )
+                        clear_project_query_cache_button = gr.Button("清除本專案快取", elem_classes="rounded-button")
                 portal_defaults_result = gr.Markdown(elem_classes="collapse-when-empty")
+                project_query_cache_action_status = gr.Markdown(elem_classes="collapse-when-empty")
+                project_query_cache_status = gr.Markdown("查詢快取：尚未選擇專案")
                 semantic_cache_status = gr.Markdown("⚠️ 語意快取：尚未選擇專案")
 
             with gr.Group(visible=False) as new_project_group:
@@ -4700,10 +4706,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 index_stop_button = gr.Button(JOB_BUTTON_LABELS["index"][1], variant="stop", visible=False)
                 document_refresh_button = gr.Button("重新整理")
                 remove_pdf_button = gr.Button("刪除所選 PDF", variant="stop")
-            with gr.Row():
-                clear_project_query_cache_button = gr.Button("清除本專案快取", size="sm")
-                project_query_cache_status = gr.Markdown("圖譜尚未載入記憶體｜本專案查詢快取：0 筆")
-                project_query_cache_action_status = gr.Markdown()
             # 由刪除按鈕的確認對話框寫入，不顯示於畫面
             remove_pdf_confirmation = gr.Checkbox(visible=False)
             
@@ -5721,9 +5723,21 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      portal_default_reasoning_effort, portal_default_response_type],
         )
         selected_project.change(semantic_mode_view, inputs=selected_project, outputs=semantic_cache_mode)
+        for portal_section_trigger in (selected_project.change, active_project_id.change):
+            portal_section_trigger(
+                lambda selected, active: gr.update(
+                    visible=bool(active) and selected_project_id(selected) == active
+                ),
+                inputs=[selected_project, active_project_id],
+                outputs=portal_defaults_section,
+                show_progress="hidden",
+            )
         selected_project.change(semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status)
         refresh_semantic_cache_status_button.click(
             semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
+        ).then(
+            lambda project_id: project_cache_status(selected_project_id(project_id)),
+            inputs=selected_project, outputs=project_query_cache_status, show_progress="hidden",
         )
         save_portal_defaults_button.click(
             save_portal_defaults_and_semantic_mode,
@@ -5961,14 +5975,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section
         ).then(**review_mode_event)
         clear_project_query_cache_button.click(
-            clear_project_query_cache,
-            inputs=active_project_id,
+            lambda project_id: clear_project_query_cache(selected_project_id(project_id)),
+            inputs=selected_project,
             outputs=[project_query_cache_action_status, project_query_cache_status],
             show_progress="hidden",
+        ).then(
+            semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
         )
-        active_project_id.change(
-            project_cache_status,
-            inputs=active_project_id,
+        selected_project.change(
+            lambda project_id: project_cache_status(selected_project_id(project_id)),
+            inputs=selected_project,
             outputs=project_query_cache_status,
             show_progress="hidden",
         )
