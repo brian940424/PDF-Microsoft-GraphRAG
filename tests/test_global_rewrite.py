@@ -81,6 +81,10 @@ class RewriteTests(unittest.TestCase):
         self.assertIn("---Answer requirements---", prompt)
         self.assertIn("---Rewriting the draft answer---", prompt)
         self.assertLess(prompt.index("---Rewriting the draft answer---"), prompt.rindex("---Target response length and format---"))
+        self.assertIn("目前取得的資料不足以回答此部分", prompt)  # not "the provided data does not state it"
+        self.assertNotIn("say only that the provided data does not state it", prompt)
+        self.assertIn("do not add remarks about what is unconfirmed, incomplete", prompt)
+        self.assertIn("Keep only the points the question asks for.", prompt)
         self.assertIn("List of 3-7 Points", prompt)
         self.assertIn("DATA", prompt)
 

@@ -4,7 +4,7 @@ Community reports are summaries made at index time, so a Global answer misses th
 manual pages give (SM3E 03_global: "Before Replace ECU", the FAST Type ID check, plastic
 material codes). After the reduce answer is grounded (``global_sources``), this module gives
 the answer model the grounded passages plus the cited communities' passages closest to the
-question, with the Basic answer requirements, and asks it to rewrite the draft from them.
+question, with the Basic answer requirements (Local's rule for unsupported parts), and asks it to rewrite the draft from them.
 It costs one embedding call and one LLM call; any failure keeps the grounded answer.
 """
 
@@ -16,10 +16,13 @@ from typing import Any
 
 import numpy as np
 
-from .answer_prompts import ANSWER_REQUIREMENTS, with_answer_requirements
+from .answer_prompts import LOCAL_ANSWER_REQUIREMENTS, with_answer_requirements
 from .global_sources import Embedder, _normalized, cited_statements, config_embedder, text_unit_vectors
 
-GLOBAL_SOURCE_REWRITE_VERSION = 1
+GLOBAL_SOURCE_REWRITE_VERSION = 2
+"""v2: no remarks about missing data and only the asked points (v1 on SM3E 03_global: judge 0.556,
+Q06 wrote "the data does not give a full item-by-item comparison", Q03 and Q06 lost points for
+procedures the question did not ask about)."""
 MAX_CONTEXT_TOKENS = 12000
 """Same budget as the Basic and Local context (``max_context_tokens``)."""
 
@@ -33,8 +36,10 @@ The data ends with a draft answer written earlier from summaries of the manuals,
 - For each point, find the passages about it and take their concrete details: names of procedures, modes, screen items and parts, the steps in order, conditions, values with units, and which models they apply to. Cite those passages as [Data: Sources (ids)] with the ids from the "id" column.
 - Add the points the question asks for that the passages give and the draft missed.
 - When a passage contradicts the draft, follow the passage.
-- When no passage covers a draft point, keep that point as the draft states it, with the draft's citation.
+- When no passage covers a draft point the question asks for, keep that point as the draft states it, with the draft's citation.
+- Keep only the points the question asks for. Leave out draft points and passage details about procedures, parts, systems or work the question does not name, even when the draft includes them.
 - Each passage starts with its manual and section path, for example "BRC > ...": the first code is the manual. Name the manual for each point, for example "In BRC, ...". When the question asks which manuals cover something, name every manual whose passages or draft points support it.
+- Never write that the manuals, the data, the passages or the draft do not state, confirm, verify, list or fully describe something, and do not add remarks about what is unconfirmed, incomplete or possibly different elsewhere.
 - Output only the final answer. Do not mention the draft, the summaries or the rewriting.
 
 """
@@ -46,7 +51,8 @@ def rewrite_prompt(response_type: str, context_data: str) -> str:
     """Basic system prompt with the answer and rewrite requirements, filled in."""
     from graphrag.prompts.query.basic_search_system_prompt import BASIC_SEARCH_SYSTEM_PROMPT
 
-    template = with_answer_requirements(BASIC_SEARCH_SYSTEM_PROMPT, ANSWER_REQUIREMENTS + REWRITE_REQUIREMENTS)
+    # Local's rule for unsupported parts: the passages are only some of the manual (F-69).
+    template = with_answer_requirements(BASIC_SEARCH_SYSTEM_PROMPT, LOCAL_ANSWER_REQUIREMENTS + REWRITE_REQUIREMENTS)
     return template.format(response_type=response_type, context_data=context_data)
 
 
