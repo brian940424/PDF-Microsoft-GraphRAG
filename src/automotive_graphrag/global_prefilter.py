@@ -18,7 +18,7 @@ from .global_sources import Embedder, _normalized, config_embedder, text_unit_ve
 
 GLOBAL_REPORT_PREFILTER_VERSION = 1
 DEFAULT_GLOBAL_REPORT_TOP_N = 200
-"""Reports kept for the map stage; 0 maps every report (GraphRAG's own behaviour)."""
+"""Reports kept for the map stage; 0 maps every report. SM3E 03_global: 300 cost 44% more tokens without a higher score."""
 
 REPORT_VECTOR_TABLE = "community_full_content"
 
