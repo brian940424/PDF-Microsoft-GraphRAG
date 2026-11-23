@@ -3,8 +3,8 @@
 Community reports are summaries made at index time, so a Global answer misses the details the
 manual pages give (SM3E 03_global: "Before Replace ECU", the FAST Type ID check, plastic
 material codes). After the reduce answer is grounded (``global_sources``), this module gives
-the answer model the grounded passages plus the cited communities' passages closest to the
-question, with the Basic answer requirements (Local's rule for unsupported parts), and asks it to rewrite the draft from them.
+the answer model the grounded passages plus the passages closest to the question, from the cited
+communities and from the whole index (v3: a manual the draft never cited can still supply a point), with the Basic answer requirements (Local's rule for unsupported parts), and asks it to rewrite the draft from them.
 It costs one embedding call and one LLM call; any failure keeps the grounded answer.
 """
 
@@ -19,15 +19,22 @@ import numpy as np
 from .answer_prompts import LOCAL_ANSWER_REQUIREMENTS, with_answer_requirements
 from .global_sources import Embedder, _normalized, cited_statements, config_embedder, text_unit_vectors
 
-GLOBAL_SOURCE_REWRITE_VERSION = 2
+GLOBAL_SOURCE_REWRITE_VERSION = 3
 """v2: no remarks about missing data and only the asked points (v1 on SM3E 03_global: judge 0.556,
 Q06 wrote "the data does not give a full item-by-item comparison", Q03 and Q06 lost points for
-procedures the question did not ask about)."""
+procedures the question did not ask about).
+v3 (F-43): also the closest passages of the whole index, and rules to keep the cautions inside an
+asked procedure and to write only real differences (v2: Q04 had no BRM passage because no cited
+report covered BRM; Q03 dropped "Never start the engine" and the FAST last five digits from a
+passage it had; Q06 listed outer sill work that is the same for both production periods)."""
 MAX_CONTEXT_TOKENS = 12000
 """Same budget as the Basic and Local context (``max_context_tokens``)."""
 
 MAX_COMMUNITY_UNITS = 2000
 """Cited communities covering more text units than this are not searched for extra passages."""
+GLOBAL_SEARCH_UNITS = 15
+"""Passages of the whole index closest to the question, added to the candidates (SM3E 03_global
+Q04: the BRM plastics table ranks 7th of 935 passages but sits in no cited community)."""
 
 REWRITE_REQUIREMENTS = """---Rewriting the draft answer---
 
@@ -38,6 +45,8 @@ The data ends with a draft answer written earlier from summaries of the manuals,
 - When a passage contradicts the draft, follow the passage.
 - When no passage covers a draft point the question asks for, keep that point as the draft states it, with the draft's citation.
 - Keep only the points the question asks for. Leave out draft points and passage details about procedures, parts, systems or work the question does not name, even when the draft includes them.
+- For a procedure the question asks about, keep what its passages say inside the steps: what must not be done during a step, what must not be done while checking, which value or which part of an identifier to use, and when an alternative applies. For example, if a passage says to check a warning lamp "with the engine not running", keep that condition.
+- When the question asks how two things, versions or periods differ, write only what differs between them: parts, steps or conditions that exist for only one side or change between them, including list entries marked as applying to only one version. Do not present work that is the same for both as a difference.
 - Each passage starts with its manual and section path, for example "BRC > ...": the first code is the manual. Name the manual for each point, for example "In BRC, ...". When the question asks which manuals cover something, name every manual whose passages or draft points support it.
 - Never write that the manuals, the data, the passages or the draft do not state, confirm, verify, list or fully describe something, and do not add remarks about what is unconfirmed, incomplete or possibly different elsewhere.
 - Output only the final answer. Do not mention the draft, the summaries or the rewriting.
@@ -70,7 +79,7 @@ def select_units(
     short_id_by_unit: dict[str, str],
     max_tokens: int = MAX_CONTEXT_TOKENS,
 ) -> list[str]:
-    """Grounded units first, then cited-community units closest to the question, within ``max_tokens``."""
+    """Grounded units first, then candidate units closest to the question, within ``max_tokens``."""
     ranked = [unit for unit in candidate_units if unit in unit_vectors and unit not in grounded_units]
     if question_vector is not None and ranked:
         scores = np.stack([unit_vectors[unit] for unit in ranked]) @ question_vector
@@ -88,6 +97,15 @@ def select_units(
         chosen.append(unit)
         used += tokens
     return chosen
+
+
+def closest_units(question_vector: np.ndarray, unit_vectors: dict[str, np.ndarray], limit: int) -> list[str]:
+    """The ``limit`` units of the whole index closest to the question."""
+    if limit <= 0 or not unit_vectors:
+        return []
+    ids = list(unit_vectors)
+    scores = np.stack([unit_vectors[unit] for unit in ids]) @ question_vector
+    return [ids[position] for position in np.argsort(-scores, kind="stable")[:limit]]
 
 
 def build_context(units: Sequence[str], text_by_unit: dict[str, str], short_id_by_unit: dict[str, str], draft: str) -> str:
@@ -145,8 +163,12 @@ def rewrite_global_answer(
         if token_count is None:
             token_count = lambda text: len(model.tokenizer.encode(text))  # noqa: E731
     question_vector = None
-    if candidates:
+    searched: list[str] = []
+    if unit_vectors:
         question_vector = _normalized(np.asarray((embed or config_embedder(root_dir))([question])[0], dtype=np.float32))
+        searched = closest_units(question_vector, unit_vectors, GLOBAL_SEARCH_UNITS)
+    community_candidates = set(candidates)
+    candidates = list(dict.fromkeys([*candidates, *searched]))
     units = select_units(grounded, candidates, question_vector, unit_vectors, token_count, text_by_unit, short_id_by_unit)
     if not units:
         return answer, [], {**report, "reason": "no passages within the token budget"}
@@ -161,6 +183,7 @@ def rewrite_global_answer(
     report.update({
         "grounded_units": sum(unit in grounded for unit in units),
         "added_units": sum(unit not in grounded for unit in units),
+        "searched_units": sum(unit not in grounded and unit not in community_candidates for unit in units),
         "cited_reports": len(cited),
     })
     if not rewritten:

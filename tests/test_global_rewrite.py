@@ -4,7 +4,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from automotive_graphrag.global_rewrite import rewrite_global_answer, rewrite_prompt, select_units
+from automotive_graphrag.global_rewrite import closest_units, rewrite_global_answer, rewrite_prompt, select_units
 
 TEXT_UNITS = pd.DataFrame({
     "id": ["u-a", "u-b", "u-c", "u-d"],
@@ -40,6 +40,13 @@ class SelectUnitsTests(unittest.TestCase):
         self.assertEqual(units, ["u-c", "u-a"])
 
 
+class ClosestUnitsTests(unittest.TestCase):
+    def test_returns_the_whole_index_units_closest_to_the_question(self):
+        self.assertEqual(closest_units(np.array([0.0, 1.0]), VECTORS, 2), ["u-d", "u-c"])
+        self.assertEqual(closest_units(np.array([0.0, 1.0]), VECTORS, 0), [])
+        self.assertEqual(closest_units(np.array([0.0, 1.0]), {}, 3), [])
+
+
 class RewriteTests(unittest.TestCase):
     def _rewrite(self, answer=DRAFT, grounded=("11",), reply="In BRC, use Before Replace ECU [Data: Sources (11, 12)]."):
         calls = []
@@ -54,13 +61,19 @@ class RewriteTests(unittest.TestCase):
         )
         return result, calls
 
-    def test_rewrites_from_grounded_and_cited_community_passages(self):
+    def test_rewrites_from_grounded_cited_community_and_searched_passages(self):
+        with patch("automotive_graphrag.global_rewrite.GLOBAL_SEARCH_UNITS", 0):
+            (_, sources, report), _ = self._rewrite()
+        self.assertEqual([item["id"] for item in sources], ["11", "12", "13"])  # community 8 is not cited
+        self.assertEqual(report["searched_units"], 0)
+
         (answer, sources, report), calls = self._rewrite()
 
         self.assertEqual(answer, "In BRC, use Before Replace ECU [Data: Sources (11, 12)].")
-        self.assertEqual([item["id"] for item in sources], ["11", "12", "13"])  # community 8 is not cited
+        # u-d is in no cited community but comes from the whole-index search
+        self.assertEqual([item["id"] for item in sources], ["11", "12", "13", "14"])
         self.assertTrue(report["applied"])
-        self.assertEqual((report["grounded_units"], report["added_units"]), (1, 2))
+        self.assertEqual((report["grounded_units"], report["added_units"], report["searched_units"]), (1, 3, 1))
         system, user = calls[0]
         self.assertEqual(user, {"role": "user", "content": "Compare ABS and BCM replacement."})
         self.assertIn("12|BRC > Type ID from FAST, last five digits.", system["content"])
@@ -85,6 +98,8 @@ class RewriteTests(unittest.TestCase):
         self.assertNotIn("say only that the provided data does not state it", prompt)
         self.assertIn("do not add remarks about what is unconfirmed, incomplete", prompt)
         self.assertIn("Keep only the points the question asks for.", prompt)
+        self.assertIn("keep what its passages say inside the steps", prompt)
+        self.assertIn("Do not present work that is the same for both as a difference.", prompt)
         self.assertIn("List of 3-7 Points", prompt)
         self.assertIn("DATA", prompt)
 
