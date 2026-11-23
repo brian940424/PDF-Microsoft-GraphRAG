@@ -4,7 +4,9 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from automotive_graphrag.global_rewrite import closest_units, rewrite_global_answer, rewrite_prompt, select_units
+from automotive_graphrag.global_rewrite import (
+    closest_units, named_manuals, rewrite_global_answer, rewrite_prompt, select_units,
+)
 
 TEXT_UNITS = pd.DataFrame({
     "id": ["u-a", "u-b", "u-c", "u-d"],
@@ -47,8 +49,22 @@ class ClosestUnitsTests(unittest.TestCase):
         self.assertEqual(closest_units(np.array([0.0, 1.0]), {}, 3), [])
 
 
+class NamedManualsTests(unittest.TestCase):
+    def test_matches_whole_manual_codes_only(self):
+        manuals = {"BR", "BRC", "BRM", "AV", "BCS"}
+        self.assertEqual(named_manuals("Across the BR and BRC manuals, which parts are non-reusable?", manuals), {"BR", "BRC"})
+        self.assertEqual(named_manuals("車身修理手冊（BRM）中，後期車型怎麼判定？", manuals), {"BRM"})
+        self.assertEqual(named_manuals("Compare ABS and BCM replacement.", manuals), set())
+
+
+MANUALS = {"u-a": "BRC", "u-b": "BRC", "u-c": "BCS", "u-d": "AV"}
+
+
 class RewriteTests(unittest.TestCase):
-    def _rewrite(self, answer=DRAFT, grounded=("11",), reply="In BRC, use Before Replace ECU [Data: Sources (11, 12)]."):
+    def _rewrite(
+        self, answer=DRAFT, grounded=("11",), reply="In BRC, use Before Replace ECU [Data: Sources (11, 12)].",
+        question="Compare ABS and BCM replacement.",
+    ):
         calls = []
 
         def complete(messages):
@@ -56,8 +72,9 @@ class RewriteTests(unittest.TestCase):
             return reply
 
         result = rewrite_global_answer(
-            "Compare ABS and BCM replacement.", answer, list(grounded), COMMUNITIES, "/tmp/none", "Single Paragraph",
+            question, answer, list(grounded), COMMUNITIES, "/tmp/none", "Single Paragraph",
             TEXT_UNITS, embed=lambda texts: [[1.0, 0.0]], complete=complete, token_count=words, unit_vectors=VECTORS,
+            manual_by_unit=MANUALS,
         )
         return result, calls
 
@@ -74,11 +91,19 @@ class RewriteTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in sources], ["11", "12", "13", "14"])
         self.assertTrue(report["applied"])
         self.assertEqual((report["grounded_units"], report["added_units"], report["searched_units"]), (1, 3, 1))
+        self.assertEqual(report["searched_manuals"], [])
+
         system, user = calls[0]
         self.assertEqual(user, {"role": "user", "content": "Compare ABS and BCM replacement."})
         self.assertIn("12|BRC > Type ID from FAST, last five digits.", system["content"])
         self.assertIn("-----Draft answer-----\n" + DRAFT, system["content"])
         self.assertIn("Single Paragraph", system["content"])
+
+    def test_question_naming_manuals_searches_only_those_manuals(self):
+        (_, sources, report), _ = self._rewrite(question="In the BRC and BCS manuals, compare the replacements.")
+
+        self.assertEqual([item["id"] for item in sources], ["11", "12", "13"])  # AV's u-d is not searched
+        self.assertEqual((report["searched_units"], report["searched_manuals"]), (0, ["BCS", "BRC"]))
 
     def test_keeps_the_answer_without_cited_passages_or_with_an_empty_reply(self):
         (answer, sources, report), calls = self._rewrite(answer="No citation.", grounded=())

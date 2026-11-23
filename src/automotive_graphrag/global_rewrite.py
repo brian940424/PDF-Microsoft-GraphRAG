@@ -10,6 +10,7 @@ It costs one embedding call and one LLM call; any failure keeps the grounded ans
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -17,16 +18,19 @@ from typing import Any
 import numpy as np
 
 from .answer_prompts import LOCAL_ANSWER_REQUIREMENTS, with_answer_requirements
+from .global_reports import _manual_name, _text_unit_pages
 from .global_sources import Embedder, _normalized, cited_statements, config_embedder, text_unit_vectors
 
-GLOBAL_SOURCE_REWRITE_VERSION = 3
+GLOBAL_SOURCE_REWRITE_VERSION = 4
 """v2: no remarks about missing data and only the asked points (v1 on SM3E 03_global: judge 0.556,
 Q06 wrote "the data does not give a full item-by-item comparison", Q03 and Q06 lost points for
 procedures the question did not ask about).
 v3 (F-43): also the closest passages of the whole index, and rules to keep the cautions inside an
 asked procedure and to write only real differences (v2: Q04 had no BRM passage because no cited
 report covered BRM; Q03 dropped "Never start the engine" and the FAST last five digits from a
-passage it had; Q06 listed outer sill work that is the same for both production periods)."""
+passage it had; Q06 listed outer sill work that is the same for both production periods).
+v4: a question that names manuals searches only them (v3: Q05 "Across the BR and BRC manuals" got
+12 BRM passages that pushed the BR union-bolt washer pages out of the budget; judge 0.60 -> 0.45)."""
 MAX_CONTEXT_TOKENS = 12000
 """Same budget as the Basic and Local context (``max_context_tokens``)."""
 
@@ -108,6 +112,23 @@ def closest_units(question_vector: np.ndarray, unit_vectors: dict[str, np.ndarra
     return [ids[position] for position in np.argsort(-scores, kind="stable")[:limit]]
 
 
+def unit_manuals(output_dir: Path) -> dict[str, str]:
+    """Manual code ("BRC") of each text unit, from ``source_metadata.jsonl``; empty when it is missing."""
+    try:
+        pages = _text_unit_pages(Path(output_dir))
+    except FileNotFoundError:
+        return {}
+    return {unit: _manual_name(document) for unit, (document, _) in pages.items()}
+
+
+def named_manuals(question: str, manuals: set[str]) -> set[str]:
+    """Manual codes the question names as whole words ("BR" in "BR and BRC", not in "BRM")."""
+    return {
+        manual for manual in manuals
+        if manual and re.search(rf"(?<![A-Za-z0-9]){re.escape(manual)}(?![A-Za-z0-9])", question)
+    }
+
+
 def build_context(units: Sequence[str], text_by_unit: dict[str, str], short_id_by_unit: dict[str, str], draft: str) -> str:
     rows = "\n".join(_row(short_id_by_unit[unit], text_by_unit.get(unit, "")) for unit in units)
     return f"-----Sources-----\n{_TABLE_HEADER}\n{rows}\n\n-----Draft answer-----\n{draft.strip()}\n"
@@ -125,6 +146,7 @@ def rewrite_global_answer(
     complete: Callable[[list[dict[str, str]]], str] | None = None,
     token_count: Callable[[str], int] | None = None,
     unit_vectors: dict[str, np.ndarray] | None = None,
+    manual_by_unit: dict[str, str] | None = None,
 ) -> tuple[str, list[dict[str, object]], dict[str, object]]:
     """Return the rewritten answer, the source rows the model saw, and a report.
 
@@ -164,9 +186,17 @@ def rewrite_global_answer(
             token_count = lambda text: len(model.tokenizer.encode(text))  # noqa: E731
     question_vector = None
     searched: list[str] = []
+    named: set[str] = set()
     if unit_vectors:
         question_vector = _normalized(np.asarray((embed or config_embedder(root_dir))([question])[0], dtype=np.float32))
-        searched = closest_units(question_vector, unit_vectors, GLOBAL_SEARCH_UNITS)
+        if manual_by_unit is None:
+            manual_by_unit = unit_manuals(output)
+        named = named_manuals(question, set(manual_by_unit.values()))
+        search_vectors = (
+            {unit: vector for unit, vector in unit_vectors.items() if manual_by_unit.get(unit) in named}
+            if named else unit_vectors
+        )
+        searched = closest_units(question_vector, search_vectors, GLOBAL_SEARCH_UNITS)
     community_candidates = set(candidates)
     candidates = list(dict.fromkeys([*candidates, *searched]))
     units = select_units(grounded, candidates, question_vector, unit_vectors, token_count, text_by_unit, short_id_by_unit)
@@ -184,6 +214,7 @@ def rewrite_global_answer(
         "grounded_units": sum(unit in grounded for unit in units),
         "added_units": sum(unit not in grounded for unit in units),
         "searched_units": sum(unit not in grounded and unit not in community_candidates for unit in units),
+        "searched_manuals": sorted(named),
         "cited_reports": len(cited),
     })
     if not rewritten:
