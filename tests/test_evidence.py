@@ -98,6 +98,25 @@ class EvidenceServiceTests(unittest.TestCase):
 
         self.assertEqual([item.text_unit_id for item in evidence], ["full-tu-2"])
 
+    def test_cited_global_reports_list_each_manual_with_pages(self) -> None:
+        context = {
+            "reports": [
+                {"id": "12", "title": "Brake fluid", "content": "Manuals: BR\n\nBleed",
+                 "manual_pages": {"BR.pdf": [3, 4], "BRC.pdf": [56]}},
+                {"id": "13", "title": "Old answer", "content": "No mapping"},
+            ]
+        }
+
+        evidence = EvidenceService(self.store).from_context("L33-SM3E", context)
+
+        self.assertEqual(
+            [(item.evidence_id, item.context_id, item.document_id, item.pages) for item in evidence],
+            [("E1", "12", "BR.pdf", (3, 4)), ("E2", "12", "BRC.pdf", (56,)), ("E3", "13", "GraphRAG Community Report", ())],
+        )
+        self.assertTrue(all(item.source_type == "community_report" for item in evidence))
+        self.assertEqual(evidence[0].section_path, "BR.pdf > Brake fluid")
+        self.assertIsNone(evidence[2].page)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1312,7 +1312,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         for item in evidence_values or []:
             if item.get("evidence_id") == evidence_id:
                 location = (
-                    f"第 {'、'.join(str(page) for page in (item.get('pages') or [item['page']]))} 頁"
+                    ("社群報告涵蓋" if item.get("source_type") == "community_report" else "")
+                    + f"第 {'、'.join(str(page) for page in (item.get('pages') or [item['page']]))} 頁"
                     if item.get("page") is not None
                     else "GraphRAG 社群報告（無單一 PDF 頁碼）"
                 )

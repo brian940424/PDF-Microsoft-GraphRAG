@@ -45,6 +45,46 @@ class GraphQueryWorkerTests(unittest.TestCase):
             self.assertEqual(set(values), set(required[name]))
             self.assertTrue(all(values[item] is frames[item] for item in required[name]))
 
+    def test_global_reports_name_manuals_and_context_keeps_only_cited_reports(self):
+        import json
+        import tempfile
+
+        import pandas as pd
+        from graphrag.cli import query as cli_query
+
+        frames = {
+            "entities": pd.DataFrame({"id": ["e"]}),
+            "communities": pd.DataFrame({"community": [1, 2], "text_unit_ids": [["tu-1"], ["tu-2"]]}),
+            "community_reports": pd.DataFrame({
+                "community": [1, 2], "full_content": ["# Brakes", "# Audio"], "summary": ["b", "a"],
+            }),
+        }
+        seen = {}
+
+        def run(**kwargs):
+            values = cli_query._resolve_output_files(config=None, output_list=list(frames))
+            seen["reports"] = values["community_reports"]
+            context = {"reports": pd.DataFrame([{"id": "1", "title": "Brakes"}, {"id": "2", "title": "Audio"}])}
+            return "Bleed the brakes [Data: Reports (1)].", context
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            output.mkdir()
+            rows = [
+                {"text_unit_id": "tu-1", "document_id": "BR.pdf", "page": 3},
+                {"text_unit_id": "tu-2", "document_id": "AV.pdf", "page": 9},
+            ]
+            (output / "source_metadata.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with patch.object(cli_query, "run_global_search", side_effect=run):
+                result = execute_graph_query({"root_dir": directory, "question": "q", "method": "global"}, frames)
+
+        self.assertEqual(seen["reports"]["full_content"][0], "Manuals: BR (pages 3)\n\n# Brakes")
+        self.assertEqual(frames["community_reports"]["full_content"][0], "# Brakes")
+        self.assertEqual(result["context"]["reports"], [
+            {"id": "1", "title": "Brakes", "manual_pages": {"BR.pdf": [3]}},
+        ])
+        self.assertEqual(result["context"]["reports_in_context_count"], 2)
+
     def test_routes_strategies_to_graph_rag_cli_functions(self):
         from graphrag.cli import query as cli_query
 
