@@ -31,6 +31,7 @@ from .evidence import Evidence, EvidenceService
 from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
+from .global_prefilter import prefilter_signature
 from .local_ranking import LOCAL_RANKING_VERSION, configure_local_context
 from .query_translation import document_language_sample, needs_rewrite
 from .strategy_routing import (
@@ -215,6 +216,11 @@ class QueryService:
         semantic_stats: dict[str, Any] = {"semantic_cache_hit": False, "semantic_cache_mode": "off", "semantic_embedding_calls": 0}
         semantic_match: dict[str, Any] | None = None
         semantic_vector: list[float] | None = None
+        # Strategies that may run Global (directly, via Auto routing or Agentic) depend on its report prefilter.
+        global_prefilter_scope = (
+            {} if normalized_method in REWRITTEN_QUERY_METHODS | {"drift"}
+            else {"global_report_prefilter": prefilter_signature()}
+        )
         if cache is not None:
             cache_key = cache.make_key({
                 "project_id": project_id,
@@ -228,6 +234,7 @@ class QueryService:
                     "settings_sha256": execution_metadata["settings_sha256"],
                     "answer_prompt_version": ANSWER_PROMPT_VERSION,
                     "local_ranking_version": LOCAL_RANKING_VERSION,
+                    **global_prefilter_scope,
                 },
                 "normalized_query": normalize_query(prompt),
             })
@@ -277,7 +284,7 @@ class QueryService:
                     "settings_sha256": execution_metadata["settings_sha256"],
                     "answer_prompt_version": ANSWER_PROMPT_VERSION,
                     "local_ranking_version": LOCAL_RANKING_VERSION,
-                    "strategy_params": {}, "portal_defaults": portal_defaults,
+                    "strategy_params": dict(global_prefilter_scope), "portal_defaults": portal_defaults,
                     "safety_filter_version": 1,
                 }
                 embed = self.semantic_embedder or (

@@ -146,10 +146,12 @@ _vector_cache: dict[tuple[str, int], dict[str, np.ndarray]] = {}
 
 
 def text_unit_vectors(lancedb_dir: Path, table: str = "text_unit_text") -> dict[str, np.ndarray]:
-    """Normalized text-unit vectors from the index's LanceDB store, cached per table version."""
+    """Normalized vectors by id from a table of the index's LanceDB store, cached per table version."""
     import lancedb
 
     path = Path(lancedb_dir) / f"{table}.lance"
+    if not path.is_dir():
+        return {}
     stamp = max((item.stat().st_mtime_ns for item in path.rglob("*") if item.is_file()), default=0)
     key = (str(path.resolve()), stamp)
     with _vector_lock:
@@ -162,7 +164,9 @@ def text_unit_vectors(lancedb_dir: Path, table: str = "text_unit_text") -> dict[
         for row in rows if row.get("vector") is not None
     }
     with _vector_lock:
-        _vector_cache.clear()
+        # One version per table: Global keeps both report and text-unit vectors loaded.
+        for stale in [item for item in _vector_cache if item[0] == key[0]]:
+            del _vector_cache[stale]
         _vector_cache[key] = vectors
     return vectors
 

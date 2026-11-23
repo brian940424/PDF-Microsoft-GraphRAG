@@ -13,6 +13,7 @@ from typing import Any
 
 from .answer_extraction import install_two_stage_basic, reset_two_stage_basic
 from .cross_references import capture_basic_retrieval, follow_references, reset_capture_basic_retrieval
+from .global_prefilter import DEFAULT_GLOBAL_REPORT_TOP_N, prefilter_reports
 from .global_reports import community_manual_pages, keep_cited_reports, label_reports
 from .global_sources import ground_global_answer
 from .llm_usage import install_litellm_recorder
@@ -108,8 +109,10 @@ def _execute_graph_query(
     global_communities: Any = None
     global_sources: list[dict[str, Any]] = []
     grounding_report: dict[str, Any] = {}
+    prefilter_report: dict[str, Any] = {}
     if method == "global":
         active_resolver = cli_query._resolve_output_files
+        report_top_n = int(payload.get("global_report_top_n", DEFAULT_GLOBAL_REPORT_TOP_N))
 
         def resolve_labelled_reports(config, output_list, optional_list=None):
             # Name the manuals in each report so Global can answer "which manuals" (F-70).
@@ -117,6 +120,17 @@ def _execute_graph_query(
             result = dict(active_resolver(config, output_list, optional_list))
             reports, communities = result.get("community_reports"), result.get("communities")
             global_communities = communities
+            if reports is not None and not dynamic_community_selection:
+                # Map only the reports closest to the question (P-05); dynamic selection walks
+                # the report hierarchy itself and needs every report.
+                try:
+                    reports, report = prefilter_reports(
+                        reports, question, root_dir, report_top_n, community_level,
+                    )
+                except Exception as exc:  # the prefilter must never block an answer
+                    report = {"applied": False, "error": str(exc)}
+                prefilter_report.update(report)
+                result["community_reports"] = reports
             if reports is not None and communities is not None:
                 try:
                     output_dir = root_dir / "output"
@@ -216,6 +230,8 @@ def _execute_graph_query(
             serialized["sources"] = global_sources
         if grounding_report:
             serialized["source_grounding"] = grounding_report
+        if prefilter_report:
+            serialized["report_prefilter"] = prefilter_report
     if variant_report and isinstance(serialized, dict):
         serialized["variant_selection"] = variant_report
     if cross_reference_report and isinstance(serialized, dict):
