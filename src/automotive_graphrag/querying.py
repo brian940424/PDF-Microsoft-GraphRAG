@@ -32,6 +32,7 @@ from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, ta
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
 from .global_prefilter import prefilter_signature
+from .global_rewrite import GLOBAL_SOURCE_REWRITE_VERSION
 from .local_ranking import LOCAL_RANKING_VERSION, configure_local_context
 from .query_translation import document_language_sample, needs_rewrite
 from .strategy_routing import (
@@ -216,10 +217,11 @@ class QueryService:
         semantic_stats: dict[str, Any] = {"semantic_cache_hit": False, "semantic_cache_mode": "off", "semantic_embedding_calls": 0}
         semantic_match: dict[str, Any] | None = None
         semantic_vector: list[float] | None = None
-        # Strategies that may run Global (directly, via Auto routing or Agentic) depend on its report prefilter.
+        # Strategies that may run Global (directly, via Auto routing or Agentic) depend on its report
+        # prefilter and source rewrite.
         global_prefilter_scope = (
             {} if normalized_method in REWRITTEN_QUERY_METHODS | {"drift"}
-            else {"global_report_prefilter": prefilter_signature()}
+            else {"global_report_prefilter": prefilter_signature(), "global_source_rewrite": GLOBAL_SOURCE_REWRITE_VERSION}
         )
         if cache is not None:
             cache_key = cache.make_key({

@@ -14,6 +14,7 @@ from typing import Any
 from .answer_extraction import install_two_stage_basic, reset_two_stage_basic
 from .cross_references import capture_basic_retrieval, follow_references, reset_capture_basic_retrieval
 from .global_prefilter import DEFAULT_GLOBAL_REPORT_TOP_N, prefilter_reports
+from .global_rewrite import rewrite_global_answer
 from .global_reports import community_manual_pages, keep_cited_reports, label_reports
 from .global_sources import ground_global_answer
 from .llm_usage import install_litellm_recorder
@@ -110,6 +111,7 @@ def _execute_graph_query(
     global_sources: list[dict[str, Any]] = []
     grounding_report: dict[str, Any] = {}
     prefilter_report: dict[str, Any] = {}
+    rewrite_report: dict[str, Any] = {}
     if method == "global":
         active_resolver = cli_query._resolve_output_files
         report_top_n = int(payload.get("global_report_top_n", DEFAULT_GLOBAL_REPORT_TOP_N))
@@ -171,6 +173,23 @@ def _execute_graph_query(
                     )
                 except Exception as exc:  # grounding must never block an answer
                     grounding_report = {"error": str(exc)}
+                if bool(payload.get("global_source_rewrite", True)) and "error" not in grounding_report:
+                    # Rewrite the summary-based answer from the cited passages (F-70 step 4).
+                    try:
+                        rewritten, rewrite_sources, rewrite_report = rewrite_global_answer(
+                            question, str(answer), [str(item["id"]) for item in global_sources],
+                            global_communities, root_dir, response_type,
+                            preloaded_dataframes.get("text_units") if preloaded_dataframes is not None else None,
+                        )
+                    except Exception as exc:  # the rewrite must never block an answer
+                        rewrite_report = {"applied": False, "error": str(exc)}
+                    else:
+                        if rewrite_report.get("applied"):
+                            seen = {str(item["id"]) for item in rewrite_sources}
+                            answer = rewritten
+                            global_sources = [
+                                *rewrite_sources, *(item for item in global_sources if str(item["id"]) not in seen),
+                            ]
         elif method == "drift":
             from .drift_compat import run_drift_search
 
@@ -232,6 +251,8 @@ def _execute_graph_query(
             serialized["source_grounding"] = grounding_report
         if prefilter_report:
             serialized["report_prefilter"] = prefilter_report
+        if rewrite_report:
+            serialized["source_rewrite"] = rewrite_report
     if variant_report and isinstance(serialized, dict):
         serialized["variant_selection"] = variant_report
     if cross_reference_report and isinstance(serialized, dict):
