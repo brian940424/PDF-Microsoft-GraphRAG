@@ -5025,8 +5025,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
                         label="回答格式",
                     )
-                autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
                 autoqa_bypass_cache = gr.Checkbox(label="略過查詢快取（強制重跑）", value=False)
+                autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
                 autoqa_answer_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_answer"][1], variant="stop", visible=False)
                 autoqa_answer_progress = gr.HTML(label="檢索與回答進度", visible=False)
                 autoqa_answer_model.input(
