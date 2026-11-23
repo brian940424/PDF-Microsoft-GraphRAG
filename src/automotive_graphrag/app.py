@@ -112,6 +112,11 @@ def display_time(value: object, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     return moment.astimezone(DISPLAY_TIMEZONE).strftime(fmt)
 
 
+def finished_stamp() -> str:
+    """Suffix marking when a long job ended, so a status message left on screen shows its age."""
+    return f"（完成時間 {datetime.now(DISPLAY_TIMEZONE):%Y-%m-%d %H:%M:%S}）"
+
+
 def project_table_rows(store: ProjectStore) -> list[list[str | int]]:
     """Project table rows with the update time shown in Taiwan time."""
     return [[*row[:-1], display_time(row[-1])] for row in store.table_rows()]
@@ -1524,7 +1529,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             choices=[(item.question_id, item.question_id) for item in result.items],
             value=result.items[0].question_id if result.items else None,
         )
-        return "✅ Retrieval 評估完成", summary, rows, selector, item_values
+        return "✅ Retrieval 評估完成" + finished_stamp(), summary, rows, selector, item_values
 
     def retrieval_item_detail(question_id: str | None, items: list[dict[str, object]]):
         for item in items or []:
@@ -1577,7 +1582,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f"模型 `{judge_model_label(result.model)}`｜Prompt `{result.prompt_version}`｜題數 {result.question_count}｜"
             f"平均分數 {_score_percent(result.average_score or 0)}"
         )
-        return "✅ 自動評測完成（LLM Judge 結果仍需人工抽查）", summary, rows, selector, values
+        return "✅ 自動評測完成（LLM Judge 結果仍需人工抽查）" + finished_stamp(), summary, rows, selector, values
 
     def automatic_evaluation_detail(question_id: str | None, items: list[dict[str, object]]):
         return next((item for item in items or [] if item.get("question_id") == question_id), {})
@@ -2790,6 +2795,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             message = f"🛑 已停止：完成 {len(run.results)} / {len(groups) * run.question_count} 筆，已保存部分答案。"
         else:
             message = f"⚠️ 答案生成部分完成：{len(run.results)}/{len(groups) * run.question_count} 筆；請檢查失敗項目並重試。"
+        message += finished_stamp()
         progress_status = {
             "answers_completed": "答案生成完成",
             "stopped": "已停止",
@@ -2878,6 +2884,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             message = f"🛑 已停止：完成 {evaluated} / {len(run.results)} 筆，已保存完成的評測。"
         else:
             message = f"✅ 評測完成：{evaluated}/{len(run.results)} 筆{evaluation_label}。"
+        message += finished_stamp()
         yield (
             *experiment_view(project_id, message),
             experiment_progress_update(evaluated, len(run.results), "已停止" if run.status == "stopped" else "評測完成"),
@@ -3059,6 +3066,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             status = f"✅ 檢索並生成回答完成：{completed}/{len(report.question_set.questions)} 題。現在可以評測。"
         else:
             status = f"⚠️ 回答生成尚未全部完成：{completed}/{len(report.question_set.questions)} 題；請確認失敗題目後重試。"
+        status += finished_stamp()
         total = len(report.question_set.questions)
         yield (
             status,
@@ -3119,6 +3127,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         total = len(report.question_set.questions)
         if stopped:
             status = f"🛑 已停止：完成 {judged} / {total} 題；未評的題目維持「待評測」，Retrieval 指標未計算。"
+        status += finished_stamp()
         yield (
             status, automatic_qa_summary(report),
             autoqa_rows_update(automatic_qa_result_rows(report.question_set, report.judge, report.judge_error)),
