@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 # v10 was used and reverted before; skip it so its cached answers are not reused.
-ANSWER_PROMPT_VERSION = "answer-requirements-v11"
+# v12: Global answers carry grounded "Sources (…)" citations (F-70), so cached v11 answers are stale.
+ANSWER_PROMPT_VERSION = "answer-requirements-v12"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 

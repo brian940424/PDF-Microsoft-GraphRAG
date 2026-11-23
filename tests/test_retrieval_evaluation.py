@@ -30,6 +30,8 @@ def evidence(rank: int, chunk_id: str, document_id: str = "WW.pdf", page: int = 
 
 
 class EvaluationQueryRunner:
+    global_grounded = False
+
     def ask(self, project_id: str, question: str, method: str = "local", source: str | None = None) -> QueryResult:
         evidence_by_question = {
             "問題一": (
@@ -40,6 +42,9 @@ class EvaluationQueryRunner:
             "問題三": (evidence(1, "irrelevant-q3", page=11),),
         }
         now = datetime.now(timezone.utc).isoformat()
+        found = evidence_by_question[question]
+        if method == "global" and not self.global_grounded:
+            found = tuple(replace(item, source_type="community_report") for item in found)
         return QueryResult(
             query_id=f"query-{question}",
             project_id=project_id,
@@ -51,7 +56,7 @@ class EvaluationQueryRunner:
             started_at=now,
             completed_at=now,
             duration_seconds=0.2,
-            evidence=evidence_by_question[question],
+            evidence=found,
         )
 
 
@@ -248,6 +253,16 @@ class RetrievalEvaluationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(result.evidence_hit_rate, 0.5)
         self.assertEqual([item.evidence_hit for item in result.items], [True, None, False])
         self.assertIn("2/3", result.retrieval_metrics_status)
+
+    def test_global_metrics_use_grounded_text_units(self) -> None:
+        self.question_sets.query_service.global_grounded = True
+
+        result = self.service.evaluate(
+            "L33-SM3E", self.question_set.question_set_id, method="global", rerun_queries=True
+        )
+
+        self.assertIsNotNone(result.evidence_hit_rate)
+        self.assertIn("Global 依回答句子", result.retrieval_metrics_status)
 
     def test_global_metrics_remain_unavailable_for_unmapped_community_reports(self) -> None:
         result = self.service.evaluate(

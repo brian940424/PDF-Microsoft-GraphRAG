@@ -14,6 +14,7 @@ from typing import Any
 from .answer_extraction import install_two_stage_basic, reset_two_stage_basic
 from .cross_references import capture_basic_retrieval, follow_references, reset_capture_basic_retrieval
 from .global_reports import community_manual_pages, keep_cited_reports, label_reports
+from .global_sources import ground_global_answer
 from .llm_usage import install_litellm_recorder
 from .local_ranking import install_local_ranking, reset_local_ranking, text_unit_similarity
 from .variants import select_basic_context
@@ -104,14 +105,18 @@ def _execute_graph_query(
 
         cli_query._resolve_output_files = resolve_cached_output_files
     manual_pages: dict[str, dict[str, tuple[int, ...]]] | None = None
+    global_communities: Any = None
+    global_sources: list[dict[str, Any]] = []
+    grounding_report: dict[str, Any] = {}
     if method == "global":
         active_resolver = cli_query._resolve_output_files
 
         def resolve_labelled_reports(config, output_list, optional_list=None):
             # Name the manuals in each report so Global can answer "which manuals" (F-70).
-            nonlocal manual_pages
+            nonlocal manual_pages, global_communities
             result = dict(active_resolver(config, output_list, optional_list))
             reports, communities = result.get("community_reports"), result.get("communities")
+            global_communities = communities
             if reports is not None and communities is not None:
                 try:
                     output_dir = root_dir / "output"
@@ -143,6 +148,15 @@ def _execute_graph_query(
                 dynamic_community_selection=dynamic_community_selection,
                 **common,
             )
+            if global_communities is not None:
+                # Point each cited statement at the closest passages of its reports (F-70).
+                try:
+                    answer, global_sources, grounding_report = ground_global_answer(
+                        str(answer), global_communities, root_dir,
+                        preloaded_dataframes.get("text_units") if preloaded_dataframes is not None else None,
+                    )
+                except Exception as exc:  # grounding must never block an answer
+                    grounding_report = {"error": str(exc)}
         elif method == "drift":
             from .drift_compat import run_drift_search
 
@@ -198,6 +212,10 @@ def _execute_graph_query(
     serialized = QueryService._serialize_context(context)
     if method == "global" and isinstance(serialized, dict):
         serialized = keep_cited_reports(serialized, str(answer), manual_pages)
+        if global_sources:
+            serialized["sources"] = global_sources
+        if grounding_report:
+            serialized["source_grounding"] = grounding_report
     if variant_report and isinstance(serialized, dict):
         serialized["variant_selection"] = variant_report
     if cross_reference_report and isinstance(serialized, dict):
