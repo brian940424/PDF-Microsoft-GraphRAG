@@ -50,7 +50,7 @@ from .documents import (
 from .downloads import stage_downloads
 from .evidence import Evidence, evidence_page_label
 from .ground_truth import GroundTruthService
-from .indexing import IndexingService, parse_indexing_progress
+from .indexing import IndexingService, condense_indexing_log, parse_indexing_progress
 from .evaluation.source_scoring import cited_sources, strip_citations
 from .project_archive import export_project as build_project_archive
 from .project_archive import import_project as restore_project_archive
@@ -110,6 +110,11 @@ def display_time(value: object, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(DISPLAY_TIMEZONE).strftime(fmt)
+
+
+def finished_stamp() -> str:
+    """Suffix marking when a long job ended, so a status message left on screen shows its age."""
+    return f"（完成時間 {datetime.now(DISPLAY_TIMEZONE):%Y-%m-%d %H:%M:%S}）"
 
 
 def project_table_rows(store: ProjectStore) -> list[list[str | int]]:
@@ -1312,7 +1317,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         for item in evidence_values or []:
             if item.get("evidence_id") == evidence_id:
                 location = (
-                    f"第 {'、'.join(str(page) for page in (item.get('pages') or [item['page']]))} 頁"
+                    ("社群報告涵蓋" if item.get("source_type") == "community_report" else "")
+                    + f"第 {'、'.join(str(page) for page in (item.get('pages') or [item['page']]))} 頁"
                     if item.get("page") is not None
                     else "GraphRAG 社群報告（無單一 PDF 頁碼）"
                 )
@@ -1523,7 +1529,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             choices=[(item.question_id, item.question_id) for item in result.items],
             value=result.items[0].question_id if result.items else None,
         )
-        return "✅ Retrieval 評估完成", summary, rows, selector, item_values
+        return "✅ Retrieval 評估完成" + finished_stamp(), summary, rows, selector, item_values
 
     def retrieval_item_detail(question_id: str | None, items: list[dict[str, object]]):
         for item in items or []:
@@ -1576,7 +1582,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             f"模型 `{judge_model_label(result.model)}`｜Prompt `{result.prompt_version}`｜題數 {result.question_count}｜"
             f"平均分數 {_score_percent(result.average_score or 0)}"
         )
-        return "✅ 自動評測完成（LLM Judge 結果仍需人工抽查）", summary, rows, selector, values
+        return "✅ 自動評測完成（LLM Judge 結果仍需人工抽查）" + finished_stamp(), summary, rows, selector, values
 
     def automatic_evaluation_detail(question_id: str | None, items: list[dict[str, object]]):
         return next((item for item in items or [] if item.get("question_id") == question_id), {})
@@ -2789,6 +2795,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             message = f"🛑 已停止：完成 {len(run.results)} / {len(groups) * run.question_count} 筆，已保存部分答案。"
         else:
             message = f"⚠️ 答案生成部分完成：{len(run.results)}/{len(groups) * run.question_count} 筆；請檢查失敗項目並重試。"
+        message += finished_stamp()
         progress_status = {
             "answers_completed": "答案生成完成",
             "stopped": "已停止",
@@ -2877,6 +2884,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             message = f"🛑 已停止：完成 {evaluated} / {len(run.results)} 筆，已保存完成的評測。"
         else:
             message = f"✅ 評測完成：{evaluated}/{len(run.results)} 筆{evaluation_label}。"
+        message += finished_stamp()
         yield (
             *experiment_view(project_id, message),
             experiment_progress_update(evaluated, len(run.results), "已停止" if run.status == "stopped" else "評測完成"),
@@ -3058,6 +3066,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             status = f"✅ 檢索並生成回答完成：{completed}/{len(report.question_set.questions)} 題。現在可以評測。"
         else:
             status = f"⚠️ 回答生成尚未全部完成：{completed}/{len(report.question_set.questions)} 題；請確認失敗題目後重試。"
+        status += finished_stamp()
         total = len(report.question_set.questions)
         yield (
             status,
@@ -3118,6 +3127,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         total = len(report.question_set.questions)
         if stopped:
             status = f"🛑 已停止：完成 {judged} / {total} 題；未評的題目維持「待評測」，Retrieval 指標未計算。"
+        status += finished_stamp()
         yield (
             status, automatic_qa_summary(report),
             autoqa_rows_update(automatic_qa_result_rows(report.question_set, report.judge, report.judge_error)),
@@ -3416,7 +3426,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
 
     def clear_project_query_cache(project_id: str | None):
         if not project_id:
-            return "❌ 請先開啟專案", project_cache_status(None)
+            return "❌ 請先選擇專案", project_cache_status(None)
         try:
             count = QueryResultCache(store.path_for(project_id)).clear()
             released = GraphIndexManager.instance().clear(project_id)
@@ -3528,6 +3538,14 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
         if mode == "serving" and (config is None or not config["calibrated"]):
             return f"✅ 已設定 {project_id} 為 serving；但校準 threshold／margin 尚未設定或無效，系統會安全停用語意查找。"
         return f"✅ 已儲存專案 {project_id} 的語意快取模式：{mode}"
+
+    def save_portal_defaults_and_semantic_mode(project_id, method, chat_model, reasoning_effort, response_type,
+                                               semantic_mode):
+        if not selected_project_id(project_id):
+            return "❌ 請先選擇專案"
+        defaults_message = save_portal_defaults(project_id, method, chat_model, reasoning_effort, response_type)
+        semantic_message = save_semantic_mode(project_id, semantic_mode)
+        return f"{defaults_message}  \n{semantic_message}"
 
     def update_project_enabled(project_id: str | None, enabled: bool):
         project_id = selected_project_id(project_id)
@@ -4339,30 +4357,43 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             progress = task_progress_markup(0, "前處理中", "準備開啟 PDF…")
             yield preprocessing, "", progress
         else:
-            yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）", log, index_progress(log)
+            yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）", "", index_progress(log)
+        # The UI gets the condensed log, and only when an update differs from the last one sent:
+        # resending the whole verbose log every 0.25 s froze the browser (SM3E: 1.6 MB).
+        last_sent: tuple[str, str, str] | None = None
         while worker.is_alive() or not events.empty():
             try:
-                kind, value = events.get(timeout=0.25)
+                pending_events = [events.get(timeout=0.25)]
             except queue.Empty:
-                if outcome["phase"] == "index":
-                    yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
-                continue
-            if kind == "preprocess":
-                done, total, name = value
-                progress = task_progress_markup(done / total if total else 0, "前處理中", f"{name}｜已處理 {done} / {total} 頁")
-                yield preprocessing, "", progress
-            elif kind == "log":
-                log += str(value)
-                yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
-            else:
-                yield f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}", log, index_progress(log)
+                pending_events = []
+            while True:
+                try:
+                    pending_events.append(events.get_nowait())
+                except queue.Empty:
+                    break
+            update: tuple[str, str, str] | None = None
+            for kind, value in pending_events:
+                if kind == "preprocess":
+                    done, total, name = value
+                    progress = task_progress_markup(done / total if total else 0, "前處理中", f"{name}｜已處理 {done} / {total} 頁")
+                    update = (preprocessing, "", progress)
+                elif kind == "log":
+                    log += str(value)
+            if outcome["phase"] == "index":
+                update = (
+                    f"⏳ GraphRAG 建圖執行中…（模型：{model_label}）{excluded_note()}",
+                    condense_indexing_log(log), index_progress(log),
+                )
+            if update is not None and update != last_sent:
+                last_sent = update
+                yield update
         worker.join()
         if "error" in outcome:
             error = outcome["error"]
             if outcome["phase"] == "preprocess":
                 yield f"❌ 前處理失敗：{error}", "", progress
             else:
-                yield f"❌ {error}", log, index_progress(log, "建圖失敗")
+                yield f"❌ {error}", condense_indexing_log(log), index_progress(log, "建圖失敗")
             return
         if "preprocess_report" in outcome:
             report = outcome["preprocess_report"]
@@ -4373,7 +4404,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             state = parse_indexing_progress(log)
             yield (
                 f"🛑 已停止：完成 {state.completed_workflows} / {state.total_workflows} 個 workflow｜{result.last_message}",
-                log,
+                condense_indexing_log(log),
                 index_progress(log, "已停止"),
             )
             return
@@ -4387,7 +4418,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             if result.status == "INDEXED"
             else index_progress(log, "建圖失敗")
         )
-        yield summary, log, final_progress
+        yield summary, condense_indexing_log(log), final_progress
 
     def preprocess_hiding_review(*args, **kwargs):
         """Hide the page review while preprocessing rewrites the pages it shows."""
@@ -4492,51 +4523,57 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                     project_export_file = gr.File(label="專案匯出檔", visible=False, interactive=False)
                     # 由刪除按鈕的確認對話框寫入，不顯示於畫面
                     delete_confirmation = gr.Checkbox(visible=False)
-                open_project_result = gr.Markdown()
-                project_activation_result = gr.Markdown()
+                open_project_result = gr.Markdown(elem_classes="collapse-when-empty")
+                project_activation_result = gr.Markdown(elem_classes="collapse-when-empty")
 
-            with gr.Accordion("前台使用者預設查詢設定（依專案）", open=False, elem_classes=["bold-title"]):
+            # 開啟專案後才顯示，且只在下拉選單選的就是已開啟專案時顯示
+            with gr.Accordion(
+                "前台使用者預設查詢設定（依專案）", open=False, visible=False, elem_classes=["bold-title"]
+            ) as portal_defaults_section:
                 gr.Markdown(
-                    "先在上方選擇專案，再調整其前台預設值。設定會套用到一般使用者入口選取此專案後的新查詢。"
+                    "調整目前開啟專案的前台預設值。設定會套用到一般使用者入口選取此專案後的新查詢。"
                     "模型可選擇沿用全域預設；若要讓前台與管理後台共用回答快取，請讓策略、模型、推理深度與回答格式一致。"
                 )
-                with gr.Row():
-                    portal_default_method = gr.Dropdown(
-                        choices=STANDARD_QUERY_METHOD_CHOICES,
-                        value="local",
-                        label="預設搜尋策略",
-                    )
-                    portal_default_chat_model = gr.Dropdown(
-                        choices=portal_default_model_choices(),
-                        value="",
-                        label="預設回答模型",
-                    )
-                with gr.Row():
-                    portal_default_reasoning_effort = gr.Dropdown(
-                        choices=REASONING_EFFORT_CHOICES,
-                        value=DEFAULT_REASONING_EFFORT,
-                        label="預設推理深度",
-                        info="僅支援推理深度的模型會使用此設定。",
-                    )
-                    portal_default_response_type = gr.Dropdown(
-                        choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
-                        value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
-                        label="預設回答格式",
-                    )
-                with gr.Row():
-                    save_portal_defaults_button = gr.Button("儲存前台預設設定", variant="primary")
-                    portal_defaults_result = gr.Markdown()
-                gr.Markdown("### 語意快取（預設關閉）")
-                gr.Markdown("Shadow 會呼叫 Embedding API 記錄候選，但仍執行全新查詢；Serving 僅在全域開關及校準門檻有效時回傳相似問題的完整結果。")
-                with gr.Row():
+
+                with gr.Group():
+                    with gr.Row():
+                        portal_default_method = gr.Dropdown(
+                            choices=STANDARD_QUERY_METHOD_CHOICES,
+                            value="local",
+                            label="預設搜尋策略",
+                        )
+                        portal_default_chat_model = gr.Dropdown(
+                            choices=portal_default_model_choices(),
+                            value="",
+                            label="預設回答模型",
+                        )
+                        portal_default_reasoning_effort = gr.Dropdown(
+                            choices=REASONING_EFFORT_CHOICES,
+                            value=DEFAULT_REASONING_EFFORT,
+                            label="預設推理深度（僅支援推理深度的模型）",
+                        )
+                        portal_default_response_type = gr.Dropdown(
+                            choices=list(EXPERIMENT_RESPONSE_TYPE_OPTIONS),
+                            value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
+                            label="預設回答格式",
+                        )
                     semantic_cache_mode = gr.Dropdown(
-                        choices=[("關閉", "off"), ("觀察（Shadow）", "shadow"), ("服務（Serving）", "serving")],
-                        value="off", label="本專案語意快取模式",
-                    )
-                    save_semantic_cache_mode_button = gr.Button("儲存語意快取模式")
-                semantic_cache_mode_result = gr.Markdown()
-                semantic_cache_status = gr.Markdown("語意快取：尚未選擇專案")
-                refresh_semantic_cache_status_button = gr.Button("重新整理語意快取狀態", size="sm")
+                            choices=[("關閉", "off"), ("觀察（Shadow）", "shadow"), ("服務（Serving）", "serving")],
+                            value="off", label="本專案語意快取模式（預設關閉）",
+                            info="Shadow 會呼叫 Embedding API 記錄候選，但仍執行全新查詢；Serving 僅在全域開關及校準門檻有效時回傳相似問題的完整結果。"
+                        )
+                    with gr.Row(elem_classes="button-row"):
+                        save_portal_defaults_button = gr.Button(
+                            "儲存前台預設設定", variant="primary", elem_classes="rounded-button"
+                        )
+                        refresh_semantic_cache_status_button = gr.Button(
+                            "重新整理快取狀態", elem_classes="rounded-button"
+                        )
+                        clear_project_query_cache_button = gr.Button("清除本專案快取", elem_classes="rounded-button")
+                portal_defaults_result = gr.Markdown(elem_classes="collapse-when-empty")
+                project_query_cache_action_status = gr.Markdown(elem_classes="collapse-when-empty")
+                project_query_cache_status = gr.Markdown("查詢快取：尚未選擇專案")
+                semantic_cache_status = gr.Markdown("⚠️ 語意快取：尚未選擇專案")
 
             with gr.Group(visible=False) as new_project_group:
                 with gr.Accordion("建立新專案", open=True, elem_classes=["static-section", "bold-title"]):
@@ -4571,7 +4608,7 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                                 "匯入專案", variant="primary", interactive=False, elem_classes="rounded-button"
                             )
             # 建立、匯入與刪除專案的結果
-            result = gr.Markdown()
+            result = gr.Markdown(elem_classes="collapse-when-empty")
 
             with gr.Accordion("專案清單", open=True, elem_classes=["static-section", "bold-title"]):
                 project_table = gr.Dataframe(
@@ -4692,10 +4729,6 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                 index_stop_button = gr.Button(JOB_BUTTON_LABELS["index"][1], variant="stop", visible=False)
                 document_refresh_button = gr.Button("重新整理")
                 remove_pdf_button = gr.Button("刪除所選 PDF", variant="stop")
-            with gr.Row():
-                clear_project_query_cache_button = gr.Button("清除本專案快取", size="sm")
-                project_query_cache_status = gr.Markdown("圖譜尚未載入記憶體｜本專案查詢快取：0 筆")
-                project_query_cache_action_status = gr.Markdown()
             # 由刪除按鈕的確認對話框寫入，不顯示於畫面
             remove_pdf_confirmation = gr.Checkbox(visible=False)
             
@@ -4823,9 +4856,9 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         inputs=[query_chat_model, query_method],
                         outputs=[query_chat_model, query_method],
                     )
+                    query_bypass_cache = gr.Checkbox(label="略過快取重新生成", value=False)
                     with gr.Row():
                         ask_button = gr.Button("送出問題", variant="primary")
-                        query_bypass_cache = gr.Checkbox(label="略過快取重新生成", value=False)
                         clear_question_button = gr.Button("清除")
                 with gr.Column():
                     query_answer = gr.Textbox(
@@ -5001,8 +5034,8 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                         value=DEFAULT_EXPERIMENT_RESPONSE_TYPE,
                         label="回答格式",
                     )
-                autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
                 autoqa_bypass_cache = gr.Checkbox(label="略過查詢快取（強制重跑）", value=False)
+                autoqa_answer_button = gr.Button("檢索並生成回答", variant="primary")
                 autoqa_answer_stop_button = gr.Button(JOB_BUTTON_LABELS["qa_answer"][1], variant="stop", visible=False)
                 autoqa_answer_progress = gr.HTML(label="檢索與回答進度", visible=False)
                 autoqa_answer_model.input(
@@ -5713,21 +5746,29 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
                      portal_default_reasoning_effort, portal_default_response_type],
         )
         selected_project.change(semantic_mode_view, inputs=selected_project, outputs=semantic_cache_mode)
+        for portal_section_trigger in (selected_project.change, active_project_id.change):
+            portal_section_trigger(
+                lambda selected, active: gr.update(
+                    visible=bool(active) and selected_project_id(selected) == active
+                ),
+                inputs=[selected_project, active_project_id],
+                outputs=portal_defaults_section,
+                show_progress="hidden",
+            )
         selected_project.change(semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status)
         refresh_semantic_cache_status_button.click(
             semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
-        )
-        save_semantic_cache_mode_button.click(
-            save_semantic_mode, inputs=[selected_project, semantic_cache_mode], outputs=semantic_cache_mode_result,
-        )
-        save_semantic_cache_mode_button.click(
-            semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
+        ).then(
+            lambda project_id: project_cache_status(selected_project_id(project_id)),
+            inputs=selected_project, outputs=project_query_cache_status, show_progress="hidden",
         )
         save_portal_defaults_button.click(
-            save_portal_defaults,
+            save_portal_defaults_and_semantic_mode,
             inputs=[selected_project, portal_default_method, portal_default_chat_model,
-                    portal_default_reasoning_effort, portal_default_response_type],
+                    portal_default_reasoning_effort, portal_default_response_type, semantic_cache_mode],
             outputs=portal_defaults_result,
+        ).then(
+            semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
         )
         export_project_button.click(
             None,
@@ -5957,14 +5998,16 @@ def create_app(project_root: str | Path | None = None) -> gr.Blocks:
             processing_section_update, inputs=[document_project, target_documents], outputs=processing_options_section
         ).then(**review_mode_event)
         clear_project_query_cache_button.click(
-            clear_project_query_cache,
-            inputs=active_project_id,
+            lambda project_id: clear_project_query_cache(selected_project_id(project_id)),
+            inputs=selected_project,
             outputs=[project_query_cache_action_status, project_query_cache_status],
             show_progress="hidden",
+        ).then(
+            semantic_cache_status_view, inputs=selected_project, outputs=semantic_cache_status,
         )
-        active_project_id.change(
-            project_cache_status,
-            inputs=active_project_id,
+        selected_project.change(
+            lambda project_id: project_cache_status(selected_project_id(project_id)),
+            inputs=selected_project,
             outputs=project_query_cache_status,
             show_progress="hidden",
         )

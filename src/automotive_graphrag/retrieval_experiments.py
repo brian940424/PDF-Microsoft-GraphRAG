@@ -59,9 +59,13 @@ from .semantic_query_cache import (
     scope_hash as semantic_scope_hash, semantic_config,
 )
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
+from .global_prefilter import DEFAULT_GLOBAL_REPORT_TOP_N, GLOBAL_REPORT_PREFILTER_VERSION
+from .global_rewrite import GLOBAL_SOURCE_REWRITE_VERSION
+from .local_ranking import LOCAL_RANKING_VERSION
 from .llm_usage import ANSWER_CHECK_STAGE, SEARCH_STAGE, aggregate_cost, query_cost_summary, tag_calls, usage_metadata
 from .strategy_routing import (
-    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
+    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, question_identifiers,
+    search_with_fallback,
 )
 
 
@@ -95,6 +99,8 @@ EXPERIMENT_STRATEGY_PARAMETER_SPECS = {
     "global": (
         ("community_level", "Community 層級", "int", 2, 0, 10),
         ("dynamic_community_selection", "啟用動態社群選擇", "bool", False, None, None),
+        ("global_report_top_n", "預篩社群報告數（0 為不預篩）", "int", DEFAULT_GLOBAL_REPORT_TOP_N, 0, 5000),
+        ("global_source_rewrite", "以原文段落二次作答", "bool", True, None, None),
         ("max_context_tokens", "最大上下文 Token", "int", 12000, 100, 100000),
         ("data_max_tokens", "Map 階段資料 Token 上限", "int", 12000, 100, 100000),
         ("map_max_length", "Map 回答長度上限（字）", "int", 1000, 100, 10000),
@@ -1452,7 +1458,9 @@ class RetrievalExperimentService:
 
                 decision = self.router.route(question.question, group.answer_model, api_base, api_key, effort)
                 llm_calls.extend(getattr(decision, "llm_calls", ()))
-                fallback = search_with_fallback(decision, search_and_track, check)
+                fallback = search_with_fallback(
+                    decision, search_and_track, check, named_terms=question_identifiers(question.question),
+                )
                 method = routed_method = fallback.method
                 routing_reason = fallback.reason
                 execution_trace = {"strategy_attempts": list(fallback.attempts)}
@@ -1980,9 +1988,11 @@ class RetrievalExperimentService:
             "embedding_model": self.connections.get_embedding_model(),
             "strategy_params": {
                 **selected_parameters,
+                **({"global_report_prefilter_version": GLOBAL_REPORT_PREFILTER_VERSION, "global_source_rewrite_version": GLOBAL_SOURCE_REWRITE_VERSION} if method == "global" else {}),
                 "response_type": response_type,
                 "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
                 "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                "local_ranking_version": LOCAL_RANKING_VERSION,
                 "settings_sha256": hashlib.sha256(
                     json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
                 ).hexdigest(),
@@ -2022,7 +2032,11 @@ class RetrievalExperimentService:
                 "reasoning_effort": self.connections.reasoning_effort_for(model, reasoning_effort),
                 "settings_sha256": hashlib.sha256(json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest(),
                 "answer_prompt_version": ANSWER_PROMPT_VERSION,
-                "strategy_params": selected_parameters,
+                "local_ranking_version": LOCAL_RANKING_VERSION,
+                "strategy_params": {
+                    **selected_parameters,
+                    **({"global_report_prefilter_version": GLOBAL_REPORT_PREFILTER_VERSION, "global_source_rewrite_version": GLOBAL_SOURCE_REWRITE_VERSION} if method == "global" else {}),
+                },
                 "portal_defaults": self.projects.get_portal_defaults(project_id), "safety_filter_version": 1,
             }
             embed = lambda text, selected_model, pid: proxy_embedding(text, selected_model, pid, self.connections)
@@ -2057,6 +2071,8 @@ class RetrievalExperimentService:
                     "response_type": response_type,
                     "community_level": selected_parameters.get("community_level", 2),
                     "dynamic_community_selection": selected_parameters.get("dynamic_community_selection", False),
+                    "global_report_top_n": selected_parameters.get("global_report_top_n", DEFAULT_GLOBAL_REPORT_TOP_N),
+                    "global_source_rewrite": selected_parameters.get("global_source_rewrite", True),
                 }
             package_root = Path(__file__).resolve().parents[2]
             environment = os.environ.copy()

@@ -31,9 +31,13 @@ from .evidence import Evidence, EvidenceService
 from .llm_usage import ANSWER_CHECK_STAGE, QUERY_REWRITE_STAGE, SEARCH_STAGE, tag_calls, usage_metadata
 from .projects import ProjectError, ProjectStore
 from .answer_prompts import ANSWER_PROMPT_VERSION, install_answer_prompts
+from .global_prefilter import prefilter_signature
+from .global_rewrite import GLOBAL_SOURCE_REWRITE_VERSION
+from .local_ranking import LOCAL_RANKING_VERSION, configure_local_context
 from .query_translation import document_language_sample, needs_rewrite
 from .strategy_routing import (
-    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, search_with_fallback,
+    SearchOutcome, StrategyRouter, context_source_count, evidence_page_records, question_identifiers,
+    search_with_fallback,
 )
 from .query_cache import QueryResultCache, index_signature, normalize_query
 from .semantic_query_cache import (
@@ -45,6 +49,8 @@ from .semantic_query_cache import (
 QUERY_METHODS = {"local", "global", "drift", "basic"}
 AUTO_METHOD = "auto"
 AGENTIC_METHOD = "agentic"
+# Searches that pick context with the question rewritten into the manual's language (Basic F-53, Local F-69).
+REWRITTEN_QUERY_METHODS = frozenset({"basic", "local"})
 
 _MANUAL_QUERY_ALIASES = {
     "翻譯": ("懸浮翻譯", "翻譯助理", "即時翻譯"),
@@ -211,6 +217,12 @@ class QueryService:
         semantic_stats: dict[str, Any] = {"semantic_cache_hit": False, "semantic_cache_mode": "off", "semantic_embedding_calls": 0}
         semantic_match: dict[str, Any] | None = None
         semantic_vector: list[float] | None = None
+        # Strategies that may run Global (directly, via Auto routing or Agentic) depend on its report
+        # prefilter and source rewrite.
+        global_prefilter_scope = (
+            {} if normalized_method in REWRITTEN_QUERY_METHODS | {"drift"}
+            else {"global_report_prefilter": prefilter_signature(), "global_source_rewrite": GLOBAL_SOURCE_REWRITE_VERSION}
+        )
         if cache is not None:
             cache_key = cache.make_key({
                 "project_id": project_id,
@@ -223,6 +235,8 @@ class QueryService:
                     "reasoning_effort": applied_effort,
                     "settings_sha256": execution_metadata["settings_sha256"],
                     "answer_prompt_version": ANSWER_PROMPT_VERSION,
+                    "local_ranking_version": LOCAL_RANKING_VERSION,
+                    **global_prefilter_scope,
                 },
                 "normalized_query": normalize_query(prompt),
             })
@@ -271,7 +285,8 @@ class QueryService:
                     "response_type": response_type, "reasoning_effort": applied_effort,
                     "settings_sha256": execution_metadata["settings_sha256"],
                     "answer_prompt_version": ANSWER_PROMPT_VERSION,
-                    "strategy_params": {}, "portal_defaults": portal_defaults,
+                    "local_ranking_version": LOCAL_RANKING_VERSION,
+                    "strategy_params": dict(global_prefilter_scope), "portal_defaults": portal_defaults,
                     "safety_filter_version": 1,
                 }
                 embed = self.semantic_embedder or (
@@ -351,12 +366,12 @@ class QueryService:
 
         rewritten: list[str | None] = []
 
-        def basic_retrieval_query() -> str | None:
-            """Rewrite the question into the manual's language once, on the first Basic search (F-53)."""
+        def manual_retrieval_query(search_method: str) -> str | None:
+            """Rewrite the question into the manual's language once, on the first Basic or Local search (F-53, F-69)."""
             if not rewritten:
                 rewritten.append(self._rewrite_for_manual(
                     project_id, graph_root, prompt, selected_model, applied_effort,
-                    llm_calls, execution_metadata, (index_dataframes or {}).get("text_units"),
+                    llm_calls, execution_metadata, (index_dataframes or {}).get("text_units"), search_method,
                 ))
             return rewritten[0]
 
@@ -365,8 +380,8 @@ class QueryService:
                 sys.executable, "-m", "graphrag", "query", "--root", str(graph_root),
                 "--method", search_method, "--response-type", response_type,
             ]
-            if rewrite and search_method == "basic":
-                retrieval = basic_retrieval_query()
+            if rewrite and search_method in REWRITTEN_QUERY_METHODS:
+                retrieval = manual_retrieval_query(search_method)
                 if retrieval:
                     command += ["--retrieval-query", retrieval]
             return command + [search_question]
@@ -413,7 +428,9 @@ class QueryService:
 
             decision = self.router.route(prompt, selected_model, api_base_url, api_key, applied_effort)
             llm_calls.extend(decision.llm_calls)
-            fallback = search_with_fallback(decision, search_and_track, check)
+            fallback = search_with_fallback(
+                decision, search_and_track, check, named_terms=question_identifiers(prompt),
+            )
             normalized_method, routing_reason = fallback.method, fallback.reason
             execution_metadata["strategy_attempts"] = list(fallback.attempts)
             result = fallback.outcome.payload or QueryExecution(0, fallback.outcome.answer, "")
@@ -548,6 +565,7 @@ class QueryService:
         llm_calls: list[dict[str, Any]],
         execution_metadata: dict[str, Any],
         text_units: pd.DataFrame | None = None,
+        search_method: str = "basic",
     ) -> str | None:
         """Return a retrieval query in the manual's language when the question is in another one."""
         script, excerpt = document_language_sample(graph_root, text_units)
@@ -558,7 +576,7 @@ class QueryService:
             question, excerpt, model, self.connection_settings.get_api_base_url(),
             self.connection_settings.get_api_key(project_id), reasoning_effort,
         )
-        llm_calls.extend(tag_calls(calls, QUERY_REWRITE_STAGE, "basic"))
+        llm_calls.extend(tag_calls(calls, QUERY_REWRITE_STAGE, search_method))
         if query:
             execution_metadata["retrieval_query"] = query
         else:
@@ -802,6 +820,7 @@ class QueryService:
         for model in value.get("embedding_models", {}).values():
             configure_embedding_model(model, embedding_model)
         install_answer_prompts(value, settings_path.parent)
+        configure_local_context(value)
         handle, temporary_name = tempfile.mkstemp(dir=settings_path.parent, prefix=".settings-", suffix=".yaml")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as temporary:

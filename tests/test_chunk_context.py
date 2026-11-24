@@ -119,6 +119,58 @@ class ContextualizeRecordsTests(unittest.TestCase):
 
         self.assertEqual(result[1]["text"], "Plain first page of another manual.")
 
+    def test_dtc_detection_table_restarts_trail_when_its_heading_was_lost(self) -> None:
+        # BRC p.88: extraction lost "C1155 BR FLUID LEVEL LOW", so the trail kept C1154 (F-69).
+        detection = (
+            "DTC DETECTION LOGIC\n"
+            "| DTC | Display item | Malfunction detected condition | Possible cause |\n|---|---|---|---|\n"
+            "| C1155 | BR FLUID LEVEL LOW | Brake fluid level is low. | • Brake fluid level switch |\n"
+            "Check the self-diagnosis results."
+        )
+        result = contextualize_records([
+            _record(86, "C1154 PNP SWITCH\nDescription\nINFOID:6\nThe transmission range switch signal.\n"
+                        "DTC DETECTION LOGIC\n| DTC | Display | Condition | Possible Cause |\n|---|---|---|---|\n"
+                        "| C1154 | PNP POS SIG | Signal line is open. | • Harness |\nYES >> GO TO 2.", "BRC.pdf"),
+            _record(88, detection, "BRC.pdf"),
+            _record(89, "4. CHECK BRAKE FLUID LEVEL SWITCH GROUND CIRCUIT\nContinuity check.", "BRC.pdf"),
+        ])
+
+        # The code's own heading is on p.86, so that page is neither cut nor relabeled.
+        self.assertEqual(result[0]["id"], "P-AV-p0086-b01")
+        self.assertEqual(result[0]["text"].splitlines()[0], "AV > C1154 PNP SWITCH > Description")
+        self.assertEqual(
+            result[1]["text"].splitlines()[0], "AV > C1155 BR FLUID LEVEL LOW > DTC Logic > DTC DETECTION LOGIC",
+        )
+        self.assertTrue(result[2]["text"].startswith("AV > C1155 BR FLUID LEVEL LOW > DTC Logic"))
+
+    def test_dtc_table_inside_a_page_cuts_it_at_the_new_code(self) -> None:
+        text = (
+            "C1101, C1102 WHEEL SENSOR\nDTC Logic\nINFOID:7\nNO >> Inspection End.\n"
+            "DTC DETECTION LOGIC\n| DTC | Display Item | Malfunction detected condition | Possible causes |\n"
+            "|---|---|---|---|\n| C1105 | RR RH SENSOR-2 | Open circuit. | • Harness |\n"
+            "| C1106 | RR LH SENSOR-2 | Open circuit. | • Harness |\nCheck the self-diagnosis results."
+        )
+
+        result = contextualize_records([_record(63, text, "BRC.pdf")])
+
+        self.assertEqual([item["id"] for item in result], ["P-AV-p0063-b01-c01", "P-AV-p0063-b01-c02"])
+        self.assertIn("Inspection End.", result[0]["text"])
+        self.assertTrue(result[0]["text"].startswith("AV > C1101, C1102 WHEEL SENSOR > DTC Logic"))
+        self.assertTrue(result[1]["text"].startswith("AV > C1105, C1106 > DTC Logic > DTC DETECTION LOGIC"))
+        self.assertNotIn("Inspection End.", result[1]["text"])
+
+    def test_dtc_tables_without_a_display_column_do_not_switch_codes(self) -> None:
+        text = (
+            "ABS ACTUATOR AND ELECTRIC UNIT (CONTROL UNIT)\nReference Value\nINFOID:8\nFail-safe list.\n"
+            "| DTC | Malfunction detected condition | Fail-safe condition |\n|---|---|---|\n"
+            "| C1155 | When brake fluid level low signal is detected. | VDC suspended. |"
+        )
+
+        result = contextualize_records([_record(40, text, "BRC.pdf")])
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["text"].startswith("AV > ABS ACTUATOR AND ELECTRIC UNIT (CONTROL UNIT) > Reference Value"))
+
     def test_input_records_are_not_modified(self) -> None:
         record = _record(1, "AV CONTROL UNIT\nReference Value\nINFOID:5\nBody.")
         original = dict(record)

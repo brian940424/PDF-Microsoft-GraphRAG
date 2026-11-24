@@ -9,6 +9,7 @@ import yaml
 import pandas as pd
 from unittest.mock import patch
 
+from automotive_graphrag.answer_prompts import ANSWER_PROMPT_VERSION
 from automotive_graphrag.connections import ConnectionSettings
 from automotive_graphrag.projects import ProjectError, ProjectStore
 from automotive_graphrag.evidence import Evidence, EvidenceService
@@ -256,8 +257,12 @@ class QueryServiceTests(unittest.TestCase):
         )
         local_prompt = Path(settings["local_search"]["prompt"])
         self.assertTrue(local_prompt.is_absolute())
+        # Passages get the Local context share community reports had (F-69).
+        self.assertEqual(
+            (settings["local_search"]["text_unit_prop"], settings["local_search"]["community_prop"]), (0.7, 0.05),
+        )
         self.assertIn("---Answer requirements---", local_prompt.read_text(encoding="utf-8"))
-        self.assertEqual(result.execution_metadata["prompt_version"], "answer-requirements-v8")
+        self.assertEqual(result.execution_metadata["prompt_version"], ANSWER_PROMPT_VERSION)
 
     def write_text_units(self, *texts: str) -> None:
         pd.DataFrame({"text": list(texts)}).to_parquet(self.graph_root / "output" / "text_units.parquet")
@@ -279,7 +284,9 @@ class QueryServiceTests(unittest.TestCase):
         basic, local = commands[:2]
         self.assertEqual(basic[basic.index("--retrieval-query") + 1], "Brake bleeding order")
         self.assertEqual(basic[-1], "煞車排氣順序為何？")
-        self.assertNotIn("--retrieval-query", local)
+        # Local reuses the same rewrite (F-69); the answer still gets the original question.
+        self.assertEqual(local[local.index("--retrieval-query") + 1], "Brake bleeding order")
+        self.assertEqual(local[-1], "煞車排氣順序為何？")
         self.assertEqual(len(router.rewrites), 1)
         self.assertEqual(result.execution_metadata["retrieval_query"], "Brake bleeding order")
         stages = [call["stage"] for call in result.execution_metadata["llm_calls"]]

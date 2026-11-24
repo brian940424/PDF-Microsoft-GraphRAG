@@ -9,6 +9,12 @@ the opposite problem: one topic's sentences are diluted by the others.
 This module walks each document's records in page order, carries a short heading trail
 across pages, splits a long page at its headings and a long Markdown table into row groups
 that repeat the table header, and prefixes every resulting text with the trail.
+
+PDF extraction often loses the heading of the next diagnostic code (for example BRC p.88
+starts at the ``C1155`` detection table without its ``C1155 BR FLUID LEVEL LOW`` heading),
+so the trail kept the previous code and C1155 steps were labeled ``C1154 PNP SWITCH`` (F-69).
+A DTC detection table (``| DTC | Display item | ...``) whose codes are not in the trail
+therefore starts a new code: the page is cut there and the trail restarts at the code.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from typing import Any
 
 from .sectioning import looks_like_section_heading
 
-CHUNK_CONTEXT_VERSION = 1
+CHUNK_CONTEXT_VERSION = 2
 # Pages at or below this size stay whole; the retrieval probe showed a heading prefix is enough.
 SPLIT_MIN_CHARS = 2500
 # Row groups and heading segments aim for this size.
@@ -30,6 +36,10 @@ _INFOID = re.compile(r"^INFOID:\S+$")
 _UPPER_HEADING = re.compile(r"^[A-Z][A-Z0-9&/.,'()\- ]*[A-Z0-9)]$")
 _ACRONYM_EXPANSION = re.compile(r"^[A-Z][A-Z0-9-]{1,7}\s+\([A-Z][A-Za-z0-9 ,/&-]+\)$")
 _TABLE_SEPARATOR = re.compile(r"^\|\s*:?-{3,}")
+_DTC_CODE = re.compile(r"\b[BCPU][0-9A-F][0-9A-F]{3}\b")
+# The detection-logic table of one code: "| DTC | Display item | ..." (CONSULT display column).
+_DTC_TABLE_HEADER = re.compile(r"^\|\s*DTC\s*\|\s*Display\b", re.IGNORECASE)
+DTC_TITLE = "DTC Logic"
 
 
 _TITLE_WORD = re.compile(r"^(?:[A-Z][A-Za-z0-9/-]*|for|and|of|the|on|in|with|to|a|an)$")
@@ -106,12 +116,74 @@ class _Trail:
         self.topic = value
         self.after_caps = True
 
+    def restart(self, component: str, title: str) -> None:
+        """Start a new component (a diagnostic code) whose own heading the page lost."""
+        self.outer, self.title, self.topic, self.pending = [component], title, "", []
+        self.after_caps = False
+
     def body(self) -> None:
         self.after_caps = False
 
     @property
     def items(self) -> list[str]:
         return [item for item in (*self.outer, self.title, self.topic) if item]
+
+
+def dtc_switches(lines: list[str]) -> dict[int, str]:
+    """Line indexes where a DTC detection table starts a code, with that code's heading.
+
+    The index is the caps heading directly above the table (such as ``DTC DETECTION LOGIC``)
+    when there is one, so the new code's context covers it. One code keeps its display item
+    (``C1155 BR FLUID LEVEL LOW``); several codes are listed (``C1105, C1106``).
+    """
+    switches: dict[int, str] = {}
+    for index, line in enumerate(lines[:-1]):
+        if not _DTC_TABLE_HEADER.match(line.strip()) or not _TABLE_SEPARATOR.match(lines[index + 1].strip()):
+            continue
+        rows: list[tuple[str, str]] = []
+        for row in lines[index + 2:]:
+            if not row.lstrip().startswith("|"):
+                break
+            cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+            code = _DTC_CODE.fullmatch(cells[0]) if cells else None
+            if code:
+                rows.append((code.group(), cells[1] if len(cells) > 1 else ""))
+        codes = list(dict.fromkeys(code for code, _ in rows))
+        if not codes:
+            continue
+        label = f"{codes[0]} {rows[0][1]}".strip() if len(codes) == 1 else ", ".join(codes)
+        start = index
+        previous = next((other for other in range(index - 1, -1, -1) if lines[other].strip()), None)
+        if previous is not None and _is_caps_heading(" ".join(lines[previous].split())):
+            start = previous
+        switches[start] = label
+    return switches
+
+
+def _starts_new_code(label: str, trail: list[str]) -> bool:
+    known = set(_DTC_CODE.findall(" ".join(trail)))
+    return not known.intersection(_DTC_CODE.findall(label))
+
+
+def _page_cuts(lines: list[str], trail: list[str]) -> set[int]:
+    """Switch indexes whose code is neither in the trail nor in a heading above it on the page."""
+    headings = heading_lines(lines)
+    cuts: set[int] = set()
+    for index, label in dtc_switches(lines).items():
+        above = [" ".join(lines[other].split()) for other in headings if other < index]
+        if _starts_new_code(label, [*trail, *above]):
+            cuts.add(index)
+    return cuts
+
+
+def _cut_at(lines: list[str], cuts: set[int]) -> list[list[str]]:
+    """Split page lines before the given indexes; a cut needs text above it."""
+    result: list[list[str]] = [[]]
+    for index, line in enumerate(lines):
+        if index in cuts and any(item.strip() for item in result[-1]):
+            result.append([])
+        result[-1].append(line)
+    return result
 
 
 def _table_row_groups(lines: list[str]) -> list[list[str]] | None:
@@ -188,20 +260,29 @@ def contextualize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]
         document = str(record.get("document_id", ""))
         trail = trails.setdefault(document, _Trail())
         lines = text.splitlines()
-        headings = heading_lines(lines)
-        segments = _split_page(lines, headings) if len(text) > SPLIT_MIN_CHARS else [lines]
-        position = 0
+        segments: list[list[str]] = []
+        for part in _cut_at(lines, _page_cuts(lines, trail.items)):
+            if sum(len(line) + 1 for line in part) > SPLIT_MIN_CHARS:
+                segments.extend(_split_page(part, heading_lines(part)))
+            elif any(line.strip() for line in part):
+                segments.append(part)
+        segments = segments or [lines]
         pieces: list[tuple[str, str]] = []
         for segment in segments:
             # Headings that open the segment are part of its own context.
             opening = True
             context = ""
+            headings = heading_lines(segment)
+            switches = dtc_switches(segment)
             for offset, line in enumerate(segment):
                 value = " ".join(line.split())
+                switch = switches.get(offset)
+                if switch and _starts_new_code(switch, trail.items):
+                    trail.restart(switch, DTC_TITLE)
                 if not value or _INFOID.match(value):
                     continue
-                if position + offset in headings:
-                    trail.heading(value, headings[position + offset])
+                if offset in headings:
+                    trail.heading(value, headings[offset])
                     continue
                 if opening:
                     context = _context(record, trail.items)
@@ -210,7 +291,6 @@ def contextualize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]
             if opening:
                 context = _context(record, trail.items)
             pieces.append((context, "\n".join(segment).strip()))
-            position += len(segment)
         for number, (context, body) in enumerate(pieces, start=1):
             item = dict(record)
             if len(pieces) > 1:

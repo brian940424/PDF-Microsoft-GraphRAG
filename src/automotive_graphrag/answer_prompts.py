@@ -1,4 +1,4 @@
-"""Answer prompts for GraphRAG Local, Basic and DRIFT queries.
+"""Answer prompts for GraphRAG Local, Basic, DRIFT and Global queries.
 
 The GraphRAG default prompts are kept as the base and an answer-requirements section is
 inserted before the final response-format section. The prompts are written next to the
@@ -12,7 +12,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-ANSWER_PROMPT_VERSION = "answer-requirements-v8"
+# v10 was used and reverted before; skip it so its cached answers are not reused.
+# v12: Global answers carry grounded "Sources (…)" citations (F-70), so cached v11 answers are stale.
+ANSWER_PROMPT_VERSION = "answer-requirements-v12"
 ANSWER_PROMPT_DIRECTORY = Path("prompts") / "automotive_answer"
 _FORMAT_HEADING = "---Target response length and format---"
 
@@ -62,21 +64,85 @@ Wording and citations.
 
 """
 
+_UNSTATED_RULE = (
+    "If the data does not contain the answer, say only that the provided data does not state it; "
+    "do not answer from what is commonly known about the topic."
+)
+# Local sees only the passages linked to a few matched entities, so a missing point usually means
+# the passage was not retrieved, not that the manual lacks it. Claiming the manual does not state
+# it contradicted the reference answers (SM3E v4 Local: 22 of 30 answers, F-69).
+INSUFFICIENT_DATA_PHRASE = "目前取得的資料不足以回答此部分"
+INSUFFICIENT_DATA_PHRASE_EN = "The retrieved data is not sufficient to answer this part"
+LOCAL_UNSTATED_RULE = (
+    "The data holds only some passages of the manual, so a point missing from it may still be in the manual. "
+    "Answer the parts of the question the data supports. For each part it does not support, write exactly "
+    f'"{INSUFFICIENT_DATA_PHRASE}" (or "{INSUFFICIENT_DATA_PHRASE_EN}." when answering in English), '
+    'and never write that the manual, the data or the sources do not state, mention or cover it. '
+    "Do not answer from what is commonly known about the topic."
+)
+LOCAL_ANSWER_REQUIREMENTS = ANSWER_REQUIREMENTS.replace(_UNSTATED_RULE, LOCAL_UNSTATED_RULE)
+if LOCAL_ANSWER_REQUIREMENTS == ANSWER_REQUIREMENTS:  # pragma: no cover - guards an edit of the shared rule
+    raise RuntimeError("Local answer requirements did not replace the unstated-answer rule")
+
+# Global answers from community reports, which summarize many pages. Each report now starts with a
+# "Manuals:" line (F-70, global_reports.py). SM3E 03_global lost points for "the records do not
+# identify the specific manuals" and for remarks such as "not confirmed for every model".
+GLOBAL_ANSWER_REQUIREMENTS = f"""---Answer requirements---
+
+- Answer only from the data. Do not use general knowledge.
+- Each report starts with a line "Manuals: NAME (pages ...); ..." that names the service manuals and pages the report was built from, the manual holding most of the report first. When the question asks which manuals, sections or documents cover something, name the manuals from those lines for every report you use, and do not leave out a manual whose report supports the point. When a report lists several manuals, name only those whose subject fits the point (manual names are section codes, for example BR for brakes), not every manual on the line. Never write that the data does not identify the manuals.
+- When you state a point, name the manual it comes from, for example "In BRC, ...".
+- Keep the concrete details the reports give: names of procedures, modes, steps and parts, the models, conditions or ranges a statement applies to, and values with their units such as positions and dimensions.
+- The data holds summaries of only some passages of the manuals, so a point missing from it may still be in the manuals. Answer the parts of the question the data supports. For each part it does not support, write exactly "{INSUFFICIENT_DATA_PHRASE}" (or "{INSUFFICIENT_DATA_PHRASE_EN}." when answering in English).
+- Never write that the manuals, the data, the records or the reports do not state, confirm, verify, identify, list or fully describe something, and do not add remarks about what is unconfirmed, incomplete or possibly different elsewhere.
+
+"""
+_GLOBAL_UNKNOWN_RULE = (
+    "If you don't know the answer or if the provided reports do not contain sufficient information "
+    "to provide an answer, just say so. Do not make anything up."
+)
+_GLOBAL_PARTIAL_RULE = (
+    "Answer the parts the reports support. Do not make anything up."
+)
+_MAP_DATA_HEADING = "---Data tables---"
+
+
+def global_prompts() -> dict[str, str]:
+    """Return the Global map and reduce prompts with the answer requirements."""
+    from graphrag.prompts.query.global_search_map_system_prompt import MAP_SYSTEM_PROMPT
+    from graphrag.prompts.query.global_search_reduce_system_prompt import REDUCE_SYSTEM_PROMPT
+
+    map_position = MAP_SYSTEM_PROMPT.find(_MAP_DATA_HEADING)
+    if map_position < 0 or _GLOBAL_UNKNOWN_RULE not in REDUCE_SYSTEM_PROMPT:
+        raise ValueError("GraphRAG Global prompts changed; update the Global answer requirements")
+    # The map prompt is a str.format template; the requirements contain no braces.
+    map_prompt = MAP_SYSTEM_PROMPT[:map_position] + GLOBAL_ANSWER_REQUIREMENTS + MAP_SYSTEM_PROMPT[map_position:]
+    reduce_prompt = with_answer_requirements(
+        REDUCE_SYSTEM_PROMPT.replace(_GLOBAL_UNKNOWN_RULE, _GLOBAL_PARTIAL_RULE), GLOBAL_ANSWER_REQUIREMENTS,
+    )
+    return {
+        "global_search_map_system_prompt.txt": map_prompt,
+        "global_search_reduce_system_prompt.txt": reduce_prompt,
+    }
+
+
 # settings section, settings key, file name
 _PROMPT_TARGETS = (
     ("local_search", "prompt", "local_search_system_prompt.txt"),
     ("basic_search", "prompt", "basic_search_system_prompt.txt"),
     ("drift_search", "prompt", "drift_search_system_prompt.txt"),
     ("drift_search", "reduce_prompt", "drift_search_reduce_prompt.txt"),
+    ("global_search", "map_prompt", "global_search_map_system_prompt.txt"),
+    ("global_search", "reduce_prompt", "global_search_reduce_system_prompt.txt"),
 )
 
 
-def with_answer_requirements(prompt: str) -> str:
+def with_answer_requirements(prompt: str, requirements: str = ANSWER_REQUIREMENTS) -> str:
     """Insert the answer requirements before the last response-format section."""
     position = prompt.rfind(_FORMAT_HEADING)
     if position < 0:
         raise ValueError("GraphRAG prompt has no response-format section")
-    return prompt[:position] + ANSWER_REQUIREMENTS + prompt[position:]
+    return prompt[:position] + requirements + prompt[position:]
 
 
 def answer_prompts() -> dict[str, str]:
@@ -94,7 +160,13 @@ def answer_prompts() -> dict[str, str]:
         "drift_search_system_prompt.txt": DRIFT_LOCAL_SYSTEM_PROMPT,
         "drift_search_reduce_prompt.txt": DRIFT_REDUCE_PROMPT,
     }
-    return {name: with_answer_requirements(text) for name, text in bases.items()}
+    requirements = {"local_search_system_prompt.txt": LOCAL_ANSWER_REQUIREMENTS}
+    prompts = {
+        name: with_answer_requirements(text, requirements.get(name, ANSWER_REQUIREMENTS))
+        for name, text in bases.items()
+    }
+    prompts.update(global_prompts())
+    return prompts
 
 
 def install_answer_prompts(settings: dict[str, Any], root: Path) -> None:

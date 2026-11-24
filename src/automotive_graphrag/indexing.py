@@ -24,6 +24,7 @@ from .connections import ConnectionSettings, configure_completion_model, configu
 from .documents import INDEXED_DOCUMENTS_FILE, SECTIONING_FORMAT_VERSION
 from .projects import ProjectError, ProjectStore, indexing_lock_held, indexing_lock_path
 from .chunk_context import contextualize_records
+from .graph_extraction import configure_graph_extraction
 from .source_metadata import SourceMetadataService
 
 
@@ -68,6 +69,46 @@ def parse_indexing_progress(log: str) -> IndexingProgress:
     done = len(completed & set(workflows))
     fraction = min((done + (item_fraction if current else 0.0)) / total, 1.0)
     return IndexingProgress(done, total, current, fraction)
+
+
+# The UI shows a condensed log: `graphrag index --verbose` prints a growing "n / total ...." line
+# per item and dumps whole tables as "WorkflowFunctionOutput(...)" (SM3E: 1.6 MB, one 407k-char
+# line). Re-sending all of it on every update froze the browser and the progress bar with it.
+INDEXING_LOG_DISPLAY_CHARS = 20_000
+INDEXING_LOG_LINE_CHARS = 500
+_WORKFLOW_OUTPUT_PREFIX = "WorkflowFunctionOutput("
+_WORKFLOW_OUTPUT_END = re.compile(r"stop=(?:True|False)\)\s*$")
+
+
+def condense_indexing_log(log: str, max_chars: int = INDEXING_LOG_DISPLAY_CHARS) -> str:
+    """The log as shown in the UI: last item-progress line per run, no table dumps, bounded length."""
+    lines: list[str] = []
+    previous_was_item = False
+    in_dump = False
+    for line in log.splitlines():
+        # A dump is one line for records, several for a DataFrame repr; it ends with "stop=...)".
+        if line.startswith(_WORKFLOW_OUTPUT_PREFIX):
+            in_dump = True
+        if in_dump:
+            in_dump = not _WORKFLOW_OUTPUT_END.search(line)
+            continue
+        if not line.strip():
+            continue
+        is_item = bool(_ITEM_PROGRESS_PATTERN.match(line))
+        if is_item:
+            # Keep only the count; the dots repeat it.
+            line = line.rstrip(". ")
+            if previous_was_item:
+                lines[-1] = line
+                continue
+        elif len(line) > INDEXING_LOG_LINE_CHARS:
+            line = line[:INDEXING_LOG_LINE_CHARS] + " …"
+        lines.append(line)
+        previous_was_item = is_item
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = "…\n" + text[-max_chars:].split("\n", 1)[-1]
+    return text
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +182,7 @@ class IndexingService:
             settings, chat_model, embedding_model,
             self.connection_settings.reasoning_effort_for(chat_model, reasoning_effort),
         )
+        self._configure_graph_extraction(settings)
         self._sync_input(project_path, graph_root)
         return settings
 
@@ -467,6 +509,13 @@ class IndexingService:
         legacy_records = IndexingService._merge_continuation_records(source_records)
         # A graph built before heading context (F-65) stays usable; the next rebuild adds the context.
         return current_records not in (IndexingService.graph_input_records(source_records), legacy_records)
+
+    @staticmethod
+    def _configure_graph_extraction(settings_path: Path) -> None:
+        """Manual-oriented entity types and extraction prompt instead of GraphRAG's defaults (F-69)."""
+        value = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
+        configure_graph_extraction(value, settings_path.parent)
+        IndexingService._atomic_text(settings_path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
 
     @staticmethod
     def _configure_api_base(settings_path: Path, api_base_url: str) -> None:

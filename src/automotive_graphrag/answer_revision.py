@@ -21,6 +21,8 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from .evaluation.source_scoring import cited_text_unit_ids
+
 REVISION_PROMPT = """---Role---
 
 You check a draft answer against the source passages it cites and put back qualifiers that the draft dropped. You do not write a new answer.
@@ -66,20 +68,9 @@ Output only the full revised answer, with no comments before or after it.
 MAX_GROWTH_RATIO = 1.5
 GROWTH_MARGIN_CHARS = 80
 
-_DATA_CITATION = re.compile(r"\[\s*Data\s*:([^\]]*)\]", re.IGNORECASE)
-_SOURCES_CITATION = re.compile(r"Sources\s*\(([^)]*)\)", re.IGNORECASE)
-
-
 def cited_source_ids(answer: str) -> list[str]:
     """Return the Sources identifiers cited in `answer`, in first-seen order."""
-    ids: list[str] = []
-    for block in _DATA_CITATION.findall(answer):
-        for group in _SOURCES_CITATION.findall(block):
-            for part in group.split(","):
-                value = part.strip()
-                if value and value.lstrip("+").lower() != "more" and value not in ids:
-                    ids.append(value)
-    return ids
+    return cited_text_unit_ids(answer)
 
 
 def cited_source_texts(answer: str, context_records: Mapping[str, Any] | None) -> list[tuple[str, str]]:

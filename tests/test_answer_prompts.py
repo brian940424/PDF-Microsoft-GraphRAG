@@ -5,6 +5,8 @@ from pathlib import Path
 from automotive_graphrag.answer_prompts import (
     ANSWER_PROMPT_DIRECTORY,
     ANSWER_REQUIREMENTS,
+    GLOBAL_ANSWER_REQUIREMENTS,
+    INSUFFICIENT_DATA_PHRASE,
     answer_prompts,
     install_answer_prompts,
     with_answer_requirements,
@@ -29,8 +31,11 @@ class AnswerPromptTests(unittest.TestCase):
         self.assertEqual(set(prompts), {
             "local_search_system_prompt.txt", "basic_search_system_prompt.txt",
             "drift_search_system_prompt.txt", "drift_search_reduce_prompt.txt",
+            "global_search_map_system_prompt.txt", "global_search_reduce_system_prompt.txt",
         })
         for name, text in prompts.items():
+            if name.startswith("global_search"):
+                continue
             with self.subTest(name=name):
                 self.assertIn("{context_data}", text)
                 self.assertIn("{response_type}", text)
@@ -57,6 +62,34 @@ class AnswerPromptTests(unittest.TestCase):
         ):
             self.assertIn(phrase, ANSWER_REQUIREMENTS)
 
+    def test_local_prompt_never_claims_the_manual_lacks_a_point(self) -> None:
+        prompts = answer_prompts()
+        local = prompts["local_search_system_prompt.txt"]
+
+        self.assertIn(INSUFFICIENT_DATA_PHRASE, local)
+        self.assertIn("never write that the manual, the data or the sources do not state", local)
+        self.assertNotIn("say only that the provided data does not state it", local)
+        for name in ("basic_search_system_prompt.txt", "drift_search_system_prompt.txt"):
+            self.assertIn("say only that the provided data does not state it", prompts[name])
+            self.assertNotIn(INSUFFICIENT_DATA_PHRASE, prompts[name])
+
+    def test_global_prompts_name_manuals_and_drop_hedging(self) -> None:
+        prompts = answer_prompts()
+        map_prompt = prompts["global_search_map_system_prompt.txt"]
+        reduce_prompt = prompts["global_search_reduce_system_prompt.txt"]
+
+        for text in (map_prompt, reduce_prompt):
+            self.assertEqual(text.count(GLOBAL_ANSWER_REQUIREMENTS), 1)
+            self.assertIn("name the manuals from those lines", text)
+            self.assertIn(INSUFFICIENT_DATA_PHRASE, text)
+            self.assertIn("do not add remarks about what is unconfirmed", text)
+        self.assertNotIn("just say so", reduce_prompt)
+        # Both are str.format templates in GraphRAG; the inserted text must not break them.
+        self.assertIn("ctx", map_prompt.format(context_data="ctx", max_length=10))
+        self.assertLess(map_prompt.index("---Answer requirements---"), map_prompt.index("---Data tables---"))
+        formatted = reduce_prompt.format(report_data="rep", response_type="Single Paragraph", max_length=10)
+        self.assertLess(formatted.index("---Answer requirements---"), formatted.rindex("Single Paragraph"))
+
     def test_install_writes_files_and_points_settings_to_absolute_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -69,6 +102,7 @@ class AnswerPromptTests(unittest.TestCase):
             for section, key in (
                 ("local_search", "prompt"), ("basic_search", "prompt"),
                 ("drift_search", "prompt"), ("drift_search", "reduce_prompt"),
+                ("global_search", "map_prompt"), ("global_search", "reduce_prompt"),
             ):
                 path = Path(settings[section][key])
                 self.assertTrue(path.is_absolute())

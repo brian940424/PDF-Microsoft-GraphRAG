@@ -140,6 +140,32 @@ class EvidenceService:
             rank = len(result) + 1
             community = str(report.get("community") or "")
             title = str(report.get("title") or f"Community Report {context_id}")
+            manual_pages = report.get("manual_pages")
+            if isinstance(manual_pages, dict) and manual_pages:
+                # F-70: one row per manual the cited report summarizes. Pages are every page of the
+                # community's text units, so they locate the report but are not cited pages.
+                for document_id, pages in manual_pages.items():
+                    page_numbers = tuple(sorted({int(page) for page in pages or ()}))
+                    rank = len(result) + 1
+                    result.append(
+                        Evidence(
+                            evidence_id=f"E{rank}",
+                            rank=rank,
+                            context_id=context_id,
+                            text_unit_id="",
+                            chunk_id="",
+                            section_id=community or context_id,
+                            section_name=title,
+                            document_id=str(document_id),
+                            page=page_numbers[0] if page_numbers else None,
+                            block_id="",
+                            text=text,
+                            source_type="community_report",
+                            section_path=f"{document_id} > {title}",
+                            pages=page_numbers,
+                        )
+                    )
+                continue
             result.append(
                 Evidence(
                     evidence_id=f"E{rank}",

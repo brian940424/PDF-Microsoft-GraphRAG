@@ -122,6 +122,25 @@ class RetrievalEvaluationService:
                 "依文件 ID／頁碼比對 Gold Evidence，不使用檢索排名"
                 if routed else "不可計算：自動模式未選到可映射來源的策略（Local／DRIFT／Basic）"
             )
+        elif method == "global" and strategy_matches and any(
+            evidence.source_type == "text_unit" for item in eligible for evidence in item.retrieved_evidence
+        ):
+            # F-70: Global answers are grounded to the passages of the cited reports that are
+            # closest to each cited statement (embedding similarity, not retrieval).
+            grounded = [
+                item for item in eligible
+                if any(evidence.source_type == "text_unit" for evidence in item.retrieved_evidence)
+            ]
+            items = tuple(
+                self._evaluate_question(item, supported=item in grounded) for item in eligible
+            )
+            metrics = compute_source_metrics(
+                tuple((item.retrieved_evidence, item.gold_evidence) for item in grounded)
+            )[:3]
+            status = (
+                f"已計算（{len(grounded)}/{len(eligible)} 題）：Global 依回答句子與引用社群報告的段落相似度對回原文頁，"
+                "非檢索取回，與 Local／Basic 不可直接比較"
+            )
         elif method not in {"local", "basic", "drift", "agentic"} or not strategy_matches:
             items = tuple(self._evaluate_question(item, supported=False) for item in eligible)
             metrics = (None, None, None)
